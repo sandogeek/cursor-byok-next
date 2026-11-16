@@ -17,6 +17,7 @@ cursor-byok/apps/desktop/src/                cursor-byok-nsh/apps/desktop/
 ├── shared/ui/Switch.tsx       开关            │   ├── Switch.tsx         完整轨道 / 滑块样式
 ├── shared/ui/ConfirmDialog.tsx 确认弹窗       │   ├── Dialog.tsx         原生键盘 / 焦点 / Escape
 └── shared/ui/Controls.module.scss             │   ├── Surface.tsx        卡片、状态徽章、导航项
+                                               │   ├── Icon.tsx           单色线型图标
                                                │   └── motion.ts         动效令牌
                                                ├── test-fixtures/        测试清单、隔离接管与纯视觉夹具
                                                └── nsh.json               语义颜色 / 圆角 / 缓动令牌
@@ -42,7 +43,7 @@ cursor-byok/apps/desktop/src/                cursor-byok-nsh/apps/desktop/
 | 状态读取 | 全应用 `refresh()` 轮询 | `resource` 初始读取 + 用户主动刷新；失败保留最后状态 | 本步只有单页，无需引入全局 store 或额外定时请求 |
 | 关闭接管 | 二次确认，说明会清代理设置 | 保留确认；精简说明 | 真实写入仍完全由 Rust 控制 |
 | 样式 | VS Code CSS 变量与 SCSS | NSH 语义 token、Tailwind 尺度 | 统一明暗主题，不在屏幕写颜色 |
-| 图标 | Iconify / Cursor SVG | 统一的文字符号图标，无新增依赖 | 当前壳只需要熟悉的导航符号，不用 emoji |
+| 图标 | Iconify / Cursor SVG | `ui/Icon` 内联 16pt 单色线型 SVG，`tintColor` 跟主题 token | 文字符号大小和笔画不齐；内联 data URI 才能让正式入口和 `test-fixtures/` 共用同一套图标，不越过 NSH 的资源目录边界 |
 
 ## 目标与设计基准
 

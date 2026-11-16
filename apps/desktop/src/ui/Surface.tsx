@@ -1,5 +1,6 @@
-import { Text, View, type JSX } from "nsh";
+import { Text, token, View, type JSX } from "nsh";
 import { Button } from "nsh/base";
+import { Icon, type IconName } from "./Icon";
 import { colorMotion } from "./motion";
 
 export function Surface(props: { children?: JSX.Element; class?: string; variant?: "card" | "sidebar" }) {
@@ -20,7 +21,7 @@ export function StatusBadge(props: { label: string; tone?: "neutral" | "success"
 
 export function NavigationItem(props: {
   label: string;
-  icon: string;
+  icon: IconName;
   selected?: boolean;
   disabled?: boolean;
   badge?: JSX.Element;
@@ -34,7 +35,9 @@ export function NavigationItem(props: {
       onPress={props.onPress}
       class={`min-h-9 flex-row items-center gap-2 rounded-(--radius) px-2.5 text-sidebar-foreground ${colorMotion} hover:bg-sidebar-accent/60 active:bg-sidebar-accent selected:bg-sidebar-accent selected:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40`}
     >
-      <Text class="w-5 text-center text-base">{props.icon}</Text>
+      <View class="h-5 w-5 items-center justify-center">
+        <Icon name={props.icon} color={props.selected ? token("sidebar-accent-foreground") : token("sidebar-foreground")} />
+      </View>
       <Text class="flex-1 text-sm">{props.label}</Text>
       {props.badge}
     </Button>

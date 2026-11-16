@@ -85,19 +85,19 @@ export function Cursor(props: { takeover: CursorTakeover }) {
       <Surface variant="sidebar" class="w-60 shrink-0 self-stretch pt-[env(safe-area-inset-top)]">
         <View class="min-h-0 flex-1 p-1.5">
           <View class="gap-0.5">
-            <NavigationItem label="数据概览" icon="▦" disabled />
-            <NavigationItem label="调用详细" icon="≡" disabled />
+            <NavigationItem label="数据概览" icon="chart" disabled />
+            <NavigationItem label="调用详细" icon="list" disabled />
             <NavigationGroup label="模型配置" />
             <NavigationItem
               label="Cursor"
-              icon="⌁"
+              icon="cursor"
               selected
               badge={<StatusBadge label={statusLabel()} tone={statusTone()} />}
             />
             <NavigationGroup label="设置" />
-            <NavigationItem label="插件配置" icon="◇" disabled />
-            <NavigationItem label="系统设置" icon="⊙" disabled />
-            <NavigationItem label="使用教程" icon="?" disabled />
+            <NavigationItem label="插件配置" icon="plugin" disabled />
+            <NavigationItem label="系统设置" icon="settings" disabled />
+            <NavigationItem label="使用教程" icon="help" disabled />
           </View>
           <View class="flex-1" />
           <View class="gap-1 border-t border-sidebar-border px-2.5 pb-1 pt-3">
