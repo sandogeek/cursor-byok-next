@@ -39,7 +39,7 @@ use self::{
 
 pub use self::account::{is_local_cursor_authorization, local_token};
 pub use self::process::terminate_cursor as quit_cursor;
-pub use self::proxy::{is_cursor_host, Routing as ProxyRouting, UPSTREAM_URL_HEADER};
+pub use self::proxy::{Routing as ProxyRouting, UPSTREAM_URL_HEADER, is_cursor_host};
 
 /// Errors from copying Cursor's files and from running the proxy.
 #[derive(Debug, thiserror::Error)]
@@ -86,7 +86,7 @@ pub enum IntegrationState {
 
 /// What a settings dialog shows. `proxyUrl` is present only while the proxy
 /// runs, so the UI can tell "off" from "starting" from "failed".
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessStatus {
     pub platform: String,
@@ -100,7 +100,7 @@ pub struct HarnessStatus {
 
 /// Where takeover writes, and which port it prefers. Tests build one of these
 /// pointing at temporary files.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct HarnessPaths {
     pub settings: SettingsStore,
     pub account: AccountStore,
@@ -127,9 +127,10 @@ impl HarnessPaths {
 pub struct CursorHarness {
     paths: Arc<HarnessPaths>,
     ca_initialization: SyncMutex<()>,
-    /// Set once the local server listens; until then the proxy forwards
-    /// everything to Cursor untouched.
-    backend: RwLock<Option<SocketAddr>>,
+    /// Serializes enable, disable and restoration across the proxy lock's
+    /// intentional await gaps. Cursor's files are one shared state machine.
+    operation: Mutex<()>,
+    routing: Routing,
     proxy: Mutex<ProxyRuntime>,
     /// Whether the user wants takeover, and the port last bound. Mirrors
     /// `harness.json` so the proxy can be restarted on the same port.
@@ -143,16 +144,31 @@ impl CursorHarness {
         Self {
             paths: Arc::new(paths),
             ca_initialization: SyncMutex::new(()),
-            backend: RwLock::new(None),
+            operation: Mutex::new(()),
+            routing: Routing::default(),
             proxy: Mutex::new(ProxyRuntime::default()),
             intent: RwLock::new(intent),
         }
     }
 
-    /// The address the local service listens on. Until it is set, takeover
-    /// still works but routes nothing locally.
-    pub fn set_backend_addr(&self, addr: SocketAddr) {
-        *self.backend.write() = Some(addr);
+    /// Connects a loopback local service. If takeover is already running, this
+    /// also applies its account and settings before local routing begins.
+    pub async fn set_backend_addr(&self, addr: SocketAddr) -> Result<()> {
+        if !addr.ip().is_loopback() {
+            return Err(Error::Config(
+                "the Cursor backend must be on loopback".into(),
+            ));
+        }
+        let _operation = self.operation.lock().await;
+        let url = self.proxy.lock().await.url();
+        if url.is_some() {
+            self.paths.account.inject_if_missing().await?;
+        }
+        self.routing.set_backend_addr(addr);
+        if let Some(url) = url {
+            self.paths.settings.write_proxy_settings(&url)?;
+        }
+        Ok(())
     }
 
     pub async fn proxy_port(&self) -> Option<u16> {
@@ -160,9 +176,16 @@ impl CursorHarness {
     }
 
     /// Drops the proxy a previous, crashed run left in `settings.json`.
-    /// Returns `true` when it did.
-    pub fn cleanup_stale_settings(&self) -> Result<bool> {
-        self.paths.settings.clear_stale_managed_settings()
+    /// Returns `true` when it did. A running harness is never stale.
+    pub async fn cleanup_stale_settings(&self) -> Result<bool> {
+        let _operation = self.operation.lock().await;
+        if self.proxy.lock().await.running() {
+            return Ok(false);
+        }
+        let Some(url) = self.saved_proxy_url() else {
+            return Ok(false);
+        };
+        self.paths.settings.clear_stale_managed_settings(&url)
     }
 
     /// Generates the CA when missing. Blocking work: run it from a task.
@@ -176,70 +199,66 @@ impl CursorHarness {
     /// A failed restore is logged, not returned: the screen still needs to show
     /// `degraded` and the reason the proxy is missing, rather than an error
     /// page.
-    pub async fn status(&self) -> Result<HarnessStatus> {
+    pub async fn status(&self) -> HarnessStatus {
+        let _operation = self.operation.lock().await;
         self.restore().await;
         self.report().await
     }
 
     /// Turns takeover on or off. Enabling fails before touching Cursor when the
-    /// CA is not trusted.
+    /// CA is not trusted. The persisted intent is committed before files change.
     pub async fn set_enabled(&self, enabled: bool) -> Result<HarnessStatus> {
+        let _operation = self.operation.lock().await;
+        let mut intent = *self.intent.read();
+        intent.enabled = enabled;
+        self.paths.state.save(intent)?;
+        *self.intent.write() = intent;
+
         if enabled {
-            self.intent.write().enabled = true;
-            if let Err(error) = self.enable().await {
-                self.intent.write().enabled = false;
-                return Err(error);
-            }
+            self.enable().await?;
         } else {
             self.disable().await?;
         }
-        self.report().await
+        Ok(self.report().await)
     }
 
-    /// Puts a wanted takeover back after a crash or a failed start. Silent:
-    /// `report` is what shows the outcome.
+    /// Restores a wanted takeover without propagating recovery errors to the
+    /// status screen. `report` exposes the resulting degraded state instead.
     async fn restore(&self) {
-        let Ok(ca) = self.paths.ca.state() else {
+        if !self.intent.read().enabled || self.ca_state() != CaState::Ready {
             return;
+        }
+        let healthy = {
+            let proxy = self.proxy.lock().await;
+            proxy.running()
+                && proxy
+                    .url()
+                    .is_some_and(|url| self.paths.settings.settings_match(&url).unwrap_or(false))
         };
-        if !self.intent.read().enabled || !matches!(ca, CaState::Ready) {
-            return;
-        }
-        let healed = self.proxy.lock().await;
-        let settings_applied = healed
-            .url()
-            .as_deref()
-            .map(|url| self.paths.settings.settings_match(url))
-            .transpose()
-            .ok()
-            .flatten()
-            .unwrap_or(false);
-        let healthy = healed.running() && settings_applied;
-        drop(healed);
-        if healthy {
-            return;
-        }
-        if let Err(error) = self.enable().await {
+        if !healthy && let Err(error) = self.enable().await {
             tracing::warn!(%error, "could not restore Cursor takeover");
         }
     }
 
-    /// The state as it is, without changing anything.
-    async fn report(&self) -> Result<HarnessStatus> {
-        let ca = self.paths.ca.state()?;
+    /// Probes independently, so one unreadable file cannot hide the rest of
+    /// the integration state. An inconsistent or unreadable state is degraded.
+    async fn report(&self) -> HarnessStatus {
+        let ca = self.ca_state();
         let proxy = self.proxy.lock().await;
         let proxy_url = proxy.url();
-        let settings_applied = proxy_url
-            .as_deref()
-            .map(|url| self.paths.settings.settings_match(url))
-            .transpose()?
-            .unwrap_or(false);
-        let integration = match (proxy.running(), settings_applied) {
-            (false, false) => IntegrationState::Disabled,
-            (true, true) => IntegrationState::Enabled,
+        let settings_url = proxy_url.clone().or_else(|| self.saved_proxy_url());
+        let settings = self
+            .paths
+            .settings
+            .settings_state(settings_url.as_deref())
+            .inspect_err(|error| tracing::warn!(%error, "could not read Cursor settings"));
+        let settings_applied = settings.as_ref().is_ok_and(|state| *state == Some(true));
+        let integration = match (proxy.running(), settings_applied, settings) {
+            (false, false, Ok(None | Some(false))) => IntegrationState::Disabled,
+            (true, true, _) => IntegrationState::Enabled,
             _ => IntegrationState::Degraded,
         };
-        Ok(HarnessStatus {
+        HarnessStatus {
             platform: std::env::consts::OS.to_owned(),
             ca,
             integration,
@@ -247,7 +266,19 @@ impl CursorHarness {
             proxy_port: proxy.port(),
             proxy_url,
             ca_install_command: self.paths.ca.install_command(),
+        }
+    }
+
+    fn ca_state(&self) -> CaState {
+        self.paths.ca.state().unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not inspect the local CA");
+            CaState::Invalid
         })
+    }
+
+    fn saved_proxy_url(&self) -> Option<String> {
+        let port = self.intent.read().proxy_port;
+        (port != 0).then(|| format!("http://127.0.0.1:{port}"))
     }
 
     async fn enable(&self) -> Result<()> {
@@ -291,10 +322,7 @@ impl CursorHarness {
             }
         };
         let ca = self.paths.ca.load()?;
-        let routing = Routing {
-            backend: *self.backend.read(),
-        };
-        let (url, actual_port) = proxy.start(routing, ca, preferred).await?;
+        let (url, actual_port) = proxy.start(self.routing.clone(), ca, preferred).await?;
         if actual_port != preferred {
             tracing::warn!(
                 requested = preferred,
@@ -305,30 +333,43 @@ impl CursorHarness {
         // The proxy is running now; release the lock before writing files.
         drop(proxy);
         if let Err(error) = self.apply(&url).await {
+            let _ = self.paths.settings.clear_proxy_settings(&url);
             self.proxy.lock().await.stop().await;
             return Err(error);
         }
-        let mut intent = self.intent.write();
-        intent.enabled = true;
+        let mut intent = *self.intent.read();
         intent.proxy_port = actual_port;
-        self.paths.state.save(*intent)
+        if let Err(error) = self.paths.state.save(intent) {
+            if let Err(cleanup) = self.paths.settings.clear_proxy_settings(&url) {
+                tracing::warn!(%cleanup, "could not roll back Cursor proxy settings");
+            }
+            self.proxy.lock().await.stop().await;
+            return Err(error);
+        }
+        *self.intent.write() = intent;
+        Ok(())
     }
 
-    /// Clears the settings first: stopping the proxy while Cursor still points
-    /// at it would leave Cursor talking to a closed port.
+    /// Clears matching settings first: stopping the proxy while Cursor still
+    /// points at it would leave Cursor talking to a closed port.
     async fn disable(&self) -> Result<()> {
-        self.paths.settings.clear_proxy_settings()?;
-        let mut proxy = self.proxy.lock().await;
-        let port = proxy.port().unwrap_or(self.intent.read().proxy_port);
-        proxy.stop().await;
-        let mut intent = self.intent.write();
-        intent.enabled = false;
-        intent.proxy_port = port;
-        self.paths.state.save(*intent)
+        let proxy_url = self
+            .proxy
+            .lock()
+            .await
+            .url()
+            .or_else(|| self.saved_proxy_url());
+        if let Some(url) = proxy_url {
+            self.paths.settings.clear_proxy_settings(&url)?;
+        }
+        self.proxy.lock().await.stop().await;
+        Ok(())
     }
 
     async fn apply(&self, proxy_url: &str) -> Result<()> {
-        self.paths.account.inject_if_missing().await?;
+        if self.routing.has_backend() {
+            self.paths.account.inject_if_missing().await?;
+        }
         self.paths.settings.write_proxy_settings(proxy_url)
     }
 }
@@ -369,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn status_reports_disabled_before_anything_is_enabled() {
         let dir = tempfile::tempdir().unwrap();
-        let status = harness(&dir).status().await.unwrap();
+        let status = harness(&dir).status().await;
 
         assert_eq!(status.ca, CaState::Missing);
         assert_eq!(status.integration, IntegrationState::Disabled);
@@ -385,7 +426,7 @@ mod tests {
 
         assert!(harness.set_enabled(true).await.is_err());
         assert!(!dir.path().join("settings.json").exists());
-        assert!(!harness.paths.state.load().enabled);
+        assert!(harness.paths.state.load().enabled);
     }
 
     #[tokio::test]
@@ -397,14 +438,20 @@ mod tests {
             .settings
             .write_proxy_settings("http://127.0.0.1:41000")
             .unwrap();
+        *harness.intent.write() = HarnessState {
+            enabled: true,
+            proxy_port: 41000,
+        };
 
         harness.disable().await.unwrap();
 
-        assert!(!harness
-            .paths
-            .settings
-            .settings_match("http://127.0.0.1:41000")
-            .unwrap());
+        assert!(
+            !harness
+                .paths
+                .settings
+                .settings_match("http://127.0.0.1:41000")
+                .unwrap()
+        );
         assert!(!harness.paths.state.load().enabled);
     }
 
@@ -413,12 +460,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let harness = harness(&dir);
 
-        assert!(!harness.cleanup_stale_settings().unwrap());
+        assert!(!harness.cleanup_stale_settings().await.unwrap());
         harness
             .paths
             .settings
             .write_proxy_settings("http://127.0.0.1:41000")
             .unwrap();
-        assert!(harness.cleanup_stale_settings().unwrap());
+        harness
+            .paths
+            .state
+            .save(HarnessState {
+                enabled: false,
+                proxy_port: 41000,
+            })
+            .unwrap();
+        *harness.intent.write() = harness.paths.state.load();
+        assert!(harness.cleanup_stale_settings().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_stale_proxy_settings_file_is_degraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let harness = harness(&dir);
+        harness
+            .paths
+            .settings
+            .write_proxy_settings("http://127.0.0.1:41000")
+            .unwrap();
+        *harness.intent.write() = HarnessState {
+            enabled: false,
+            proxy_port: 41000,
+        };
+
+        let status = harness.status().await;
+        assert_eq!(status.integration, IntegrationState::Degraded);
+        assert!(status.settings_applied);
+    }
+
+    #[tokio::test]
+    async fn unreadable_settings_still_return_a_degraded_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let harness = harness(&dir);
+        fs::write(dir.path().join("settings.json"), "{ not JSONC").unwrap();
+
+        let status = harness.status().await;
+        assert_eq!(status.integration, IntegrationState::Degraded);
+        assert!(!status.settings_applied);
     }
 }

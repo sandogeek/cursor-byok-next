@@ -130,10 +130,11 @@ impl Harness {
 
     /// The current state. Also heals a takeover whose proxy went away.
     pub async fn status(this: Instance<Self>) -> Result<HarnessState, HarnessError> {
-        this.with(|harness| harness.inner.clone())
+        Ok(this
+            .with(|harness| harness.inner.clone())
             .status()
             .await
-            .map(Into::into)
+            .into())
     }
 
     /// Turns takeover on or off. Enabling fails, without touching Cursor, when
@@ -148,6 +149,17 @@ impl Harness {
             .map(Into::into)
     }
 
+    /// Connects the local service after it starts listening. Existing takeover
+    /// starts routing locally and receives its local account at the same time.
+    pub async fn set_backend_addr(this: Instance<Self>, addr: String) -> Result<(), HarnessError> {
+        let addr = addr.parse().map_err(|error| {
+            HarnessError::Config(format!("invalid local backend address: {error}"))
+        })?;
+        this.with(|harness| harness.inner.clone())
+            .set_backend_addr(addr)
+            .await
+    }
+
     /// Generates the CA when it is missing. Trusting it is the user's step:
     /// copy `caInstallCommand` into a terminal.
     pub async fn initialize_ca(this: Instance<Self>) -> Result<HarnessState, HarnessError> {
@@ -158,7 +170,7 @@ impl Harness {
             .map_err(|error| {
                 HarnessError::Process(format!("CA initialization task failed: {error}"))
             })??;
-        harness.status().await.map(Into::into)
+        Ok(harness.status().await.into())
     }
 
     /// Drops the proxy a crashed run left in Cursor's settings. `true` when it
@@ -166,6 +178,7 @@ impl Harness {
     pub async fn cleanup_stale_settings(this: Instance<Self>) -> Result<bool, HarnessError> {
         this.with(|harness| harness.inner.clone())
             .cleanup_stale_settings()
+            .await
     }
 
     /// Quits Cursor so a freshly written proxy setting applies at once. `false`
@@ -223,6 +236,7 @@ impl Format {
 }
 
 /// A count kept in Rust.
+#[derive(Default)]
 #[class]
 pub struct Counter {
     count: u32,

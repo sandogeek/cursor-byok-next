@@ -7,9 +7,9 @@
 
 use std::path::PathBuf;
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::json;
-use sqlx::{sqlite::SqliteConnectOptions, Connection, Row, SqliteConnection};
+use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
 
 use super::{Error, Result};
 
@@ -20,7 +20,7 @@ const MEMBERSHIP_TYPE: &str = "ultra";
 const SUBSCRIPTION_STATUS: &str = "active";
 
 /// Cursor's `state.vscdb`, where its auth and membership cache live.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct AccountStore {
     state_db: PathBuf,
 }
@@ -44,7 +44,7 @@ impl AccountStore {
             platform => {
                 return Err(Error::Config(format!(
                     "Cursor account injection is unsupported on {platform}"
-                )))
+                )));
             }
         };
         Ok(Self { state_db: path })
@@ -76,14 +76,15 @@ impl AccountStore {
         .map_err(|error| Error::Database(error.to_string()))?;
 
         let token = local_token()?;
-        let account = sqlx::query("SELECT CAST(value AS TEXT) AS value FROM ItemTable WHERE key = ?")
-            .bind("cursorAuth/accessToken")
-            .fetch_optional(&mut connection)
-            .await
-            .map_err(|error| Error::Database(error.to_string()))?;
+        let account =
+            sqlx::query("SELECT CAST(value AS TEXT) AS value FROM ItemTable WHERE key = ?")
+                .bind("cursorAuth/accessToken")
+                .fetch_optional(&mut connection)
+                .await
+                .map_err(|error| Error::Database(error.to_string()))?;
         if account.is_some_and(|row| {
             row.try_get::<String, _>("value")
-                .is_ok_and(|value| !value.trim().is_empty() && value != token)
+                .is_ok_and(|value| !value.trim().is_empty() && !is_local_cursor_token(&value))
         }) {
             return Ok(());
         }
@@ -130,12 +131,42 @@ pub fn is_local_cursor_authorization(authorization: &str) -> bool {
 }
 
 fn is_local_cursor_token(token: &str) -> bool {
-    local_token().is_ok_and(|local| local == token)
+    let mut segments = token.split('.');
+    let Some(header) = segments.next() else {
+        return false;
+    };
+    let Some(payload) = segments.next() else {
+        return false;
+    };
+    let Some(signature) = segments.next() else {
+        return false;
+    };
+    if segments.next().is_some() || signature != SUBJECT {
+        return false;
+    }
+    URL_SAFE_NO_PAD
+        .decode(header)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("alg")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("HS256")
+        && URL_SAFE_NO_PAD
+            .decode(payload)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|value| {
+                value.get("sub").and_then(serde_json::Value::as_str) == Some(SUBJECT)
+            })
 }
 
-/// The unsigned JWT Cursor stores for the local account. Its third segment is
-/// the subject itself, which makes `is_local_cursor_token` a cheap string
-/// compare.
+/// The unsigned JWT Cursor stores for the local account. Recognition validates
+/// its header, subject and marker segment, not JSON serialization order.
 pub fn local_token() -> Result<String> {
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
     let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({
@@ -252,5 +283,23 @@ mod tests {
         ));
         assert!(!is_local_cursor_token("official-cursor-token"));
         assert!(!is_local_cursor_token(""));
+    }
+
+    #[test]
+    fn recognises_a_local_token_with_changed_payload() {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"cursor-local-user","exp":1}"#);
+        let token = format!("{header}.{payload}.{SUBJECT}");
+        assert_ne!(token, local_token().unwrap());
+        assert!(is_local_cursor_token(&token));
+    }
+
+    #[test]
+    fn a_fake_signature_does_not_make_a_token_local() {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"cursor-local-user"}"#);
+        assert!(!is_local_cursor_token(&format!(
+            "{header}.{payload}.official"
+        )));
     }
 }

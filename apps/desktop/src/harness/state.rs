@@ -20,7 +20,7 @@ pub struct HarnessState {
     pub proxy_port: u16,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct HarnessStateStore {
     path: PathBuf,
 }

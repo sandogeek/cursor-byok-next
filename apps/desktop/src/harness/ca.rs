@@ -14,7 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, RsaKeySize, PKCS_RSA_SHA256,
+    KeyUsagePurpose, PKCS_RSA_SHA256, RsaKeySize,
 };
 #[cfg(target_os = "macos")]
 use sha1::{Digest, Sha1};
@@ -30,7 +30,7 @@ pub struct LoadedCa {
 
 /// Owns the CA files: generating them once, loading them, and telling whether
 /// the system trusts them.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CaManager {
     dir: PathBuf,
 }
@@ -118,7 +118,7 @@ impl CaManager {
     pub fn initialize(&self) -> Result<()> {
         match self.state()? {
             CaState::Invalid => {
-                return Err(Error::Config("CA files are incomplete or invalid".into()))
+                return Err(Error::Config("CA files are incomplete or invalid".into()));
             }
             CaState::Ready => return Ok(()),
             CaState::Missing => self.generate()?,
@@ -211,7 +211,8 @@ fn is_installed(cert: &str) -> Result<bool> {
         let output = Command::new("security")
             .args(["find-certificate", "-a", "-Z", keychain])
             .output()?;
-        if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(&fingerprint) {
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(&fingerprint)
+        {
             return Ok(true);
         }
     }

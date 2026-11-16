@@ -5,17 +5,18 @@
 //! the path is on the allowlist. Everything else is forwarded to Cursor
 //! untouched, so an app with no backend yet still leaves Cursor fully working.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use hudsucker::{
-    certificate_authority::RcgenAuthority,
-    hyper::{Request, Uri},
-    rustls::crypto::aws_lc_rs,
     Body, HttpContext, HttpHandler, Proxy, RequestOrResponse,
+    certificate_authority::RcgenAuthority,
+    hyper::{Request, Response, StatusCode, Uri},
+    rustls::crypto::aws_lc_rs,
 };
+use parking_lot::RwLock;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
-use super::{ca::LoadedCa, Error, Result};
+use super::{Error, Result, ca::LoadedCa};
 
 /// The header the local backend reads to know where the request was going.
 pub const UPSTREAM_URL_HEADER: &str = "x-server-upstream-url";
@@ -32,9 +33,7 @@ pub struct ProxyRuntime {
 
 impl ProxyRuntime {
     pub fn running(&self) -> bool {
-        self.task
-            .as_ref()
-            .is_some_and(|task| !task.is_finished())
+        self.task.as_ref().is_some_and(|task| !task.is_finished())
     }
 
     pub fn url(&self) -> Option<String> {
@@ -81,16 +80,31 @@ impl ProxyRuntime {
         Ok((self.url.clone().expect("just set"), address.port()))
     }
 
-    /// Stops the proxy and waits for its listener to close.
+    /// Stops the proxy and reclaims its task, even if open connections prevent
+    /// a graceful shutdown. Dropping a live task would leak its listening port.
     pub async fn stop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
-        if let Some(task) = self.task.take() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        if let Some(mut task) = self.task.take()
+            && tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
+            let _ = task.await;
         }
         self.url = None;
         self.port = None;
+    }
+}
+
+impl Drop for ProxyRuntime {
+    fn drop(&mut self) {
+        self.stop.take();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -106,20 +120,30 @@ async fn bind_listener(requested_port: u16) -> Result<TcpListener> {
     }
 }
 
-/// Which requests go to the local backend. `backend: None` keeps every request
-/// on its way to Cursor: takeover without a local service is a no-op routing
-/// wise, and Cursor keeps working.
-#[derive(Clone, Copy, Debug, Default)]
+/// Which requests go to the local backend. The relay reads this shared value
+/// for every request, so a backend can arrive after the proxy has started.
+#[derive(Clone, Debug, Default)]
 pub struct Routing {
-    pub backend: Option<SocketAddr>,
+    backend: Arc<RwLock<Option<SocketAddr>>>,
 }
 
 impl Routing {
-    fn routes(&self, host: &str, path: &str) -> bool {
-        let Some(_) = self.backend else {
-            return false;
-        };
-        is_cursor_host(host) && is_local_path(path)
+    pub fn set_backend_addr(&self, addr: SocketAddr) {
+        *self.backend.write() = Some(addr);
+    }
+
+    fn backend(&self) -> Option<SocketAddr> {
+        self.backend.read().filter(|addr| addr.ip().is_loopback())
+    }
+
+    pub fn has_backend(&self) -> bool {
+        self.backend().is_some()
+    }
+
+    fn routes(&self, host: &str, path: &str) -> Option<SocketAddr> {
+        (is_cursor_host(host) && is_local_path(path))
+            .then(|| self.backend())
+            .flatten()
     }
 }
 
@@ -135,20 +159,22 @@ impl HttpHandler for CursorRelay {
         mut request: Request<Body>,
     ) -> RequestOrResponse {
         let original = request.uri().clone();
-        let host = original.host().unwrap_or_default();
-        let path = original
-            .path_and_query()
-            .map(|value| value.as_str())
-            .unwrap_or("/");
-        if self.routing.routes(host, original.path()) {
-            if let Some(backend) = self.routing.backend {
-                if let Ok(value) = original.to_string().parse() {
-                    request.headers_mut().insert(UPSTREAM_URL_HEADER, value);
-                }
-                if let Ok(uri) = format!("http://{backend}{path}").parse::<Uri>() {
-                    *request.uri_mut() = uri;
-                }
-            }
+        if let Some(backend) = self
+            .routing
+            .routes(original.host().unwrap_or_default(), original.path())
+        {
+            let Some(upstream) = original.to_string().parse().ok() else {
+                return bad_gateway("the original Cursor URL is not a valid header");
+            };
+            let path = original
+                .path_and_query()
+                .map(|value| value.as_str())
+                .unwrap_or("/");
+            let Ok(uri) = format!("http://{backend}{path}").parse::<Uri>() else {
+                return bad_gateway("could not build the local Cursor backend URL");
+            };
+            request.headers_mut().insert(UPSTREAM_URL_HEADER, upstream);
+            *request.uri_mut() = uri;
         }
         request.into()
     }
@@ -173,6 +199,14 @@ impl HttpHandler for CursorRelay {
     ) -> bool {
         hello.server_name().is_some_and(is_cursor_host)
     }
+}
+
+fn bad_gateway(message: &'static str) -> RequestOrResponse {
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(Body::from(message))
+        .expect("a static bad gateway response is valid")
+        .into()
 }
 
 /// The hosts Cursor talks to for AI, account and dashboard traffic.
@@ -255,6 +289,8 @@ mod tests {
         assert_eq!(runtime.url(), None);
         assert_eq!(runtime.port(), None);
         assert!(!runtime.running());
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        drop(listener);
     }
 
     #[tokio::test]
@@ -273,6 +309,22 @@ mod tests {
         runtime.stop().await;
     }
 
+    #[tokio::test]
+    async fn dropping_releases_the_listening_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = ProxyRuntime::default();
+        let (_, port) = runtime
+            .start(Routing::default(), test_ca(dir.path()), 0)
+            .await
+            .unwrap();
+
+        drop(runtime);
+        tokio::task::yield_now().await;
+
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        drop(listener);
+    }
+
     #[test]
     fn only_cursor_hosts_are_cursor_hosts() {
         for host in [
@@ -283,12 +335,7 @@ mod tests {
         ] {
             assert!(is_cursor_host(host), "{host}");
         }
-        for host in [
-            "cursor.com",
-            "notcursor.sh",
-            "example.com",
-            "",
-        ] {
+        for host in ["cursor.com", "notcursor.sh", "example.com", ""] {
             assert!(!is_cursor_host(host), "{host}");
         }
     }
@@ -296,17 +343,63 @@ mod tests {
     #[test]
     fn a_backendless_takeover_routes_nothing() {
         let routing = Routing::default();
-        assert!(!routing.routes("api2.cursor.sh", "/agent.v1.AgentService/RunSSE"));
+        assert_eq!(
+            routing.routes("api2.cursor.sh", "/agent.v1.AgentService/RunSSE"),
+            None
+        );
     }
 
     #[test]
     fn a_configured_backend_routes_only_allowlisted_cursor_paths() {
-        let routing = Routing {
-            backend: Some(SocketAddr::from(([127, 0, 0, 1], 3000))),
+        let routing = Routing::default();
+        let backend = SocketAddr::from(([127, 0, 0, 1], 3000));
+        routing.set_backend_addr(backend);
+        assert_eq!(
+            routing.routes("api2.cursor.sh", "/aiserver.v1.BidiService/BidiAppend"),
+            Some(backend)
+        );
+        assert_eq!(
+            routing.routes("api2.cursor.sh", "/auth/stripe_profile"),
+            Some(backend)
+        );
+        assert_eq!(
+            routing.routes("api2.cursor.sh", "/aiserver.v1.AiService/SomeOtherMethod"),
+            None
+        );
+        assert_eq!(routing.routes("example.com", "/auth/stripe_profile"), None);
+    }
+
+    #[test]
+    fn a_backend_arriving_after_start_updates_the_shared_route() {
+        let routing = Routing::default();
+        let relay = CursorRelay {
+            routing: routing.clone(),
         };
-        assert!(routing.routes("api2.cursor.sh", "/aiserver.v1.BidiService/BidiAppend"));
-        assert!(routing.routes("api2.cursor.sh", "/auth/stripe_profile"));
-        assert!(!routing.routes("api2.cursor.sh", "/aiserver.v1.AiService/SomeOtherMethod"));
-        assert!(!routing.routes("example.com", "/auth/stripe_profile"));
+        assert_eq!(
+            relay
+                .routing
+                .routes("api2.cursor.sh", "/auth/stripe_profile"),
+            None
+        );
+
+        let backend = SocketAddr::from(([127, 0, 0, 1], 3000));
+        routing.set_backend_addr(backend);
+
+        assert_eq!(
+            relay
+                .routing
+                .routes("api2.cursor.sh", "/auth/stripe_profile"),
+            Some(backend)
+        );
+    }
+
+    #[test]
+    fn a_non_loopback_backend_is_not_used() {
+        let routing = Routing::default();
+        routing.set_backend_addr(SocketAddr::from(([192, 0, 2, 1], 3000)));
+        assert_eq!(
+            routing.routes("api2.cursor.sh", "/auth/stripe_profile"),
+            None
+        );
     }
 }

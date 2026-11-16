@@ -1,7 +1,7 @@
 # 移植记录：Cursor 接管（`local_app` → `harness`）
 
 上游实现：`cursor-byok/server/src/local_app/`（1149 行，含 `ca/`，含单测）。
-本移植：`apps/desktop/src/harness/`（1754 行，含单测）。
+本移植：`apps/desktop/src/harness/`（2018 行，含单测）。
 
 范围只有一件事：**让 Cursor 愿意走本地**——把它的网络栈指向本机代理、让它信任代理签发的证书、让它以为已登录。代理之后把请求改写给谁，是下一步（local loop 的服务端）的事。
 
@@ -9,18 +9,18 @@
 
 ```text
 cursor-byok/server/src/local_app/          apps/desktop/src/harness/
-├── mod.rs             235 行  CursorHarness  ├── mod.rs              423 行
-├── proxy.rs           223 行  代理与路由      ├── proxy.rs            311 行
-├── settings.rs        111 行  settings.json  ├── settings.rs         222 行
-├── account.rs         175 行  state.vscdb    ├── account.rs          255 行
+├── mod.rs             235 行  CursorHarness  ├── mod.rs              507 行
+├── proxy.rs           223 行  代理与路由      ├── proxy.rs            405 行
+├── settings.rs        111 行  settings.json  ├── settings.rs         253 行
+├── account.rs         175 行  state.vscdb    ├── account.rs          305 行
 ├── process.rs          91 行  结束 Cursor    ├── process.rs           97 行
 └── ca/
-    ├── mod.rs         239 行  CA 生成与信任   ├── ca.rs               283 行（目录收成单文件）
-    └── windows.rs      75 行  Win32 ROOT 枚举 └── windows.rs           70 行
-                                               └── state.rs            93 行（新增：意图与端口持久化）
+    ├── mod.rs         239 行  CA 生成与信任   ├── ca.rs               285 行（目录收成单文件）
+    └── windows.rs      75 行  Win32 ROOT 枚举 └── windows.rs           71 行
+                                               └── state.rs            94 行（新增：意图与端口持久化）
 ```
 
-行数为 `wc -l` 实测，两侧都含 `#[cfg(test)]`。nsh 侧多出 39 行，主要来自 `state.rs` 与新增的 `ProxyRuntime` 生命周期测试。
+行数为 `wc -l` 实测，两侧都含 `#[cfg(test)]`。nsh 侧新增 `state.rs`、操作串行化、后端热接线、代理生命周期与状态降级测试。
 
 上游划掉的 `pub(crate)` 辅助（`proxy_host_allowed`、`request_uses_local_cursor_token`、`local_cursor_authorization`）在本仓库没有消费方（`api/cursor/proxy.rs`、`cursor/services/{account,entitlement,compatibility}.rs` 还没移植），因此以公开导出保留：
 
@@ -46,9 +46,9 @@ pub use self::proxy::{is_cursor_host, Routing as ProxyRouting, UPSTREAM_URL_HEAD
 | 6 | 自愈触发条件 | 必须有 `backend_addr` 才自愈 | 有 CA + 有意愿就自愈 | 配合 #1：代理先跑起来接管流量，后端后接 |
 | 7 | 状态结构 | `CursorHarnessStatus` 含 `configured_models` / `enabled_models` | `HarnessStatus` 去掉模型计数，加 `proxy_port` | 模型计数依赖 `Store`，本步没有。`proxy_port` 是端口回退后 UI 必须能看到的 |
 | 8 | 启停入口 | HTTP `PUT /__byok-api__/api/harness/cursor/enabled` + `SetEnabled { enabled }` | `#[class] Harness` 的 `setEnabled(enabled)` / `status()` / `initializeCa()` | 这个仓库没有 axum 管理面；nsh 的类型边界是 `#[class]` |
-| 9 | 回滚语义 | `start` 后写端口失败 → `stop()`；写设置失败 → `stop()` | 只有“写设置失败 → `stop()`” | 本仓库不写端口到数据库，`harness.json` 与设置写入放在同一次成功后提交（#3） |
-| 10 | 锁 | 全程持有 `proxy` 锁；`apply_cursor_configuration` 是同步函数，不需要 await | `apply()` 是 `async`（账号注入要 await），因此写文件前先 `drop(proxy)`，失败再重新取锁回滚 | `tokio::sync::Mutex` 不能跨 await 持锁写文件；否则 UI 的 `status()` 会排队等整次接管 |
-| 11 | 账号注入的串行化 | 每次 `enable` 直接写 | 同；额外显式 `.busy_timeout(5s)` | 与 sqlx 默认值一致（`sqlx-sqlite 0.8.6` 默认 5s），写出来是为了让“Cursor 正开着这个库”这件事在代码里可见 |
+| 9 | 回滚语义 | `start` 后写端口失败 → `stop()`；写设置失败 → `stop()` | 写设置失败会尝试清除完整托管设置；端口保存失败先清设置再停代理 | 停用不变量同样适用于失败回滚，不能把 Cursor 留在死端口 |
+| 10 | 锁 | 全程持有 `proxy` 锁；`apply_cursor_configuration` 是同步函数，不需要 await | `operation` 串行化 enable/disable/restore/后端接线；`proxy` 锁只在需要时持有 | `apply()` 要 await 账号注入；仅有 `proxy` 锁无法阻止启停在释放锁后交错 |
+| 11 | 账号注入的串行化 | 每次 `enable` 直接写 | `operation` 串行化；仅后端就绪时注入，显式 `.busy_timeout(5s)` | 后端未就绪时请求直通官方，不能注入会被直接转发的伪 token |
 | 12 | 代理 URL 解析 | `reqwest::Url` | 自带 `loopback_host()`（约 10 行） | 只用来判断“是不是 loopback”，不值得为此引入 `reqwest`（它在本仓库会额外拉 native-tls） |
 | 13 | `clear_stale_managed_settings` | `Result<()>` | `Result<bool>`（是否真的清了） | UI 需要区分“没有残留”与“清掉了”，否则每次启动都要弹一次提示 |
 | 14 | `terminate_cursor` | `Result<()>` | `Result<bool>`（Cursor 是否在运行） | 调用方据此决定日志措辞；也让“没装 Cursor”不被当成失败 |
@@ -56,11 +56,16 @@ pub use self::proxy::{is_cursor_host, Routing as ProxyRouting, UPSTREAM_URL_HEAD
 | 16 | 数据目录 | `~/.cursor-byok-v3`（CA 在 `ca/`） | `~/.cursor-byok-nsh`（CA 在 `ca/`） | 两个客户端要能并存，证书也不能互相覆盖 |
 | 17 | Linux 锚文件名 | `cursor-byok-local-ca.crt` | `cursor-byok-nsh-local-ca.crt` | 同上 |
 | 18 | 桩数据 | 无 | 测试全部指向临时目录（`SettingsStore::at` / `AccountStore::at` / `CaManager::at` / `HarnessStateStore::at`） | 单测绝不读真实 `~/Library/Application Support/Cursor` |
+| 19 | 后端热接线 | 启动时复制 `backend_addr`，之后不可变 | `Routing` 持有共享 loopback 地址；`setBackendAddr` 更新已运行代理并注入账号 | 接管可以先启动，local loop 后启动；不应靠重启代理切换路由 |
+| 20 | 代理任务回收 | 停止超时后丢弃 `JoinHandle` | 超时后 `abort` 并等待；`Drop` 也取消任务 | 丢弃句柄不取消 Tokio 任务，会遗留监听端口 |
+| 21 | 本地 token 判定 | 比较完整序列化 token | 验证 JWT `alg=HS256`、本地 `sub` 与 marker 段 | 不依赖 JSON 字段顺序，payload 演进仍识别旧本地账号 |
+| 22 | 停用 / 残留清理 | 完整通用签名 + 任意 loopback 地址即可删除 | 只清理完整匹配本 harness 代理 URL 的 5 个键 | 不删除用户后来改回的代理，也不清理其他本地工具 |
+| 23 | 路由改写失败 | URI 构造失败则静默发往上游 | 返回 502，不向上游旁路 | 命中本地白名单后必须失败关闭 |
 
 ### 顺带修掉的上游隐患
 
 - **`status()` 是自愈入口，同时是轮询接口**：见 #5，nsh 把它拆开。
-- **`enable()` 里的失败路径没有覆盖 `harness.json`**：上游“先记住意图再动作”，崩在中间会留下“想开但没开”的持久状态；nsh 只在成功后提交 `{ enabled: true, proxyPort: actual }`，失败时同时把内存意图复位。
+- **`enable()` 里的失败路径没有覆盖 `harness.json`**：`{ enabled }` 先作为用户意图持久化，修改 Cursor 后保存实际端口；任一步失败都按真实文件状态报告 `degraded`，不伪报运行成功。
 
 ## 必须保持的语义（两侧一致）
 
@@ -70,7 +75,7 @@ pub use self::proxy::{is_cursor_host, Routing as ProxyRouting, UPSTREAM_URL_HEAD
 | 停用顺序：先清 `settings.json`，再停代理 | `mod.rs:225-229` | `mod.rs:317-328` |
 | 写设置前先落意图，`enable` 幂等 | `mod.rs:155-164` | `mod.rs:186-197` + `enable` 内 `running()` 早返回 |
 | 只在设置**尚未生效**时结束 Cursor，失败不阻断 | `mod.rs:190-196` | `mod.rs:266-275` |
-| 清理残留只认“托管签名 + loopback”，绝不删用户/企业代理 | `settings.rs:96-111` | `settings.rs:94-109` |
+| 清理残留只认“完整托管签名 + loopback + 本 harness URL”，绝不删用户/企业代理 | `settings.rs:96-111` | `settings.rs` 的 `clear_proxy_settings` |
 | 已有真实登录不覆盖；只修“本来就是本地 token”的会员缓存 | `account.rs:56-65` | `account.rs:72-81` |
 | 设置文件读 JSONC、写原子替换（temp + rename） | `settings.rs:36-60` | `settings.rs:111-137` |
 | 只 MITM `*.cursor.sh`，其余主机纯隧道 | `proxy.rs:132-155` | `proxy.rs:159-181` |
@@ -118,6 +123,7 @@ new Harness()                               // 读 harness.json，恢复端口�
 await harness.status()                      // HarnessState，见下
 await harness.setEnabled(enabled)           // 切接管；CA 未信任时抛错且不动 Cursor
 await harness.initializeCa()                // 生成缺失的 CA（阻塞工作，跑在 blocking 线程）
+await harness.setBackendAddr("127.0.0.1:3000") // local loop 监听后接线，可晚于启用
 await harness.cleanupStaleSettings()        // 清崩溃残留，返回是否清掉了
 await Harness.quitCursor()                  // 结束 Cursor，返回它是否在运行
 ```
@@ -141,10 +147,11 @@ interface HarnessState {
 ## 验证
 
 ```sh
-cargo check --all-targets   # 无 warning
-cargo test                  # 20 passed
+cargo check --all-targets   # crate + TSX 类型检查
+cargo test                  # 27 passed
+cargo clippy --all-targets -- -D warnings
 nsh check                   # crate + TSX 类型检查
-nsh test                    # 21 passed（含 App.test.tsx）
+nsh test                    # 28 passed（含 App.test.tsx）
 ```
 
 覆盖到的行为（每条一个测试）：
@@ -169,6 +176,11 @@ nsh test                    # 21 passed（含 App.test.tsx）
 | `enabling_without_a_trusted_ca_fails_before_touching_cursor` | 第一道门 |
 | `disable_clears_settings_and_persists_the_intent` | 停用顺序 |
 | `stale_cleanup_reports_whether_it_removed_anything` | #13 |
+| `a_backend_arriving_after_start_updates_the_shared_route` | 已运行代理读取新后端 |
+| `a_non_loopback_backend_is_not_used` | 后端只允许 loopback |
+| `dropping_releases_the_listening_port` | 代理任务回收后端口可复绑 |
+| `recognises_a_local_token_with_changed_payload` | token 识别不依赖序列化 |
+| `a_stale_proxy_settings_file_is_degraded` / `unreadable_settings_still_return_a_degraded_status` | 状态矩阵与只读降级 |
 
 **未做的验证**：没有在真机 Cursor 上跑通完整接管（需要 sudo 信任 CA、会结束 Cursor 进程）。这一步的验收是单测与类型检查，端到端留给接管页一起做。
 
@@ -176,5 +188,5 @@ nsh test                    # 21 passed（含 App.test.tsx）
 
 1. **接管页 UI**：`src/ui/` 基础层 + `src/screens/Cursor.tsx`，按 `ca → 复制安装命令 → 初始化 → 启用 → 状态回读` 的顺序；`caInstallCommand` 只复制不执行。
 2. **备份与还原**：两侧目前都直接改用户的 `settings.json` 与 `state.vscdb`。要支持多机/多账号，应在首次写入前把原始键值存到 `harness.json` 同级，`disable()` 时还原而不是删除。
-3. **后端接线**：local loop 服务端进仓库后调用 `harness.set_backend_addr(addr)`，`Routing.backend` 一变，白名单内请求才开始改写到本地。
+3. **后端接线**：`harness.setBackendAddr("127.0.0.1:<port>")` 已接入类型边界；local loop 服务端进仓库后调用它，已运行的代理会立即更新白名单路由并补齐本地账号。
 4. **tab 中转**：需要时再加 `TabMode` 与 `TAB_PATHS`（差异 #2），届时要同时实现 tab 服务。

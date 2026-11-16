@@ -20,7 +20,7 @@ const KEYS: [&str; 5] = [
 ];
 
 /// Cursor's user settings file, edited in place.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct SettingsStore {
     path: PathBuf,
 }
@@ -42,7 +42,7 @@ impl SettingsStore {
             platform => {
                 return Err(Error::Config(format!(
                     "Cursor settings are unsupported on {platform}"
-                )))
+                )));
             }
         };
         Ok(Self { path })
@@ -65,48 +65,34 @@ impl SettingsStore {
         self.write(&settings)
     }
 
-    pub fn clear_proxy_settings(&self) -> Result<()> {
+    pub fn clear_proxy_settings(&self, proxy_url: &str) -> Result<bool> {
         let mut settings = self.read()?;
-        let before = settings.len();
+        if !matches_managed_proxy(&settings, proxy_url) {
+            return Ok(false);
+        }
         for key in KEYS {
             settings.remove(key);
         }
-        if settings.len() != before {
-            self.write(&settings)?;
-        }
-        Ok(())
+        self.write(&settings)?;
+        Ok(true)
+    }
+
+    /// Reads settings even when no current proxy URL exists, so corruption is
+    /// still visible to the status screen rather than looking like "disabled".
+    pub fn settings_state(&self, proxy_url: Option<&str>) -> Result<Option<bool>> {
+        let settings = self.read()?;
+        Ok(proxy_url.map(|url| matches_managed_proxy(&settings, url)))
     }
 
     /// Whether all five managed keys hold exactly what takeover writes.
     pub fn settings_match(&self, proxy_url: &str) -> Result<bool> {
-        let settings = self.read()?;
-        Ok(
-            settings.get(KEYS[0]) == Some(&Value::String(proxy_url.into()))
-                && settings.get(KEYS[1]) == Some(&Value::String(proxy_url.into()))
-                && settings.get(KEYS[2]) == Some(&Value::String("on".into()))
-                && settings.get(KEYS[3]) == Some(&Value::Bool(true))
-                && settings.get(KEYS[4]) == Some(&Value::Bool(true)),
-        )
+        Ok(matches_managed_proxy(&self.read()?, proxy_url))
     }
 
-    /// Clears a proxy this app left behind when it was killed before
-    /// disabling. Only a full managed signature pointing at loopback counts:
-    /// a proxy configured by the user or by IT is never touched.
-    pub fn clear_stale_managed_settings(&self) -> Result<bool> {
-        let settings = self.read()?;
-        let managed_signature = settings.get(KEYS[2]) == Some(&Value::String("on".into()))
-            && settings.get(KEYS[3]) == Some(&Value::Bool(true))
-            && settings.get(KEYS[4]) == Some(&Value::Bool(true));
-        let loopback = settings
-            .get(KEYS[0])
-            .and_then(Value::as_str)
-            .and_then(loopback_host)
-            .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1"));
-        if managed_signature && loopback {
-            self.clear_proxy_settings()?;
-            return Ok(true);
-        }
-        Ok(false)
+    /// Clears only the complete settings written for this harness's proxy. A
+    /// loopback proxy belonging to another tool is not a managed signature.
+    pub fn clear_stale_managed_settings(&self, proxy_url: &str) -> Result<bool> {
+        self.clear_proxy_settings(proxy_url)
     }
 
     /// Cursor's file is JSONC (`json5`), and a missing file is an empty one.
@@ -114,7 +100,7 @@ impl SettingsStore {
         let data = match fs::read_to_string(&self.path) {
             Ok(data) => data,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(BTreeMap::new())
+                return Ok(BTreeMap::new());
             }
             Err(error) => return Err(error.into()),
         };
@@ -139,6 +125,18 @@ impl SettingsStore {
 }
 
 /// The host of a proxy URL such as `http://127.0.0.1:41000`.
+fn matches_managed_proxy(settings: &BTreeMap<String, Value>, proxy_url: &str) -> bool {
+    let loopback = loopback_host(proxy_url)
+        .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1"));
+    loopback
+        && settings.get(KEYS[0]).and_then(Value::as_str) == Some(proxy_url)
+        && settings.get(KEYS[1]).and_then(Value::as_str) == Some(proxy_url)
+        && settings.get(KEYS[2]).and_then(Value::as_str) == Some("on")
+        && settings.get(KEYS[3]).and_then(Value::as_bool) == Some(true)
+        && settings.get(KEYS[4]).and_then(Value::as_bool) == Some(true)
+}
+
+/// The host of a proxy URL such as `http://127.0.0.1:41000`.
 fn loopback_host(value: &str) -> Option<String> {
     let authority = value.split_once("://").map_or(value, |(_, rest)| rest);
     let authority = authority.split('/').next().unwrap_or_default();
@@ -146,7 +144,11 @@ fn loopback_host(value: &str) -> Option<String> {
         Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => host,
         _ => authority,
     };
-    let host = host.rsplit('@').next().unwrap_or(host).trim_matches(['[', ']']);
+    let host = host
+        .rsplit('@')
+        .next()
+        .unwrap_or(host)
+        .trim_matches(['[', ']']);
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
@@ -171,7 +173,9 @@ mod tests {
             r#"{ "editor.fontSize": 14, "http.noProxy": "*.cursor.sh" }"#,
         );
 
-        settings.write_proxy_settings("http://127.0.0.1:41000").unwrap();
+        settings
+            .write_proxy_settings("http://127.0.0.1:41000")
+            .unwrap();
 
         assert!(settings.settings_match("http://127.0.0.1:41000").unwrap());
         let written = settings.read().unwrap();
@@ -183,10 +187,14 @@ mod tests {
     fn clearing_keeps_unmanaged_keys() {
         let dir = tempfile::tempdir().unwrap();
         let settings = store(&dir);
-        settings.write_proxy_settings("http://127.0.0.1:41000").unwrap();
+        settings
+            .write_proxy_settings("http://127.0.0.1:41000")
+            .unwrap();
         let before = settings.read().unwrap().len();
 
-        settings.clear_proxy_settings().unwrap();
+        settings
+            .clear_proxy_settings("http://127.0.0.1:41000")
+            .unwrap();
 
         let after = settings.read().unwrap();
         assert_eq!(after.len(), before - KEYS.len());
@@ -200,11 +208,17 @@ mod tests {
 
         write_raw(
             &settings,
-            r#"{ "http.proxy": "http://127.0.0.1:41000", "http.proxySupport": "on",
+            r#"{ "http.proxy": "http://127.0.0.1:41000",
+                 "http.proxyKerberosServicePrincipal": "http://127.0.0.1:41000",
+                 "http.proxySupport": "on",
                  "cursor.general.disableHttp2": true,
                  "http.experimental.systemCertificatesV2": true }"#,
         );
-        assert!(settings.clear_stale_managed_settings().unwrap());
+        assert!(
+            settings
+                .clear_stale_managed_settings("http://127.0.0.1:41000")
+                .unwrap()
+        );
         assert!(settings.read().unwrap().is_empty());
 
         write_raw(
@@ -213,11 +227,27 @@ mod tests {
                  "cursor.general.disableHttp2": true,
                  "http.experimental.systemCertificatesV2": true }"#,
         );
-        assert!(!settings.clear_stale_managed_settings().unwrap());
+        assert!(
+            !settings
+                .clear_stale_managed_settings("http://127.0.0.1:41000")
+                .unwrap()
+        );
         assert_eq!(settings.read().unwrap().len(), 4);
 
         write_raw(&settings, r#"{ "http.proxy": "http://127.0.0.1:41000" }"#);
-        assert!(!settings.clear_stale_managed_settings().unwrap());
-        assert_eq!(settings.read().unwrap().len(), 1);
+        assert!(
+            !settings
+                .clear_stale_managed_settings("http://127.0.0.1:41000")
+                .unwrap()
+        );
+        settings
+            .write_proxy_settings("http://127.0.0.1:41000")
+            .unwrap();
+        assert!(
+            !settings
+                .clear_stale_managed_settings("http://127.0.0.1:41001")
+                .unwrap()
+        );
+        assert!(settings.settings_match("http://127.0.0.1:41000").unwrap());
     }
 }
