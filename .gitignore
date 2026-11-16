@@ -1,1 +1,4 @@
 .DS_Store
+# Per-machine editor setup: the folder list and settings reference paths
+# that only exist on one machine.
+*.code-workspace
