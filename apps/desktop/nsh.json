@@ -3,5 +3,81 @@
   "id": "com.example.cursorbyok",
   "version": "1.0.0",
   "build": 1,
-  "rust": "."
+  "rust": ".",
+  "theme": {
+    "cssVars": {
+      "theme": {
+        "radius": "6px",
+        "radius-lg": "10px",
+        "radius-inset": "8px"
+      },
+      "light": {
+        "background": "#f4f4f5",
+        "foreground": "#27272a",
+        "card": "#ffffff",
+        "card-foreground": "#27272a",
+        "popover": "#ffffff",
+        "popover-foreground": "#27272a",
+        "primary": "#2563eb",
+        "primary-foreground": "#ffffff",
+        "primary-hover": "#1d4ed8",
+        "primary-active": "#1e40af",
+        "secondary": "#e4e4e7",
+        "secondary-foreground": "#3f3f46",
+        "muted": "#e9e9ec",
+        "muted-foreground": "#71717a",
+        "accent": "#e4e4e7",
+        "accent-foreground": "#27272a",
+        "destructive": "#dc2626",
+        "border": "#dedee3",
+        "input": "#d4d4d8",
+        "ring": "#2563eb",
+        "sidebar": "#eaeaed",
+        "sidebar-foreground": "#3f3f46",
+        "sidebar-accent": "#dddde2",
+        "sidebar-accent-foreground": "#18181b",
+        "sidebar-border": "#dedee3",
+        "success": "#15803d",
+        "warning": "#b45309",
+        "scrim": "#18181b66",
+        "code": "#eaeaee"
+      },
+      "dark": {
+        "background": "#1e1e22",
+        "foreground": "#e4e4e7",
+        "card": "#27272c",
+        "card-foreground": "#e4e4e7",
+        "popover": "#27272c",
+        "popover-foreground": "#e4e4e7",
+        "primary": "#3b82f6",
+        "primary-foreground": "#ffffff",
+        "primary-hover": "#2563eb",
+        "primary-active": "#1d4ed8",
+        "secondary": "#36363d",
+        "secondary-foreground": "#d4d4d8",
+        "muted": "#343439",
+        "muted-foreground": "#a1a1aa",
+        "accent": "#3f3f46",
+        "accent-foreground": "#f4f4f5",
+        "destructive": "#f87171",
+        "border": "#3b3b42",
+        "input": "#52525b",
+        "ring": "#60a5fa",
+        "sidebar": "#252529",
+        "sidebar-foreground": "#d4d4d8",
+        "sidebar-accent": "#3b3b42",
+        "sidebar-accent-foreground": "#f4f4f5",
+        "sidebar-border": "#3b3b42",
+        "success": "#4ade80",
+        "warning": "#fbbf24",
+        "scrim": "#00000080",
+        "code": "#1d1d21"
+      }
+    }
+  },
+  "tailwind": {
+    "ease": {
+      "soft": [0.22, 1, 0.36, 1]
+    }
+  }
 }
