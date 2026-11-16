@@ -1,0 +1,3 @@
+[workspace]
+members = ["apps/desktop", "crates/cursor-protocol-extractor"]
+resolver = "3"

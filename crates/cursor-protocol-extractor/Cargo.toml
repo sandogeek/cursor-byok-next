@@ -1,0 +1,18 @@
+[package]
+name = "cursor-protocol-extractor"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Extract Cursor local-loop protobuf schemas from installed JS bundles"
+
+[[bin]]
+name = "cursor-protocol-extractor"
+path = "src/main.rs"
+
+[dependencies]
+oxc = { version = "0.159", features = ["ast_visit"] }
+regex = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

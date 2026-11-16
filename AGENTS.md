@@ -8,16 +8,19 @@
 
 ```text
 cursor-byok-nsh/
-├── Cargo.toml                     # 尚未创建：目前 apps/desktop 自带 [workspace]
+├── Cargo.toml                     # workspace：apps/desktop + crates/cursor-protocol-extractor
 ├── AGENTS.md                      # 本文件：移植边界与约定
 ├── .agents/skills/                # nsh / nsh-design-guides 技能（只读参考）
+├── crates/
+│   └── cursor-protocol-extractor/ # 从 Cursor JS bundle 提取 agent.v1 / aiserver.v1
 └── apps/desktop/                  # nsh mixed 应用：App.tsx + 同目录 Rust crate
     ├── nsh.json                   # "rust": "."，无 "root" ⇒ App.tsx 是入口
     ├── App.tsx                    # 入口（目前仍是模板）
     ├── App.test.tsx               # nsh test
     ├── Cargo.toml                 # crate nsh-app-cursor-byok
     ├── docs/
-    │   └── CURSOR_TAKEOVER.md     # 接管（local_app）移植记录：目录映射、差异清单、不变量
+    │   ├── CURSOR_TAKEOVER.md     # 接管（local_app）移植记录
+    │   └── PROTOCOL_EXTRACTOR.md  # 协议提取器移植记录
     └── src/
         ├── lib.rs                 # #[native_module("cursor-byok/native")]：目前导出 Badge/Format/Counter/Harness
         └── harness/               # 上游 server/src/local_app 的移植
@@ -70,9 +73,13 @@ cursor-byok-nsh/
 ## 常用命令
 
 ```sh
+# 仓库根
+cargo check --workspace --all-targets
+cargo test --workspace
+cargo test -p cursor-protocol-extractor
+
+# 桌面 mixed 应用
 cd apps/desktop
-cargo check --all-targets
-cargo test
 nsh check        # crate + TSX 类型检查
 nsh test         # crate 单测 + *.test.tsx
 nsh run          # 看真实界面
@@ -84,6 +91,7 @@ nsh package --target macos
 ## 当前进度
 
 - [x] 让 Cursor 走本地：`harness/`（见 `apps/desktop/docs/CURSOR_TAKEOVER.md`）
+- [x] 协议提取器：`crates/cursor-protocol-extractor/`（见 `apps/desktop/docs/PROTOCOL_EXTRACTOR.md`）
 - [ ] 接管页 UI（`src/ui/` + `src/screens/Cursor.tsx`）
 - [ ] local loop 服务端接入（`set_backend_addr`）
 - [ ] 模型配置 / 调用记录

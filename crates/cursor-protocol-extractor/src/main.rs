@@ -1,0 +1,67 @@
+//! CLI for extracting agent.v1 / aiserver.v1 protobuf schemas from Cursor JS bundles.
+
+use std::env;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use cursor_protocol_extractor::extract_from_files;
+
+fn main() -> ExitCode {
+    let mut inputs = Vec::new();
+    let mut output = None;
+    let mut strict = true;
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-input" | "--input" => {
+                if let Some(path) = args.next() {
+                    inputs.push(PathBuf::from(path));
+                }
+            }
+            "-output" | "--output" => output = args.next().map(PathBuf::from),
+            "-strict" | "--strict" => strict = true,
+            "-no-strict" | "--no-strict" => strict = false,
+            "-h" | "--help" => {
+                print_usage();
+                return ExitCode::SUCCESS;
+            }
+            other if !other.starts_with('-') => inputs.push(PathBuf::from(other)),
+            other => {
+                eprintln!("unknown flag: {other}");
+                print_usage();
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if inputs.is_empty() {
+        print_usage();
+        return ExitCode::from(2);
+    }
+    let Some(output) = output else {
+        eprintln!("-output is required");
+        return ExitCode::from(2);
+    };
+    match extract_from_files(&inputs, &output, strict) {
+        Ok(result) => {
+            eprint!("{}", result.diagnostics);
+            eprintln!(
+                "提取完成: {} 个消息, {} 个枚举, {} 个服务",
+                result.messages.len(),
+                result.enums.len(),
+                result.services.len()
+            );
+            eprintln!("Output directory: {}", output.display());
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn print_usage() {
+    eprintln!(
+        "Usage: cursor-protocol-extractor -input <js-bundle> [-input <js-bundle> ...] -output <dir> [--no-strict]"
+    );
+}
