@@ -1,5 +1,7 @@
 //! Walk a Cursor JS bundle with oxc and collect protobuf declarations.
 
+use std::collections::HashMap;
+
 use oxc::allocator::Allocator;
 use oxc::ast::ast::{
     ArrayExpression, CallExpression, Class, ClassElement, Expression, FormalParameters,
@@ -8,6 +10,8 @@ use oxc::ast::ast::{
 use oxc::ast_visit::{walk, Visit};
 use oxc::parser::Parser;
 use oxc::span::{GetSpan, SourceType, Span};
+use regex::Regex;
+use std::sync::OnceLock;
 
 use crate::ast_util::{
     argument_expr, array_from_expr, assignment_ident, assignment_member, binding_ident,
@@ -43,15 +47,40 @@ pub fn scan_source(source: &str) -> BundleScan {
     if looks_like_webpack_modules(source) && scan.module_starts.is_empty() {
         let wrapped = format!("({{\n{source}\n}})");
         let wrapped_scan = scan_source_once(&wrapped);
-        if !wrapped_scan.module_starts.is_empty() || scan_has_protocol(&wrapped_scan) {
+        if wrapped_scan_is_better(&scan, &wrapped_scan) {
             return wrapped_scan;
         }
     }
     scan
 }
 
+fn wrapped_scan_is_better(original: &BundleScan, wrapped: &BundleScan) -> bool {
+    if wrapped.module_starts.is_empty() && !scan_has_protocol(wrapped) {
+        return false;
+    }
+    let original_decls =
+        original.messages.len() + original.enums.len() + original.services.len();
+    let wrapped_decls = wrapped.messages.len() + wrapped.enums.len() + wrapped.services.len();
+    if wrapped_decls < original_decls {
+        return false;
+    }
+    if wrapped.diagnostics.parse_errors.len() > original.diagnostics.parse_errors.len()
+        && wrapped_decls == original_decls
+    {
+        return false;
+    }
+    true
+}
+
 fn looks_like_webpack_modules(source: &str) -> bool {
-    source.contains(":(") && source.as_bytes().iter().any(|b| b.is_ascii_digit())
+    webpack_module_key().is_match(source)
+}
+
+fn webpack_module_key() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?:^|,)\s*\d+\s*:\s*(?:function\s*\(|\()").expect("webpack module key")
+    })
 }
 
 fn scan_has_protocol(scan: &BundleScan) -> bool {
@@ -74,7 +103,17 @@ fn scan_source_once(source: &str) -> BundleScan {
         pending_compact: Vec::new(),
         pending_enum_pkgs: Vec::new(),
         current_class: None,
+        message_index: HashMap::new(),
+        enum_index: HashMap::new(),
+        service_index: HashMap::new(),
+        enum_by_pos: HashMap::new(),
     };
+    for error in parsed.diagnostics.errors() {
+        visitor
+            .scan
+            .diagnostics
+            .add_parse_error(&error.to_string());
+    }
     visitor.visit_program(&parsed.program);
     visitor.finish()
 }
@@ -88,6 +127,10 @@ struct Scanner<'a> {
     pending_compact: Vec<CompactPendingMessage>,
     pending_enum_pkgs: Vec<(u32, String)>,
     current_class: Option<CurrentClass>,
+    message_index: HashMap<String, usize>,
+    enum_index: HashMap<String, usize>,
+    service_index: HashMap<String, usize>,
+    enum_by_pos: HashMap<u32, usize>,
 }
 
 struct CurrentClass {
@@ -99,28 +142,24 @@ struct CurrentClass {
 impl<'a> Scanner<'a> {
     fn finish(mut self) -> BundleScan {
         self.qualify_late_prefixes();
-        let compact_enums = self
-            .scan
-            .enums
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let compact_enums = self.scan.enums.clone();
         let pending = std::mem::take(&mut self.pending_compact);
         let compact_messages = finish_compact_messages(pending, &compact_enums);
         for message in compact_messages {
             self.push_message(message);
         }
-        self.scan.module_starts = self.module_starts.clone();
+        self.scan.module_starts = self.module_starts;
         self.scan
     }
 
     fn module_start_for(&self, pos: u32) -> u32 {
-        self.module_starts
-            .iter()
-            .rev()
-            .find(|(start, _id)| *start <= pos)
-            .map(|(start, _)| *start)
-            .unwrap_or(0)
+        match self
+            .module_starts
+            .partition_point(|(start, _)| *start <= pos)
+        {
+            0 => 0,
+            index => self.module_starts[index - 1].0,
+        }
     }
 
     fn push_declared(&mut self, type_name: &str) {
@@ -143,12 +182,8 @@ impl<'a> Scanner<'a> {
         if !self.keep_type(&message.type_name) {
             return;
         }
-        if let Some(existing) = self
-            .scan
-            .messages
-            .iter_mut()
-            .find(|existing| existing.type_name == message.type_name)
-        {
+        if let Some(&index) = self.message_index.get(&message.type_name) {
+            let existing = &mut self.scan.messages[index];
             if existing.var_name.is_empty() && !message.var_name.is_empty() {
                 existing.var_name = message.var_name;
                 existing.internal_name = message.internal_name;
@@ -158,6 +193,8 @@ impl<'a> Scanner<'a> {
             }
             return;
         }
+        self.message_index
+            .insert(message.type_name.clone(), self.scan.messages.len());
         self.scan.messages.push(message);
     }
 
@@ -165,12 +202,8 @@ impl<'a> Scanner<'a> {
         if !item.package.is_empty() && !self.keep_type(&item.type_name) {
             return;
         }
-        if let Some(existing) = self
-            .scan
-            .enums
-            .iter_mut()
-            .find(|existing| existing.type_name == item.type_name)
-        {
+        if let Some(&index) = self.enum_index.get(&item.type_name) {
+            let existing = &mut self.scan.enums[index];
             if existing.var_name.is_empty() && !item.var_name.is_empty() {
                 existing.var_name = item.var_name;
             }
@@ -179,11 +212,9 @@ impl<'a> Scanner<'a> {
             }
             return;
         }
-        if self.scan.enums.iter().any(|existing| {
-            existing.type_name == item.type_name && existing.var_name == item.var_name
-        }) {
-            return;
-        }
+        let index = self.scan.enums.len();
+        self.enum_index.insert(item.type_name.clone(), index);
+        self.enum_by_pos.insert(item.pos, index);
         self.scan.enums.push(item);
     }
 
@@ -191,14 +222,11 @@ impl<'a> Scanner<'a> {
         if !self.keep_type(&service.type_name) {
             return;
         }
-        if self
-            .scan
-            .services
-            .iter()
-            .any(|existing| existing.type_name == service.type_name)
-        {
+        if self.service_index.contains_key(&service.type_name) {
             return;
         }
+        self.service_index
+            .insert(service.type_name.clone(), self.scan.services.len());
         self.scan.services.push(service);
     }
 
@@ -453,20 +481,41 @@ impl<'a> Scanner<'a> {
             if !self.keep_package(&pkg) {
                 continue;
             }
-            if let Some(item) = self.scan.enums.iter_mut().find(|item| item.pos == pos) {
-                let short = if item.short_name.is_empty() {
-                    crate::ast_util::last_segment(&item.type_name).to_string()
-                } else {
-                    crate::ast_util::last_segment(&item.short_name).to_string()
-                };
-                item.package = pkg.clone();
-                item.short_name = short.clone();
-                item.type_name = format!("{pkg}.{short}");
+            let Some(&index) = self.enum_by_pos.get(&pos) else {
+                continue;
+            };
+            let item = &mut self.scan.enums[index];
+            let short = if item.short_name.is_empty() {
+                crate::ast_util::last_segment(&item.type_name).to_string()
+            } else {
+                crate::ast_util::last_segment(&item.short_name).to_string()
+            };
+            item.package = pkg.clone();
+            item.short_name = short.clone();
+            let type_name = format!("{pkg}.{short}");
+            if item.type_name != type_name {
+                self.enum_index.remove(&item.type_name);
+                item.type_name = type_name;
+                self.enum_index.insert(item.type_name.clone(), index);
             }
         }
-        self.scan
-            .enums
-            .retain(|item| is_local_loop_pkg(&item.package) || is_google_pkg(&item.package) || item.package.is_empty());
+        let mut kept = Vec::with_capacity(self.scan.enums.len());
+        let mut enum_index = HashMap::new();
+        let mut enum_by_pos = HashMap::new();
+        for item in self.scan.enums.drain(..) {
+            if !(is_local_loop_pkg(&item.package)
+                || is_google_pkg(&item.package)
+                || item.package.is_empty())
+            {
+                continue;
+            }
+            enum_index.insert(item.type_name.clone(), kept.len());
+            enum_by_pos.insert(item.pos, kept.len());
+            kept.push(item);
+        }
+        self.scan.enums = kept;
+        self.enum_index = enum_index;
+        self.enum_by_pos = enum_by_pos;
     }
 
     fn class_type_name(&self) -> Option<String> {

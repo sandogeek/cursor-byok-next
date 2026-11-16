@@ -4,8 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::resolver::{fallback_type_token, TypeResolver};
 use crate::types::{
-    is_google_pkg, parse_type_name, scalar_name, Diagnostics, Enum, Field, Message, Service,
-    TypeToken,
+    parse_type_name, scalar_name, Diagnostics, Enum, Field, Message, Service, TypeToken,
 };
 
 #[derive(Default)]
@@ -49,7 +48,7 @@ pub fn generate_proto_file(
     for item in enums {
         insert_enum(&mut root, &nested_path(&item.short_name), item.clone());
     }
-    write_type_tree(&root, &mut out, resolver, copied, diag, 0, pkg_name);
+    write_type_tree(&root, &mut out, resolver, copied, diag, 0);
 
     let mut services = services.to_vec();
     services.sort_by(|a, b| a.short_name.cmp(&b.short_name));
@@ -128,7 +127,6 @@ fn write_type_tree(
     copied: &HashMap<String, String>,
     diag: &mut Diagnostics,
     indent: usize,
-    current_pkg: &str,
 ) {
     let indent_str = "  ".repeat(indent);
     for (name, child) in &node.children {
@@ -172,7 +170,7 @@ fn write_type_tree(
                 }
             }
             out.push_str(&format!("{indent_str}message {name} {{\n"));
-            write_type_tree(child, out, resolver, copied, diag, indent + 1, current_pkg);
+            write_type_tree(child, out, resolver, copied, diag, indent + 1);
             if let Some(message) = &child.message {
                 write_message_fields(message, out, resolver, copied, diag, indent + 1);
             }
@@ -381,7 +379,6 @@ pub fn collect_imports(
             add(&method.output_type, service.pos, service.module_start, "message");
         }
     }
-    let _ = is_google_pkg;
     imports
 }
 

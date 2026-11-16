@@ -2,7 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::merge::{
     collect_needed_types, compact_strings, declaration_coverage, keep_local_loop_enums,
@@ -54,11 +55,7 @@ pub fn extract_from_sources(sources: &[(&str, String)], strict: bool) -> Result<
 
     for (_name, source) in sources {
         let mut scan = scan_source(source);
-        diag.total_field_objects += scan.diagnostics.total_field_objects;
-        diag.parsed_field_objects += scan.diagnostics.parsed_field_objects;
-        diag.skipped_field_objects += scan.diagnostics.skipped_field_objects;
-        diag.skipped_field_samples
-            .append(&mut scan.diagnostics.skipped_field_samples);
+        diag.merge_from(&mut scan.diagnostics);
         declared.append(&mut scan.declared);
         remap_module_imports(&mut scan);
         let aliases = build_alias_index(&scan.aliases);
@@ -67,6 +64,7 @@ pub fn extract_from_sources(sources: &[(&str, String)], strict: bool) -> Result<
         resolver.module_imports = build_module_imports(&scan.module_imports, &scan.module_starts);
         reclassify_enum_fields(&mut scan.messages, &scan.enums);
         normalize_type_references(&mut scan.messages, &mut scan.services, &resolver);
+        reclassify_enum_fields(&mut scan.messages, &scan.enums);
         all_messages.append(&mut scan.messages);
         all_enums.append(&mut scan.enums);
         all_services.append(&mut scan.services);
@@ -84,7 +82,7 @@ pub fn extract_from_sources(sources: &[(&str, String)], strict: bool) -> Result<
     diag.extracted_types = extracted_count;
     diag.missing_declarations = compact_strings(missing);
 
-    let files = generate_local_loop_protos(&messages, &enums, &services, &resolver, &mut diag)?;
+    let files = generate_local_loop_protos(&messages, &enums, &services, &resolver, &mut diag);
     if strict && diag.has_failure(false) {
         return Err(ExtractError::Validation(diag.to_string()));
     }
@@ -122,18 +120,92 @@ pub fn extract_from_files(
 
 pub fn write_protos(output_dir: impl AsRef<Path>, files: &HashMap<String, String>) -> Result<(), ExtractError> {
     let output_dir = output_dir.as_ref();
-    fs::create_dir_all(output_dir).map_err(|source| ExtractError::Write {
-        path: output_dir.display().to_string(),
+    let parent = output_dir.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| ExtractError::Write {
+        path: parent.display().to_string(),
         source,
     })?;
-    for (name, body) in files {
-        let path = output_dir.join(name);
-        fs::write(&path, body).map_err(|source| ExtractError::Write {
-            path: path.display().to_string(),
+    let temp_dir = unique_temp_dir(parent, output_dir)?;
+    let write_result = (|| {
+        for (name, body) in files {
+            let path = temp_dir.join(name);
+            fs::write(&path, body).map_err(|source| ExtractError::Write {
+                path: path.display().to_string(),
+                source,
+            })?;
+        }
+        replace_dir(output_dir, &temp_dir)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+    write_result
+}
+
+fn unique_temp_dir(parent: &Path, output_dir: &Path) -> Result<PathBuf, ExtractError> {
+    let stem = output_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("protos");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0..32 {
+        let candidate = parent.join(format!(".{stem}.tmp.{nanos}.{attempt}"));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(ExtractError::Write {
+                    path: candidate.display().to_string(),
+                    source,
+                });
+            }
+        }
+    }
+    Err(ExtractError::Write {
+        path: parent.display().to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "failed to allocate a unique temp directory",
+        ),
+    })
+}
+
+fn replace_dir(output_dir: &Path, temp_dir: &Path) -> Result<(), ExtractError> {
+    let parent = output_dir.parent().unwrap_or_else(|| Path::new("."));
+    let backup = if output_dir.exists() {
+        let backup = unique_temp_dir(parent, output_dir)?;
+        fs::remove_dir(&backup).map_err(|source| ExtractError::Write {
+            path: backup.display().to_string(),
             source,
         })?;
+        fs::rename(output_dir, &backup).map_err(|source| ExtractError::Write {
+            path: output_dir.display().to_string(),
+            source,
+        })?;
+        Some(backup)
+    } else {
+        None
+    };
+    match fs::rename(temp_dir, output_dir) {
+        Ok(()) => {
+            if let Some(backup) = backup {
+                let _ = fs::remove_dir_all(backup);
+            }
+            Ok(())
+        }
+        Err(source) => {
+            if let Some(backup) = backup {
+                let _ = fs::rename(&backup, output_dir);
+            }
+            Err(ExtractError::Write {
+                path: output_dir.display().to_string(),
+                source,
+            })
+        }
     }
-    Ok(())
 }
 
 fn generate_local_loop_protos(
@@ -142,7 +214,7 @@ fn generate_local_loop_protos(
     services: &[Service],
     resolver: &TypeResolver,
     diag: &mut Diagnostics,
-) -> Result<HashMap<String, String>, ExtractError> {
+) -> HashMap<String, String> {
     let mut packages: HashMap<String, Package> = HashMap::new();
     for message in messages {
         packages.entry(message.package.clone()).or_default().messages.push(message.clone());
@@ -184,7 +256,7 @@ fn generate_local_loop_protos(
         );
         if let Err(err) = validate_required_agent_shapes(&format!("{}.proto", pkg_name.replace('.', "_")), &body)
         {
-            return Err(ExtractError::Validation(err));
+            diag.add_shape_error(&err);
         }
         for (idx, line) in body.lines().enumerate() {
             if has_placeholder(line) {
@@ -194,7 +266,7 @@ fn generate_local_loop_protos(
         }
         files.insert(format!("{}.proto", pkg_name.replace('.', "_")), body);
     }
-    Ok(files)
+    files
 }
 
 #[derive(Default, Clone)]

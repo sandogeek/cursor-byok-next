@@ -184,6 +184,8 @@ pub struct Diagnostics {
     pub declared_types: usize,
     pub extracted_types: usize,
     pub missing_declarations: Vec<String>,
+    pub parse_errors: Vec<String>,
+    pub shape_errors: Vec<String>,
 }
 
 impl Diagnostics {
@@ -215,12 +217,42 @@ impl Diagnostics {
         *self.unresolved_type_refs.entry(key).or_insert(0) += 1;
     }
 
+    pub fn add_parse_error(&mut self, message: &str) {
+        if self.parse_errors.len() < 20 {
+            self.parse_errors.push(message.to_string());
+        } else if self.parse_errors.len() == 20 {
+            self.parse_errors
+                .push(format!("... and more parse errors after {message}"));
+        }
+    }
+
+    pub fn add_shape_error(&mut self, message: &str) {
+        self.shape_errors.push(message.to_string());
+    }
+
+    pub fn merge_from(&mut self, other: &mut Diagnostics) {
+        self.total_field_objects += other.total_field_objects;
+        self.parsed_field_objects += other.parsed_field_objects;
+        self.skipped_field_objects += other.skipped_field_objects;
+        self.skipped_field_samples
+            .append(&mut other.skipped_field_samples);
+        if self.skipped_field_samples.len() > 20 {
+            self.skipped_field_samples.truncate(20);
+        }
+        self.parse_errors.append(&mut other.parse_errors);
+        if self.parse_errors.len() > 20 {
+            self.parse_errors.truncate(20);
+        }
+    }
+
     pub fn has_failure(&self, validate_err: bool) -> bool {
         validate_err
             || self.skipped_field_objects > 0
             || !self.unresolved_type_refs.is_empty()
             || !self.placeholder_hits.is_empty()
             || !self.missing_declarations.is_empty()
+            || !self.parse_errors.is_empty()
+            || !self.shape_errors.is_empty()
     }
 }
 
@@ -228,7 +260,7 @@ impl fmt::Display for Diagnostics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "诊断汇总: fields {}/{} 解析成功, declarations {}/{} 已提取, skipped={}, unresolved={}, placeholders={}, empty_messages={}",
+            "诊断汇总: fields {}/{} 解析成功, declarations {}/{} 已提取, skipped={}, unresolved={}, placeholders={}, empty_messages={}, parse_errors={}, shape_errors={}",
             self.parsed_field_objects,
             self.total_field_objects,
             self.extracted_types,
@@ -236,12 +268,26 @@ impl fmt::Display for Diagnostics {
             self.skipped_field_objects,
             self.unresolved_type_refs.len(),
             self.placeholder_hits.len(),
-            self.empty_messages.len()
+            self.empty_messages.len(),
+            self.parse_errors.len(),
+            self.shape_errors.len()
         )?;
         if self.skipped_field_objects > 0 {
             writeln!(f, "字段解析失败样例:")?;
             for sample in &self.skipped_field_samples {
                 writeln!(f, "  - {sample}")?;
+            }
+        }
+        if !self.parse_errors.is_empty() {
+            writeln!(f, "JS bundle 解析错误:")?;
+            for error in &self.parse_errors {
+                writeln!(f, "  - {error}")?;
+            }
+        }
+        if !self.shape_errors.is_empty() {
+            writeln!(f, "必要形状校验失败:")?;
+            for error in &self.shape_errors {
+                writeln!(f, "  - {error}")?;
             }
         }
         if !self.unresolved_type_refs.is_empty() {

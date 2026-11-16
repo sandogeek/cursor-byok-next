@@ -472,6 +472,60 @@ service InferenceService {
 }
 
 #[test]
+fn validate_required_agent_shapes_stays_inside_message_block() {
+    const BODY: &str = r#"
+message RunInferencePromptModelMetadata {
+  string vendor = 1;
+}
+message Other {
+  repeated RunInferenceAgentModeConfig agent_mode_configs = 46;
+  optional RunInferenceAskQuestionConfig ask_question_config = 48;
+}
+"#;
+    let err = validate_required_agent_shapes("aiserver_v1.proto", BODY).expect_err("cross-message leak");
+    assert!(err.contains("agent_mode_configs"));
+}
+
+#[test]
+fn scan_records_oxc_parse_errors() {
+    let scan = scan_source("var x = {;");
+    assert!(!scan.diagnostics.parse_errors.is_empty());
+}
+
+#[test]
+fn scan_keeps_valid_factory_after_recoverable_noise() {
+    let scan = scan_source("var Keep=n.makeMessageType(\"agent.v1.Keep\",()=>[]);");
+    assert!(scan
+        .messages
+        .iter()
+        .any(|message| message.type_name == "agent.v1.Keep"));
+}
+
+#[test]
+fn no_strict_extract_keeps_files_when_required_shapes_are_missing() {
+    const BUNDLE: &str = r#"
+var Keep=n.makeMessageType("aiserver.v1.Keep",()=>[{no:1,name:"id",kind:"scalar",T:9}]);
+var Ads={typeName:"aiserver.v1.InAppAdService",methods:{ping:{name:"Ping",I:Keep,O:Keep,kind:n.MethodKind.Unary}}};
+"#;
+    let result = extract_from_sources(&[("bundle.js", BUNDLE.to_string())], false).expect("extract");
+    assert!(result.files.contains_key("aiserver_v1.proto"));
+    assert!(result.diagnostics.shape_errors.is_empty());
+}
+
+#[test]
+fn write_protos_replaces_directory_atomically() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out");
+    std::fs::create_dir_all(&output).expect("create output");
+    std::fs::write(output.join("stale.proto"), "old").expect("stale");
+    let mut files = std::collections::HashMap::new();
+    files.insert("agent_v1.proto".into(), "syntax = \"proto3\";\n".into());
+    super::write_protos(&output, &files).expect("write");
+    assert!(output.join("agent_v1.proto").exists());
+    assert!(!output.join("stale.proto").exists());
+}
+
+#[test]
 fn local_loop_extract_drops_unrelated_packages() {
     const BUNDLE: &str = r#"
 var Keep=n.makeMessageType("agent.v1.Keep",()=>[{no:1,name:"id",kind:"scalar",T:9}]);

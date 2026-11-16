@@ -3,8 +3,6 @@
 #![allow(
     clippy::collapsible_if,
     clippy::get_first,
-    clippy::iter_cloned_collect,
-    clippy::only_used_in_recursion,
     clippy::too_many_arguments
 )]
 
