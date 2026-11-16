@@ -1,0 +1,4 @@
+.nsh/
+# Also a symlink to the shared mbx build cache: `target/` alone misses it.
+target
+.DS_Store
