@@ -2,8 +2,12 @@ import { Text, View, type JSX } from "nsh";
 import { Button } from "nsh/base";
 import { colorMotion } from "./motion";
 
-export function Surface(props: { children?: JSX.Element; class?: string }) {
-  return <View class={`rounded-(--radius-lg) border border-border bg-card ${props.class ?? ""}`}>{props.children}</View>;
+export function Surface(props: { children?: JSX.Element; class?: string; variant?: "card" | "sidebar" }) {
+  return (
+    <View class={`${props.variant === "sidebar" ? "border-r border-sidebar-border bg-sidebar" : "rounded-(--radius-lg) border border-border bg-card"} ${props.class ?? ""}`}>
+      {props.children}
+    </View>
+  );
 }
 
 export function StatusBadge(props: { label: string; tone?: "neutral" | "success" | "warning" }) {

@@ -81,31 +81,33 @@ export function Cursor(props: { takeover: CursorTakeover }) {
   };
 
   return (
-    <View class="flex-1 flex-row bg-background p-4 pt-[env(safe-area-inset-top)]">
-      <Surface class="w-60 shrink-0 self-stretch p-1.5">
-        <View class="gap-0.5">
-          <NavigationItem label="数据概览" icon="▦" disabled />
-          <NavigationItem label="调用详细" icon="≡" disabled />
-          <NavigationGroup label="模型配置" />
-          <NavigationItem
-            label="Cursor"
-            icon="⌁"
-            selected
-            badge={<StatusBadge label={statusLabel()} tone={statusTone()} />}
-          />
-          <NavigationGroup label="设置" />
-          <NavigationItem label="插件配置" icon="◇" disabled />
-          <NavigationItem label="系统设置" icon="⊙" disabled />
-          <NavigationItem label="使用教程" icon="?" disabled />
-        </View>
-        <View class="flex-1" />
-        <View class="gap-1 border-t border-sidebar-border px-2.5 pb-1 pt-3">
-          <Text class="text-xs font-medium text-sidebar-foreground">Cursor BYOK</Text>
-          <Text class="text-xs text-muted-foreground">本地接管 · NSH</Text>
+    <View class="flex-1 flex-row bg-background">
+      <Surface variant="sidebar" class="w-60 shrink-0 self-stretch pt-[env(safe-area-inset-top)]">
+        <View class="min-h-0 flex-1 p-1.5">
+          <View class="gap-0.5">
+            <NavigationItem label="数据概览" icon="▦" disabled />
+            <NavigationItem label="调用详细" icon="≡" disabled />
+            <NavigationGroup label="模型配置" />
+            <NavigationItem
+              label="Cursor"
+              icon="⌁"
+              selected
+              badge={<StatusBadge label={statusLabel()} tone={statusTone()} />}
+            />
+            <NavigationGroup label="设置" />
+            <NavigationItem label="插件配置" icon="◇" disabled />
+            <NavigationItem label="系统设置" icon="⊙" disabled />
+            <NavigationItem label="使用教程" icon="?" disabled />
+          </View>
+          <View class="flex-1" />
+          <View class="gap-1 border-t border-sidebar-border px-2.5 pb-1 pt-3">
+            <Text class="text-xs font-medium text-sidebar-foreground">Cursor BYOK</Text>
+            <Text class="text-xs text-muted-foreground">本地接管 · NSH</Text>
+          </View>
         </View>
       </Surface>
 
-      <View class="min-w-0 flex-1 pl-4">
+      <View class="min-w-0 flex-1 px-4 pb-4 pt-[env(safe-area-inset-top)]">
         <View class="min-h-16 flex-row items-center justify-between gap-4 pb-3 pl-1" desktop={{ windowDrag: true }}>
           <Text role="header" class="text-2xl font-semibold text-foreground">Cursor</Text>
           <Surface class="flex-row items-center gap-2 p-1.5">
