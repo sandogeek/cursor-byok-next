@@ -20,18 +20,15 @@ cursor-byok-nsh/
     ├── Cargo.toml                 # crate nsh-app-cursor-byok
     ├── docs/
     │   ├── CURSOR_TAKEOVER.md     # 接管（local_app）移植记录
-    │   └── PROTOCOL_EXTRACTOR.md  # 协议提取器移植记录
+    │   ├── PROTOCOL_EXTRACTOR.md  # 协议提取器移植记录
+    │   ├── CURSOR_UI.md           # 接管页 UI
+    │   └── PLUGIN_CATALOG.md      # Magpie 插件目录
     └── src/
-        ├── lib.rs                 # #[native_module("cursor-byok/native")]：目前导出 Badge/Format/Counter/Harness
-        └── harness/               # 上游 server/src/local_app 的移植
-            ├── mod.rs             # CursorHarness 生命周期 = enable/disable/status/initialize_ca/cleanup
-            ├── proxy.rs           # hudsucker MITM + RcgenAuthority + 路由判定
-            ├── ca.rs              # 本地 CA 生成/加载/信任检测
-            ├── settings.rs        # Cursor settings.json 的 5 个托管键
-            ├── account.rs         # state.vscdb 注入本地 ultra 账号
-            ├── state.rs           # ~/.cursor-byok-nsh/harness.json：开关与端口
-            ├── process.rs         # 结束 Cursor（可选加速器）
-            └── windows.rs         # Win32 ROOT 枚举
+        ├── lib.rs                 # #[native_module("cursor-byok/native")]：Harness + Plugins
+        ├── harness/               # 上游 server/src/local_app 的移植
+        ├── plugins/               # 插件宿主、Bun worker、Magpie 目录
+        ├── screens/
+        └── ui/
 ```
 
 上游参照：`../cursor-byok/server/src/local_app/`（同一工作区里的 `jsProject/cursor-byok`）。
@@ -92,6 +89,8 @@ nsh package --target macos
 
 - [x] 让 Cursor 走本地：`harness/`（见 `apps/desktop/docs/CURSOR_TAKEOVER.md`）
 - [x] 协议提取器：`crates/cursor-protocol-extractor/`（见 `apps/desktop/docs/PROTOCOL_EXTRACTOR.md`）
-- [ ] 接管页 UI（`src/ui/` + `src/screens/Cursor.tsx`）
+- [x] 接管页 UI（`src/ui/` + `src/screens/Cursor.tsx`）
+- [x] Magpie 插件目录（`src/plugins/` + `src/screens/Plugins.tsx`，见 `apps/desktop/docs/PLUGIN_CATALOG.md`）
 - [ ] local loop 服务端接入（`set_backend_addr`）
-- [ ] 模型配置 / 调用记录
+- [ ] 把 Magpie 模型广告给 Cursor picker
+- [ ] 模型调用 / 调用记录

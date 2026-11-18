@@ -78,7 +78,7 @@
     }
   },
   "capabilities": {
-    "host": ["cursor.*"],
+    "host": ["cursor.*", "plugins.*"],
     "statusBar": true
   }
 }

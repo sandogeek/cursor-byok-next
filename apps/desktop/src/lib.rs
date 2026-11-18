@@ -7,6 +7,7 @@
 //! drive it come next; this file is the typed boundary they will call.
 
 pub mod harness;
+pub mod plugins;
 
 use std::sync::Arc;
 
@@ -16,6 +17,12 @@ use nsh_core::prelude::*;
 use self::harness::{
     CaState as HarnessCa, CursorHarness, Error as HarnessError, HarnessPaths, HarnessStatus,
     IntegrationState as HarnessIntegration,
+};
+use self::plugins::{
+    FormSubmitResponse as HostFormSubmit, PluginHost, PluginSnapshot as HostSnapshot,
+    PluginDescriptor as HostPlugin, PluginModelDescriptor as HostModel,
+    PluginProviderDescriptor as HostProvider, PluginResourceDescriptor as HostResource,
+    PluginResourceView as HostResourceView, ResourceState as HostResourceState,
 };
 
 /// The proxy port Cursor is pointed at when this app has never bound one.
@@ -29,7 +36,8 @@ fn native(registry: &mut Registry) {
         .register::<Badge>()
         .module::<Format>()
         .class::<Counter>()
-        .class::<Harness>();
+        .class::<Harness>()
+        .class::<Plugins>();
 }
 
 /// Whether the system trusts the local CA.
@@ -185,6 +193,389 @@ impl Harness {
     /// when Cursor was not running.
     pub async fn quit_cursor() -> Result<bool, HarnessError> {
         harness::quit_cursor().await
+    }
+}
+
+fn localized_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Object(map) => map
+            .get("zh-CN")
+            .or_else(|| map.get("en-US"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                map.values()
+                    .find_map(|entry| entry.as_str().filter(|text| !text.trim().is_empty()))
+            })
+            .unwrap_or_default()
+            .to_owned(),
+        _ => String::new(),
+    }
+}
+
+fn resource_status(state: &HostResourceState) -> ResourceStatus {
+    match state {
+        HostResourceState::Ready => ResourceStatus::Ready,
+        HostResourceState::Cooling { .. } => ResourceStatus::Cooling,
+        HostResourceState::Invalid { .. } => ResourceStatus::Invalid,
+    }
+}
+
+fn resource_message(state: &HostResourceState) -> Option<String> {
+    match state {
+        HostResourceState::Ready => None,
+        HostResourceState::Cooling { message, .. } | HostResourceState::Invalid { message } => {
+            message.clone()
+        }
+    }
+}
+
+impl From<HostSnapshot> for PluginSnapshot {
+    fn from(value: HostSnapshot) -> Self {
+        Self {
+            runtime_ready: value.runtime_ready,
+            runtime_error: value.runtime_error,
+            plugins: value.plugins.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<HostPlugin> for PluginInfo {
+    fn from(value: HostPlugin) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            version: value.version,
+            author: value.author,
+            icon: value.icon,
+            runtime_ready: value.runtime_ready,
+            runtime_error: value.runtime_error,
+            providers: value.providers.into_iter().map(Into::into).collect(),
+            resources: value.resources.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<HostProvider> for PluginProvider {
+    fn from(value: HostProvider) -> Self {
+        Self {
+            id: value.id,
+            plugin_id: value.plugin_id,
+            display_name: localized_text(&value.display_name),
+            description: localized_text(&value.description),
+            provider_type: value.provider_type,
+            resource_type: value.resource_type,
+            catalog: value.catalog,
+            configured: value.configured,
+            catalog_error: value.catalog_error,
+            models: value.models.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<HostModel> for PluginModel {
+    fn from(value: HostModel) -> Self {
+        Self {
+            id: value.id,
+            plugin_id: value.plugin_id,
+            plugin_name: value.plugin_name,
+            provider_id: value.provider_id,
+            model_id: value.model_id,
+            display_name: value.display_name,
+            description: value.description,
+            max_output_tokens: value.max_output_tokens,
+        }
+    }
+}
+
+impl From<HostResource> for PluginResource {
+    fn from(value: HostResource) -> Self {
+        Self {
+            resource_type: value.resource_type,
+            display_name: localized_text(&value.display_name),
+            add: value.add.into_iter().map(Into::into).collect(),
+            resources: value.resources.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<plugins::AddMethodDefinition> for PluginAddMethod {
+    fn from(value: plugins::AddMethodDefinition) -> Self {
+        Self {
+            id: value.id,
+            display_name: localized_text(&value.display_name),
+            fields: value.fields.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<plugins::FormFieldDefinition> for PluginFormField {
+    fn from(value: plugins::FormFieldDefinition) -> Self {
+        Self {
+            id: value.id,
+            label: localized_text(&value.label),
+            field_type: value.field_type,
+            required: value.required,
+            placeholder: localized_text(&value.placeholder),
+        }
+    }
+}
+
+impl From<HostResourceView> for PluginResourceView {
+    fn from(value: HostResourceView) -> Self {
+        Self {
+            id: value.id,
+            status: resource_status(&value.state),
+            message: resource_message(&value.state),
+            display_name: value.display_name,
+            description: localized_text(&value.description),
+        }
+    }
+}
+
+impl From<HostFormSubmit> for PluginFormResult {
+    fn from(value: HostFormSubmit) -> Self {
+        Self {
+            added: value.added as u32,
+            updated: value.updated as u32,
+            model_sync_error: value.model_sync_error,
+        }
+    }
+}
+
+/// A plugin runtime snapshot the settings page shows.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct PluginSnapshot {
+    /// Whether Bun was found and can evaluate plugins.
+    pub runtime_ready: bool,
+    /// Why the runtime is unavailable, when it is.
+    pub runtime_error: Option<String>,
+    /// Installed plugins, including Magpie.
+    pub plugins: Vec<PluginInfo>,
+}
+
+/// One plugin as the settings page shows it.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct PluginInfo {
+    /// Stable plugin id.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Plugin version.
+    pub version: String,
+    /// Optional author.
+    pub author: Option<String>,
+    /// Data URL of the plugin icon.
+    pub icon: String,
+    /// Whether this plugin's worker can run.
+    pub runtime_ready: bool,
+    /// Why this plugin cannot run, when it cannot.
+    pub runtime_error: Option<String>,
+    /// Providers the plugin exposes.
+    pub providers: Vec<PluginProvider>,
+    /// Resource types the plugin exposes.
+    pub resources: Vec<PluginResource>,
+}
+
+/// A provider that can list models.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct PluginProvider {
+    /// Provider id inside the plugin.
+    pub id: String,
+    /// Owning plugin id.
+    pub plugin_id: String,
+    /// Localized display name.
+    pub display_name: String,
+    /// Localized description.
+    pub description: String,
+    /// Product identity, such as `"magpie"`.
+    pub provider_type: String,
+    /// Resource type this provider consumes, when any.
+    pub resource_type: Option<String>,
+    /// `"live"` or `"snapshot"`.
+    pub catalog: String,
+    /// Whether a resource is present so models can be listed.
+    pub configured: bool,
+    /// Last catalog refresh error, if any.
+    pub catalog_error: Option<String>,
+    /// Models currently known for this provider.
+    pub models: Vec<PluginModel>,
+}
+
+/// One model from a plugin catalog.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct PluginModel {
+    /// Stable plugin model id.
+    pub id: String,
+    /// Owning plugin id.
+    pub plugin_id: String,
+    /// Plugin display name.
+    pub plugin_name: String,
+    /// Provider id.
+    pub provider_id: String,
+    /// Upstream or live-bound model id.
+    pub model_id: String,
+    /// User-facing name.
+    pub display_name: String,
+    /// Optional description.
+    pub description: Option<String>,
+    /// Optional max output tokens.
+    pub max_output_tokens: Option<u64>,
+}
+
+/// A resource type a plugin can persist.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct PluginResource {
+    /// Resource type, such as `"gateway"`.
+    pub resource_type: String,
+    /// Localized type name.
+    pub display_name: String,
+    /// Form methods that add a resource.
+    pub add: Vec<PluginAddMethod>,
+    /// Saved resources of this type.
+    pub resources: Vec<PluginResourceView>,
+}
+
+/// A form that creates a plugin resource.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct PluginAddMethod {
+    /// Method id.
+    pub id: String,
+    /// Localized method name.
+    pub display_name: String,
+    /// Fields the host draws.
+    pub fields: Vec<PluginFormField>,
+}
+
+/// One field of a plugin form.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct PluginFormField {
+    /// Field id submitted to the plugin.
+    pub id: String,
+    /// Localized label.
+    pub label: String,
+    /// `"url"`, `"secret"` or `"text"`.
+    pub field_type: String,
+    /// Whether the field is required.
+    pub required: bool,
+    /// Localized placeholder.
+    pub placeholder: String,
+}
+
+/// Whether a saved resource is usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PropEnum)]
+pub enum ResourceStatus {
+    Ready,
+    Cooling,
+    Invalid,
+}
+
+/// A saved resource as the UI may show it. Credentials never appear here.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct PluginResourceView {
+    /// Host-assigned resource id.
+    pub id: String,
+    /// Current usability.
+    pub status: ResourceStatus,
+    /// Optional status message.
+    pub message: Option<String>,
+    /// User-facing name, such as a gateway origin.
+    pub display_name: String,
+    /// Optional description.
+    pub description: String,
+}
+
+/// Result of submitting a plugin form.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct PluginFormResult {
+    /// Newly created resources.
+    pub added: u32,
+    /// Updated existing resources.
+    pub updated: u32,
+    /// Catalog refresh error after the resource was saved, if any.
+    pub model_sync_error: Option<String>,
+}
+
+/// One form field value.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct PluginFormValue {
+    /// Field id.
+    pub id: String,
+    /// Submitted text.
+    pub value: String,
+}
+
+/// Plugin catalog and Magpie gateway configuration.
+///
+/// Create one and keep it for the app's lifetime: it owns plugin workers.
+#[class]
+pub struct Plugins {
+    inner: Arc<PluginHost>,
+}
+
+#[class]
+impl Plugins {
+    /// Restores installed plugins and looks for Bun on PATH.
+    pub fn new() -> Result<Self, plugins::Error> {
+        Ok(Self {
+            inner: Arc::new(PluginHost::managed()?),
+        })
+    }
+
+    /// The current plugin snapshot, including Magpie models when a gateway exists.
+    pub async fn snapshot(this: Instance<Self>) -> Result<PluginSnapshot, plugins::Error> {
+        Ok(this
+            .with(|plugins| plugins.inner.clone())
+            .snapshot()
+            .await
+            .into())
+    }
+
+    /// Submits a plugin form. Magpie uses this to save a gateway.
+    pub async fn submit_form(
+        this: Instance<Self>,
+        plugin_id: String,
+        resource_type: String,
+        method_id: String,
+        values: Vec<PluginFormValue>,
+    ) -> Result<PluginFormResult, plugins::Error> {
+        let mut object = serde_json::Map::new();
+        for value in values {
+            object.insert(value.id, serde_json::Value::String(value.value));
+        }
+        this.with(|plugins| plugins.inner.clone())
+            .form_submit(
+                &plugin_id,
+                &resource_type,
+                &method_id,
+                serde_json::Value::Object(object),
+            )
+            .await
+            .map(Into::into)
+    }
+
+    /// Removes a saved plugin resource.
+    pub async fn delete_resource(
+        this: Instance<Self>,
+        plugin_id: String,
+        resource_type: String,
+        resource_id: String,
+    ) -> Result<PluginSnapshot, plugins::Error> {
+        let host = this.with(|plugins| plugins.inner.clone());
+        host.delete_resource(&plugin_id, &resource_type, &resource_id)
+            .await?;
+        Ok(host.snapshot().await.into())
+    }
+
+    /// Refreshes a live catalog without changing resources.
+    pub async fn refresh_catalog(
+        this: Instance<Self>,
+        plugin_id: String,
+        provider_id: String,
+    ) -> Result<PluginSnapshot, plugins::Error> {
+        let host = this.with(|plugins| plugins.inner.clone());
+        let _ = host.refresh_catalog(&plugin_id, &provider_id).await?;
+        Ok(host.snapshot().await.into())
     }
 }
 

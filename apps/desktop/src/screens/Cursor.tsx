@@ -1,10 +1,11 @@
 import { Clipboard, createMotion, resource, Scroll, signal, Text, View } from "nsh";
-import { Harness, type HarnessState } from "cursor-byok/native";
+import type { HarnessState } from "cursor-byok/native";
 import { Button, IconButton } from "../ui/Button";
 import { Dialog } from "../ui/Dialog";
 import { motion } from "../ui/motion";
 import { NavigationGroup, NavigationItem, StatusBadge, Surface } from "../ui/Surface";
 import { Switch } from "../ui/Switch";
+import { Plugins, type PluginCatalog } from "./Plugins";
 
 export interface CursorTakeover {
   status(): Promise<HarnessState>;
@@ -23,7 +24,8 @@ function errorText(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
-export function Cursor(props: { takeover: CursorTakeover }) {
+export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog }) {
+  const page = signal<"cursor" | "plugins">("cursor");
   const state = resource(() => props.takeover.status(), { initialValue: initialState });
   const busy = signal(false);
   const error = signal("");
@@ -91,11 +93,17 @@ export function Cursor(props: { takeover: CursorTakeover }) {
             <NavigationItem
               label="Cursor"
               icon="cursor"
-              selected
+              selected={page() === "cursor"}
               badge={<StatusBadge label={statusLabel()} tone={statusTone()} />}
+              onPress={() => page.set("cursor")}
             />
             <NavigationGroup label="设置" />
-            <NavigationItem label="插件配置" icon="plugin" disabled />
+            <NavigationItem
+              label="插件配置"
+              icon="plugin"
+              selected={page() === "plugins"}
+              onPress={() => page.set("plugins")}
+            />
             <NavigationItem label="系统设置" icon="settings" disabled />
             <NavigationItem label="使用教程" icon="help" disabled />
           </View>
@@ -109,7 +117,8 @@ export function Cursor(props: { takeover: CursorTakeover }) {
 
       <View class="min-w-0 flex-1 px-4 pb-4 pt-[env(safe-area-inset-top)]">
         <View class="min-h-16 flex-row items-center justify-between gap-4 pb-3 pl-1" desktop={{ windowDrag: true }}>
-          <Text role="header" class="text-2xl font-semibold text-foreground">Cursor</Text>
+          <Text role="header" class="text-2xl font-semibold text-foreground">{page() === "plugins" ? "插件配置" : "Cursor"}</Text>
+          <If when={page() === "cursor"}>
           <Surface class="flex-row items-center gap-2 p-1.5">
             <Text class="pl-1 text-xs text-muted-foreground">{statusLabel()}</Text>
             <Switch
@@ -120,8 +129,13 @@ export function Cursor(props: { takeover: CursorTakeover }) {
             />
             <IconButton label="刷新" icon="↻" loading={state.loading()} disabled={busy()} onPress={refresh} />
           </Surface>
+          </If>
         </View>
 
+        <If when={page() === "plugins"}>
+          <Plugins catalog={props.plugins} />
+        </If>
+        <If when={page() === "cursor"}>
         <Scroll class="min-h-0 flex-1" contentClass="grow">
           <View class="min-h-64 flex-1 items-center justify-center gap-3 rounded-(--radius-lg) border border-dashed border-border p-8" style={reveal.style}>
             <If when={state.error()}>
@@ -167,6 +181,7 @@ export function Cursor(props: { takeover: CursorTakeover }) {
             </If>
           </View>
         </Scroll>
+        </If>
       </View>
 
       <Dialog

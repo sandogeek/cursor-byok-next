@@ -1,0 +1,206 @@
+//! Evaluates TypeScript plugin definitions through a Bun subprocess.
+
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
+
+use tokio::io::AsyncReadExt;
+
+use super::{descriptor::PluginModuleDefinition, Error, Result};
+
+const DEFINITION_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
+const OUTPUT_PREFIX: &str = "CURSOR_BYOK_PLUGIN_DEFINITION:";
+
+#[derive(Clone)]
+pub struct PluginDefinitionLoader {
+    sdk_dir: PathBuf,
+    bunfig: PathBuf,
+    collector: PathBuf,
+    worker: PathBuf,
+}
+
+impl PluginDefinitionLoader {
+    pub fn managed() -> Result<Self> {
+        Self::in_directory(crate::harness::data_dir()?.join("plugins/runtime/sdk/v1"))
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(root: &Path) -> Result<Self> {
+        Self::in_directory(root.join(".plugin-sdk"))
+    }
+
+    fn in_directory(sdk_dir: PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(&sdk_dir)?;
+        std::fs::create_dir_all(sdk_dir.join("protocol"))?;
+        let bunfig = sdk_dir.join("bunfig.toml");
+        let collector = sdk_dir.join("collect.ts");
+        let worker = sdk_dir.join("worker.ts");
+        let modules = [
+            (&bunfig, include_str!("sdk/bunfig.toml")),
+            (&collector, include_str!("sdk/collect.ts")),
+            (&worker, include_str!("sdk/worker.ts")),
+            (&sdk_dir.join("plugin.ts"), include_str!("sdk/plugin.ts")),
+            (
+                &sdk_dir.join("provider.ts"),
+                include_str!("sdk/provider.ts"),
+            ),
+            (&sdk_dir.join("model.ts"), include_str!("sdk/model.ts")),
+            (
+                &sdk_dir.join("resource.ts"),
+                include_str!("sdk/resource.ts"),
+            ),
+            (
+                &sdk_dir.join("protocol/openai_responses.ts"),
+                include_str!("sdk/protocol/openai_responses.ts"),
+            ),
+            (
+                &sdk_dir.join("protocol/openai_chat.ts"),
+                include_str!("sdk/protocol/openai_chat.ts"),
+            ),
+            (
+                &sdk_dir.join("protocol/anthropic.ts"),
+                include_str!("sdk/protocol/anthropic.ts"),
+            ),
+        ];
+        for (path, content) in &modules {
+            write_if_changed(path, content)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sdk_dir, std::fs::Permissions::from_mode(0o700))?;
+            std::fs::set_permissions(
+                sdk_dir.join("protocol"),
+                std::fs::Permissions::from_mode(0o700),
+            )?;
+            for (path, _) in &modules {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        Ok(Self {
+            sdk_dir,
+            bunfig,
+            collector,
+            worker,
+        })
+    }
+
+    pub fn worker_path(&self) -> &Path {
+        &self.worker
+    }
+
+    pub fn bunfig(&self) -> &Path {
+        &self.bunfig
+    }
+
+    pub fn sdk_dir(&self) -> &Path {
+        &self.sdk_dir
+    }
+
+    pub async fn load(
+        &self,
+        executable: &Path,
+        plugin_directory: &Path,
+        entry: &Path,
+    ) -> Result<PluginModuleDefinition> {
+        let entry_url = file_url(entry)?;
+        let mut command = tokio::process::Command::new(executable);
+        super::detach_console(&mut command);
+        command
+            .arg("run")
+            .arg("--no-install")
+            .arg(format!("--config={}", self.bunfig.display()))
+            .arg(&self.collector)
+            .arg(entry_url.as_str())
+            .current_dir(&self.sdk_dir)
+            .env("BUN_INSTALL_CACHE_DIR", self.sdk_dir.join("cache"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Config("cannot capture plugin definition output".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::Config("cannot capture plugin definition error output".into()))?;
+        let (stdout, stderr, status) = tokio::time::timeout(DEFINITION_TIMEOUT, async move {
+            let (stdout, stderr, status) =
+                tokio::join!(read_limited(stdout), read_limited(stderr), child.wait());
+            Ok::<_, Error>((stdout?, stderr?, status?))
+        })
+        .await
+        .map_err(|_| Error::Config("plugin definition evaluation timed out".into()))??;
+        if !status.success() {
+            return Err(Error::Config(format!(
+                "plugin definition evaluation failed: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            )));
+        }
+        let _ = plugin_directory;
+        parse_definition_output(&stdout)
+    }
+}
+
+pub(super) fn file_url(path: &Path) -> Result<url::Url> {
+    url::Url::from_file_path(path).map_err(|_| {
+        Error::Config(format!(
+            "plugin entry path is not a valid file URL: {}",
+            path.display()
+        ))
+    })
+}
+
+async fn read_limited(reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_OUTPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() as u64 > MAX_OUTPUT_BYTES {
+        return Err(Error::Config(
+            "plugin definition output is larger than allowed".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn parse_definition_output(output: &[u8]) -> Result<PluginModuleDefinition> {
+    let output = String::from_utf8(output.to_vec()).map_err(|error| {
+        Error::Config(format!("plugin definition output is not UTF-8: {error}"))
+    })?;
+    let json = output
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(OUTPUT_PREFIX))
+        .ok_or_else(|| Error::Config("plugin definition did not produce a descriptor".into()))?;
+    Ok(serde_json::from_str(json)?)
+}
+
+pub(super) fn write_if_changed(path: &Path, content: &str) -> Result<()> {
+    if std::fs::read(path).is_ok_and(|current| current == content.as_bytes()) {
+        return Ok(());
+    }
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_form_and_live_descriptor_fields() {
+        let output = br#"CURSOR_BYOK_PLUGIN_DEFINITION:{"providers":[{"id":"gateway","displayName":"Gateway","description":null,"providerType":"openai","resourceType":"gateway","hasModels":true,"catalog":"live"}],"resources":[{"type":"gateway","displayName":"Gateways","add":[{"type":"form","id":"connect","displayName":"Connect","description":null,"fields":[{"id":"base-url","label":"URL","type":"url","required":true,"placeholder":null}]}],"import":null,"actions":[],"canRefresh":false,"canRemove":false}]}"#;
+        let descriptor = parse_definition_output(output).unwrap();
+        assert_eq!(descriptor.providers[0].catalog, "live");
+        assert_eq!(descriptor.resources[0].add[0].method_type, "form");
+        assert_eq!(descriptor.resources[0].add[0].fields[0].id, "base-url");
+    }
+}

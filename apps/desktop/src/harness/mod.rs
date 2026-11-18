@@ -375,7 +375,7 @@ impl CursorHarness {
 }
 
 /// The app's own directory: `~/.cursor-byok-nsh`, beside the data file.
-fn data_dir() -> Result<PathBuf> {
+pub(crate) fn data_dir() -> Result<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| Error::Config("cannot resolve the user home directory".into()))?;
     let dir = home.join(".cursor-byok-nsh");
