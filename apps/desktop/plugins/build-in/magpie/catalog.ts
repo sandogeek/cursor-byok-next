@@ -1,5 +1,5 @@
-import type { JsonValue, PluginContext } from "cursor-byok:plugin";
-import type { ModelDefinition, ModelSupport } from "cursor-byok:model";
+import type { JsonValue, PluginContext } from "cursor-byok-next:plugin";
+import type { ModelDefinition, ModelSupport } from "cursor-byok-next:model";
 import { gatewayData, gatewayHeaders } from "./resources.ts";
 
 function object(value: unknown): Record<string, unknown> | null {

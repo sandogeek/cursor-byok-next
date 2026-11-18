@@ -1,7 +1,7 @@
 # AGENTS.md
 
 当前目标：
-- 逐步移植 cursor-byok 到 nsh 版本
+- 逐步移植 cursor-byok 到 nsh 版本，产物名为 **Cursor-BYOK-Next**
 - 不做 engine 部分，只做 agent local loop
 
 ## 仓库结构
@@ -17,14 +17,14 @@ cursor-byok-nsh/
     ├── nsh.json                   # "rust": "."，无 "root" ⇒ App.tsx 是入口
     ├── App.tsx                    # 入口（目前仍是模板）
     ├── App.test.tsx               # nsh test
-    ├── Cargo.toml                 # crate nsh-app-cursor-byok
+    ├── Cargo.toml                 # crate nsh-app-cursor-byok-next
     ├── docs/
     │   ├── CURSOR_TAKEOVER.md     # 接管（local_app）移植记录
     │   ├── PROTOCOL_EXTRACTOR.md  # 协议提取器移植记录
     │   ├── CURSOR_UI.md           # 接管页 UI
     │   └── PLUGIN_CATALOG.md      # Magpie 插件目录
     └── src/
-        ├── lib.rs                 # #[native_module("cursor-byok/native")]：Harness + Plugins
+        ├── lib.rs                 # #[native_module("cursor-byok-next/native")]：Harness + Plugins
         ├── harness/               # 上游 server/src/local_app 的移植
         ├── plugins/               # 插件宿主、Bun worker、Magpie 目录
         ├── screens/
@@ -67,6 +67,25 @@ cursor-byok-nsh/
 - 差异不能削弱上面的不变量；
 - 上游有测试覆盖的行为，本仓库要有对应测试。
 
+## 命名（Cursor-BYOK-Next）
+
+| 位置 | 值 |
+|---|---|
+| 应用名 / 窗口标题 | `Cursor-BYOK-Next`（`nsh.json` `name`） |
+| Bundle id | `dev.cursorbyoknext.app`（`nsh.json` `id`） |
+| Crate | `nsh-app-cursor-byok-next` |
+| TSX 导入 | `cursor-byok-next/native` |
+| 应用数据目录 | `~/.cursor-byok-next`（`harness.json`、`ca/`、`plugins/`） |
+| CA 主题 | `Cursor-BYOK-Next Local CA` / `Cursor-BYOK-Next` |
+| Linux 锚文件 | `cursor-byok-next-local-ca.crt` |
+| Magpie 插件 id | `dev.cursorbyoknext.plugins.magpie` |
+| 插件 SDK specifier | `cursor-byok-next:plugin` / `:provider` / `:model` / `:resource` / `:protocol/*` |
+| descriptor 前缀 | `CURSOR_BYOK_NEXT_PLUGIN_DEFINITION:` |
+
+上游 `cursor-byok` 的名字只作为移植来源出现在对照表里，不作为本应用的标识。
+
+改名带来的唯一运行时后果：数据目录从 `~/.cursor-byok-nsh` 变成 `~/.cursor-byok-next`，旧 CA 与 `harness.json` 不再被读取。升级后需要在接管页重新初始化并信任 CA（系统里旧的 `Cursor BYOK Local CA` 可手动删除），接管开关回到“关”。
+
 ## 常用命令
 
 ```sh
@@ -83,7 +102,7 @@ nsh run          # 看真实界面
 nsh package --target macos
 ```
 
-改了 Rust 导出签名后 `nsh check` 会重写 `.nsh/types/cursor-byok/native.d.ts`，该文件不要手改。
+改了 Rust 导出签名后 `nsh check` 会重写 `.nsh/types/cursor-byok-next/native.d.ts`，该文件不要手改。
 
 ## 当前进度
 

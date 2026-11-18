@@ -374,11 +374,11 @@ impl CursorHarness {
     }
 }
 
-/// The app's own directory: `~/.cursor-byok-nsh`, beside the data file.
+/// The app's own directory: `~/.cursor-byok-next`, beside the data file.
 pub(crate) fn data_dir() -> Result<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| Error::Config("cannot resolve the user home directory".into()))?;
-    let dir = home.join(".cursor-byok-nsh");
+    let dir = home.join(".cursor-byok-next");
     // The app may start twice at once: whoever wins the race creates it.
     match fs::create_dir(&dir) {
         Ok(()) => {}

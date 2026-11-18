@@ -382,7 +382,7 @@ mod tests {
             .collect();
         let magpie = manifests
             .iter()
-            .find(|manifest| manifest.id == "dev.cursorbyok.plugins.magpie")
+            .find(|manifest| manifest.id == "dev.cursorbyoknext.plugins.magpie")
             .unwrap();
         assert!(magpie.permissions.resource_origin);
         assert!(magpie.permissions.network.is_empty());

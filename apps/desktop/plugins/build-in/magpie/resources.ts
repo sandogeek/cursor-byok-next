@@ -1,15 +1,15 @@
-import type { JsonValue } from "cursor-byok:plugin";
+import type { JsonValue } from "cursor-byok-next:plugin";
 import type {
   FormAddMethod,
   ResourceDraft,
   ResourceSnapshot,
   ResourceView,
-} from "cursor-byok:resource";
+} from "cursor-byok-next:resource";
 
 export const RESOURCE_TYPE = "gateway";
 export const CONNECT_METHOD_ID = "connect";
 export const DEFAULT_ORIGIN = "http://127.0.0.1:3425";
-export const DEFAULT_API_KEY = "magpie-cursor-byok";
+export const DEFAULT_API_KEY = "magpie-cursor-byok-next";
 
 export type GatewayData = {
   origin: string;

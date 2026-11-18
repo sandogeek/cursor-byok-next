@@ -1,8 +1,8 @@
-# Cursor BYOK
+# Cursor-BYOK-Next
 
 A TSX app with a Rust crate of its own: `App.tsx` is the app, and the directory is also a crate (`Cargo.toml`,
-`src/lib.rs`; `nsh.json` `"rust": "."`) whose `#[native_module("cursor-byok/native")]` exports a component (`Badge`), a
-module (`Format`) and a class (`Counter`) that `App.tsx` imports from `cursor-byok/native`.
+`src/lib.rs`; `nsh.json` `"rust": "."`) whose `#[native_module("cursor-byok-next/native")]` exports a component (`Badge`), a
+module (`Format`) and a class (`Counter`) that `App.tsx` imports from `cursor-byok-next/native`.
 
 ```sh
 nsh run                      # this machine's backend; --target ios, android, web, macos, linux, windows or gpui
@@ -13,7 +13,7 @@ nsh package --target web     # or ios, android, macos, linux, windows
 
 `nsh` describes the crate's exports with a small program of the crate and builds the app's hosts with it linked in.
 TSX edits are hot updates; Rust edits rebuild and restart the app. The first build writes the crate's TypeScript declarations into
-`.nsh/types/cursor-byok/native.d.ts`, doc comments included.
+`.nsh/types/cursor-byok-next/native.d.ts`, doc comments included.
 
 A function or a member runs the way its Rust signature says: one that is not `async` runs inside the TSX call and
 returns its value (`Format.times(2)`, `counter.count`); an `async fn` returns a Promise and runs as a task with NSH's

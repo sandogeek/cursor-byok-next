@@ -1,4 +1,4 @@
-import { defineProviderPlugin } from "cursor-byok:plugin";
+import { defineProviderPlugin } from "cursor-byok-next:plugin";
 import { magpieProvider } from "./provider.ts";
 import { magpieConnect, presentGateway, RESOURCE_TYPE } from "./resources.ts";
 

@@ -1,5 +1,5 @@
 import { expect, open, test } from "nsh/test";
-import type { HarnessState, PluginSnapshot } from "cursor-byok/native";
+import type { HarnessState, PluginSnapshot } from "cursor-byok-next/native";
 
 const missing: HarnessState = {
   platform: "macos",
@@ -24,14 +24,14 @@ const enabled: HarnessState = {
 const magpieReady: PluginSnapshot = {
   runtimeReady: true,
   plugins: [{
-    id: "dev.cursorbyok.plugins.magpie",
+    id: "dev.cursorbyoknext.plugins.magpie",
     name: "Magpie",
     version: "0.1.0",
     icon: "",
     runtimeReady: true,
     providers: [{
       id: "magpie",
-      pluginId: "dev.cursorbyok.plugins.magpie",
+      pluginId: "dev.cursorbyoknext.plugins.magpie",
       displayName: "Magpie",
       description: "从 Magpie 网关实时读取目录。",
       providerType: "magpie",
@@ -39,8 +39,8 @@ const magpieReady: PluginSnapshot = {
       catalog: "live",
       configured: true,
       models: [{
-        id: "plugin:dev.cursorbyok.plugins.magpie/magpie/resource-1/openai/gpt-5",
-        pluginId: "dev.cursorbyok.plugins.magpie",
+        id: "plugin:dev.cursorbyoknext.plugins.magpie/magpie/resource-1/openai/gpt-5",
+        pluginId: "dev.cursorbyoknext.plugins.magpie",
         pluginName: "Magpie",
         providerId: "magpie",
         modelId: "resource-1/openai/gpt-5",
@@ -55,7 +55,7 @@ const magpieReady: PluginSnapshot = {
         displayName: "连接 Magpie",
         fields: [
           { id: "base-url", label: "网关地址", fieldType: "url", required: true, placeholder: "http://127.0.0.1:3425" },
-          { id: "api-key", label: "API 密钥", fieldType: "secret", required: true, placeholder: "magpie-cursor-byok" },
+          { id: "api-key", label: "API 密钥", fieldType: "secret", required: true, placeholder: "magpie-cursor-byok-next" },
         ],
       }],
       resources: [{
@@ -164,7 +164,7 @@ test("插件页显示 Magpie 目录且不含密钥", async () => {
   await app.press("插件配置");
   expect(app.texts()).toContain("Magpie");
   expect(app.texts()).toContain("GPT-5");
-  expect(app.texts()).toContain("plugin:dev.cursorbyok.plugins.magpie/magpie/resource-1/openai/gpt-5");
+  expect(app.texts()).toContain("plugin:dev.cursorbyoknext.plugins.magpie/magpie/resource-1/openai/gpt-5");
   expect(app.texts()).toContain("1 个模型 · 仅本页可见");
   expect(app.texts().join("\n")).not.toContain("sk-");
   expect(app.texts().join("\n")).not.toContain("privateData");

@@ -1,6 +1,6 @@
 {
-  "name": "Cursor BYOK",
-  "id": "com.example.cursorbyok",
+  "name": "Cursor-BYOK-Next",
+  "id": "dev.cursorbyoknext.app",
   "version": "1.0.0",
   "build": 1,
   "rust": ".",

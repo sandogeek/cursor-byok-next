@@ -3,15 +3,15 @@ import type {
   ProviderOutput,
   ProviderResult,
   ProviderSupport,
-} from "cursor-byok:provider";
-import type { PluginContext } from "cursor-byok:plugin";
-import type { ModelSnapshot } from "cursor-byok:model";
-import { HttpError as ChatHttpError, streamOpenAiChat } from "cursor-byok:protocol/openai-chat";
+} from "cursor-byok-next:provider";
+import type { PluginContext } from "cursor-byok-next:plugin";
+import type { ModelSnapshot } from "cursor-byok-next:model";
+import { HttpError as ChatHttpError, streamOpenAiChat } from "cursor-byok-next:protocol/openai-chat";
 import {
   HttpError as ResponsesHttpError,
   streamOpenAiResponses,
-} from "cursor-byok:protocol/openai-responses";
-import { HttpError as AnthropicHttpError, streamAnthropic } from "cursor-byok:protocol/anthropic";
+} from "cursor-byok-next:protocol/openai-responses";
+import { HttpError as AnthropicHttpError, streamAnthropic } from "cursor-byok-next:protocol/anthropic";
 import { magpieModels } from "./catalog.ts";
 import { gatewayData, gatewayHeaders, RESOURCE_TYPE } from "./resources.ts";
 

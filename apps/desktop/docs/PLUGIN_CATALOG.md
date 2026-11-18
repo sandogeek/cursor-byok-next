@@ -57,7 +57,7 @@ cursor-byok/server/plugins/build-in/magpie/ apps/desktop/plugins/build-in/magpie
 3. live catalog 按 `(plugin, provider, resource)` 缓存，TTL 15s；资源变更使缓存失效。
 4. 稳定模型 ID：`plugin:<plugin>/<provider>/<resource>/<upstream>`；发给 Magpie 的是裸上游 ID。
 5. 目录刷新失败时保留旧缓存；无缓存则向 UI 报告错误，不抛给 Cursor。
-6. 测试使用临时目录，不读真实 `~/.cursor-byok-nsh` 或真实 Magpie。
+6. 测试使用临时目录，不读真实 `~/.cursor-byok-next` 或真实 Magpie。
 7. 不改 Cursor 代理白名单，不写 Cursor 文件。
 
 ## Motion inventory
@@ -73,6 +73,6 @@ cursor-byok/server/plugins/build-in/magpie/ apps/desktop/plugins/build-in/magpie
 ## 验证
 
 ```sh
-cargo test -p nsh-app-cursor-byok
+cargo test -p nsh-app-cursor-byok-next
 cd apps/desktop && nsh check && nsh test
 ```

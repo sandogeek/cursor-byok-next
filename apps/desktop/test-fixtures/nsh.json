@@ -1,5 +1,5 @@
 {
-  "name": "Cursor BYOK UI Tests",
+  "name": "Cursor-BYOK-Next UI Tests",
   "rust": "..",
   "theme": {
     "cssVars": {

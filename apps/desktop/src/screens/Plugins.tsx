@@ -1,5 +1,5 @@
 import { List, createMotion, resource, Scroll, signal, Text, View } from "nsh";
-import type { PluginFormResult, PluginSnapshot } from "cursor-byok/native";
+import type { PluginFormResult, PluginSnapshot } from "cursor-byok-next/native";
 import { Button } from "../ui/Button";
 import { Dialog } from "../ui/Dialog";
 import { Field } from "../ui/Field";
@@ -38,7 +38,7 @@ export function Plugins(props: { catalog: PluginCatalog }) {
     enter: { keyframes: [{ opacity: 0, translateY: motion.distance }, { opacity: 1, translateY: 0 }], duration: motion.base, easing: "easeOut" },
   });
   const current = () => state() ?? emptySnapshot;
-  const magpie = () => current().plugins.find((plugin) => plugin.id === "dev.cursorbyok.plugins.magpie");
+  const magpie = () => current().plugins.find((plugin) => plugin.id === "dev.cursorbyoknext.plugins.magpie");
   const provider = () => magpie()?.providers[0];
   const resourceType = () => magpie()?.resources[0];
   const method = () => resourceType()?.add[0];

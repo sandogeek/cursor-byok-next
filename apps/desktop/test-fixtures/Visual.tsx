@@ -1,5 +1,5 @@
 import { host, mount, setColorScheme } from "nsh";
-import type { HarnessState, PluginFormResult, PluginSnapshot } from "cursor-byok/native";
+import type { HarnessState, PluginFormResult, PluginSnapshot } from "cursor-byok-next/native";
 import { Cursor } from "../src/screens/Cursor";
 
 if (host.params.colorScheme === "light" || host.params.colorScheme === "dark") {

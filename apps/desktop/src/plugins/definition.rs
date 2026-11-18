@@ -12,7 +12,7 @@ use super::{descriptor::PluginModuleDefinition, Error, Result};
 
 const DEFINITION_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
-const OUTPUT_PREFIX: &str = "CURSOR_BYOK_PLUGIN_DEFINITION:";
+const OUTPUT_PREFIX: &str = "CURSOR_BYOK_NEXT_PLUGIN_DEFINITION:";
 
 #[derive(Clone)]
 pub struct PluginDefinitionLoader {
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn parses_form_and_live_descriptor_fields() {
-        let output = br#"CURSOR_BYOK_PLUGIN_DEFINITION:{"providers":[{"id":"gateway","displayName":"Gateway","description":null,"providerType":"openai","resourceType":"gateway","hasModels":true,"catalog":"live"}],"resources":[{"type":"gateway","displayName":"Gateways","add":[{"type":"form","id":"connect","displayName":"Connect","description":null,"fields":[{"id":"base-url","label":"URL","type":"url","required":true,"placeholder":null}]}],"import":null,"actions":[],"canRefresh":false,"canRemove":false}]}"#;
+        let output = br#"CURSOR_BYOK_NEXT_PLUGIN_DEFINITION:{"providers":[{"id":"gateway","displayName":"Gateway","description":null,"providerType":"openai","resourceType":"gateway","hasModels":true,"catalog":"live"}],"resources":[{"type":"gateway","displayName":"Gateways","add":[{"type":"form","id":"connect","displayName":"Connect","description":null,"fields":[{"id":"base-url","label":"URL","type":"url","required":true,"placeholder":null}]}],"import":null,"actions":[],"canRefresh":false,"canRemove":false}]}"#;
         let descriptor = parse_definition_output(output).unwrap();
         assert_eq!(descriptor.providers[0].catalog, "live");
         assert_eq!(descriptor.resources[0].add[0].method_type, "form");

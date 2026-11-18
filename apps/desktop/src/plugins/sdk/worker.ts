@@ -1,7 +1,7 @@
 import { argv, stdin, stdout } from "node:process";
-import { __getRegisteredPlugin, type JsonValue, type NetworkEventStream, type PluginContext } from "cursor-byok:plugin";
-import type { ModelEvent, ProviderSupport } from "cursor-byok:provider";
-import type { ResourceAddMethod, ResourceSupport } from "cursor-byok:resource";
+import { __getRegisteredPlugin, type JsonValue, type NetworkEventStream, type PluginContext } from "cursor-byok-next:plugin";
+import type { ModelEvent, ProviderSupport } from "cursor-byok-next:provider";
+import type { ResourceAddMethod, ResourceSupport } from "cursor-byok-next:resource";
 
 const args = argv.slice(2);
 if (args.length !== 1) throw new Error("plugin entry URL is required");

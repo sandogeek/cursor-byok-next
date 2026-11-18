@@ -1,6 +1,6 @@
-//! The app's Rust code: what `App.tsx` imports from `cursor-byok/native`. Their
+//! The app's Rust code: what `App.tsx` imports from `cursor-byok-next/native`. Their
 //! TypeScript declarations are generated from these types into
-//! `.nsh/types/cursor-byok/native.d.ts`.
+//! `.nsh/types/cursor-byok-next/native.d.ts`.
 //!
 //! `harness/` is the port of cursor-byok's `local_app`: it is what makes Cursor
 //! willing to talk to this app (proxy, CA, local account). The screens that
@@ -30,7 +30,7 @@ use self::plugins::{
 const DEFAULT_PROXY_PORT: u16 = 0;
 
 /// The crate's UI set (`nsh.json` `"rust"`).
-#[native_module("cursor-byok/native")]
+#[native_module("cursor-byok-next/native")]
 fn native(registry: &mut Registry) {
     registry
         .register::<Badge>()

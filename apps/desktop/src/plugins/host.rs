@@ -707,11 +707,11 @@ mod tests {
         assert_eq!(model.id, "resource-1/gpt-5");
         assert_eq!(
             crate::plugins::parse_model_id(&format!(
-                "plugin:dev.cursorbyok.plugins.magpie/magpie/{}",
+                "plugin:dev.cursorbyoknext.plugins.magpie/magpie/{}",
                 model.id
             )),
             Some((
-                "dev.cursorbyok.plugins.magpie",
+                "dev.cursorbyoknext.plugins.magpie",
                 "magpie",
                 "resource-1/gpt-5"
             ))

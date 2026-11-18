@@ -1,5 +1,5 @@
 import { Clipboard, createMotion, resource, Scroll, signal, Text, View } from "nsh";
-import type { HarnessState } from "cursor-byok/native";
+import type { HarnessState } from "cursor-byok-next/native";
 import { Button, IconButton } from "../ui/Button";
 import { Dialog } from "../ui/Dialog";
 import { motion } from "../ui/motion";
@@ -109,7 +109,7 @@ export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog
           </View>
           <View class="flex-1" />
           <View class="gap-1 border-t border-sidebar-border px-2.5 pb-1 pt-3">
-            <Text class="text-xs font-medium text-sidebar-foreground">Cursor BYOK</Text>
+            <Text class="text-xs font-medium text-sidebar-foreground">Cursor-BYOK-Next</Text>
             <Text class="text-xs text-muted-foreground">本地接管 · NSH</Text>
           </View>
         </View>

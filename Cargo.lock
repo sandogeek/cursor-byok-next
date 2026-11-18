@@ -2000,7 +2000,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nsh-app-cursor-byok"
+name = "nsh-app-cursor-byok-next"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",

@@ -1,5 +1,5 @@
 [package]
-name = "nsh-app-cursor-byok"
+name = "nsh-app-cursor-byok-next"
 version = "0.1.0"
 edition = "2024"
 publish = false

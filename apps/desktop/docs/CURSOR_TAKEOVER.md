@@ -40,7 +40,7 @@ pub use self::proxy::{is_cursor_host, Routing as ProxyRouting, UPSTREAM_URL_HEAD
 |---|---|---|---|---|
 | 1 | 后端未就绪时 | 一律把命中白名单的请求改写到 `127.0.0.1:<service_port>` | `Routing.backend == None` 时**原样转发**给 Cursor | 本仓库还没有本地服务；此时改写到空端口会让 Cursor 全面报错。接管可以先开，路由随后接 |
 | 2 | Tab / FileSync 路由 | `is_local_path(path) \|\| (is_tab_path(path) && tab_mode != Direct)`，含 `set_tab_settings` | 不在白名单，也没有 `TabMode` | 那是独立的 tab 中转功能（16 条 `TAB_PATHS`），不属于“让 Cursor 走本地”。加它等于同时承诺实现 tab 服务 |
-| 3 | 端口记忆 | 存 SQLite `network_ports`，启动读 `proxy_port` | 存 `~/.cursor-byok-nsh/harness.json`，重启**复用上次实际绑定的端口** | 本仓库还没有数据库。端口变了 Cursor 的 `http.proxy` 就失效，所以实际端口必须回写并复用 |
+| 3 | 端口记忆 | 存 SQLite `network_ports`，启动读 `proxy_port` | 存 `~/.cursor-byok-next/harness.json`，重启**复用上次实际绑定的端口** | 本仓库还没有数据库。端口变了 Cursor 的 `http.proxy` 就失效，所以实际端口必须回写并复用 |
 | 4 | 端口被占 | 回退随机端口，警告 | 同样回退，但把实际端口写回 `harness.json` | 见 #3；上游重启会退回“请求的端口”，nsh 重启会退回“上次真的跑通的端口” |
 | 5 | `status()` 的自愈 | `if takeover_enabled && ca ready && backend_addr.is_some() { self.enable().await? }` —— 失败即返回错误 | 拆成 `restore()` + `report()`：自愈条件不再要求 `backend`，失败只 `warn` | UI 会轮询 `status()`。错误从只读接口冒出去会把“状态页刷新”变成“应用错误态”。恢复失败应该表现为 `degraded`，不是异常 |
 | 6 | 自愈触发条件 | 必须有 `backend_addr` 才自愈 | 有 CA + 有意愿就自愈 | 配合 #1：代理先跑起来接管流量，后端后接 |
@@ -53,8 +53,8 @@ pub use self::proxy::{is_cursor_host, Routing as ProxyRouting, UPSTREAM_URL_HEAD
 | 13 | `clear_stale_managed_settings` | `Result<()>` | `Result<bool>`（是否真的清了） | UI 需要区分“没有残留”与“清掉了”，否则每次启动都要弹一次提示 |
 | 14 | `terminate_cursor` | `Result<()>` | `Result<bool>`（Cursor 是否在运行） | 调用方据此决定日志措辞；也让“没装 Cursor”不被当成失败 |
 | 15 | 意图持久化 | SQLite 键 `cursor_takeover_enabled` | `harness.json` 的 `{ enabled, proxyPort }` | 同上，本仓库还没有数据库；文件损坏/缺失一律读成“关”，绝不凭读不懂的文件接管 |
-| 16 | 数据目录 | `~/.cursor-byok-v3`（CA 在 `ca/`） | `~/.cursor-byok-nsh`（CA 在 `ca/`） | 两个客户端要能并存，证书也不能互相覆盖 |
-| 17 | Linux 锚文件名 | `cursor-byok-local-ca.crt` | `cursor-byok-nsh-local-ca.crt` | 同上 |
+| 16 | 数据目录 | `~/.cursor-byok-v3`（CA 在 `ca/`） | `~/.cursor-byok-next`（CA 在 `ca/`） | 两个客户端要能并存，证书也不能互相覆盖 |
+| 17 | Linux 锚文件名 | `cursor-byok-local-ca.crt` | `cursor-byok-next-local-ca.crt` | 同上 |
 | 18 | 桩数据 | 无 | 测试全部指向临时目录（`SettingsStore::at` / `AccountStore::at` / `CaManager::at` / `HarnessStateStore::at`） | 单测绝不读真实 `~/Library/Application Support/Cursor` |
 | 19 | 后端热接线 | 启动时复制 `backend_addr`，之后不可变 | `Routing` 持有共享 loopback 地址；`setBackendAddr` 更新已运行代理并注入账号 | 接管可以先启动，local loop 后启动；不应靠重启代理切换路由 |
 | 20 | 代理任务回收 | 停止超时后丢弃 `JoinHandle` | 超时后 `abort` 并等待；`Drop` 也取消任务 | 丢弃句柄不取消 Tokio 任务，会遗留监听端口 |
@@ -103,8 +103,8 @@ settings 匹配    Degraded          Enabled    ← 残留设置 / 端口不符
 |---|---|---|
 | `settings.json` | `~/Library/Application Support/Cursor/User/settings.json`（同） | 同 |
 | `state.vscdb` | `…/User/globalStorage/state.vscdb`（同） | 同 |
-| CA 证书/私钥 | `~/.cursor-byok-v3/ca/{ca.crt,ca.key}` | `~/.cursor-byok-nsh/ca/{ca.crt,ca.key}` |
-| 意图与端口 | SQLite `cursor_takeover_enabled` + `network_ports` | `~/.cursor-byok-nsh/harness.json` |
+| CA 证书/私钥 | `~/.cursor-byok-v3/ca/{ca.crt,ca.key}` | `~/.cursor-byok-next/ca/{ca.crt,ca.key}` |
+| 意图与端口 | SQLite `cursor_takeover_enabled` + `network_ports` | `~/.cursor-byok-next/harness.json` |
 
 写入的 5 个托管键两侧完全一致，并删除 `http.noProxy`：
 
@@ -142,7 +142,7 @@ interface HarnessState {
 }
 ```
 
-类型由 Rust 生成（`.nsh/types/cursor-byok/native.d.ts`），Rust 侧的 `CaState` / `IntegrationState` 分别镜像 `harness::CaState` / `harness::IntegrationState`，映射在 `src/lib.rs` 的 `From` 实现里——只此一处翻译。
+类型由 Rust 生成（`.nsh/types/cursor-byok-next/native.d.ts`），Rust 侧的 `CaState` / `IntegrationState` 分别镜像 `harness::CaState` / `harness::IntegrationState`，映射在 `src/lib.rs` 的 `From` 实现里——只此一处翻译。
 
 ## 验证
 
