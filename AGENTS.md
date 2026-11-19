@@ -8,11 +8,12 @@
 
 ```text
 cursor-byok-nsh/
-├── Cargo.toml                     # workspace：apps/desktop + crates/cursor-protocol-extractor
+├── Cargo.toml                     # workspace：apps/desktop + crates/*
 ├── AGENTS.md                      # 本文件：移植边界与约定
 ├── .agents/skills/                # nsh / nsh-design-guides 技能（只读参考）
 ├── crates/
-│   └── cursor-protocol-extractor/ # 从 Cursor JS bundle 提取 agent.v1 / aiserver.v1
+│   ├── cursor-protocol-extractor/ # 从 Cursor JS bundle 提取 agent.v1 / aiserver.v1
+│   └── cursor-capture/            # Cursor API 抓包调试器（Rust 逻辑 + 原版 web）
 └── apps/desktop/                  # nsh mixed 应用：App.tsx + 同目录 Rust crate
     ├── nsh.json                   # "rust": "."，无 "root" ⇒ App.tsx 是入口
     ├── App.tsx                    # 入口（目前仍是模板）
@@ -21,6 +22,7 @@ cursor-byok-nsh/
     ├── docs/
     │   ├── CURSOR_TAKEOVER.md     # 接管（local_app）移植记录
     │   ├── PROTOCOL_EXTRACTOR.md  # 协议提取器移植记录
+    │   ├── CURSOR_CAPTURE.md      # 协议调试器移植记录
     │   ├── CURSOR_UI.md           # 接管页 UI
     │   └── PLUGIN_CATALOG.md      # Magpie 插件目录
     └── src/
@@ -93,6 +95,7 @@ cursor-byok-nsh/
 cargo check --workspace --all-targets
 cargo test --workspace
 cargo test -p cursor-protocol-extractor
+cargo test -p cursor-capture
 
 # 桌面 mixed 应用
 cd apps/desktop
@@ -108,6 +111,7 @@ nsh package --target macos
 
 - [x] 让 Cursor 走本地：`harness/`（见 `apps/desktop/docs/CURSOR_TAKEOVER.md`）
 - [x] 协议提取器：`crates/cursor-protocol-extractor/`（见 `apps/desktop/docs/PROTOCOL_EXTRACTOR.md`）
+- [x] 协议调试器：`crates/cursor-capture/`（见 `apps/desktop/docs/CURSOR_CAPTURE.md`）
 - [x] 接管页 UI（`src/ui/` + `src/screens/Cursor.tsx`）
 - [x] Magpie 插件目录（`src/plugins/` + `src/screens/Plugins.tsx`，见 `apps/desktop/docs/PLUGIN_CATALOG.md`）
 - [ ] local loop 服务端接入（`set_backend_addr`）

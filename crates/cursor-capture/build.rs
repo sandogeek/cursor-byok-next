@@ -1,0 +1,188 @@
+//! Compiles agent.v1 / aiserver.v1 into a FileDescriptorSet for dynamic decoding.
+
+use std::env;
+use std::path::{Path, PathBuf};
+
+use prost::Message;
+
+fn main() {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest directory"));
+    let proto_dir = manifest.join("../../protocols/cursor");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let generated = out_dir.join("protos");
+    std::fs::create_dir_all(&generated).expect("create sanitized proto directory");
+
+    let agent_path = generated.join("agent_v1.proto");
+    let aiserver_path = generated.join("aiserver_v1.proto");
+    let mut agent = sanitize(&read_proto(&proto_dir.join("agent_v1.proto")));
+    let mut aiserver = sanitize(&read_proto(&proto_dir.join("aiserver_v1.proto")));
+
+    println!(
+        "cargo:rerun-if-changed={}",
+        proto_dir.join("agent_v1.proto").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        proto_dir.join("aiserver_v1.proto").display()
+    );
+
+    for _ in 0..500 {
+        write_proto(&agent_path, &agent);
+        write_proto(&aiserver_path, &aiserver);
+        match protox::compile([&agent_path, &aiserver_path], [&generated]) {
+            Ok(file_descriptor_set) => {
+                std::fs::write(out_dir.join("cursor.bin"), file_descriptor_set.encode_to_vec())
+                    .expect("write cursor descriptor set");
+                return;
+            }
+            Err(err) => {
+                let message = err.to_string();
+                let Some(name) = undefined_type_name(&message) else {
+                    panic!("compile Cursor protobuf descriptors: {message}");
+                };
+                let next_agent = replace_ident(&agent, &name, "bytes");
+                let next_aiserver = replace_ident(&aiserver, &name, "bytes");
+                if next_agent == agent && next_aiserver == aiserver {
+                    panic!("could not patch undefined type {name}: {message}");
+                }
+                agent = next_agent;
+                aiserver = next_aiserver;
+            }
+        }
+    }
+    panic!("too many undefined protobuf types while compiling Cursor descriptors");
+}
+
+fn read_proto(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+}
+
+fn write_proto(path: &Path, contents: &str) {
+    std::fs::write(path, contents)
+        .unwrap_or_else(|err| panic!("write {}: {err}", path.display()));
+}
+
+fn sanitize(source: &str) -> String {
+    rewrite_nested_type_refs(&join_backslash_continuations(source))
+}
+
+fn undefined_type_name(message: &str) -> Option<String> {
+    let start = message.find("name '")? + 6;
+    let rest = &message[start..];
+    let end = rest.find("' is not defined")?;
+    Some(rest[..end].to_string())
+}
+
+/// The extractor wraps identifiers at a column limit with `\` + newline.
+fn join_backslash_continuations(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut pending = false;
+    for line in source.lines() {
+        if pending {
+            out.push_str(line.trim_start());
+            pending = false;
+        } else {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            if let Some(stripped) = line.strip_suffix('\\') {
+                out.push_str(stripped);
+                pending = true;
+            } else {
+                out.push_str(line);
+            }
+        }
+    }
+    if source.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Nested types are declared as `message Parent { message Child {} }`, but field
+/// types are emitted as `Parent_Child`. Rewrite those to `Parent.Child`.
+fn rewrite_nested_type_refs(source: &str) -> String {
+    let mut replacements: Vec<(String, String)> = collect_nested_type_paths(source)
+        .into_iter()
+        .filter(|path| path.len() > 1)
+        .map(|path| (path.join("_"), path.join(".")))
+        .collect();
+    replacements.sort_by_key(|left| std::cmp::Reverse(left.0.len()));
+    replacements.dedup();
+    let mut out = source.to_string();
+    for (from, to) in replacements {
+        out = replace_ident(&out, &from, &to);
+    }
+    out
+}
+
+fn collect_nested_type_paths(source: &str) -> Vec<Vec<String>> {
+    let mut depth = 0_i32;
+    let mut stack: Vec<(i32, String)> = Vec::new();
+    let mut nested = Vec::new();
+    for line in source.lines() {
+        if let Some(name) =
+            declaration_name(line, "message").or_else(|| declaration_name(line, "enum"))
+        {
+            stack.push((depth, name));
+            let path: Vec<String> = stack.iter().map(|(_, name)| name.clone()).collect();
+            if path.len() > 1 {
+                nested.push(path);
+            }
+        } else if declaration_name(line, "service").is_some() {
+            stack.push((depth, String::new()));
+        }
+        depth += brace_delta(line);
+        while stack.last().is_some_and(|(open, _)| *open >= depth) {
+            stack.pop();
+        }
+    }
+    nested
+}
+
+fn declaration_name(line: &str, keyword: &str) -> Option<String> {
+    let trimmed = strip_line_comment(line).trim();
+    let rest = trimmed.strip_prefix(keyword)?.trim_start();
+    let name: String = rest
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .collect();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+fn strip_line_comment(line: &str) -> &str {
+    line.split("//").next().unwrap_or(line)
+}
+
+fn brace_delta(line: &str) -> i32 {
+    let text = strip_line_comment(line);
+    let opens = text.bytes().filter(|byte| *byte == b'{').count() as i32;
+    let closes = text.bytes().filter(|byte| *byte == b'}').count() as i32;
+    opens - closes
+}
+
+fn replace_ident(haystack: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(haystack.len());
+    let mut last = 0;
+    for (idx, _) in haystack.match_indices(from) {
+        if idx < last {
+            continue;
+        }
+        let before_ok =
+            idx == 0 || !is_ident_char(haystack[..idx].chars().next_back().unwrap_or('\0'));
+        let after_idx = idx + from.len();
+        let after_ok = after_idx == haystack.len()
+            || !is_ident_char(haystack[after_idx..].chars().next().unwrap_or('\0'));
+        if before_ok && after_ok {
+            out.push_str(&haystack[last..idx]);
+            out.push_str(to);
+            last = after_idx;
+        }
+    }
+    out.push_str(&haystack[last..]);
+    out
+}
+
+fn is_ident_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
+}
