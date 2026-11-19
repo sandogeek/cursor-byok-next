@@ -17,5 +17,8 @@ visualTest("明暗主题下均可渲染，弹窗可用 Escape 关闭", async () 
     await app.screenshot(`/tmp/cursor-byok-next-${colorScheme}-dialog.png`);
     await app.keyboard.press("Escape");
     expect(app.texts()).not.toContain("证书授权需要管理员密码。应用只复制命令，不会替你执行。");
+    await app.press("插件配置");
+    expect(app.texts()).toContain("无法读取已保存的网关，请检查插件数据文件后重试。");
+    await app.screenshot(`/tmp/cursor-byok-next-${colorScheme}-plugin-storage.png`);
   }
 });

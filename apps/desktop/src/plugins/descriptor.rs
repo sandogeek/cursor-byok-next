@@ -171,6 +171,7 @@ pub struct PluginResourceDescriptor {
     pub add: Vec<AddMethodDefinition>,
     pub can_refresh: bool,
     pub can_remove: bool,
+    pub storage_error: Option<String>,
     pub resources: Vec<PluginResourceView>,
 }
 

@@ -11,17 +11,17 @@ use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 
 use super::{
+    Error, Result,
     catalog::{PluginCatalog, PluginEntry},
     data::PluginDataStore,
     descriptor::{
-        PluginDescriptor, PluginModelDescriptor, PluginProviderDescriptor, PluginResourceDescriptor,
-        PluginResourceView, ProviderDefinition, ResourceDefinition, ResourcePresentation,
-        FORM_ADD_METHOD, FORM_FIELD_URL, LIVE_CATALOG,
+        FORM_ADD_METHOD, FORM_FIELD_URL, LIVE_CATALOG, PluginDescriptor, PluginModelDescriptor,
+        PluginProviderDescriptor, PluginResourceDescriptor, PluginResourceView, ProviderDefinition,
+        ResourceDefinition, ResourcePresentation,
     },
     origin,
     state::{PluginStateStore, ResourceDraft, ResourceRecord, StoredModel},
     worker::PluginWorker,
-    Error, Result,
 };
 
 const LIVE_CATALOG_TTL: Duration = Duration::from_secs(15);
@@ -37,6 +37,7 @@ struct HostInner {
     entries: RwLock<Option<Vec<PluginEntry>>>,
     workers: Mutex<HashMap<String, Arc<PluginWorker>>>,
     live_catalogs: Mutex<HashMap<LiveCatalogKey, LiveCatalogEntry>>,
+    operations: Mutex<()>,
     executable: RwLock<Option<std::path::PathBuf>>,
 }
 
@@ -50,7 +51,7 @@ struct LiveCatalogKey {
 #[derive(Clone, Debug)]
 struct LiveCatalogEntry {
     models: Vec<StoredModel>,
-    fetched_at: Instant,
+    last_attempt: Instant,
     error: Option<String>,
 }
 
@@ -72,20 +73,35 @@ pub struct PluginSnapshot {
 
 impl PluginHost {
     pub fn managed() -> Result<Self> {
-        Ok(Self {
+        Ok(Self::new(
+            PluginCatalog::managed()?,
+            PluginDataStore::managed()?,
+        ))
+    }
+
+    fn new(catalog: PluginCatalog, data: PluginDataStore) -> Self {
+        Self {
             inner: Arc::new(HostInner {
-                catalog: PluginCatalog::managed()?,
-                state: PluginStateStore::new(PluginDataStore::managed()?),
+                catalog,
+                state: PluginStateStore::new(data),
                 entries: RwLock::new(None),
                 workers: Mutex::new(HashMap::new()),
                 live_catalogs: Mutex::new(HashMap::new()),
+                operations: Mutex::new(()),
                 executable: RwLock::new(find_bun()),
             }),
-        })
+        }
     }
 
     pub async fn snapshot(&self) -> PluginSnapshot {
-        let executable = self.inner.executable.read().await.clone();
+        let _operation = self.inner.operations.lock().await;
+        let executable = {
+            let mut executable = self.inner.executable.write().await;
+            if self.inner.entries.read().await.is_none() {
+                *executable = find_bun();
+            }
+            executable.clone()
+        };
         let Some(executable) = executable else {
             return PluginSnapshot {
                 runtime_ready: false,
@@ -93,9 +109,17 @@ impl PluginHost {
                 plugins: self.manifest_plugins(),
             };
         };
+        let entries = self.entries(&executable).await;
         let mut plugins = Vec::new();
-        for entry in self.entries(&executable).await {
+        for entry in entries {
             plugins.push(self.descriptor(&entry, &executable).await);
+        }
+        if plugins.is_empty() {
+            return PluginSnapshot {
+                runtime_ready: true,
+                runtime_error: Some("无法加载内置 Magpie 插件，请检查 Bun 是否可用后重试。".into()),
+                plugins,
+            };
         }
         PluginSnapshot {
             runtime_ready: true,
@@ -111,6 +135,7 @@ impl PluginHost {
         method_id: &str,
         values: serde_json::Value,
     ) -> Result<FormSubmitResponse> {
+        let _operation = self.inner.operations.lock().await;
         let executable = self.executable().await?;
         let entry = self.find_entry(&executable, plugin_id).await?;
         let resource = find_resource(&entry, resource_type)?;
@@ -178,10 +203,12 @@ impl PluginHost {
             .inner
             .state
             .upsert_resources(plugin_id, resource_type, resources)
-            .await?;
-        self.invalidate_live_catalogs(plugin_id, None).await;
+            .await
+            .map_err(|_| Error::Storage("无法保存网关，请检查插件数据目录。".into()))?;
+        let changed: HashSet<_> = outcome.changed_ids.into_iter().collect();
+        self.invalidate_live_catalogs(plugin_id, &changed).await;
         let model_sync_error = self
-            .sync_provider_models_for_resource(&entry, &executable, resource_type)
+            .sync_provider_models_for_resource(&entry, &executable, resource_type, &changed)
             .await;
         Ok(FormSubmitResponse {
             added: outcome.added,
@@ -196,24 +223,31 @@ impl PluginHost {
         resource_type: &str,
         resource_id: &str,
     ) -> Result<()> {
+        let _operation = self.inner.operations.lock().await;
         let executable = self.executable().await?;
         let entry = self.find_entry(&executable, plugin_id).await?;
         find_resource(&entry, resource_type)?;
         self.inner
             .state
             .remove_resource(plugin_id, resource_type, resource_id)
-            .await?;
-        self.invalidate_live_catalogs(plugin_id, Some(resource_id))
+            .await
+            .map_err(|error| match error {
+                Error::NotFound(_) => error,
+                _ => Error::Storage("无法移除网关，请检查插件数据目录。".into()),
+            })?;
+        self.invalidate_live_catalogs(plugin_id, &HashSet::from([resource_id.to_owned()]))
             .await;
         Ok(())
     }
 
-    pub async fn refresh_catalog(&self, plugin_id: &str, provider_id: &str) -> Result<usize> {
+    pub async fn refresh_catalog(&self, plugin_id: &str, provider_id: &str) -> Result<()> {
+        let _operation = self.inner.operations.lock().await;
         let executable = self.executable().await?;
         let entry = self.find_entry(&executable, plugin_id).await?;
-        let provider = find_provider(&entry, provider_id)?.clone();
-        self.refresh_live_provider_models(&entry, &executable, &provider)
-            .await
+        let provider = find_provider(&entry, provider_id)?;
+        self.provider_models(&entry, &executable, provider, true, None)
+            .await;
+        Ok(())
     }
 
     fn manifest_plugins(&self) -> Vec<PluginDescriptor> {
@@ -240,7 +274,7 @@ impl PluginHost {
         let mut providers = Vec::new();
         for provider in &entry.definition.providers {
             let (stored, catalog_error) = self
-                .provider_models(entry, executable, provider, false)
+                .provider_models(entry, executable, provider, false, None)
                 .await;
             let configured = self.provider_configured(entry, provider).await;
             providers.push(PluginProviderDescriptor {
@@ -257,33 +291,33 @@ impl PluginHost {
                 models: stored
                     .iter()
                     .map(|model| {
-                        PluginModelDescriptor::new(
-                            plugin_id,
-                            &entry.manifest.name,
-                            provider,
-                            model,
-                        )
+                        PluginModelDescriptor::new(plugin_id, &entry.manifest.name, provider, model)
                     })
                     .collect(),
             });
         }
         let mut resources = Vec::new();
         for definition in &entry.definition.resources {
-            let records = self
+            let (views, storage_error) = match self
                 .inner
                 .state
                 .resources(plugin_id, &definition.resource_type)
                 .await
-                .unwrap_or_default();
-            let views = self
-                .present_resources(entry, executable, definition, &records)
-                .await;
+            {
+                Ok(records) => (
+                    self.present_resources(entry, executable, definition, &records)
+                        .await,
+                    None,
+                ),
+                Err(error) => (Vec::new(), Some(resource_storage_error(plugin_id, &error))),
+            };
             resources.push(PluginResourceDescriptor {
                 resource_type: definition.resource_type.clone(),
                 display_name: definition.display_name.clone(),
                 add: definition.add.clone(),
                 can_refresh: definition.can_refresh,
                 can_remove: definition.can_remove,
+                storage_error,
                 resources: views,
             });
         }
@@ -377,60 +411,19 @@ impl PluginHost {
         entry: &PluginEntry,
         executable: &Path,
         resource_type: &str,
+        changed: &HashSet<String>,
     ) -> Option<String> {
         let mut errors = Vec::new();
-        for provider in entry.definition.providers.clone() {
-            if provider.resource_type.as_deref() != Some(resource_type) || !provider.has_models {
+        for provider in &entry.definition.providers {
+            if provider.resource_type.as_deref() != Some(resource_type) {
                 continue;
             }
-            if let Err(error) = self
-                .refresh_live_provider_models(entry, executable, &provider)
-                .await
-            {
-                errors.push(format!("{}: {error}", provider.id));
-            }
+            let (_, error) = self
+                .provider_models(entry, executable, provider, true, Some(changed))
+                .await;
+            errors.extend(error);
         }
         (!errors.is_empty()).then(|| errors.join("; "))
-    }
-
-    async fn refresh_live_provider_models(
-        &self,
-        entry: &PluginEntry,
-        executable: &Path,
-        provider: &ProviderDefinition,
-    ) -> Result<usize> {
-        let resource_type = provider.resource_type.as_deref().ok_or_else(|| {
-            Error::Config(format!(
-                "plugin provider '{}' live catalog requires a resource type",
-                provider.id
-            ))
-        })?;
-        let records = self
-            .inner
-            .state
-            .resources(&entry.manifest.id, resource_type)
-            .await?;
-        if records.is_empty() {
-            return Err(Error::Provider(format!(
-                "plugin '{}' has no '{resource_type}' resource; add one first",
-                entry.manifest.id
-            )));
-        }
-        let mut count = 0;
-        let mut errors = Vec::new();
-        for record in records {
-            match self
-                .live_models_for_resource(entry, executable, provider, &record, true)
-                .await
-            {
-                Ok(models) => count += models.len(),
-                Err(error) => errors.push(format!("{}: {error}", record.id)),
-            }
-        }
-        if count == 0 && !errors.is_empty() {
-            return Err(Error::Provider(errors.join("; ")));
-        }
-        Ok(count)
     }
 
     async fn provider_models(
@@ -439,6 +432,7 @@ impl PluginHost {
         executable: &Path,
         provider: &ProviderDefinition,
         force: bool,
+        only: Option<&HashSet<String>>,
     ) -> (Vec<StoredModel>, Option<String>) {
         if !provider.has_models || provider.catalog != LIVE_CATALOG {
             return (Vec::new(), None);
@@ -450,23 +444,26 @@ impl PluginHost {
             .inner
             .state
             .resources(&entry.manifest.id, resource_type)
-            .await
-            .unwrap_or_default();
+            .await;
+        let records = match records {
+            Ok(records) => records,
+            Err(_) => return (Vec::new(), None), // Reported on the resource descriptor.
+        };
         let mut models = Vec::new();
         let mut errors = Vec::new();
         for record in records {
-            match self
+            if only.is_some_and(|ids| !ids.contains(&record.id)) {
+                continue;
+            }
+            let catalog = self
                 .live_models_for_resource(entry, executable, provider, &record, force)
-                .await
-            {
-                Ok(resource_models) => models.extend(resource_models),
-                Err(error) => errors.push(format!("{}: {error}", record.id)),
+                .await;
+            models.extend(catalog.models);
+            if let Some(error) = catalog.error {
+                errors.push(format!("{}：{error}", record.key));
             }
         }
-        (
-            models,
-            (!errors.is_empty()).then(|| errors.join("; ")),
-        )
+        (models, (!errors.is_empty()).then(|| errors.join("; ")))
     }
 
     async fn live_models_for_resource(
@@ -476,7 +473,7 @@ impl PluginHost {
         provider: &ProviderDefinition,
         record: &ResourceRecord,
         force: bool,
-    ) -> Result<Vec<StoredModel>> {
+    ) -> LiveCatalogEntry {
         let key = LiveCatalogKey {
             plugin_id: entry.manifest.id.clone(),
             provider_id: provider.id.clone(),
@@ -485,54 +482,32 @@ impl PluginHost {
         if !force {
             let catalogs = self.inner.live_catalogs.lock().await;
             if let Some(cached) = catalogs.get(&key)
-                && cached.fetched_at.elapsed() < LIVE_CATALOG_TTL
+                && cached.last_attempt.elapsed() < LIVE_CATALOG_TTL
             {
-                return match &cached.error {
-                    Some(error) if cached.models.is_empty() => {
-                        Err(Error::Provider(error.clone()))
-                    }
-                    _ => Ok(cached.models.clone()),
-                };
+                return cached.clone();
             }
         }
-        match self
+        let result = self
             .list_models(entry, executable, provider, Some(record))
-            .await
-        {
+            .await;
+        let mut catalogs = self.inner.live_catalogs.lock().await;
+        let cached = catalogs.entry(key).or_insert_with(|| LiveCatalogEntry {
+            models: Vec::new(),
+            last_attempt: Instant::now(),
+            error: None,
+        });
+        cached.last_attempt = Instant::now();
+        match result {
             Ok(models) => {
-                let stored = models
+                cached.models = models
                     .into_iter()
                     .map(|model| bind_live_model(model, &record.id))
-                    .collect::<Vec<_>>();
-                let mut catalogs = self.inner.live_catalogs.lock().await;
-                catalogs.insert(
-                    key,
-                    LiveCatalogEntry {
-                        models: stored.clone(),
-                        fetched_at: Instant::now(),
-                        error: None,
-                    },
-                );
-                Ok(stored)
+                    .collect();
+                cached.error = None;
             }
-            Err(error) => {
-                let mut catalogs = self.inner.live_catalogs.lock().await;
-                if let Some(cached) = catalogs.get_mut(&key) {
-                    cached.fetched_at = Instant::now();
-                    cached.error = Some(error.to_string());
-                    return Ok(cached.models.clone());
-                }
-                catalogs.insert(
-                    key,
-                    LiveCatalogEntry {
-                        models: Vec::new(),
-                        fetched_at: Instant::now(),
-                        error: Some(error.to_string()),
-                    },
-                );
-                Err(error)
-            }
+            Err(error) => cached.error = Some(error.to_string()),
         }
+        cached.clone()
     }
 
     async fn list_models(
@@ -581,10 +556,9 @@ impl PluginHost {
             .collect()
     }
 
-    async fn invalidate_live_catalogs(&self, plugin_id: &str, resource_id: Option<&str>) {
+    async fn invalidate_live_catalogs(&self, plugin_id: &str, resource_ids: &HashSet<String>) {
         self.inner.live_catalogs.lock().await.retain(|key, _| {
-            key.plugin_id != plugin_id
-                || resource_id.is_some_and(|resource_id| key.resource_id != resource_id)
+            key.plugin_id != plugin_id || !resource_ids.contains(&key.resource_id)
         });
     }
 
@@ -602,7 +576,9 @@ impl PluginHost {
             return entries.clone();
         }
         let loaded = self.inner.catalog.entries(executable).await;
-        *self.inner.entries.write().await = Some(loaded.clone());
+        if !loaded.is_empty() {
+            *self.inner.entries.write().await = Some(loaded.clone());
+        }
         loaded
     }
 
@@ -627,6 +603,18 @@ impl PluginHost {
             })
             .clone()
     }
+}
+
+fn resource_storage_error(plugin_id: &str, error: &Error) -> String {
+    tracing::warn!(
+        plugin = plugin_id,
+        kind = match error {
+            Error::Json(_) => "invalid JSON",
+            _ => "read failed",
+        },
+        "plugin resource storage unavailable"
+    );
+    "无法读取已保存的网关，请检查插件数据文件后重试。".into()
 }
 
 fn find_provider<'a>(entry: &'a PluginEntry, provider_id: &str) -> Result<&'a ProviderDefinition> {
@@ -690,6 +678,152 @@ fn which(name: &str) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    const MAGPIE: &str = "dev.cursorbyoknext.plugins.magpie";
+    const FAKE_KEY: &str = "integration-test-placeholder-key";
+
+    async fn fake_gateway() -> (
+        String,
+        Arc<AtomicBool>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let offline = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let offline = offline.clone();
+            let calls = calls.clone();
+            async move {
+                loop {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut request = String::new();
+                    while socket.read_line(&mut request).await.unwrap() > 0 {
+                        if request.ends_with("\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    assert!(request.starts_with("GET /v1/models HTTP/1.1\r\n"));
+                    assert!(request.contains(&format!("Bearer {FAKE_KEY}")));
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    let (status, body) = if offline.load(Ordering::Relaxed) {
+                        (
+                            "503 Service Unavailable",
+                            format!("untrusted response containing {FAKE_KEY}"),
+                        )
+                    } else {
+                        ("200 OK", r#"{"data":[{"id":"openai/gpt-5","magpie_label":"GPT-5","max_output_tokens":8192,"native_endpoints":["/v1/responses"]},{"id":"openai/gpt-5","display_name":"duplicate"},{"id":"media","kind":"image"},{"id":"video","kind":"video"}]}"#.into())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket
+                        .get_mut()
+                        .write_all(response.as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        (origin, offline, calls, task)
+    }
+
+    #[tokio::test]
+    async fn magpie_catalog_through_real_bun() {
+        assert!(
+            find_bun().is_some(),
+            "install Bun on PATH to run the Magpie integration test"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("data");
+        let host = PluginHost::new(
+            PluginCatalog::for_test(temp.path()).unwrap(),
+            PluginDataStore::for_test(root.clone()).unwrap(),
+        );
+        let initial = host.snapshot().await;
+        assert!(
+            initial.runtime_ready && initial.plugins.iter().any(|plugin| plugin.id == MAGPIE),
+            "{initial:?}"
+        );
+        let (origin, offline, calls, server) = fake_gateway().await;
+        let (second, _, second_calls, second_server) = fake_gateway().await;
+        let submit = |origin: String| {
+            host.form_submit(
+                MAGPIE,
+                "gateway",
+                "connect",
+                serde_json::json!({
+                    "base-url": format!("{origin}/ignored"), "api-key": FAKE_KEY,
+                }),
+            )
+        };
+        assert_eq!(submit(origin.clone()).await.unwrap().added, 1);
+        let snapshot = host.snapshot().await;
+        let model = &snapshot.plugins[0].providers[0].models[0];
+        assert_eq!(model.display_name, "GPT-5");
+        assert_eq!(model.max_output_tokens, Some(8192));
+        assert_eq!(
+            host.inner
+                .live_catalogs
+                .lock()
+                .await
+                .values()
+                .next()
+                .unwrap()
+                .models[0]
+                .private_data["nativeEndpoints"][0],
+            "/v1/responses"
+        );
+        assert!(model.id.ends_with("/openai/gpt-5"));
+        assert_eq!(snapshot.plugins[0].providers[0].models.len(), 1);
+        assert_eq!(
+            snapshot.plugins[0].resources[0].resources[0].display_name,
+            origin
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        offline.store(true, Ordering::Relaxed);
+        host.refresh_catalog(MAGPIE, "magpie").await.unwrap();
+        let stale = host.snapshot().await;
+        let provider = &stale.plugins[0].providers[0];
+        assert_eq!(provider.models[0].id, model.id);
+        assert!(
+            provider
+                .catalog_error
+                .as_deref()
+                .is_some_and(|error| error.contains("503"))
+        );
+        assert!(!serde_json::to_string(&stale).unwrap().contains(FAKE_KEY));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        assert_eq!(submit(second).await.unwrap().added, 1);
+        let merged = host.snapshot().await;
+        assert_eq!(merged.plugins[0].providers[0].models.len(), 2);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(second_calls.load(Ordering::Relaxed), 1);
+        let gateway = &merged.plugins[0].resources[0].resources[0];
+        host.delete_resource(MAGPIE, "gateway", &gateway.id)
+            .await
+            .unwrap();
+        let removed = host.snapshot().await;
+        assert_eq!(removed.plugins[0].providers[0].models.len(), 1);
+        assert!(removed.plugins[0].providers[0].catalog_error.is_none());
+
+        std::fs::write(
+            root.join(MAGPIE).join("resources-gateway.json"),
+            b"invalid JSON",
+        )
+        .unwrap();
+        let degraded = host.snapshot().await;
+        assert!(degraded.plugins[0].resources[0].storage_error.is_some());
+        server.abort();
+        second_server.abort();
+    }
 
     #[test]
     fn binds_live_models_to_resource_ids() {

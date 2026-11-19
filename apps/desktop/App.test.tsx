@@ -171,3 +171,30 @@ test("插件页显示 Magpie 目录且不含密钥", async () => {
   await app.press("刷新目录");
   expect(calls).toEqual(["refreshCatalog"]);
 });
+
+test("已安装 Bun 时，插件加载失败可重试而不会误报缺少 Bun", async () => {
+  const setup = options(ready, [], { runtimeReady: true, runtimeError: "内置插件加载失败", plugins: [] });
+  let loads = 0;
+  setup.host.handlers["plugins.snapshot"] = () => ++loads === 1
+    ? { runtimeReady: true, runtimeError: "内置插件加载失败", plugins: [] }
+    : magpieReady;
+  const app = await open("./test-fixtures/App.tsx", setup);
+  await app.press("插件配置");
+  expect(app.texts()).toContain("无法加载 Magpie 插件");
+  expect(app.texts()).not.toContain("需要 Bun 才能加载 Magpie 插件");
+  await app.press("刷新状态");
+  expect(app.texts()).toContain("GPT-5");
+});
+
+test("网关数据读取失败时不显示首次配置的空状态", async () => {
+  const plugin = magpieReady.plugins[0]!;
+  const gatewayType = plugin.resources[0]!;
+  const app = await open("./test-fixtures/App.tsx", options(ready, [], {
+    ...magpieReady,
+    plugins: [{ ...plugin, resources: [{ ...gatewayType, resources: [], storageError: "无法读取已保存的网关" }] }],
+  }));
+  await app.press("插件配置");
+  expect(app.texts()).toContain("无法读取已保存的网关");
+  expect(app.texts()).not.toContain("还没有 Magpie 网关。填写地址和 API 密钥后保存。");
+  expect(app.enabled("保存连接")).toBe(false);
+});

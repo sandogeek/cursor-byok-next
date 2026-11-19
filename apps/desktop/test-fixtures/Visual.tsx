@@ -20,9 +20,16 @@ const takeover = {
 };
 const plugins = {
   snapshot: async (): Promise<PluginSnapshot> => ({
-    runtimeReady: false,
-    runtimeError: "bun is not on PATH",
-    plugins: [],
+    runtimeReady: true,
+    plugins: [{
+      id: "dev.cursorbyoknext.plugins.magpie",
+      name: "Magpie",
+      version: "0.1.0",
+      icon: "",
+      runtimeReady: true,
+      providers: [{ id: "magpie", pluginId: "dev.cursorbyoknext.plugins.magpie", displayName: "Magpie", description: "从 Magpie 网关实时读取目录。", providerType: "magpie", catalog: "live", configured: false, models: [] }],
+      resources: [{ resourceType: "gateway", displayName: "网关", add: [], storageError: "无法读取已保存的网关，请检查插件数据文件后重试。", resources: [] }],
+    }],
   }),
   submitForm: async (): Promise<PluginFormResult> => ({ added: 0, updated: 0 }),
   deleteResource: async (): Promise<PluginSnapshot> => ({ runtimeReady: false, plugins: [] }),

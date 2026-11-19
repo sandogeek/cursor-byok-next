@@ -1,4 +1,4 @@
-//! Owns filesystem plugin discovery, sandboxed workers, and plugin providers.
+//! Owns discovery and Bun workers for trusted built-in plugins.
 
 mod builtin;
 mod catalog;
@@ -12,8 +12,6 @@ mod origin;
 mod protocol;
 mod state;
 mod worker;
-#[cfg(test)]
-mod magpie;
 
 pub use descriptor::{
     parse_model_id, AddMethodDefinition, FormFieldDefinition, PluginDescriptor,

@@ -1,18 +1,17 @@
-//! Discovers plugin manifests and evaluates serializable TypeScript definitions.
+//! Loads only the app's embedded Magpie plugin.
 
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 
 use super::{
+    Error, Result,
     definition::PluginDefinitionLoader,
     descriptor::PluginModuleDefinition,
-    manifest::{validate_id, PluginManifest},
-    Error, Result,
+    manifest::{PluginManifest, validate_id},
 };
 
 const MANIFEST_FILE_NAME: &str = "plugin.json";
@@ -21,14 +20,12 @@ const APP_VERSION: &str = "1.0.1";
 
 #[derive(Clone)]
 pub struct PluginCatalog {
-    roots: Vec<PathBuf>,
+    directory: PathBuf,
     definition_loader: PluginDefinitionLoader,
-    app_version: String,
 }
 
 #[derive(Clone)]
 pub(crate) struct PluginEntry {
-    pub directory: PathBuf,
     pub entry: PathBuf,
     pub manifest: PluginManifest,
     pub definition: PluginModuleDefinition,
@@ -37,25 +34,20 @@ pub(crate) struct PluginEntry {
 
 impl PluginCatalog {
     pub fn managed() -> Result<Self> {
-        let installed = crate::harness::data_dir()?.join("plugins/installed");
-        fs::create_dir_all(&installed)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&installed, fs::Permissions::from_mode(0o700))?;
-        }
-        super::builtin::install(&installed)?;
-        #[cfg(debug_assertions)]
-        let roots = vec![
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins/build-in"),
-            installed,
-        ];
-        #[cfg(not(debug_assertions))]
-        let roots = vec![installed];
+        Self::in_temporary_workspace(&std::env::temp_dir())
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(root: &Path) -> Result<Self> {
+        Self::in_temporary_workspace(root)
+    }
+
+    fn in_temporary_workspace(parent: &Path) -> Result<Self> {
+        let definition_loader = PluginDefinitionLoader::in_temporary_workspace(parent)?;
+        let directory = super::builtin::materialize_magpie(definition_loader.workspace())?;
         Ok(Self {
-            roots,
-            definition_loader: PluginDefinitionLoader::managed()?,
-            app_version: APP_VERSION.into(),
+            directory,
+            definition_loader,
         })
     }
 
@@ -64,80 +56,27 @@ impl PluginCatalog {
     }
 
     pub(crate) async fn entries(&self, executable: &Path) -> Vec<PluginEntry> {
-        let mut plugins = BTreeMap::new();
-        for root in &self.roots {
-            let mut directories = match child_directories(root) {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::warn!(path = %root.display(), %error, "failed to scan plugin directory");
-                    continue;
-                }
-            };
-            directories.sort();
-            for directory in directories {
-                match load_plugin(
-                    &directory,
-                    &self.definition_loader,
-                    executable,
-                    &self.app_version,
-                )
-                .await
-                {
-                    Ok(entry) => {
-                        if plugins.contains_key(&entry.manifest.id) {
-                            tracing::warn!(plugin = %entry.manifest.id, path = %directory.display(), "ignoring duplicate plugin");
-                        } else {
-                            plugins.insert(entry.manifest.id.clone(), entry);
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(path = %directory.display(), %error, "ignoring invalid plugin")
-                    }
-                }
+        match load_plugin(&self.directory, &self.definition_loader, executable).await {
+            Ok(entry) => vec![entry],
+            Err(error) => {
+                tracing::warn!(%error, "failed to load bundled Magpie");
+                Vec::new()
             }
         }
-        plugins.into_values().collect()
     }
 
     pub(crate) fn manifests(&self) -> Vec<(PluginManifest, String)> {
-        let mut plugins = BTreeMap::new();
-        for root in &self.roots {
-            let Ok(mut directories) = child_directories(root) else {
-                continue;
-            };
-            directories.sort();
-            for directory in directories {
-                let loaded = (|| -> Result<_> {
-                    let manifest: PluginManifest =
-                        serde_json::from_slice(&fs::read(directory.join(MANIFEST_FILE_NAME))?)?;
-                    manifest.validate(&directory)?;
-                    require_app_version(&manifest, &self.app_version)?;
-                    let icon = icon_data_url(&directory, &manifest.icon)?;
-                    Ok((manifest, icon))
-                })();
-                if let Ok((manifest, icon)) = loaded {
-                    plugins
-                        .entry(manifest.id.clone())
-                        .or_insert((manifest, icon));
-                }
-            }
-        }
-        plugins.into_values().collect()
+        load_manifest(&self.directory).into_iter().collect()
     }
 }
 
-fn child_directories(root: &Path) -> Result<Vec<PathBuf>> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut directories = Vec::new();
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() && !entry.file_name().to_string_lossy().starts_with('.') {
-            directories.push(entry.path());
-        }
-    }
-    Ok(directories)
+fn load_manifest(directory: &Path) -> Result<(PluginManifest, String)> {
+    let manifest: PluginManifest =
+        serde_json::from_slice(&fs::read(directory.join(MANIFEST_FILE_NAME))?)?;
+    manifest.validate(directory)?;
+    require_app_version(&manifest, APP_VERSION)?;
+    let icon = icon_data_url(directory, &manifest.icon)?;
+    Ok((manifest, icon))
 }
 
 fn require_app_version(manifest: &PluginManifest, app_version: &str) -> Result<()> {
@@ -157,18 +96,12 @@ async fn load_plugin(
     directory: &Path,
     loader: &PluginDefinitionLoader,
     executable: &Path,
-    app_version: &str,
 ) -> Result<PluginEntry> {
-    let manifest: PluginManifest =
-        serde_json::from_slice(&fs::read(directory.join(MANIFEST_FILE_NAME))?)?;
-    manifest.validate(directory)?;
-    require_app_version(&manifest, app_version)?;
-    let icon = icon_data_url(directory, &manifest.icon)?;
+    let (manifest, icon) = load_manifest(directory)?;
     let entry = directory.join(&manifest.entry).canonicalize()?;
-    let definition = loader.load(executable, directory, &entry).await?;
+    let definition = loader.load(executable, &entry).await?;
     validate_definition(&manifest.id, &definition)?;
     Ok(PluginEntry {
-        directory: directory.to_path_buf(),
         entry,
         manifest,
         definition,
@@ -352,7 +285,7 @@ fn icon_data_url(directory: &Path, relative: &str) -> Result<String> {
         _ => {
             return Err(Error::Config(format!(
                 "unsupported plugin icon: {relative}"
-            )))
+            )));
         }
     };
     Ok(format!(
@@ -364,28 +297,62 @@ fn icon_data_url(directory: &Path, relative: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::descriptor::{AddMethodDefinition, FormFieldDefinition, ProviderDefinition, ResourceDefinition};
+    use crate::plugins::descriptor::{
+        AddMethodDefinition, FormFieldDefinition, ProviderDefinition, ResourceDefinition,
+    };
 
     #[test]
-    fn repository_magpie_has_valid_static_manifest() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins/build-in");
-        let sdk = tempfile::tempdir().unwrap();
-        let catalog = PluginCatalog {
-            roots: vec![root],
-            definition_loader: PluginDefinitionLoader::for_test(sdk.path()).unwrap(),
-            app_version: "1.0.1".into(),
-        };
-        let manifests: Vec<_> = catalog
-            .manifests()
-            .into_iter()
-            .map(|(manifest, _)| manifest)
-            .collect();
-        let magpie = manifests
-            .iter()
-            .find(|manifest| manifest.id == "dev.cursorbyoknext.plugins.magpie")
-            .unwrap();
+    fn embedded_magpie_ignores_installed_manifests_and_source() {
+        let root = tempfile::tempdir().unwrap();
+        let installed = root.path().join("plugins/installed");
+        fs::create_dir_all(&installed).unwrap();
+        let shadow = super::super::builtin::materialize_magpie(&installed).unwrap();
+        fs::write(shadow.join("main.ts"), "throw new Error('untrusted')").unwrap();
+        let arbitrary = installed.join("arbitrary");
+        fs::rename(&shadow, &arbitrary).unwrap();
+        let impostor = super::super::builtin::materialize_magpie(&installed).unwrap();
+        fs::write(impostor.join("main.ts"), "throw new Error('same version')").unwrap();
+        let manifest_path = arbitrary.join("plugin.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["id"] = serde_json::json!("dev.example.arbitrary");
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let catalog = PluginCatalog::for_test(root.path()).unwrap();
+        let manifests = catalog.manifests();
+        assert_eq!(manifests.len(), 1);
+        let (magpie, icon) = &manifests[0];
+        assert_eq!(magpie.id, "dev.cursorbyoknext.plugins.magpie");
         assert!(magpie.permissions.resource_origin);
         assert!(magpie.permissions.network.is_empty());
+        assert!(icon.starts_with("data:image/svg+xml;base64,"));
+        assert_ne!(catalog.directory, impostor);
+        assert_eq!(
+            fs::read_to_string(catalog.directory.join("main.ts")).unwrap(),
+            include_str!("../../plugins/build-in/magpie/main.ts")
+        );
+        assert_eq!(
+            fs::read_to_string(impostor.join("main.ts")).unwrap(),
+            "throw new Error('same version')"
+        );
+    }
+
+    #[tokio::test]
+    async fn bun_collects_embedded_magpie() {
+        match std::process::Command::new("bun").arg("--version").output() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            result => assert!(result.unwrap().status.success()),
+        }
+        let root = tempfile::Builder::new()
+            .prefix("magpie smoke ")
+            .tempdir()
+            .unwrap();
+        let catalog = PluginCatalog::for_test(root.path()).unwrap();
+        let entry = load_plugin(&catalog.directory, catalog.loader(), Path::new("bun"))
+            .await
+            .unwrap();
+        assert_eq!(entry.definition.providers[0].id, "magpie");
+        assert_eq!(entry.definition.resources[0].resource_type, "gateway");
     }
 
     #[test]

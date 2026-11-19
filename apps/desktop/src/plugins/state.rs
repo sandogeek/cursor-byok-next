@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{data::PluginDataStore, Error, Result};
+use super::{Error, Result, data::PluginDataStore};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -166,6 +166,7 @@ pub struct PluginStateStore {
 pub struct UpsertOutcome {
     pub added: usize,
     pub updated: usize,
+    pub changed_ids: Vec<String>,
 }
 
 impl PluginStateStore {
@@ -199,6 +200,7 @@ impl PluginStateStore {
         let mut outcome = UpsertOutcome {
             added: 0,
             updated: 0,
+            changed_ids: Vec::new(),
         };
         for draft in drafts {
             if draft.key.trim().is_empty() {
@@ -212,11 +214,14 @@ impl PluginStateStore {
                     existing.private_data = draft.private_data;
                     existing.state = state;
                     existing.updated_at_ms = now;
+                    outcome.changed_ids.push(existing.id.clone());
                     outcome.updated += 1;
                 }
                 None => {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    outcome.changed_ids.push(id.clone());
                     records.push(ResourceRecord {
-                        id: uuid::Uuid::new_v4().to_string(),
+                        id,
                         key: draft.key,
                         private_data: draft.private_data,
                         state,

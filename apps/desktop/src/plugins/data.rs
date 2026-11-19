@@ -116,22 +116,26 @@ fn write_once(
     bytes: &[u8],
 ) -> Result<(), Error> {
     use std::io::Write;
-    std::fs::create_dir_all(directory)?;
-    let _ = set_directory_permissions(directory);
-    let mut file = std::fs::File::create(temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    let _ = set_file_permissions(temporary);
-    #[cfg(windows)]
-    match std::fs::remove_file(target) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+    let mut directories = std::fs::DirBuilder::new();
+    directories.recursive(true);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        directories.mode(0o700);
+        options.mode(0o600);
     }
-    std::fs::rename(temporary, target)?;
-    let _ = set_file_permissions(target);
-    Ok(())
+    directories.create(directory)?;
+    set_directory_permissions(directory)?;
+    let mut file = options.open(temporary)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    let result = written.and_then(|()| std::fs::rename(temporary, target));
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result.map_err(Into::into)
 }
 
 fn validate_component(value: &str, label: &str) -> Result<()> {
@@ -151,19 +155,6 @@ fn set_directory_permissions(path: &Path) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
-}
-
-fn set_file_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     #[cfg(not(unix))]
     {

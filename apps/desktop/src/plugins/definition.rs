@@ -1,14 +1,16 @@
 //! Evaluates TypeScript plugin definitions through a Bun subprocess.
 
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 
 use tokio::io::AsyncReadExt;
 
-use super::{descriptor::PluginModuleDefinition, Error, Result};
+use super::{Error, Result, descriptor::PluginModuleDefinition};
 
 const DEFINITION_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
@@ -16,30 +18,46 @@ const OUTPUT_PREFIX: &str = "CURSOR_BYOK_NEXT_PLUGIN_DEFINITION:";
 
 #[derive(Clone)]
 pub struct PluginDefinitionLoader {
+    workspace: Arc<RuntimeDirectory>,
     sdk_dir: PathBuf,
     bunfig: PathBuf,
+    tsconfig: PathBuf,
     collector: PathBuf,
     worker: PathBuf,
 }
 
+struct RuntimeDirectory(PathBuf);
+
+impl Drop for RuntimeDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 impl PluginDefinitionLoader {
-    pub fn managed() -> Result<Self> {
-        Self::in_directory(crate::harness::data_dir()?.join("plugins/runtime/sdk/v1"))
-    }
-
-    #[cfg(test)]
-    pub(super) fn for_test(root: &Path) -> Result<Self> {
-        Self::in_directory(root.join(".plugin-sdk"))
-    }
-
-    fn in_directory(sdk_dir: PathBuf) -> Result<Self> {
+    pub(super) fn in_temporary_workspace(parent: &Path) -> Result<Self> {
+        let path = parent
+            .canonicalize()?
+            .join(format!("cursor-byok-next-plugin-{}", uuid::Uuid::new_v4()));
+        let mut directory = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        // Create a new isolated copy; never reuse code under a discoverable install path.
+        directory.create(&path)?;
+        let workspace = Arc::new(RuntimeDirectory(path));
+        let sdk_dir = workspace.0.join("sdk");
         std::fs::create_dir_all(&sdk_dir)?;
         std::fs::create_dir_all(sdk_dir.join("protocol"))?;
         let bunfig = sdk_dir.join("bunfig.toml");
+        let tsconfig = sdk_dir.join("tsconfig.json");
         let collector = sdk_dir.join("collect.ts");
         let worker = sdk_dir.join("worker.ts");
         let modules = [
             (&bunfig, include_str!("sdk/bunfig.toml")),
+            (&tsconfig, include_str!("sdk/tsconfig.json")),
             (&collector, include_str!("sdk/collect.ts")),
             (&worker, include_str!("sdk/worker.ts")),
             (&sdk_dir.join("plugin.ts"), include_str!("sdk/plugin.ts")),
@@ -66,7 +84,7 @@ impl PluginDefinitionLoader {
             ),
         ];
         for (path, content) in &modules {
-            write_if_changed(path, content)?;
+            std::fs::write(path, content)?;
         }
         #[cfg(unix)]
         {
@@ -81,47 +99,50 @@ impl PluginDefinitionLoader {
             }
         }
         Ok(Self {
+            workspace,
             sdk_dir,
             bunfig,
+            tsconfig,
             collector,
             worker,
         })
+    }
+
+    pub(super) fn workspace(&self) -> &Path {
+        &self.workspace.0
     }
 
     pub fn worker_path(&self) -> &Path {
         &self.worker
     }
 
-    pub fn bunfig(&self) -> &Path {
-        &self.bunfig
-    }
-
-    pub fn sdk_dir(&self) -> &Path {
-        &self.sdk_dir
-    }
-
-    pub async fn load(
-        &self,
-        executable: &Path,
-        plugin_directory: &Path,
-        entry: &Path,
-    ) -> Result<PluginModuleDefinition> {
-        let entry_url = file_url(entry)?;
+    pub(super) fn bun_command(&self, executable: &Path) -> tokio::process::Command {
         let mut command = tokio::process::Command::new(executable);
         super::detach_console(&mut command);
+        let mut config = OsString::from("--config=");
+        config.push(&self.bunfig);
+        let mut tsconfig = OsString::from("--tsconfig-override=");
+        tsconfig.push(&self.tsconfig);
         command
-            .arg("run")
-            .arg("--no-install")
-            .arg(format!("--config={}", self.bunfig.display()))
-            .arg(&self.collector)
-            .arg(entry_url.as_str())
+            .args(["run", "--no-install", "--no-env-file"])
+            .arg(config)
+            .arg(tsconfig)
             .current_dir(&self.sdk_dir)
             .env("BUN_INSTALL_CACHE_DIR", self.sdk_dir.join("cache"))
+            .kill_on_drop(true);
+        command
+    }
+
+    pub async fn load(&self, executable: &Path, entry: &Path) -> Result<PluginModuleDefinition> {
+        let entry_url = file_url(entry)?;
+        let mut child = self
+            .bun_command(executable)
+            .arg(&self.collector)
+            .arg(entry_url.as_str())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command.spawn()?;
+            .spawn()?;
         let stdout = child
             .stdout
             .take()
@@ -143,7 +164,6 @@ impl PluginDefinitionLoader {
                 String::from_utf8_lossy(&stderr).trim()
             )));
         }
-        let _ = plugin_directory;
         parse_definition_output(&stdout)
     }
 }
@@ -181,14 +201,6 @@ fn parse_definition_output(output: &[u8]) -> Result<PluginModuleDefinition> {
         .find_map(|line| line.strip_prefix(OUTPUT_PREFIX))
         .ok_or_else(|| Error::Config("plugin definition did not produce a descriptor".into()))?;
     Ok(serde_json::from_str(json)?)
-}
-
-pub(super) fn write_if_changed(path: &Path, content: &str) -> Result<()> {
-    if std::fs::read(path).is_ok_and(|current| current == content.as_bytes()) {
-        return Ok(());
-    }
-    std::fs::write(path, content)?;
-    Ok(())
 }
 
 #[cfg(test)]

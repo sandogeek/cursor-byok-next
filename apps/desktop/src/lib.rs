@@ -293,6 +293,7 @@ impl From<HostResource> for PluginResource {
         Self {
             resource_type: value.resource_type,
             display_name: localized_text(&value.display_name),
+            storage_error: value.storage_error,
             add: value.add.into_iter().map(Into::into).collect(),
             resources: value.resources.into_iter().map(Into::into).collect(),
         }
@@ -346,7 +347,7 @@ impl From<HostFormSubmit> for PluginFormResult {
 /// A plugin runtime snapshot the settings page shows.
 #[derive(Debug, Clone, PartialEq, JsObject)]
 pub struct PluginSnapshot {
-    /// Whether Bun was found and can evaluate plugins.
+    /// Whether a Bun executable was found; a plugin may still fail to load.
     pub runtime_ready: bool,
     /// Why the runtime is unavailable, when it is.
     pub runtime_error: Option<String>,
@@ -432,6 +433,8 @@ pub struct PluginResource {
     pub display_name: String,
     /// Form methods that add a resource.
     pub add: Vec<PluginAddMethod>,
+    /// Why saved resources could not be read, when storage is degraded.
+    pub storage_error: Option<String>,
     /// Saved resources of this type.
     pub resources: Vec<PluginResourceView>,
 }
@@ -574,7 +577,7 @@ impl Plugins {
         provider_id: String,
     ) -> Result<PluginSnapshot, plugins::Error> {
         let host = this.with(|plugins| plugins.inner.clone());
-        let _ = host.refresh_catalog(&plugin_id, &provider_id).await?;
+        host.refresh_catalog(&plugin_id, &provider_id).await?;
         Ok(host.snapshot().await.into())
     }
 }

@@ -1,8 +1,1 @@
-[alias]
-"cursor-byok-next:plugin" = "./plugin.ts"
-"cursor-byok-next:provider" = "./provider.ts"
-"cursor-byok-next:model" = "./model.ts"
-"cursor-byok-next:resource" = "./resource.ts"
-"cursor-byok-next:protocol/openai-responses" = "./protocol/openai_responses.ts"
-"cursor-byok-next:protocol/openai-chat" = "./protocol/openai_chat.ts"
-"cursor-byok-next:protocol/anthropic" = "./protocol/anthropic.ts"
+# SDK specifiers are resolved by the explicit --tsconfig-override, not bunfig.

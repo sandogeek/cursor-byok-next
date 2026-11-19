@@ -76,7 +76,7 @@ export const magpieModels: ModelSupport = {
       headers: gatewayHeaders(data.apiKey),
     });
     if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Magpie model discovery failed (HTTP ${response.status}): ${response.body}`);
+      throw new Error(`Magpie model discovery failed (HTTP ${response.status})`);
     }
     let body: unknown;
     try {

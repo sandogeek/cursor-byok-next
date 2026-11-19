@@ -4,35 +4,109 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
     time::Duration,
 };
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin},
-    sync::{mpsc, Mutex},
+    process::ChildStdin,
+    sync::{Mutex, mpsc, oneshot, watch},
+    task::JoinHandle,
 };
 
 use super::{
+    Error, Result,
     catalog::PluginEntry,
-    definition::{file_url, PluginDefinitionLoader},
+    definition::{PluginDefinitionLoader, file_url},
     origin,
     protocol::{HostMessage, WorkerMessage},
-    Error, Result,
 };
 
 const INVOCATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_NETWORK_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
-#[derive(Debug)]
-pub enum WorkerStreamItem {
-    #[allow(dead_code)]
-    Event(serde_json::Value),
-    Result(Result<serde_json::Value>),
+type InvocationResult = Result<serde_json::Value>;
+type Writer = mpsc::Sender<Vec<u8>>;
+
+// One registry per process generation. None means the generation cannot accept new requests.
+struct Pending(parking_lot::Mutex<Option<HashMap<String, PendingInvocation>>>);
+
+struct PendingInvocation {
+    result: oneshot::Sender<InvocationResult>,
+    active: watch::Sender<()>,
+    state: Arc<InvocationState>,
 }
 
-type Pending = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<WorkerStreamItem>>>>;
+struct InvocationGuard {
+    id: String,
+    pending: Arc<Pending>,
+}
+
+impl Drop for InvocationGuard {
+    fn drop(&mut self) {
+        self.pending.remove(&self.id);
+    }
+}
+
+impl Pending {
+    fn open() -> Self {
+        Self(parking_lot::Mutex::new(Some(HashMap::new())))
+    }
+
+    fn register(
+        self: &Arc<Self>,
+        state: InvocationState,
+    ) -> Result<(InvocationGuard, oneshot::Receiver<InvocationResult>)> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (result, receiver) = oneshot::channel();
+        let (active, _) = watch::channel(());
+        self.0
+            .lock()
+            .as_mut()
+            .ok_or_else(|| Error::Provider("plugin worker stopped".into()))?
+            .insert(
+                id.clone(),
+                PendingInvocation {
+                    result,
+                    active,
+                    state: Arc::new(state),
+                },
+            );
+        Ok((
+            InvocationGuard {
+                id,
+                pending: self.clone(),
+            },
+            receiver,
+        ))
+    }
+
+    fn remove(&self, id: &str) -> Option<PendingInvocation> {
+        self.0.lock().as_mut()?.remove(id)
+    }
+
+    fn authorization(&self, id: &str) -> Option<(Arc<InvocationState>, watch::Receiver<()>)> {
+        let pending = self.0.lock();
+        let invocation = pending.as_ref()?.get(id)?;
+        Some((invocation.state.clone(), invocation.active.subscribe()))
+    }
+
+    fn is_closed(&self) -> bool {
+        self.0.lock().is_none()
+    }
+
+    fn close(&self, message: &str) {
+        let pending = self.0.lock().take();
+        for (_, PendingInvocation { result, active, .. }) in pending.into_iter().flatten() {
+            drop(active);
+            let _ = result.send(Err(Error::Provider(message.into())));
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct PluginWorker {
@@ -42,21 +116,44 @@ pub struct PluginWorker {
 struct PluginWorkerInner {
     plugin_id: String,
     executable: PathBuf,
-    directory: PathBuf,
     entry: PathBuf,
     loader: PluginDefinitionLoader,
     host: HostContext,
     process: Mutex<Option<WorkerProcess>>,
-    pending: Pending,
 }
 
 struct WorkerProcess {
-    child: Child,
-    stdin: Arc<Mutex<ChildStdin>>,
+    task: JoinHandle<()>,
+    writer: Writer,
+    pending: Arc<Pending>,
+}
+
+impl Drop for WorkerProcess {
+    fn drop(&mut self) {
+        self.pending.close("plugin worker stopped");
+        self.task.abort();
+    }
 }
 
 struct InvocationState {
     allowed_origins: HashSet<String>,
+    magpie_catalog_status: Option<AtomicU16>,
+}
+
+impl InvocationState {
+    fn failure(&self) -> Error {
+        let status = self
+            .magpie_catalog_status
+            .as_ref()
+            .map(|status| status.load(Ordering::Relaxed));
+        let message = match status {
+            Some(status @ (100..=199 | 300..=599)) => {
+                format!("Magpie model discovery failed (HTTP {status})")
+            }
+            _ => "plugin invocation failed".into(),
+        };
+        Error::Provider(message)
+    }
 }
 
 #[derive(Clone)]
@@ -64,7 +161,6 @@ struct HostContext {
     plugin_id: String,
     network_hosts: Arc<HashSet<String>>,
     resource_origin: bool,
-    invocations: Arc<Mutex<HashMap<String, Arc<InvocationState>>>>,
 }
 
 impl PluginWorker {
@@ -84,15 +180,12 @@ impl PluginWorker {
                             .collect(),
                     ),
                     resource_origin: plugin.manifest.permissions.resource_origin,
-                    invocations: Arc::new(Mutex::new(HashMap::new())),
                 },
                 plugin_id,
                 executable,
-                directory: plugin.directory.clone(),
                 entry: plugin.entry.clone(),
                 loader,
                 process: Mutex::new(None),
-                pending: Arc::new(Mutex::new(HashMap::new())),
             }),
         }
     }
@@ -103,22 +196,30 @@ impl PluginWorker {
         params: serde_json::Value,
         allowed_origins: HashSet<String>,
     ) -> Result<serde_json::Value> {
-        let mut items = self
-            .invoke_streaming(method, params, allowed_origins)
-            .await?;
-        let result = tokio::time::timeout(INVOCATION_TIMEOUT, async {
-            while let Some(item) = items.recv().await {
-                if let WorkerStreamItem::Result(result) = item {
-                    return result;
-                }
-            }
-            Err(Error::Provider(format!(
-                "plugin '{}' worker stopped",
-                self.inner.plugin_id
-            )))
+        match tokio::time::timeout(INVOCATION_TIMEOUT, async {
+            let (writer, pending) = self.connection().await?;
+            let permit = writer
+                .reserve()
+                .await
+                .map_err(|_| Error::Provider("plugin worker stopped".into()))?;
+            let (request, result) = pending.register(InvocationState {
+                allowed_origins,
+                magpie_catalog_status: (self.inner.plugin_id
+                    == "dev.cursorbyoknext.plugins.magpie"
+                    && method == "models.list")
+                    .then(AtomicU16::default),
+            })?;
+            permit.send(encode_message(&HostMessage::Request {
+                id: &request.id,
+                method,
+                params: &params,
+            })?);
+            result
+                .await
+                .map_err(|_| Error::Provider("plugin worker stopped".into()))?
         })
-        .await;
-        match result {
+        .await
+        {
             Ok(result) => result,
             Err(_) => Err(Error::Provider(format!(
                 "plugin '{}' invocation timed out",
@@ -127,93 +228,32 @@ impl PluginWorker {
         }
     }
 
-    async fn invoke_streaming(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-        allowed_origins: HashSet<String>,
-    ) -> Result<mpsc::UnboundedReceiver<WorkerStreamItem>> {
-        let id = uuid::Uuid::new_v4().to_string();
-        self.inner.host.invocations.lock().await.insert(
-            id.clone(),
-            Arc::new(InvocationState { allowed_origins }),
-        );
-        let (sender, receiver) = mpsc::unbounded_channel();
-        self.inner
-            .pending
-            .lock()
-            .await
-            .insert(id.clone(), sender.clone());
-        let send_result = async {
-            let stdin = self.stdin().await?;
-            write_message(
-                &stdin,
-                &HostMessage::Request {
-                    id: &id,
-                    method,
-                    params: &params,
-                },
-            )
-            .await
-        }
-        .await;
-        if let Err(error) = send_result {
-            self.cleanup(&id).await;
-            return Err(error);
-        }
-        Ok(receiver)
-    }
-
     #[allow(dead_code)]
     pub async fn stop(&self) {
-        if let Some(mut process) = self.inner.process.lock().await.take() {
-            let _ = process.child.kill().await;
-        }
-        fail_pending(&self.inner.pending, "plugin worker stopped").await;
+        self.inner.process.lock().await.take();
     }
 
-    async fn cleanup(&self, id: &str) {
-        self.inner.pending.lock().await.remove(id);
-        self.inner.host.invocations.lock().await.remove(id);
-    }
-
-    async fn stdin(&self) -> Result<Arc<Mutex<ChildStdin>>> {
+    async fn connection(&self) -> Result<(Writer, Arc<Pending>)> {
         let mut process = self.inner.process.lock().await;
-        let dead = match process.as_mut() {
-            Some(current) => current
-                .child
-                .try_wait()
-                .map_err(|error| {
-                    Error::Config(format!("cannot check plugin worker status: {error}"))
-                })?
-                .is_some(),
-            None => true,
-        };
-        if dead {
-            *process = Some(self.spawn().await?);
-        }
-        Ok(process
+        if process
             .as_ref()
-            .expect("plugin worker was started")
-            .stdin
-            .clone())
+            .is_none_or(|current| current.pending.is_closed())
+        {
+            *process = Some(self.spawn()?);
+        }
+        let process = process.as_ref().expect("plugin worker was started");
+        Ok((process.writer.clone(), process.pending.clone()))
     }
 
-    async fn spawn(&self) -> Result<WorkerProcess> {
+    fn spawn(&self) -> Result<WorkerProcess> {
         let entry_url = file_url(&self.inner.entry)?;
-        let mut command = tokio::process::Command::new(&self.inner.executable);
-        super::detach_console(&mut command);
+        let mut command = self.inner.loader.bun_command(&self.inner.executable);
         command
-            .arg("run")
-            .arg("--no-install")
-            .arg(format!("--config={}", self.inner.loader.bunfig().display()))
             .arg(self.inner.loader.worker_path())
             .arg(entry_url.as_str())
-            .current_dir(&self.inner.directory)
-            .env("BUN_INSTALL_CACHE_DIR", self.inner.loader.sdk_dir().join("cache"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .kill_on_drop(true);
         let mut child = command.spawn().map_err(|error| {
             Error::Config(format!(
@@ -221,149 +261,136 @@ impl PluginWorker {
                 self.inner.executable.display()
             ))
         })?;
-        let stdin =
-            Arc::new(Mutex::new(child.stdin.take().ok_or_else(|| {
-                Error::Config("cannot open plugin worker stdin".into())
-            })?));
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Config("cannot open plugin worker stdin".into()))?;
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| Error::Config("cannot open plugin worker stdout".into()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| Error::Config("cannot open plugin worker stderr".into()))?;
-        spawn_stdout_reader(
-            self.inner.plugin_id.clone(),
-            stdout,
-            stdin.clone(),
-            self.inner.pending.clone(),
-            self.inner.host.clone(),
-        );
-        spawn_stderr_reader(self.inner.plugin_id.clone(), stderr);
-        Ok(WorkerProcess { child, stdin })
+        let pending = Arc::new(Pending::open());
+        let (writer, messages) = mpsc::channel(32);
+        let task = tokio::spawn({
+            let plugin_id = self.inner.plugin_id.clone();
+            let writer = writer.clone();
+            let pending = pending.clone();
+            let host = self.inner.host.clone();
+            async move {
+                tokio::select! {
+                    _ = read_stdout(stdout, &writer, &pending, &host) => {},
+                    _ = write_stdin(stdin, messages) => {},
+                    _ = child.wait() => {},
+                }
+                pending.close(&format!("plugin '{plugin_id}' worker exited"));
+            }
+        });
+        Ok(WorkerProcess {
+            task,
+            writer,
+            pending,
+        })
     }
 }
 
-fn spawn_stdout_reader(
-    plugin_id: String,
+async fn read_stdout(
     stdout: tokio::process::ChildStdout,
-    stdin: Arc<Mutex<ChildStdin>>,
-    pending: Pending,
-    host: HostContext,
+    writer: &Writer,
+    pending: &Pending,
+    host: &HostContext,
 ) {
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let message = match serde_json::from_str::<WorkerMessage>(&line) {
-                Ok(message) => message,
-                Err(error) => {
-                    tracing::warn!(plugin = %plugin_id, %error, "plugin worker wrote an invalid message");
-                    continue;
-                }
-            };
-            match message {
-                WorkerMessage::Result { id, result, error } => {
-                    if let Some(sender) = pending.lock().await.remove(&id) {
-                        let value = match error {
-                            Some(error) => {
-                                Err(Error::Provider(format!("plugin '{plugin_id}': {error}")))
-                            }
-                            None => Ok(result),
-                        };
-                        let _ = sender.send(WorkerStreamItem::Result(value));
-                    }
-                }
-                WorkerMessage::Event { id, event } => {
-                    if let Some(sender) = pending.lock().await.get(&id) {
-                        let _ = sender.send(WorkerStreamItem::Event(event));
-                    }
-                }
-                WorkerMessage::HostCall {
-                    id,
-                    request_id,
-                    method,
-                    params,
-                } => {
-                    let host = host.clone();
-                    let stdin = stdin.clone();
-                    tokio::spawn(async move {
-                        let result = host.call(&request_id, &method, params).await;
-                        match result {
-                            Ok(result) => {
-                                let _ = write_message(
-                                    &stdin,
-                                    &HostMessage::HostResult {
-                                        id: &id,
-                                        result: &result,
-                                    },
-                                )
-                                .await;
-                            }
-                            Err(error) => {
-                                let text = error.to_string();
-                                let _ = write_message(
-                                    &stdin,
-                                    &HostMessage::HostError {
-                                        id: &id,
-                                        error: &text,
-                                    },
-                                )
-                                .await;
-                            }
-                        }
-                    });
+    let mut lines = BufReader::new(stdout).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let message = match serde_json::from_str::<WorkerMessage>(&line) {
+            Ok(message) => message,
+            Err(_) => {
+                tracing::warn!(plugin = %host.plugin_id, "plugin worker wrote an invalid message");
+                continue;
+            }
+        };
+        match message {
+            WorkerMessage::Result { id, result, error } => {
+                if let Some(PendingInvocation {
+                    result: sender,
+                    active,
+                    state,
+                }) = pending.remove(&id)
+                {
+                    drop(active);
+                    let value = if error.is_some() {
+                        Err(state.failure())
+                    } else {
+                        Ok(result)
+                    };
+                    let _ = sender.send(value);
                 }
             }
+            WorkerMessage::Event { id, event } => {
+                // This caller does not consume streaming model events yet.
+                drop((id, event));
+            }
+            WorkerMessage::HostCall {
+                id,
+                request_id,
+                method,
+                params,
+            } => {
+                let Some((invocation, mut active)) = pending.authorization(&request_id) else {
+                    continue;
+                };
+                let host = host.clone();
+                let writer = writer.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        biased;
+                        _ = active.changed() => {},
+                        _ = async {
+                            let response = match host.call(&invocation, &method, params).await {
+                                Ok(result) => encode_message(&HostMessage::HostResult { id: &id, result: &result }),
+                                Err(_) => encode_message(&HostMessage::HostError { id: &id, error: "plugin host call failed" }),
+                            };
+                            if let Ok(bytes) = response {
+                                let _ = writer.send(bytes).await;
+                            }
+                        } => {},
+                    }
+                });
+            }
         }
-        fail_pending(&pending, &format!("plugin '{plugin_id}' worker exited")).await;
-    });
+    }
 }
 
-fn spawn_stderr_reader(plugin_id: String, stderr: tokio::process::ChildStderr) {
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            tracing::warn!(plugin = %plugin_id, message = %line, "plugin worker stderr");
-        }
-    });
-}
-
-async fn write_message(stdin: &Arc<Mutex<ChildStdin>>, message: &HostMessage<'_>) -> Result<()> {
+fn encode_message(message: &HostMessage<'_>) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec(message)?;
     bytes.push(b'\n');
-    let mut stdin = stdin.lock().await;
-    stdin
-        .write_all(&bytes)
-        .await
-        .map_err(|error| Error::Config(format!("cannot write to plugin worker: {error}")))?;
-    stdin
-        .flush()
-        .await
-        .map_err(|error| Error::Config(format!("cannot flush plugin worker stdin: {error}")))?;
-    Ok(())
+    Ok(bytes)
 }
 
-async fn fail_pending(pending: &Pending, message: &str) {
-    for (_, sender) in std::mem::take(&mut *pending.lock().await) {
-        let _ = sender.send(WorkerStreamItem::Result(Err(Error::Provider(
-            message.into(),
-        ))));
+// A single writer finishes each frame even if its requesting future is dropped.
+async fn write_stdin(
+    mut stdin: ChildStdin,
+    mut messages: mpsc::Receiver<Vec<u8>>,
+) -> std::io::Result<()> {
+    while let Some(bytes) = messages.recv().await {
+        stdin.write_all(&bytes).await?;
+        stdin.flush().await?;
     }
+    Ok(())
 }
 
 impl HostContext {
     async fn call(
         &self,
-        request_id: &str,
+        invocation: &InvocationState,
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
         match method {
-            "network.fetch" => self.fetch(request_id, params).await,
+            "network.fetch" => self.fetch(invocation, params).await,
             "network.stream.open" | "network.stream.read" | "network.stream.close" => {
                 Err(Error::Protocol(
-                    "plugin streaming is not available until model invocation is implemented".into(),
+                    "plugin streaming is not available until model invocation is implemented"
+                        .into(),
                 ))
             }
             _ => Err(Error::Protocol(format!(
@@ -374,7 +401,7 @@ impl HostContext {
 
     async fn fetch(
         &self,
-        request_id: &str,
+        invocation: &InvocationState,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let raw_url = required_string(&params, "url")?;
@@ -390,10 +417,7 @@ impl HostContext {
             .ok_or_else(|| Error::Config("plugin network URL has no host".into()))?
             .to_ascii_lowercase();
         let origin = origin::request_origin(&url)?;
-        let invocation = self.invocations.lock().await.get(request_id).cloned();
-        let allowed_origin = invocation
-            .as_ref()
-            .is_some_and(|state| state.allowed_origins.contains(&origin));
+        let allowed_origin = invocation.allowed_origins.contains(&origin);
         let allowed_static_host = url.scheme() == "https" && self.network_hosts.contains(&host);
         if !allowed_static_host && !(self.resource_origin && allowed_origin) {
             if url.scheme() != "https" && !self.resource_origin {
@@ -418,6 +442,10 @@ impl HostContext {
             .timeout(Duration::from_secs(60))
             .build()
             .map_err(|error| Error::Config(format!("cannot build plugin HTTP client: {error}")))?;
+        // Only host-observed status from the bound Magpie catalog GET is exposed on failure.
+        let catalog_status = invocation.magpie_catalog_status.as_ref().filter(|_| {
+            allowed_origin && method == reqwest::Method::GET && url.path() == "/v1/models"
+        });
         let mut request = client.request(method, url);
         if let Some(headers) = params.get("headers").and_then(serde_json::Value::as_object) {
             for (name, value) in headers {
@@ -430,11 +458,18 @@ impl HostContext {
         if let Some(body) = params.get("body").and_then(serde_json::Value::as_str) {
             request = request.body(body.to_owned());
         }
-        let response = request
+        let mut response = request
             .send()
             .await
-            .map_err(|error| Error::Provider(error.to_string()))?;
+            .map_err(|_| Error::Provider("plugin network request failed".into()))?;
         let status = response.status().as_u16();
+        if let Some(catalog_status) = catalog_status {
+            catalog_status.store(status, Ordering::Relaxed);
+            // Magpie only needs the status for a failed catalog response.
+            if !response.status().is_success() {
+                return Ok(serde_json::json!({"status": status, "headers": {}, "body": ""}));
+            }
+        }
         if response
             .content_length()
             .is_some_and(|size| size > MAX_NETWORK_RESPONSE_BYTES)
@@ -453,14 +488,18 @@ impl HostContext {
                     .map(|value| (name.to_string(), value.to_string()))
             })
             .collect::<std::collections::BTreeMap<_, _>>();
-        let body = response
-            .bytes()
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|error| Error::Provider(error.to_string()))?;
-        if body.len() as u64 > MAX_NETWORK_RESPONSE_BYTES {
-            return Err(Error::Provider(
-                "plugin network response is larger than allowed".into(),
-            ));
+            .map_err(|_| Error::Provider("cannot read plugin network response".into()))?
+        {
+            if chunk.len() as u64 > MAX_NETWORK_RESPONSE_BYTES - body.len() as u64 {
+                return Err(Error::Provider(
+                    "plugin network response is larger than allowed".into(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
         }
         Ok(serde_json::json!({
             "status": status,
@@ -481,29 +520,135 @@ fn required_string<'a>(params: &'a serde_json::Value, key: &str) -> Result<&'a s
 mod tests {
     use super::*;
 
+    fn invocation(allowed_origins: HashSet<String>) -> InvocationState {
+        InvocationState {
+            allowed_origins,
+            magpie_catalog_status: None,
+        }
+    }
+
     #[tokio::test]
     async fn resource_origin_allows_bound_http_and_rejects_others() {
-        let invocations = Arc::new(Mutex::new(HashMap::new()));
-        invocations.lock().await.insert(
-            "invocation".into(),
-            Arc::new(InvocationState {
-                allowed_origins: HashSet::from(["http://192.168.1.2:3425".into()]),
-            }),
-        );
+        let invocation = invocation(HashSet::from(["http://192.168.1.2:3425".into()]));
         let host = HostContext {
             plugin_id: "test".into(),
             network_hosts: Arc::new(HashSet::new()),
             resource_origin: true,
-            invocations,
         };
         let error = host
             .call(
-                "invocation",
+                &invocation,
                 "network.fetch",
                 serde_json::json!({ "url": "http://10.0.0.2:3425/v1/models" }),
             )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("cannot access host"));
+    }
+
+    #[tokio::test]
+    async fn magpie_catalog_reports_only_the_host_observed_status() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            socket
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 11\r\nConnection: close\r\n\r\nmock detail")
+                .await
+                .unwrap();
+        });
+        let host = HostContext {
+            plugin_id: "test".into(),
+            network_hosts: Arc::new(HashSet::new()),
+            resource_origin: true,
+        };
+        let invocation = InvocationState {
+            allowed_origins: HashSet::from([origin.clone()]),
+            magpie_catalog_status: Some(AtomicU16::default()),
+        };
+        assert!(!invocation.failure().to_string().contains("HTTP"));
+        let result = host
+            .call(
+                &invocation,
+                "network.fetch",
+                serde_json::json!({ "url": format!("{origin}/v1/models") }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({"status": 401, "headers": {}, "body": ""})
+        );
+        assert!(invocation.failure().to_string().contains("HTTP 401"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_authorization_ends_on_completion_and_drop() {
+        let pending = Arc::new(Pending::open());
+        let (completed, receiver) = pending.register(invocation(HashSet::new())).unwrap();
+        let (_, mut active) = pending.authorization(&completed.id).unwrap();
+        let PendingInvocation {
+            result,
+            active: signal,
+            ..
+        } = pending.remove(&completed.id).unwrap();
+        drop(signal);
+        result.send(Ok(serde_json::Value::Null)).unwrap();
+        assert!(receiver.await.unwrap().unwrap().is_null());
+        assert!(active.changed().await.is_err());
+        assert!(pending.authorization(&completed.id).is_none());
+
+        let (cancelled, receiver) = pending.register(invocation(HashSet::new())).unwrap();
+        let id = cancelled.id.clone();
+        let (_, mut active) = pending.authorization(&id).unwrap();
+        drop(cancelled);
+        assert!(receiver.await.is_err());
+        assert!(active.changed().await.is_err());
+        assert!(pending.authorization(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn invocation_timeout_drops_its_pending_entry() {
+        let pending = Arc::new(Pending::open());
+        let mut id = None;
+        let timed_out = tokio::time::timeout(Duration::from_millis(1), async {
+            let (request, result) = pending.register(invocation(HashSet::new())).unwrap();
+            id = Some(request.id.clone());
+            result.await
+        })
+        .await;
+        assert!(timed_out.is_err());
+        assert!(pending.authorization(&id.unwrap()).is_none());
+    }
+
+    #[tokio::test]
+    async fn closing_one_generation_revokes_only_its_invocations() {
+        let old = Arc::new(Pending::open());
+        let (old_request, failed) = old.register(invocation(HashSet::new())).unwrap();
+        let (_, mut active) = old.authorization(&old_request.id).unwrap();
+        let new = Arc::new(Pending::open());
+        let (new_request, mut unaffected) = new.register(invocation(HashSet::new())).unwrap();
+        old.close("plugin worker exited");
+        assert!(
+            failed
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("worker exited")
+        );
+        assert!(active.changed().await.is_err());
+        assert!(old.authorization(&old_request.id).is_none());
+        assert!(old.register(invocation(HashSet::new())).is_err());
+        assert!(new.authorization(&new_request.id).is_some());
+        assert!(matches!(
+            unaffected.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
     }
 }
