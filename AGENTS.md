@@ -11,6 +11,9 @@ cursor-byok-nsh/
 ├── Cargo.toml                     # workspace：apps/desktop + crates/*
 ├── AGENTS.md                      # 本文件：移植边界与约定
 ├── .agents/skills/                # nsh / nsh-design-guides 技能（只读参考）
+├── docs/
+│   └── protocol/                  # 协议字段用途分析：README / agent-v1 / aiserver-v1
+├── protocols/cursor/              # 提取器产物：agent_v1.proto、aiserver_v1.proto
 ├── crates/
 │   ├── cursor-protocol-extractor/ # 从 Cursor JS bundle 提取 agent.v1 / aiserver.v1
 │   └── cursor-capture/            # Cursor API 抓包调试器（Rust 逻辑 + 原版 web）
@@ -35,6 +38,7 @@ cursor-byok-nsh/
 
 上游参照：`../cursor-byok/server/src/local_app/`（同一工作区里的 `jsProject/cursor-byok`）。
 每一步移植都要在 `apps/desktop/docs/` 留下该步的对照文档：目录映射、逐行差异及原因、必须保持的不变量。
+协议字段的用途分析（谁写、谁读、取值、证据）统一放 `docs/protocol/`，不写进移植记录。
 
 ## 分工
 
@@ -114,6 +118,7 @@ nsh package --target macos
 - [x] 协议调试器：`crates/cursor-capture/`（见 `apps/desktop/docs/CURSOR_CAPTURE.md`）
 - [x] 接管页 UI（`src/ui/` + `src/screens/Cursor.tsx`）
 - [x] Magpie 插件目录（`src/plugins/` + `src/screens/Plugins.tsx`，见 `apps/desktop/docs/PLUGIN_CATALOG.md`）
+- [ ] 协议字段分析（`docs/protocol/`）
 - [ ] local loop 服务端接入（`set_backend_addr`）
 - [ ] 把 Magpie 模型广告给 Cursor picker
 - [ ] 模型调用 / 调用记录
