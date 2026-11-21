@@ -217,11 +217,16 @@ pub fn is_cursor_host(host: &str) -> bool {
 
 /// The requests a local backend owns once it exists. Adding a path here widens
 /// what takeover can serve; every entry needs a local handler behind it.
+///
+/// `AgentService/Run`, `RunSSE`, and `RunPoll` stay off this list: they serve
+/// the backend loop, which needs a local `RunEngine` this app does not have.
+/// The agent-host still routes turns that the local loop refuses (unsupported
+/// mode or action, harness override, tool restriction) to that loop, so
+/// claiming them locally would turn working turns into a 404.
 fn is_local_path(path: &str) -> bool {
     matches!(
         path,
-        "/agent.v1.AgentService/RunSSE"
-            | "/aiserver.v1.InferenceService/RunInferenceSSE"
+        "/aiserver.v1.InferenceService/RunInferenceSSE"
             | "/aiserver.v1.BidiService/BidiAppend"
             | "/aiserver.v1.AiService/AvailableDocs"
             | "/aiserver.v1.DashboardService/GetEffectiveUserPlugins"
@@ -344,9 +349,38 @@ mod tests {
     fn a_backendless_takeover_routes_nothing() {
         let routing = Routing::default();
         assert_eq!(
-            routing.routes("api2.cursor.sh", "/agent.v1.AgentService/RunSSE"),
+            routing.routes("api2.cursor.sh", "/aiserver.v1.BidiService/BidiAppend"),
             None
         );
+    }
+
+    /// The backend loop belongs to Cursor. Running it locally would need a
+    /// `RunEngine`; without one, those turns must keep reaching the upstream.
+    #[test]
+    fn backend_loop_rpcs_stay_with_cursor_upstream() {
+        let routing = Routing::default();
+        routing.set_backend_addr(SocketAddr::from(([127, 0, 0, 1], 3000)));
+        for path in [
+            "/agent.v1.AgentService/Run",
+            "/agent.v1.AgentService/RunSSE",
+            "/agent.v1.AgentService/RunPoll",
+        ] {
+            assert_eq!(routing.routes("api2.cursor.sh", path), None, "{path}");
+        }
+    }
+
+    /// The local loop only needs the client-owned inference read/write pair.
+    #[test]
+    fn the_local_loop_pair_is_routed_locally() {
+        let routing = Routing::default();
+        let backend = SocketAddr::from(([127, 0, 0, 1], 3000));
+        routing.set_backend_addr(backend);
+        for path in [
+            "/aiserver.v1.InferenceService/RunInferenceSSE",
+            "/aiserver.v1.BidiService/BidiAppend",
+        ] {
+            assert_eq!(routing.routes("api2.cursor.sh", path), Some(backend), "{path}");
+        }
     }
 
     #[test]

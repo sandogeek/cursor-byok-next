@@ -87,7 +87,7 @@ Cursor / 调试客户端
 | 清洗 | 拼接反斜杠续行；`Parent_Child` 改写为 `Parent.Child`；编译报“类型未定义”时把该名字替换为 `bytes`（最多 500 轮，仍失败即构建失败） |
 | 帧 | 5 字节头（1 字节 flags + 4 字节大端长度），`0x01` 压缩、`0x02` end-stream；单帧上限 64 MiB，收满 `max_frames` 后停止解码 |
 | 解压 | `gzip` / `deflate` / `br` / `identity`；流式读 `connect-content-encoding`，普通响应读 `content-encoding` |
-| 流式类型 | `RunSSE` 硬编码请求 `aiserver.v1.BidiRequestId`、响应 `agent.v1.AgentServerMessage`；其余按 proto 的 streaming 方法取 input/output |
+| 流式类型 | `RunSSE` 硬编码请求 `aiserver.v1.BidiRequestId`、响应 `agent.v1.AgentServerMessage`；`RunInferenceSSE` 按 proto 的 streaming 方法取 input/output。`RunSSE` 抓的是 backend loop 的帧，`RunInferenceSSE` 抓的是 local loop 的帧（见 `docs/protocol/cursor-agent-loop-routing.md`） |
 | 一元类型 | 白名单内 RPC 直接映射消息名（BidiAppend、AvailableModels、GetServerConfig、GetKnownServers…），未登记的一元方法从 `MethodDescriptor` 取 input/output |
 | BidiAppend | 解 `BidiAppendRequest`，再解 hex / binary 内层 `AgentClientMessage`，抽出 `conversation_id`，输出外层与内层合并视图 |
 | 非 proto | JSON 美化、文本按 MIME 标语言，其余给截断 hex |

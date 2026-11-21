@@ -30,7 +30,7 @@ pub use self::process::terminate_cursor as quit_cursor;
 pub use self::proxy::{is_cursor_host, Routing as ProxyRouting, UPSTREAM_URL_HEADER};
 ```
 
-`proxy.rs` 的 32 条本地路径白名单逐条对齐（`is_local_path`，脚本比对结果：两侧完全相同）。
+`proxy.rs` 的本地路径白名单（`is_local_path`）与上游逐条比对后只**少一条**：上游 32 条，这里 31 条，少的正是 `/agent.v1.AgentService/RunSSE`（差异 #24）。
 
 ## 差异清单
 
@@ -61,6 +61,7 @@ pub use self::proxy::{is_cursor_host, Routing as ProxyRouting, UPSTREAM_URL_HEAD
 | 21 | 本地 token 判定 | 比较完整序列化 token | 验证 JWT `alg=HS256`、本地 `sub` 与 marker 段 | 不依赖 JSON 字段顺序，payload 演进仍识别旧本地账号 |
 | 22 | 停用 / 残留清理 | 完整通用签名 + 任意 loopback 地址即可删除 | 只清理完整匹配本 harness 代理 URL 的 5 个键 | 不删除用户后来改回的代理，也不清理其他本地工具 |
 | 23 | 路由改写失败 | URI 构造失败则静默发往上游 | 返回 502，不向上游旁路 | 命中本地白名单后必须失败关闭 |
+| 24 | `AgentService/Run*` | `RunSSE` 在白名单，且有本地 handler（配 `RunEngine`） | 白名单不含 `Run` / `RunSSE` / `RunPoll`，一律直通官方 | 这三条只服务 backend loop；本仓库不做 engine，而白名单命中后没有 handler 就是 502。local loop 会拒绝一部分 turn（模式、action、harness 覆盖、tool restriction），这些 turn 必须还能打到官方。见 [`docs/protocol/cursor-agent-loop-routing.md`](../../../docs/protocol/cursor-agent-loop-routing.md) |
 
 ### 顺带修掉的上游隐患
 
@@ -80,6 +81,7 @@ pub use self::proxy::{is_cursor_host, Routing as ProxyRouting, UPSTREAM_URL_HEAD
 | 设置文件读 JSONC、写原子替换（temp + rename） | `settings.rs:36-60` | `settings.rs:111-137` |
 | 只 MITM `*.cursor.sh`，其余主机纯隧道 | `proxy.rs:132-155` | `proxy.rs:159-181` |
 | 改写的上游 URL 要能被下游校验（`x-server-upstream-url`） | `proxy.rs:117-120` | `proxy.rs:118-127` |
+| 白名单只列有本地 handler 的路径；命中后无 handler 就失败关闭，不向上游旁路 | `is_local_path` + `fallback`（`handlers.rs:167` 是显式列出） | `is_local_path`（差异 #24 去掉了 `RunSSE`） |
 
 ## 三个前置条件与状态矩阵
 
@@ -169,6 +171,8 @@ nsh test                    # 28 passed（含 App.test.tsx）
 | `a_missing_file_reads_as_off` / `a_save_state` / `a_corrupt_file_reads_as_off` | 意图持久化与降级 |
 | `only_cursor_hosts_are_cursor_hosts` | 域名判定（含大小写与尾点） |
 | `a_backendless_takeover_routes_nothing` | #1：无后端不改写 |
+| `backend_loop_rpcs_stay_with_cursor_upstream` | #24：`AgentService/Run*` 不接管 |
+| `the_local_loop_pair_is_routed_locally` | local loop 的读/写两条命中白名单 |
 | `a_configured_backend_routes_only_allowlisted_cursor_paths` | 白名单边界 |
 | `starting_twice_returns_the_same_port_and_stopping_clears_it` | 代理启停幂等 |
 | `a_taken_port_falls_back_to_a_free_one` | 端口被占回退 |

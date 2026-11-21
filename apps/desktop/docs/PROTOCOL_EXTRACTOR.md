@@ -83,9 +83,9 @@ crates/cursor-protocol-extractor/
 
 local loop 下一步（prost / ConnectRPC）只应依赖：
 
-- `agent.v1.AgentService/RunSSE` 及 Agent 消息
 - `aiserver.v1.InferenceService/RunInference` + `RunInferenceSSE`
 - `aiserver.v1.BidiService/BidiAppend` 的请求形状（由生成文件 + 后续手写子集校验）
+- `agent.v1.AgentClientMessage` / `AgentServerMessage` 只在做 backend loop（`AgentService/Run*`）时才需要，本仓库不接管，见 `docs/protocol/cursor-agent-loop-routing.md`
 
 ## 验证
 

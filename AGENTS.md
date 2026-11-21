@@ -12,7 +12,7 @@ cursor-byok-nsh/
 ├── AGENTS.md                      # 本文件：移植边界与约定
 ├── .agents/skills/                # nsh / nsh-design-guides 技能（只读参考）
 ├── docs/
-│   └── protocol/                  # 协议字段用途分析：README / agent-v1 / aiserver-v1
+│   └── protocol/                  # 协议分析：README / agent-v1 / aiserver-v1 / cursor-inference-service / cursor-agent-loop-routing
 ├── protocols/cursor/              # 提取器产物：agent_v1.proto、aiserver_v1.proto
 ├── crates/
 │   ├── cursor-protocol-extractor/ # 从 Cursor JS bundle 提取 agent.v1 / aiserver.v1
@@ -119,6 +119,6 @@ nsh package --target macos
 - [x] 接管页 UI（`src/ui/` + `src/screens/Cursor.tsx`）
 - [x] Magpie 插件目录（`src/plugins/` + `src/screens/Plugins.tsx`，见 `apps/desktop/docs/PLUGIN_CATALOG.md`）
 - [ ] 协议字段分析（`docs/protocol/`）
-- [ ] local loop 服务端接入（`set_backend_addr`）
+- [ ] local loop 服务端接入（`set_backend_addr`）：只做 `InferenceService/RunInferenceSSE` + `BidiService/BidiAppend`；`AgentService/Run*` 属 backend loop，不接管（见 `docs/protocol/cursor-agent-loop-routing.md`）
 - [ ] 把 Magpie 模型广告给 Cursor picker
 - [ ] 模型调用 / 调用记录

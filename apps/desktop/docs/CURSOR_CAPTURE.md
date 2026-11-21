@@ -73,6 +73,7 @@ crates/cursor-capture/
 | 敏感头脱敏为 `[已隐藏]` | `isSensitiveHeader` | 同名单 |
 | 单向载荷上限 2MiB，帧上限 2000 | `types.go` 默认值 | 同 |
 | RunSSE 请求帧是 `aiserver.v1.BidiRequestId`，响应帧是 `agent.v1.AgentServerMessage` | `decode.go` | 同，有单测 |
+| 抓包同时覆盖两条 loop：`RunSSE`（backend loop）与 `RunInferenceSSE` / `BidiAppend`（local loop） | `decode.go` 硬编码 RunSSE，其余走通用 descriptor | 同；哪条 loop 归哪个方法见 `docs/protocol/cursor-agent-loop-routing.md` |
 | BidiAppend 解 hex/binary `AgentClientMessage`，抽出 `conversation_id` | `decodeBidiClientMessage` | `decode_bidi_append_request` |
 | 同 `request_id` 的捕获补齐 `conversation_id` | `associateConversationLocked` | `associate_conversation_locked` |
 | JSON 字段名 camelCase：`startedAt` / `decodedLanguage` / `rawHex` | Go struct tag | serde `rename_all = "camelCase"` |

@@ -10,7 +10,7 @@
 | 服务 | proto 行 | local loop | 用途 |
 |---|---|---|---|
 | `AiService` | 56606 | 部分 | 老一代 chat / edit / 模型能力接口；`AvailableModels` 与 `agent.v1.AgentService/GetUsableModels` 的关系待确认 |
-| `BidiService` | 57255 | ✓ | `BidiAppend`：`Run` / `RunSSE` 的 bidi 帧入口 |
+| `BidiService` | 57255 | ✓ | `BidiAppend`：local loop 的写方向（读方向是 `InferenceService/RunInference*`） |
 | `InferenceService` | 58435 | ✓ | `RunInference` / `RunInferenceSSE` / `RunInferencePoll`：模型推理主链路 |
 | `PrivateInferenceService` | 58482 | 不接管 | 私有部署配额：`AdmitRun` + `ReportUsage`，不是推理帧 |
 | `ServerConfigService` | 58542 | 待定 | `GetServerConfig`：服务端功能开关，local loop 可能也要返回一份 |
@@ -22,9 +22,11 @@
 
 跳过的服务不写字段分析；它们的消息仍会出现在 `RunInference` 的字段里时，在那个字段下就地解释。
 
-## local loop 三组接口
+## local loop 两组接口（推理链）
 
 术语见 [`README.md`](README.md#传输形态)。`RunInference` / `RunInferenceSSE` / `RunInferencePoll` 是同一个逻辑流在 http2 / http1+SSE / http1+poll 下的三条落地路径，选择规则见 `cursor-inference-service.md` §2。
+
+这四条加 `Stream` 全部属于 local loop；`AgentService/Run*` 属于 backend loop，不在本表（见 `cursor-agent-loop-routing.md`）。
 
 | rpc | proto 行 | 请求 | 响应 | 传输形态 | 分析状态 |
 |---|---|---|---|---|---|
@@ -189,5 +191,6 @@ ProtoPromptExecutor.stream                         daemon.cjs:25534-25535
 
 - 抓包：`apps/desktop/docs/CURSOR_CAPTURE.md`
 - 上游同语义实现：`jsProject/cursor-byok/server/src/cursor/inference/`（请求投影、调用生命周期、响应编码）
-- 相邻包：`agent.v1` 的 `AgentService`（见 `agent-v1.md`）
+- 相邻包：`agent.v1` 的 `AgentService`（见 `agent-v1.md`；其中 `Run*` 属 backend loop，不接管）
+- 两条 loop 的取舍：`cursor-agent-loop-routing.md`
 - 模型 picker：`agent.v1.AgentService/GetUsableModels` 与 `aiserver.v1.AiService` 的模型列表方法，两者关系待确认

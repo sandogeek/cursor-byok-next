@@ -21,6 +21,7 @@ docs/protocol/
 ├── agent-v1.md                        agent.v1：AgentService 方法表，RunSSE 帧结构
 ├── aiserver-v1.md                     aiserver.v1：服务索引，BidiAppend / InferenceStream* 字段
 ├── cursor-inference-service.md        InferenceService 服务级：方法表、传输降级、帧顺序、local loop 开关
+├── cursor-agent-loop-routing.md       local loop 与 backend loop 的取舍：谁跑循环、何时落到哪条、降级方向
 └── cursor-prompt-model-metadata.md    RunInferencePromptModelMetadata 的模型身份位（is_opus55 等）
 ```
 
@@ -101,7 +102,7 @@ http1_sse       RunInferenceSSE（server-stream）  ← BidiService/BidiAppend�
 http1_poll      RunInferencePoll（poll）           ← BidiService/BidiAppend（unary × N）
 ```
 
-agent 链路（`AgentService/Run` → `RunSSE` / `RunPoll`）在同一张映射表里，走完全相同的写法。
+`AgentService/Run` → `RunSSE` / `RunPoll` 在同一张映射表里，走完全相同的写法，但它属于另一条 loop（backend loop）：local loop 的模型调用不走 `AgentService`，见 [`cursor-agent-loop-routing.md`](cursor-agent-loop-routing.md)。
 
 三条路径的逻辑消息完全一致（写 `RunInferenceClientMessage` / 读 `RunInferenceServerMessage`），只有外壳不同。两条 http1 路径靠同一个 `x-request-id` 把读流和 append 拼成一条逻辑流，且**是并发的**：读流先起，append 在后台发。详见 `cursor-inference-service.md` §2。
 
@@ -121,50 +122,55 @@ poll 与 server-stream 在 `cursor-capture` 里共用同一个解码分支，区
 
 帧壳与客户端实现的行号按 Cursor `3.30.14` 计；升级后压缩变量名与行号会变，检索方式见 `cursor-inference-service.md` §8。
 
-### 最小接管集合与落点
+### 两条 bidi 链路分属两条 loop
 
-形态决定「要写几个 handler」，这是协议层面的结论，与实现进度无关。`AgentService/Run` 与 `InferenceService/RunInference` 是**并列的两条 bidi 主链路**，`BIDI_ENDPOINT_TO_SSE_METHOD_MAP`（`daemon.cjs:9366`）同时把两者映射到各自的 server-stream 伴生方法：
+`BIDI_ENDPOINT_TO_SSE_METHOD_MAP`（`daemon.cjs:9366`）把 8 条 bidi 方法映射到各自 server-stream 伴生方法，其中两条主链路落在**不同的 loop** 上：
 
 ```text
-[AgentService.methods.run.name]               → AgentService.methods.runSSE
-[InferenceService.methods.runInference.name]  → InferenceService.methods.runInferenceSSE
-[ChatService ×2 / HealthService ×1 / AiService ×3] → 各自的 *SSE 伴生方法（不接管）
+[InferenceService.methods.runInference.name]  → InferenceService.methods.runInferenceSSE   ← local loop（客户端持有循环）
+[AgentService.methods.run.name]               → AgentService.methods.runSSE                ← backend loop（NAL）
+[ChatService ×2 / HealthService ×1 / AiService ×3] → 各自的 *SSE 伴生方法（与 local loop 无关）
 ```
 
 `BIDI_ENDPOINT_TO_POLL_METHOD_MAP` 在同一行，是同一批键，因此 poll 与 server-stream 的覆盖面完全一致。
 
-| 形态 | 要实现的方法 | 依赖 | 不实现时的后果 |
+一次 agent-host turn 只会在一条 loop 上跑：`createLocalLoopTurnRouter`（`daemon.cjs:3176`）决定 `runtime`，`turnRouteLoop`（`daemon.cjs:14775`）把 `managed-local` 记成 `"local_loop"`、`connect` 记成 `"nal"`。local loop 的模型调用只走 `RunInference*` + `BidiAppend`；`AgentService/Run*` 只出现在 `connect` 分支（`AgentClientHostAdapter`，`daemon.cjs:25979`）。取舍、拒绝条件与降级方向见 [`cursor-agent-loop-routing.md`](cursor-agent-loop-routing.md)。
+
+| loop | 要实现的方法 | 依赖 | 不实现时的后果 |
 |---|---|---|---|
-| bidi | `AgentService/Run` + `InferenceService/RunInference` | 代理链能承载 HTTP/2 双向流 | 客户端按 `http2_config` 走 http1 降级（现状） |
-| server-stream + unary | `AgentService/RunSSE` + `InferenceService/RunInferenceSSE` + `BidiService/BidiAppend` | 只缺 handler，白名单已有 | 请求原样打到官方 |
-| poll + unary | `AgentService/RunPoll` + `InferenceService/RunInferencePoll` + 同一套 `BidiAppend` | 额外保证 `BidiPollResponse.seqno` 严格 +1 | 回退 `Unimplemented`，客户端整轮失败 |
+| local loop（本仓库目标） | `InferenceService/RunInferenceSSE` + `BidiService/BidiAppend` | 只缺 handler，白名单已有 | 请求原样打到官方 |
+| local loop，bidi 主通道 | `InferenceService/RunInference` | 代理链能承载 HTTP/2 双向流 | 客户端按 `http2_config` 走 http1 降级（现状） |
+| local loop，poll | `InferenceService/RunInferencePoll` + 同一套 `BidiAppend` | 额外保证 `BidiPollResponse.seqno` 严格 +1 | 回退 `Unimplemented`，客户端整轮失败 |
+| backend loop（不接管） | `AgentService/Run` / `RunSSE` / `RunPoll` | 需要本地 `RunEngine` 与 checkpoint，超出「只做 local loop」的边界 | 这些 turn 直通官方（现状）；若误加白名单而没有 handler，会变成 404 |
 | server-stream | `InferenceService/Stream` | 无；业务层经适配器折进 `RunInference.invoke_model` | 不影响 local loop |
 
-**bidi 与 server-stream 共用同一套编解码器**：两条 bidi 主链路各自的逻辑消息不变（推理是 `RunInferenceClientMessage` / `RunInferenceServerMessage`，agent 是 `AgentClientMessage` / `AgentServerMessage`），差别只在外壳（一次 POST 双向 vs 两条 HTTP 请求）。因此 `http1_sse` 是唯一能只靠 unary + server-stream 跑通的形态，也是 BYOK 现状的选择。
+**读写编解码器按链路各自复用，不跨链路**：local loop 用 `RunInferenceClientMessage` / `RunInferenceServerMessage`，backend loop 用 `AgentClientMessage` / `AgentServerMessage`。因此 `http1_sse` 是唯一能只靠 unary + server-stream 跑通 local loop 的形态，也是 BYOK 现状的选择；`RunSSE` 的 handler 只有在同时做 engine 时才有意义。
 
 两处重映射的键集完全相同（`ChatService` 2 条、`HealthService` 1 条、`AiService` 3 条、`AgentService/Run`、`InferenceService/RunInference`，共 8 条），所以 server-stream 覆盖到的方法，poll 也覆盖，不会出现「只有一种降级可用」的中间态。
 
 本仓库落点（只固定「形态 → 方法 → 落点」的对应关系，不记进度，避免与 `AGENTS.md` 两处状态漂移）：
 
-| 方法 | 形态 | 白名单条目 | 本地 handler | 上游同名实现（路由 / handler） |
-|---|---|---|---|---|
-| `AgentService/RunSSE` | server-stream | `proxy.rs` `is_local_path` ✓ | 无 | `handlers.rs:51` / `:198` |
-| `InferenceService/RunInferenceSSE` | server-stream | ✓ | 无 | `handlers.rs:53` / `:235` |
-| `BidiService/BidiAppend` | unary | ✓ | 无 | `handlers.rs:56` / `:279` |
-| `AgentService/Run` | bidi | ✗（另需加） | 无 | 经 `BidiAppend` 写入 |
-| `InferenceService/RunInference` | bidi | ✗ | 无 | 隐式经 `invoke_model`（`:25620`） |
-| `AgentService/RunPoll` | poll | ✗ | 无 | 无 |
-| `InferenceService/RunInferencePoll` | poll | ✗ | 无 | 无 |
-| `InferenceService/Stream` | server-stream | ✗ | 无（也不需要） | 适配器复用，无独立 handler |
+| 方法 | loop | 形态 | 白名单条目 | 本地 handler | 上游同名实现（路由 / handler） |
+|---|---|---|---|---|---|
+| `InferenceService/RunInferenceSSE` | local | server-stream | ✓ | 无 | `handlers.rs:53` / `:235` |
+| `BidiService/BidiAppend` | local | unary | ✓ | 无 | `handlers.rs:56` / `:279` |
+| `InferenceService/RunInference` | local | bidi | ✗ | 无 | 隐式经 `invoke_model`（`:25620`） |
+| `InferenceService/RunInferencePoll` | local | poll | ✗ | 无 | 无 |
+| `InferenceService/Stream` | local | server-stream | ✗ | 无（也不需要） | 适配器复用，无独立 handler |
+| `AgentService/RunSSE` | backend | server-stream | ✗（刻意移除） | 无 | `handlers.rs:51` / `:198`（上游连 engine 一起移植才有） |
+| `AgentService/Run` | backend | bidi | ✗ | 无 | 经 `BidiAppend` 写入 |
+| `AgentService/RunPoll` | backend | poll | ✗ | 无 | 无 |
 
 白名单只决定「命中就改写到 loopback」，不等于有 handler：`Routing.backend` 为空时命中白名单的请求仍原样转发官方（`proxy.rs` `Routing::routes` 的 `.then(|| self.backend())`）。所以「白名单 ✓ + handler 无」在运行时等于直通，这也是接管可以先开、后端后接的原因。
 
-WebSocket 不在上表：它不是 Cursor 协议里的 RPC，而是两条 bidi 主链路的并行路由，各有独立门控；接管前都要确认未命中，否则请求走 `wss://` 绕过 HTTP 白名单：
+反过来，`backend` 一旦就绪，命中白名单而本地没有 handler 就是硬失败（`proxy.rs` 返回 502，不向上游旁路）。`AgentService/Run*` 因此必须留在白名单外：local loop 会拒绝一部分 turn（非 userMessage/executePlan、非 agent/plan/ask/debug/multitask 模式、带 harness 覆盖、`toolRestriction` 只允许 local loop 等），这些 turn 会落到 `connect`，若被改写到本地就成了「本来能用的 turn 变 404」。
 
-| 路由 | gate / 配置名 | 创建条件 |
-|---|---|---|
-| `AgentService/Run` | `nal_websocket_client`（配套 `agent_websocket_cold_pool_dial`、`nal_websocket_client_pool`） | 独立于 http2 开关 |
-| `RunInference` | `run_inference_websocket_client`；实验臂头 `x-cursor-run-inference-websocket-arm` | 仅 `isHttp2Disabled` 为真时创建 selection（`daemon.cjs:9400`） |
+WebSocket 不在上表：它不是 Cursor 协议里的 RPC，而是 bidi 链路的并行路由，各有独立门控；接管前都要确认未命中，否则请求走 `wss://` 绕过 HTTP 白名单：
+
+| 路由 | loop | gate / 配置名 | 创建条件 |
+|---|---|---|---|
+| `AgentService/Run` | backend | `nal_websocket_client`（配套 `agent_websocket_cold_pool_dial`、`nal_websocket_client_pool`） | 独立于 http2 开关 |
+| `RunInference` | local | `run_inference_websocket_client`；实验臂头 `x-cursor-run-inference-websocket-arm` | 仅 `isHttp2Disabled` 为真时创建 selection（`daemon.cjs:9400`） |
 
 两处 gate 都未确认是否启用，因此「http2 禁用 → server-stream」这条推断仍带一个未验证分支。
 
@@ -210,5 +216,6 @@ oneof 类型每个分支单独一行，并额外标注它在客户端侧触发�
 
 - 抓包与解码：`apps/desktop/docs/CURSOR_CAPTURE.md`
 - 协议提取：`apps/desktop/docs/PROTOCOL_EXTRACTOR.md`
-- local loop 只依赖的三组接口：`AgentService/RunSSE`、`InferenceService/RunInferenceSSE`、`BidiService/BidiAppend`（bidi 与 poll 是它们的替代路径，见 `cursor-inference-service.md`）
-- 形态 → 方法 → 是否需要 handler 的完整对应见上文「最小接管集合与落点」；进度与不变量见 `AGENTS.md` 与 `apps/desktop/docs/CURSOR_TAKEOVER.md`
+- local loop 只依赖的两组接口：`InferenceService/RunInferenceSSE`（读）+ `BidiService/BidiAppend`（写）；bidi 与 poll 是它们的替代路径，见 `cursor-inference-service.md`
+- `AgentService/Run*` 属于 backend loop，不接管：见 `cursor-agent-loop-routing.md`
+- 形态 → 方法 → 是否需要 handler 的完整对应见上文「两条 bidi 链路分属两条 loop」；进度与不变量见 `AGENTS.md` 与 `apps/desktop/docs/CURSOR_TAKEOVER.md`
