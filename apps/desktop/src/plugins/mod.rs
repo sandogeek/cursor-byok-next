@@ -15,9 +15,9 @@ mod wire;
 mod worker;
 
 pub use descriptor::{
-    parse_model_id, AddMethodDefinition, FormFieldDefinition, PluginDescriptor,
+    ADAPTER_ID_PREFIX, AddMethodDefinition, FormFieldDefinition, PluginDescriptor,
     PluginModelDescriptor, PluginProviderDescriptor, PluginResourceDescriptor, PluginResourceView,
-    ADAPTER_ID_PREFIX,
+    parse_model_id,
 };
 pub use error::{Error, Result};
 pub use host::{FormSubmitResponse, PluginHost, PluginSnapshot};

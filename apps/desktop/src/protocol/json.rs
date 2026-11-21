@@ -4,7 +4,7 @@
 //! be integers, so exact integer-valued floats are emitted as JSON integers
 //! when they fit in `u64` / `i64` without saturating.
 
-use prost_types::{value::Kind, Struct, Value as ProtoValue};
+use prost_types::{Struct, Value as ProtoValue, value::Kind};
 use serde_json::Value;
 
 pub(crate) fn prost_json(value: &ProtoValue) -> Value {

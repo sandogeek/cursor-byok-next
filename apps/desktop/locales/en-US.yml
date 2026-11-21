@@ -5,6 +5,11 @@ common:
   refresh: Refresh
   remove: Remove
   loading: Working…
+  back: Back
+  copy: Copy
+  copied: Copied
+  yes: Yes
+  no: No
 
 nav:
   overview: Overview
@@ -114,3 +119,92 @@ plugin:
     storage_unreadable: Could not read saved gateways. Check the plugin data file and try again.
     storage_save_failed: Could not save the gateway. Check the plugin data directory.
     storage_remove_failed: Could not remove the gateway. Check the plugin data directory.
+
+calls:
+  error:
+    status: Could not read call records
+    detail: Could not read the call details
+  loading: Reading call records…
+  empty: No Magpie calls yet. They appear here after Cursor uses a local model.
+  degraded: Call records may be incomplete. Refresh and try again.
+  count: "%{calls} calls · %{requests} requests · %{chunks} response chunks"
+  detailed: Detailed recording
+  detailedHint: Stores redacted requests and raw responses up to 1 MiB each for later calls. In-flight calls keep their original setting. The latest 1000 calls are retained.
+  clearDetails: Clear details
+  clearAll: Clear all
+  refresh: Refresh
+  view: View details
+  viewNamed: View details for %{name}
+  none: —
+  status:
+    running: Running
+    completed: Completed
+    error: Failed
+    cancelled: Cancelled
+  columns:
+    status: Status
+    model: Model
+    http: HTTP
+    duration: Duration
+    input: Input
+    output: Output
+    total: Total
+    error: Error
+  dialog:
+    details:
+      title: Clear request and response details?
+      body: Deletes stored request and response payloads. Call summaries and token usage stay.
+      confirm: Delete details
+    all:
+      title: Clear every call record?
+      body: Deletes every Magpie call summary, request, and response this app saved. Official Cursor records are not stored here.
+      confirm: Delete all records
+  detail:
+    title: Call details
+    missing: This call was not found.
+    requestTruncated: The request exceeded 1 MiB, so its body was not stored. Byte counts still reflect the actual request.
+    responseTruncated: The response exceeded 1 MiB. Only complete chunks within the first 1 MiB were stored; byte counts still reflect the actual response.
+    request: Request
+    response: Response stream
+    noRequest: The request was not recorded. Turn on detailed recording and try again.
+    noResponse: The response was not recorded. Turn on detailed recording and try again.
+    bytes: "%{count} bytes"
+    chunks: "%{count} chunks · %{bytes} bytes"
+    fields:
+      callId: Call ID
+      runId: Run ID
+      conversationId: Conversation ID
+      index: Call index
+      modelHash: Model Hash
+      providerType: Provider type
+      providerUrl: Provider URL
+      requestType: Request type
+      requestUrl: Request URL
+      modelId: Model ID
+      displayName: Display name
+      reasoning: Reasoning
+      fast: Fast
+      status: Status
+      finish: Finish reason
+      http: HTTP status
+      created: Created
+      duration: Duration
+      responseHeaders: Response headers
+      ttfr: TTFR
+      ttft: TTFT
+      input: Input tokens
+      output: Output tokens
+      total: Total tokens
+      cacheRead: Cache-read tokens
+      cacheWrite: Cache-write tokens
+      reasoningTokens: Reasoning tokens
+      messages: Messages
+      tools: Tools
+      requestBytes: Request bytes
+      responseBytes: Response bytes
+      responseChunks: Network chunks
+      detailed: Detailed
+      errorKind: Error kind
+      errorMessage: Error message
+      headers: Request headers
+      body: Request body

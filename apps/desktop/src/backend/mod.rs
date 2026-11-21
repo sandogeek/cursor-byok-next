@@ -11,25 +11,26 @@ mod server_config;
 use std::net::SocketAddr;
 
 use axum::{
-    body::{to_bytes, Body, Bytes},
-    extract::Extension,
-    http::{header, HeaderValue, Request, Response, StatusCode},
-    routing::{get, post},
     Router,
+    body::{Body, Bytes, to_bytes},
+    extract::Extension,
+    http::{HeaderValue, Request, Response, StatusCode, header},
+    routing::{get, post},
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::{
+    Result,
+    calls::CallStore,
     harness,
-    loop_service::{decode_append, InferenceRoute, InferenceService},
+    loop_service::{InferenceRoute, InferenceService, decode_append},
     plugins::PluginHost,
     protocol::{
         connect,
         proto::{agent::v1 as agent, aiserver::v1 as ai, inference},
     },
-    Result,
 };
 
 pub use knowledge::KnowledgeService;
@@ -40,9 +41,9 @@ pub struct Backend {
 }
 
 impl Backend {
-    pub async fn start(plugins: PluginHost) -> Result<Self> {
+    pub async fn start(plugins: PluginHost, calls: CallStore) -> Result<Self> {
         let knowledge = KnowledgeService::managed()?;
-        let inference = InferenceService::new(plugins.clone(), knowledge.clone());
+        let inference = InferenceService::new(plugins.clone(), knowledge.clone(), calls);
         let proxy = proxy::CursorProxy::default();
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
@@ -67,7 +68,10 @@ fn router(
     knowledge: KnowledgeService,
 ) -> Router {
     Router::new()
-        .route("/aiserver.v1.InferenceService/RunInferenceSSE", post(run_inference_sse))
+        .route(
+            "/aiserver.v1.InferenceService/RunInferenceSSE",
+            post(run_inference_sse),
+        )
         .route("/aiserver.v1.BidiService/BidiAppend", post(bidi_append))
         .route(
             "/aiserver.v1.AiService/AvailableDocs",
@@ -121,7 +125,10 @@ fn router(
             "/aiserver.v1.AiService/GetDefaultModelNudgeData",
             post(catalog::default_model_nudge),
         )
-        .route("/aiserver.v1.AuthService/GetEmail", post(account::get_email))
+        .route(
+            "/aiserver.v1.AuthService/GetEmail",
+            post(account::get_email),
+        )
         .route(
             "/aiserver.v1.AuthService/GetUserMeta",
             post(account::get_user_meta),
@@ -143,7 +150,10 @@ fn router(
             "/aiserver.v1.DashboardService/GetUsageLimitStatusAndActiveGrants",
             post(account::usage_limit_status),
         )
-        .route("/aiserver.v1.AiService/KnowledgeBaseAdd", post(knowledge::add))
+        .route(
+            "/aiserver.v1.AiService/KnowledgeBaseAdd",
+            post(knowledge::add),
+        )
         .route(
             "/aiserver.v1.AiService/KnowledgeBaseList",
             post(knowledge::list),
@@ -289,7 +299,9 @@ async fn bidi_append(
             InferenceRoute::Upstream => {
                 let finished = matches!(
                     message.message,
-                    Some(inference::run_inference_client_message::Message::FinishRun(_))
+                    Some(inference::run_inference_client_message::Message::FinishRun(
+                        _
+                    ))
                 );
                 let response = proxy::forward(
                     Extension(proxy),
@@ -358,22 +370,26 @@ pub(crate) fn router_for_test(
     knowledge: KnowledgeService,
     proxy: proxy::CursorProxy,
 ) -> Router {
-    let inference = InferenceService::new(plugins.clone(), knowledge.clone());
+    let directory = tempfile::tempdir().expect("temporary call store");
+    let inference = InferenceService::new(
+        plugins.clone(),
+        knowledge.clone(),
+        CallStore::at(directory.path().join("calls.db")),
+    );
+    std::mem::forget(directory);
     router(plugins, inference, proxy, knowledge)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        protocol::{
-            connect,
-            proto::{agent::v1 as agent, aiserver::v1 as ai, inference as pb},
-        },
+    use crate::protocol::{
+        connect,
+        proto::{agent::v1 as agent, aiserver::v1 as ai, inference as pb},
     };
     use axum::{
         body::Body,
-        http::{header, Request, StatusCode},
+        http::{Request, StatusCode, header},
     };
     use futures_util::StreamExt;
     use prost::Message;

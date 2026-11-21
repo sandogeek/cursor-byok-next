@@ -1,9 +1,9 @@
 //! Shared errors for the local loop backend.
 
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -32,6 +32,12 @@ pub enum Error {
     Http(#[from] reqwest::Error),
     #[error("{0}")]
     Storage(String),
+}
+
+impl From<sqlx::Error> for Error {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Storage(error.to_string())
+    }
 }
 
 impl From<crate::plugins::Error> for Error {

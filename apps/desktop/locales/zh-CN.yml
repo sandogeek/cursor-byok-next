@@ -5,6 +5,11 @@ common:
   refresh: 刷新
   remove: 移除
   loading: 处理中…
+  back: 返回
+  copy: 复制
+  copied: 已复制
+  yes: 是
+  no: 否
 
 nav:
   overview: 数据概览
@@ -114,3 +119,92 @@ plugin:
     storage_unreadable: 无法读取已保存的网关，请检查插件数据文件后重试。
     storage_save_failed: 无法保存网关，请检查插件数据目录。
     storage_remove_failed: 无法移除网关，请检查插件数据目录。
+
+calls:
+  error:
+    status: 暂时无法读取调用记录
+    detail: 暂时无法读取调用详情
+  loading: 正在读取调用记录…
+  empty: 还没有 Magpie 调用。Cursor 走本地模型后会出现在这里。
+  degraded: 调用记录可能不完整，请刷新后再试。
+  count: "%{calls} 条调用 · %{requests} 条请求 · %{chunks} 个响应块"
+  detailed: 详细记录
+  detailedHint: 开启后保存脱敏请求和原始响应，单份上限 1 MiB，不影响已在途的调用。保留最近 1000 次调用。
+  clearDetails: 清空详情
+  clearAll: 清空全部
+  refresh: 刷新
+  view: 查看详情
+  viewNamed: 查看 %{name} 的详情
+  none: —
+  status:
+    running: 进行中
+    completed: 已完成
+    error: 失败
+    cancelled: 已取消
+  columns:
+    status: 状态
+    model: 模型
+    http: HTTP
+    duration: 耗时
+    input: 输入
+    output: 输出
+    total: 合计
+    error: 错误
+  dialog:
+    details:
+      title: 清空请求和响应详情？
+      body: 会删除已保存的请求和响应内容，调用摘要和用量会保留。
+      confirm: 删除已存详情
+    all:
+      title: 清空全部调用记录？
+      body: 会删除本应用保存的全部 Magpie 调用摘要、请求和响应。Cursor 官方记录不受影响。
+      confirm: 删除全部记录
+  detail:
+    title: 调用详情
+    missing: 找不到这条调用。
+    requestTruncated: 请求体超过 1 MiB，未保存原文；字节数仍按实际请求统计。
+    responseTruncated: 响应超过 1 MiB，仅保存前 1 MiB 的完整分块；字节数仍按实际响应统计。
+    request: 请求
+    response: 响应流
+    noRequest: 未记录请求内容。开启详细记录后重试。
+    noResponse: 未记录响应内容。开启详细记录后重试。
+    bytes: "%{count} 字节"
+    chunks: "%{count} 个分块 · %{bytes} 字节"
+    fields:
+      callId: Call ID
+      runId: Run ID
+      conversationId: Conversation ID
+      index: 上游调用序号
+      modelHash: Model Hash
+      providerType: 上游类型
+      providerUrl: 上游地址
+      requestType: 最终请求类型
+      requestUrl: 最终请求地址
+      modelId: Model ID
+      displayName: 显示名称
+      reasoning: 思考强度
+      fast: Fast
+      status: 状态
+      finish: Finish Reason
+      http: HTTP Status
+      created: 创建时间
+      duration: 耗时
+      responseHeaders: 响应头耗时
+      ttfr: TTFR
+      ttft: TTFT
+      input: Input Token
+      output: Output Token
+      total: Total Token
+      cacheRead: Cache Read Token
+      cacheWrite: Cache Write Token
+      reasoningTokens: Reasoning Token
+      messages: 消息数
+      tools: 工具数
+      requestBytes: 请求字节
+      responseBytes: 响应字节
+      responseChunks: 网络分块数
+      detailed: 详细记录
+      errorKind: Error Kind
+      errorMessage: Error Message
+      headers: 请求头
+      body: 请求体

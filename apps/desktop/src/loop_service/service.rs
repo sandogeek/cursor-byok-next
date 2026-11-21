@@ -15,12 +15,13 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     Error, Result,
     backend::KnowledgeService,
+    calls::{CallRecorder, CallStore, NewLlmCall, plugin_request_url},
     loop_service::{
         output::OutputHub,
         overflow, project,
         subagent_models::{self, ByokModel},
     },
-    model::{ModelInvocation, Usage},
+    model::{ModelInvocation, ModelLatency, Usage},
     plugins::{ADAPTER_ID_PREFIX, PluginHost, PluginModelDescriptor},
     protocol::{
         connect,
@@ -41,6 +42,7 @@ pub(crate) struct InferenceService {
     changed: Arc<Notify>,
     plugins: PluginHost,
     knowledge: KnowledgeService,
+    calls: CallStore,
 }
 
 #[derive(Clone)]
@@ -112,6 +114,7 @@ struct LocalModel {
 struct ServeContext {
     output: Arc<OutputHub>,
     plugins: PluginHost,
+    calls: CallStore,
     run_id: String,
     conversation_id: String,
     model_id: String,
@@ -120,12 +123,13 @@ struct ServeContext {
 }
 
 impl InferenceService {
-    pub fn new(plugins: PluginHost, knowledge: KnowledgeService) -> Self {
+    pub fn new(plugins: PluginHost, knowledge: KnowledgeService, calls: CallStore) -> Self {
         Self {
             state: Arc::new(Mutex::new(HashMap::new())),
             changed: Arc::new(Notify::new()),
             plugins,
             knowledge,
+            calls,
         }
     }
 
@@ -205,6 +209,7 @@ impl InferenceService {
                 ServeContext {
                     output,
                     plugins: self.plugins.clone(),
+                    calls: self.calls.clone(),
                     run_id: request_id.into(),
                     conversation_id: request.conversation_id.clone(),
                     model_id: model_id.into(),
@@ -309,6 +314,7 @@ async fn serve(
     let ServeContext {
         output,
         plugins,
+        calls,
         run_id,
         conversation_id,
         model_id,
@@ -387,11 +393,22 @@ async fn serve(
                 let context_window_tokens = request.model.context_window_tokens;
                 let cancellation = cancellation.child_token();
                 invocations.lock().insert(id.clone(), cancellation.clone());
+                let recorder = start_recorder(
+                    &calls,
+                    &id,
+                    &run_id,
+                    &conversation_id,
+                    provider_call_index,
+                    &request,
+                    model.as_ref(),
+                )
+                .await;
                 tasks.spawn(serve_invocation(
                     plugins.clone(),
                     output.clone(),
                     invocations.clone(),
                     cancellation,
+                    recorder,
                     ModelInvocation {
                         call_id: id,
                         run_id: run_id.clone(),
@@ -638,11 +655,13 @@ async fn serve_invocation(
     output: Arc<OutputHub>,
     invocations: Arc<Mutex<HashMap<String, CancellationToken>>>,
     cancellation: CancellationToken,
+    recorder: CallRecorder,
     invocation: ModelInvocation,
     context_window_tokens: Option<u64>,
 ) {
     let id = invocation.call_id.clone();
-    let mut stream = plugins.stream_model(invocation, cancellation.clone());
+    let _cancel_on_drop = recorder.cancel_on_drop();
+    let mut stream = plugins.stream_model(invocation, cancellation.clone(), Some(recorder.clone()));
     let mut tool_calls = HashMap::<usize, (String, String, String)>::new();
     let mut error = None;
     while let Some(next) = tokio::select! {
@@ -651,6 +670,7 @@ async fn serve_invocation(
     } {
         match next {
             Ok(event) => {
+                let _ = recorder.event(&event).await;
                 for response in model_responses(event, &mut tool_calls, context_window_tokens) {
                     emit(
                         &output,
@@ -676,9 +696,18 @@ async fn serve_invocation(
                         ),
                     );
                 }
+                let _ = recorder.failed(&value).await;
                 error = Some(message);
                 break;
             }
+        }
+    }
+    if !recorder.is_finished() {
+        if cancellation.is_cancelled() {
+            let _ = recorder.cancelled().await;
+        } else {
+            let ended = Error::Provider("provider stream ended without Done".into());
+            let _ = recorder.failed(&ended).await;
         }
     }
     invocations.lock().remove(&id);
@@ -895,6 +924,46 @@ pub(crate) fn decode_append(data: &[u8]) -> Result<pb::RunInferenceClientMessage
     pb::RunInferenceClientMessage::decode(data).map_err(Error::from)
 }
 
+async fn start_recorder(
+    store: &CallStore,
+    call_id: &str,
+    run_id: &str,
+    conversation_id: &str,
+    provider_call_index: u64,
+    request: &crate::model::ModelRequest,
+    model: Option<&LocalModel>,
+) -> CallRecorder {
+    let (stored_id, provider_type, request_url) = plugin_request_url(&request.model.model_id);
+    let display_name = request
+        .model
+        .display_name
+        .clone()
+        .or_else(|| model.map(|model| model.display_name.clone()))
+        .unwrap_or_else(|| stored_id.clone());
+    CallRecorder::start(
+        store.clone(),
+        NewLlmCall {
+            call_id: call_id.into(),
+            run_id: run_id.into(),
+            conversation_id: conversation_id.into(),
+            provider_call_index: provider_call_index.min(i64::MAX as u64) as i64,
+            model_hash: request.model.model_id.clone(),
+            provider_type: provider_type.clone(),
+            provider_url: request_url.clone(),
+            request_type: provider_type,
+            request_url,
+            model_id: stored_id,
+            display_name,
+            reasoning_effort: request.model.reasoning.effort.clone(),
+            fast: request.model.latency == ModelLatency::Fast,
+            message_count: request.history.len(),
+            tool_count: request.prompt.tools.len(),
+            detailed: false,
+        },
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,6 +983,7 @@ mod tests {
         let service = InferenceService::new(
             PluginHost::for_test(root.path()).unwrap(),
             KnowledgeService::with_root(root.path().join("rules")).unwrap(),
+            CallStore::at(root.path().join("calls.db")),
         );
         let (sender, _receiver) = mpsc::channel(1);
         let run = Arc::new(Run {
@@ -946,6 +1016,39 @@ mod tests {
         assert!(run.cancellation.is_cancelled());
         assert!(run.output.is_closed());
         assert!(service.route("run").is_none());
+    }
+
+    #[tokio::test]
+    async fn official_models_do_not_create_call_records() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CallStore::at(root.path().join("calls.db"));
+        let service = InferenceService::new(
+            PluginHost::for_test(root.path()).unwrap(),
+            KnowledgeService::with_root(root.path().join("rules")).unwrap(),
+            store.clone(),
+        );
+        let route = service
+            .begin(
+                "official-run",
+                &pb::RunInferenceClientMessage {
+                    message: Some(pb::run_inference_client_message::Message::RunRequest(
+                        pb::RunInferenceRunRequest {
+                            conversation_id: "conversation".into(),
+                            requested_model: Some(pb::InferenceRequestedModel {
+                                model_id: "gpt-5".into(),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(route, InferenceRoute::Upstream));
+        let snapshot = store.snapshot(200).await;
+        assert!(snapshot.calls.is_empty());
+        assert_eq!(snapshot.storage.call_count, 0);
     }
 
     #[test]

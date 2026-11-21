@@ -1,5 +1,5 @@
 import { expect, open, test } from "nsh/test";
-import type { HarnessState, PluginSnapshot } from "cursor-byok-next/native";
+import type { CallDetail, CallRecord, CallsSnapshot, HarnessState, PluginSnapshot } from "cursor-byok-next/native";
 
 const missing: HarnessState = {
   platform: "macos",
@@ -68,9 +68,65 @@ const magpieReady: PluginSnapshot = {
   }],
 };
 
-function options(initial: HarnessState, calls: string[] = [], plugins: PluginSnapshot = { runtimeReady: false, runtimeError: "bun is not on PATH", plugins: [] }) {
+const sampleCall: CallRecord = {
+  callId: "call-1",
+  runId: "run-1",
+  conversationId: "conversation-1",
+  providerCallIndex: 0,
+  modelHash: "plugin:dev.cursorbyoknext.plugins.magpie/magpie/resource-1/openai/gpt-5",
+  providerType: "plugin",
+  providerUrl: "plugin://dev.cursorbyoknext.plugins.magpie/magpie",
+  requestType: "plugin",
+  requestUrl: "plugin://dev.cursorbyoknext.plugins.magpie/magpie",
+  modelId: "openai/gpt-5",
+  displayName: "GPT-5",
+  fast: false,
+  status: "completed",
+  finishReason: "stop",
+  createdAtMs: 1_700_000_000_000,
+  durationMs: 42,
+  inputTokens: 10,
+  outputTokens: 4,
+  totalTokens: 14,
+  messageCount: 1,
+  toolCount: 0,
+  requestBytes: 12,
+  responseBytes: 20,
+  responseChunkCount: 1,
+  httpStatus: 200,
+  detailed: true,
+  requestTruncated: false,
+  responseTruncated: false,
+};
+
+const emptyCalls: CallsSnapshot = {
+  calls: [],
+  detailed: false,
+  storage: { callCount: 0, requestCount: 0, chunkCount: 0 },
+  degraded: false,
+};
+
+const recordedCalls: CallsSnapshot = {
+  calls: [sampleCall],
+  detailed: true,
+  storage: { callCount: 1, requestCount: 1, chunkCount: 1 },
+  degraded: false,
+};
+
+const sampleDetail: CallDetail = {
+  call: sampleCall,
+  request: {
+    headersJson: "{\"content-type\":\"application/json\"}",
+    bodyJson: "{\"model\":\"openai/gpt-5\"}",
+    byteCount: 12,
+  },
+  chunks: [{ seq: 0, receivedOffsetMs: 12, data: "data: [DONE]\\n\\n", byteCount: 14 }],
+};
+
+function options(initial: HarnessState, calls: string[] = [], plugins: PluginSnapshot = { runtimeReady: false, runtimeError: "bun is not on PATH", plugins: [] }, records: CallsSnapshot = emptyCalls) {
   let current = initial;
   let catalog = plugins;
+  let log = records;
   return {
     width: 1100,
     height: 720,
@@ -109,6 +165,26 @@ function options(initial: HarnessState, calls: string[] = [], plugins: PluginSna
         "plugins.refreshCatalog": () => {
           calls.push("refreshCatalog");
           return catalog;
+        },
+        "calls.snapshot": () => log,
+        "calls.detail": ({ callId }: { callId: string }) => {
+          calls.push(`detail:${callId}`);
+          return sampleDetail;
+        },
+        "calls.setDetailed": ({ enabled: next }: { enabled: boolean }) => {
+          calls.push(next ? "detailed-on" : "detailed-off");
+          log = { ...log, detailed: next };
+          return log;
+        },
+        "calls.clearDetails": () => {
+          calls.push("clear-details");
+          log = { ...log, storage: { ...log.storage, requestCount: 0, chunkCount: 0 } };
+          return log;
+        },
+        "calls.clearAll": () => {
+          calls.push("clear-all");
+          log = emptyCalls;
+          return log;
         },
       },
     },
@@ -213,4 +289,52 @@ test("界面语言跟随设备，切换后立即翻译并记住选择", async ()
   await app.press("中文");
   expect(app.texts()).toContain("数据概览");
   expect(app.storage()["cursor-byok-next:locale"]).toBe("zh-CN");
+});
+
+test("调用详细页显示 Magpie 记录、详情和清理确认", async () => {
+  const calls: string[] = [];
+  const app = await open("./test-fixtures/App.tsx", options(ready, calls, magpieReady, recordedCalls));
+  await app.press("调用详细");
+  expect(app.texts()).toContain("GPT-5");
+  expect(app.texts()).toContain("openai/gpt-5");
+  expect(app.texts()).toContain("1 条调用 · 1 条请求 · 1 个响应块");
+  expect(app.enabled("清空详情")).toBe(true);
+  expect(app.enabled("清空全部")).toBe(true);
+  expect(app.texts().join("\n")).not.toContain("Bearer");
+  expect(app.texts().join("\n")).not.toContain("sk-");
+  await app.press("查看 GPT-5 的详情");
+  expect(calls).toContain("detail:call-1");
+  const detail = app.texts().join("\n");
+  expect(detail).toContain("Call ID");
+  expect(detail).toContain("call-1");
+  expect(detail).toContain("content-type");
+  expect(detail).toContain("data: [DONE]");
+  expect(detail).not.toContain("secret");
+  await app.press("返回");
+  await app.press("清空详情");
+  expect(app.texts()).toContain("清空请求和响应详情？");
+  await app.press("删除已存详情");
+  expect(calls).toContain("clear-details");
+});
+
+test("找不到调用时显示独立空状态", async () => {
+  const setup = options(ready, [], magpieReady, recordedCalls);
+  (setup.host.handlers as Record<string, unknown>)["calls.detail"] = (): CallDetail | null => null;
+  const app = await open("./test-fixtures/App.tsx", setup);
+  await app.press("调用详细");
+  await app.press("查看 GPT-5 的详情");
+  expect(app.texts()).toContain("找不到这条调用。");
+  expect(app.texts()).not.toContain("暂时无法读取调用详情");
+});
+
+test("调用详细空状态与英文文案", async () => {
+  const app = await open("./test-fixtures/App.tsx", options(ready));
+  await app.press("调用详细");
+  expect(app.texts()).toContain("还没有 Magpie 调用。Cursor 走本地模型后会出现在这里。");
+  expect(app.enabled("清空详情")).toBe(false);
+  expect(app.enabled("清空全部")).toBe(false);
+  await app.press("界面语言");
+  await app.press("English");
+  await app.press("Calls");
+  expect(app.texts()).toContain("No Magpie calls yet. They appear here after Cursor uses a local model.");
 });

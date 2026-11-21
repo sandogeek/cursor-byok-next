@@ -11,6 +11,7 @@ use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use crate::calls::CallRecorder;
 use crate::{
     model::ModelInvocation,
     provider::{ModelEvent, ProviderStream},
@@ -316,6 +317,7 @@ impl PluginHost {
         &self,
         invocation: ModelInvocation,
         cancellation: CancellationToken,
+        recorder: Option<CallRecorder>,
     ) -> ProviderStream {
         let host = self.clone();
         Box::pin(async_stream::try_stream! {
@@ -371,6 +373,7 @@ impl PluginHost {
                     "provider.invoke",
                     params,
                     cancellation.clone(),
+                    recorder.clone(),
                     origins,
                 )
                 .await?;
@@ -1183,6 +1186,7 @@ mod tests {
         let mut stream = responses_host.0.stream_model(
             invocation(responses_host.1, vec![file]),
             CancellationToken::new(),
+            None,
         );
         while let Some(event) = stream.next().await {
             event.unwrap();
@@ -1210,6 +1214,7 @@ mod tests {
         let mut stream = chat_host.0.stream_model(
             invocation(chat_host.1, vec![file]),
             CancellationToken::new(),
+            None,
         );
         while let Some(event) = stream.next().await {
             event.unwrap();
@@ -1235,6 +1240,7 @@ mod tests {
         let mut stream = messages_host.0.stream_model(
             invocation(messages_host.1, vec![file]),
             cancellation.clone(),
+            None,
         );
         assert!(matches!(
             stream.next().await,
@@ -1262,6 +1268,123 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), messages.3.notified())
             .await
             .expect("cancelling an invocation must close its upstream HTTP stream");
+        messages.4.abort();
+    }
+
+    #[tokio::test]
+    async fn magpie_invocation_records_the_completed_call() {
+        assert!(
+            find_bun().is_some(),
+            "install Bun on PATH to run the Magpie integration test"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::calls::CallStore::at(temp.path().join("calls.db"));
+        store.set_detailed_logging(true).await.unwrap();
+        let responses = invocation_gateway(
+            "/v1/responses",
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+            ),
+        )
+        .await;
+        let host = configured_invocation_host(&temp.path().join("responses"), responses.0).await;
+        let recorder = crate::calls::CallRecorder::start(
+            store.clone(),
+            crate::calls::NewLlmCall {
+                call_id: "call".into(),
+                run_id: "run".into(),
+                conversation_id: "conversation".into(),
+                provider_call_index: 0,
+                model_hash: host.1.clone(),
+                provider_type: "plugin".into(),
+                provider_url: "plugin://dev.cursorbyoknext.plugins.magpie/magpie".into(),
+                request_type: "plugin".into(),
+                request_url: "plugin://dev.cursorbyoknext.plugins.magpie/magpie".into(),
+                model_id: "model".into(),
+                display_name: "Model".into(),
+                reasoning_effort: None,
+                fast: false,
+                message_count: 1,
+                tool_count: 0,
+                detailed: true,
+            },
+        )
+        .await;
+        let mut stream = host.0.stream_model(
+            invocation(host.1, Vec::new()),
+            CancellationToken::new(),
+            Some(recorder.clone()),
+        );
+        while let Some(event) = stream.next().await {
+            recorder.event(&event.unwrap()).await.unwrap();
+        }
+        if !recorder.is_finished() {
+            recorder
+                .completed(crate::provider::FinishReason::Stop)
+                .await
+                .unwrap();
+        }
+        let call = store.llm_call("call").await.unwrap().unwrap();
+        assert_eq!(call.http_status, Some(200));
+        assert!(call.response_bytes > 0);
+        let request = store.llm_call_request("call").await.unwrap().unwrap();
+        let recorded = request.headers.to_string() + &request.body.to_string();
+        assert!(!recorded.contains(FAKE_KEY));
+        assert!(!recorded.contains("Bearer"));
+        responses.4.abort();
+    }
+
+    #[tokio::test]
+    async fn magpie_invocation_records_cancellation() {
+        assert!(
+            find_bun().is_some(),
+            "install Bun on PATH to run the Magpie integration test"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::calls::CallStore::at(temp.path().join("calls.db"));
+        let messages = invocation_gateway("/v1/messages", "").await;
+        let host = configured_invocation_host(&temp.path().join("messages"), messages.0).await;
+        let recorder = crate::calls::CallRecorder::start(
+            store.clone(),
+            crate::calls::NewLlmCall {
+                call_id: "cancelled-call".into(),
+                run_id: "run".into(),
+                conversation_id: "conversation".into(),
+                provider_call_index: 0,
+                model_hash: host.1.clone(),
+                provider_type: "plugin".into(),
+                provider_url: "plugin://dev.cursorbyoknext.plugins.magpie/magpie".into(),
+                request_type: "plugin".into(),
+                request_url: "plugin://dev.cursorbyoknext.plugins.magpie/magpie".into(),
+                model_id: "model".into(),
+                display_name: "Model".into(),
+                reasoning_effort: None,
+                fast: false,
+                message_count: 1,
+                tool_count: 0,
+                detailed: false,
+            },
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+        let mut stream = host.0.stream_model(
+            invocation(host.1, Vec::new()),
+            cancellation.clone(),
+            Some(recorder.clone()),
+        );
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(ModelEvent::Start { .. }))
+        ));
+        tokio::time::timeout(Duration::from_secs(3), messages.2.notified())
+            .await
+            .expect("the invocation must reach the test gateway");
+        cancellation.cancel();
+        while stream.next().await.is_some() {}
+        recorder.cancelled().await.unwrap();
+        let call = store.llm_call("cancelled-call").await.unwrap().unwrap();
+        assert_eq!(call.status, "cancelled");
         messages.4.abort();
     }
 

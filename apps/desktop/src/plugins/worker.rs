@@ -6,7 +6,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
     time::Duration,
 };
@@ -26,6 +26,7 @@ use super::{
     origin,
     protocol::{HostMessage, WorkerMessage},
 };
+use crate::calls::CallRecorder;
 
 const INVOCATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_NETWORK_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
@@ -93,7 +94,11 @@ impl Pending {
     }
 
     fn sender(&self, id: &str) -> Option<mpsc::UnboundedSender<WorkerStreamItem>> {
-        self.0.lock().as_ref()?.get(id).map(|invocation| invocation.items.clone())
+        self.0
+            .lock()
+            .as_ref()?
+            .get(id)
+            .map(|invocation| invocation.items.clone())
     }
 
     fn remove(&self, id: &str) -> Option<PendingInvocation> {
@@ -114,7 +119,9 @@ impl Pending {
         let pending = self.0.lock().take();
         for (_, PendingInvocation { items, active, .. }) in pending.into_iter().flatten() {
             drop(active);
-            let _ = items.send(WorkerStreamItem::Result(Err(Error::Provider(message.into()))));
+            let _ = items.send(WorkerStreamItem::Result(Err(Error::Provider(
+                message.into(),
+            ))));
         }
     }
 }
@@ -150,9 +157,20 @@ struct InvocationState {
     allowed_origins: HashSet<String>,
     magpie_catalog_status: Option<AtomicU16>,
     cancellation: CancellationToken,
+    recorder: Option<CallRecorder>,
+    recorder_claimed: AtomicBool,
 }
 
 impl InvocationState {
+    fn claim_recorder(&self) -> Option<CallRecorder> {
+        self.recorder.as_ref().and_then(|recorder| {
+            self.recorder_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .ok()
+                .map(|_| recorder.clone())
+        })
+    }
+
     fn failure(&self) -> Error {
         let status = self
             .magpie_catalog_status
@@ -215,6 +233,7 @@ impl PluginWorker {
                 method,
                 params,
                 CancellationToken::new(),
+                None,
                 allowed_origins,
             )
             .await?;
@@ -244,6 +263,7 @@ impl PluginWorker {
         method: &str,
         params: serde_json::Value,
         cancellation: CancellationToken,
+        recorder: Option<CallRecorder>,
         allowed_origins: HashSet<String>,
     ) -> Result<mpsc::UnboundedReceiver<WorkerStreamItem>> {
         let (writer, pending) = self.connection().await?;
@@ -254,11 +274,12 @@ impl PluginWorker {
         let request_cancellation = CancellationToken::new();
         let (request, receiver) = pending.register(InvocationState {
             allowed_origins,
-            magpie_catalog_status: (self.inner.plugin_id
-                == "dev.cursorbyoknext.plugins.magpie"
+            magpie_catalog_status: (self.inner.plugin_id == "dev.cursorbyoknext.plugins.magpie"
                 && method == "models.list")
                 .then(AtomicU16::default),
             cancellation: request_cancellation.clone(),
+            recorder,
+            recorder_claimed: AtomicBool::new(false),
         })?;
         permit.send(encode_message(&HostMessage::Request {
             id: &request.id,
@@ -477,7 +498,12 @@ impl HostContext {
         &self,
         invocation: &InvocationState,
         params: &serde_json::Value,
-    ) -> Result<(reqwest::RequestBuilder, reqwest::Url, reqwest::Method)> {
+    ) -> Result<(
+        reqwest::RequestBuilder,
+        reqwest::Url,
+        reqwest::Method,
+        Option<CallRecorder>,
+    )> {
         let raw_url = required_string(params, "url")?;
         let url = url::Url::parse(raw_url)
             .map_err(|error| Error::Config(format!("invalid plugin network URL: {error}")))?;
@@ -527,7 +553,12 @@ impl HostContext {
         if let Some(body) = params.get("body").and_then(serde_json::Value::as_str) {
             request = request.body(body.to_owned());
         }
-        Ok((request, url, method))
+        let recorder = invocation.claim_recorder();
+        if let Some(recorder) = &recorder {
+            let (headers, body) = recorded_network_request(params)?;
+            recorder.request(headers, &body).await?;
+        }
+        Ok((request, url, method, recorder))
     }
 
     async fn fetch(
@@ -535,7 +566,7 @@ impl HostContext {
         invocation: &InvocationState,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let (request, url, method) = self.request(invocation, &params).await?;
+        let (request, url, method, recorder) = self.request(invocation, &params).await?;
         let origin = origin::request_origin(&url)?;
         let catalog_status = invocation.magpie_catalog_status.as_ref().filter(|_| {
             invocation.allowed_origins.contains(&origin)
@@ -550,6 +581,9 @@ impl HostContext {
             }
         };
         let status = response.status().as_u16();
+        if let Some(recorder) = &recorder {
+            recorder.response_headers(status).await?;
+        }
         if let Some(catalog_status) = catalog_status {
             catalog_status.store(status, Ordering::Relaxed);
             if !response.status().is_success() {
@@ -581,6 +615,9 @@ impl HostContext {
             }
             body.extend_from_slice(&chunk);
         }
+        if let Some(recorder) = &recorder {
+            recorder.response_chunk(&body).await?;
+        }
         Ok(serde_json::json!({
             "status": status,
             "headers": headers,
@@ -593,7 +630,7 @@ impl HostContext {
         invocation: &InvocationState,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let (request, _, _) = self.request(invocation, &params).await?;
+        let (request, _, _, recorder) = self.request(invocation, &params).await?;
         let cancellation = invocation.cancellation.clone();
         let response = tokio::select! {
             _ = cancellation.cancelled() => return Err(Error::Cancelled),
@@ -602,6 +639,9 @@ impl HostContext {
             }
         };
         let status = response.status().as_u16();
+        if let Some(recorder) = &recorder {
+            recorder.response_headers(status).await?;
+        }
         let headers = header_map(&response);
         let (sender, receiver) = mpsc::channel::<Result<String>>(256);
         tokio::spawn(async move {
@@ -637,6 +677,12 @@ impl HostContext {
                         )))
                         .await;
                     return;
+                }
+                if let Some(recorder) = &recorder {
+                    if let Err(error) = recorder.response_chunk(&chunk).await {
+                        let _ = sender.send(Err(error.into())).await;
+                        return;
+                    }
                 }
                 buffered.extend_from_slice(&chunk);
                 while let Some(position) = buffered.iter().position(|byte| *byte == b'\n') {
@@ -731,6 +777,28 @@ fn required_string<'a>(params: &'a serde_json::Value, key: &str) -> Result<&'a s
         .ok_or_else(|| Error::Protocol(format!("plugin host call requires string '{key}'")))
 }
 
+fn recorded_network_request(
+    params: &serde_json::Value,
+) -> Result<(serde_json::Value, serde_json::Value)> {
+    let mut recorded_headers = serde_json::Map::new();
+    if let Some(headers) = params.get("headers").and_then(serde_json::Value::as_object) {
+        for (name, value) in headers {
+            let value = value.as_str().ok_or_else(|| {
+                Error::Config(format!("plugin HTTP header '{name}' must be a string"))
+            })?;
+            if !crate::calls::is_sensitive_header(name) {
+                recorded_headers.insert(name.clone(), value.into());
+            }
+        }
+    }
+    let body = params
+        .get("body")
+        .and_then(serde_json::Value::as_str)
+        .map(|body| serde_json::from_str(body).unwrap_or_else(|_| body.into()))
+        .unwrap_or(serde_json::Value::Null);
+    Ok((serde_json::Value::Object(recorded_headers), body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,6 +808,8 @@ mod tests {
             allowed_origins,
             magpie_catalog_status: None,
             cancellation: CancellationToken::new(),
+            recorder: None,
+            recorder_claimed: AtomicBool::new(false),
         }
     }
 
@@ -787,6 +857,8 @@ mod tests {
             allowed_origins: HashSet::from([origin.clone()]),
             magpie_catalog_status: Some(AtomicU16::default()),
             cancellation: CancellationToken::new(),
+            recorder: None,
+            recorder_claimed: AtomicBool::new(false),
         };
         assert!(!invocation.failure().to_string().contains("HTTP"));
         let result = host
@@ -871,5 +943,165 @@ mod tests {
             unaffected.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    fn network_params() -> serde_json::Value {
+        serde_json::json!({
+            "url": "https://example.com/v1/responses",
+            "method": "POST",
+            "headers": {
+                "Authorization": "Bearer secret",
+                "X-Api-Key": "secret-key",
+                "Cookie": "session=secret",
+                "content-type": "application/json",
+                "x-client-request-id": "request-1"
+            },
+            "body": "{\"model\":\"test\",\"stream\":true}"
+        })
+    }
+
+    async fn recorder(
+        detailed: bool,
+        call_id: &str,
+    ) -> (tempfile::TempDir, crate::calls::CallStore, CallRecorder) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::calls::CallStore::at(directory.path().join("calls.db"));
+        store.set_detailed_logging(detailed).await.unwrap();
+        let recorder = CallRecorder::start(
+            store.clone(),
+            crate::calls::NewLlmCall {
+                call_id: call_id.into(),
+                run_id: "run".into(),
+                conversation_id: "conversation".into(),
+                provider_call_index: 0,
+                model_hash: "plugin:test/provider/model".into(),
+                provider_type: "plugin".into(),
+                provider_url: "plugin://test/provider".into(),
+                request_type: "plugin".into(),
+                request_url: "plugin://test/provider".into(),
+                model_id: "model".into(),
+                display_name: "Model".into(),
+                reasoning_effort: None,
+                fast: false,
+                message_count: 1,
+                tool_count: 0,
+                detailed: false,
+            },
+        )
+        .await;
+        (directory, store, recorder)
+    }
+
+    fn recorded_invocation(recorder: CallRecorder) -> InvocationState {
+        InvocationState {
+            allowed_origins: HashSet::new(),
+            magpie_catalog_status: None,
+            cancellation: CancellationToken::new(),
+            recorder: Some(recorder),
+            recorder_claimed: AtomicBool::new(false),
+        }
+    }
+
+    fn recording_host() -> HostContext {
+        HostContext {
+            plugin_id: "test".into(),
+            network_hosts: Arc::new(HashSet::from(["example.com".into()])),
+            resource_origin: false,
+            streams: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[test]
+    fn recorded_plugin_request_omits_sensitive_headers() {
+        let (headers, body) = recorded_network_request(&network_params()).unwrap();
+        assert_eq!(
+            headers,
+            serde_json::json!({
+                "content-type": "application/json",
+                "x-client-request-id": "request-1"
+            })
+        );
+        assert_eq!(body, serde_json::json!({ "model": "test", "stream": true }));
+    }
+
+    #[tokio::test]
+    async fn only_the_first_plugin_network_request_claims_the_recorder() {
+        let (_directory, store, recorder) = recorder(true, "first-request").await;
+        let host = recording_host();
+        let invocation = recorded_invocation(recorder.clone());
+        let (_, _, _, first) = host.request(&invocation, &network_params()).await.unwrap();
+        let (_, _, _, second) = host.request(&invocation, &network_params()).await.unwrap();
+        assert!(first.is_some());
+        assert!(second.is_none());
+        recorder.response_headers(200).await.unwrap();
+        recorder
+            .response_chunk(b"data: {\"type\":\"response.created\"}\n\n")
+            .await
+            .unwrap();
+        recorder.response_chunk(b"data: [DONE]\n\n").await.unwrap();
+        recorder
+            .completed(crate::provider::FinishReason::Stop)
+            .await
+            .unwrap();
+        let request = store
+            .llm_call_request("first-request")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            request.headers,
+            serde_json::json!({
+                "content-type": "application/json",
+                "x-client-request-id": "request-1"
+            })
+        );
+        let recorded = serde_json::to_string(&request.headers).unwrap()
+            + &serde_json::to_string(&request.body).unwrap();
+        assert!(!recorded.contains("secret"));
+        let chunks = store.llm_call_chunks("first-request").await.unwrap();
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.data.as_str())
+                .collect::<String>(),
+            "data: {\"type\":\"response.created\"}\n\ndata: [DONE]\n\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_plugin_network_recording_keeps_metrics_without_payloads() {
+        let (_directory, store, recorder) = recorder(false, "standard-plugin").await;
+        let host = recording_host();
+        let invocation = recorded_invocation(recorder.clone());
+        let params = network_params();
+        let (_, body) = recorded_network_request(&params).unwrap();
+        let request_bytes = serde_json::to_string(&body).unwrap().len() as i64;
+        let (_, _, _, claimed) = host.request(&invocation, &params).await.unwrap();
+        assert!(claimed.is_some());
+        recorder.response_headers(204).await.unwrap();
+        recorder.response_chunk(b"data: [DONE]\n\n").await.unwrap();
+        recorder
+            .completed(crate::provider::FinishReason::Stop)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .llm_call_request("standard-plugin")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .llm_call_chunks("standard-plugin")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let summary = store.llm_call("standard-plugin").await.unwrap().unwrap();
+        assert_eq!(summary.http_status, Some(204));
+        assert_eq!(summary.request_bytes, Some(request_bytes));
+        assert_eq!(summary.response_bytes, 14);
+        assert!(!summary.detailed);
     }
 }

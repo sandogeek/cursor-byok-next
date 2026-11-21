@@ -1,5 +1,5 @@
 import { host, mount, setColorScheme } from "nsh";
-import type { HarnessState, PluginFormResult, PluginSnapshot } from "cursor-byok-next/native";
+import type { CallDetail, CallRecord, CallsSnapshot, HarnessState, PluginFormResult, PluginSnapshot } from "cursor-byok-next/native";
 import { Cursor } from "../src/screens/Cursor";
 import { restoreLocale } from "../src/screens/Language";
 
@@ -36,7 +36,58 @@ const plugins = {
   deleteResource: async (): Promise<PluginSnapshot> => ({ runtimeReady: false, plugins: [] }),
   refreshCatalog: async (): Promise<PluginSnapshot> => ({ runtimeReady: false, plugins: [] }),
 };
+const sampleCall: CallRecord = {
+  callId: "call-1",
+  runId: "run-1",
+  conversationId: "conversation-1",
+  providerCallIndex: 0,
+  modelHash: "plugin:dev.cursorbyoknext.plugins.magpie/magpie/resource-1/openai/gpt-5",
+  providerType: "plugin",
+  providerUrl: "plugin://dev.cursorbyoknext.plugins.magpie/magpie",
+  requestType: "plugin",
+  requestUrl: "plugin://dev.cursorbyoknext.plugins.magpie/magpie",
+  modelId: "openai/gpt-5",
+  displayName: "GPT-5",
+  fast: false,
+  status: "completed",
+  finishReason: "stop",
+  createdAtMs: 1_700_000_000_000,
+  durationMs: 42,
+  inputTokens: 10,
+  outputTokens: 4,
+  totalTokens: 14,
+  messageCount: 1,
+  toolCount: 0,
+  requestBytes: 12,
+  responseBytes: 20,
+  responseChunkCount: 1,
+  httpStatus: 200,
+  detailed: true,
+  requestTruncated: false,
+  responseTruncated: false,
+};
+const recordedCalls: CallsSnapshot = {
+  calls: [sampleCall],
+  detailed: true,
+  storage: { callCount: 1, requestCount: 1, chunkCount: 1 },
+  degraded: false,
+};
+const calls = {
+  snapshot: async (): Promise<CallsSnapshot> => recordedCalls,
+  detail: async (): Promise<CallDetail | null> => ({
+    call: sampleCall,
+    request: {
+      headersJson: "{\"content-type\":\"application/json\"}",
+      bodyJson: "{\"model\":\"openai/gpt-5\"}",
+      byteCount: 12,
+    },
+    chunks: [{ seq: 0, receivedOffsetMs: 12, data: "data: [DONE]\\n\\n", byteCount: 14 }],
+  }),
+  setDetailed: async (): Promise<CallsSnapshot> => recordedCalls,
+  clearDetails: async (): Promise<CallsSnapshot> => recordedCalls,
+  clearAll: async (): Promise<CallsSnapshot> => recordedCalls,
+};
 
 void restoreLocale().then(() => {
-  mount(() => <Cursor takeover={takeover} plugins={plugins} />);
+  mount(() => <Cursor takeover={takeover} plugins={plugins} calls={calls} />);
 });

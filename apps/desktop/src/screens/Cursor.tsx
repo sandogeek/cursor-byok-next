@@ -6,6 +6,8 @@ import { Dialog } from "../ui/Dialog";
 import { motion } from "../ui/motion";
 import { NavigationGroup, NavigationItem, StatusBadge, Surface } from "../ui/Surface";
 import { Switch } from "../ui/Switch";
+import { CallDetails } from "./CallDetails";
+import { Calls, type CallLog } from "./Calls";
 import { LanguagePicker } from "./Language";
 import { Plugins, type PluginCatalog } from "./Plugins";
 
@@ -26,8 +28,9 @@ function errorText(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
-export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog }) {
-  const page = signal<"cursor" | "plugins">("cursor");
+export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog; calls: CallLog }) {
+  const page = signal<"cursor" | "plugins" | "calls">("cursor");
+  const selectedCall = signal<string | null>(null);
   const state = resource(() => props.takeover.status(), { initialValue: initialState });
   const busy = signal(false);
   const error = signal("");
@@ -90,7 +93,15 @@ export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog
         <View class="min-h-0 flex-1 p-1.5">
           <View class="gap-0.5">
             <NavigationItem label={t("nav.overview")} icon="chart" disabled />
-            <NavigationItem label={t("nav.calls")} icon="list" disabled />
+            <NavigationItem
+              label={t("nav.calls")}
+              icon="list"
+              selected={page() === "calls"}
+              onPress={() => {
+                selectedCall.set(null);
+                page.set("calls");
+              }}
+            />
             <NavigationGroup label={t("nav.modelConfig")} />
             <NavigationItem
               label={t("nav.cursor")}
@@ -122,7 +133,7 @@ export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog
 
       <View class="min-w-0 flex-1 px-4 pb-4 pt-[env(safe-area-inset-top)]">
         <View class="min-h-16 flex-row items-center justify-between gap-4 pb-3 pl-1" desktop={{ windowDrag: true }}>
-          <Text role="header" class="text-2xl font-semibold text-foreground">{page() === "plugins" ? t("nav.plugins") : t("nav.cursor")}</Text>
+          <Text role="header" class="text-2xl font-semibold text-foreground">{page() === "plugins" ? t("nav.plugins") : page() === "calls" ? t("nav.calls") : t("nav.cursor")}</Text>
           <If when={page() === "cursor"}>
           <Surface class="flex-row items-center gap-2 p-1.5">
             <Text class="pl-1 text-xs text-muted-foreground">{statusLabel()}</Text>
@@ -139,6 +150,16 @@ export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog
 
         <If when={page() === "plugins"}>
           <Plugins catalog={props.plugins} />
+        </If>
+        <If when={page() === "calls" && selectedCall() === null}>
+          <Calls log={props.calls} onOpen={(callId) => selectedCall.set(callId)} />
+        </If>
+        <If when={page() === "calls" && selectedCall() !== null}>
+          <CallDetails
+            callId={selectedCall() ?? ""}
+            inspector={props.calls}
+            onBack={() => selectedCall.set(null)}
+          />
         </If>
         <If when={page() === "cursor"}>
         <Scroll class="min-h-0 flex-1" contentClass="grow">

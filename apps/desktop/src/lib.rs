@@ -7,6 +7,7 @@
 //! drive it come next; this file is the typed boundary they will call.
 
 pub mod backend;
+pub mod calls;
 pub mod error;
 pub mod harness;
 pub mod loop_service;
@@ -30,15 +31,16 @@ use nsh_core::{
 use tokio::sync::watch;
 
 use self::backend::Backend;
+use self::calls::CallStore;
 use self::harness::{
     CaState as HarnessCa, CursorHarness, Error as HarnessError, HarnessPaths, HarnessStatus,
     IntegrationState as HarnessIntegration,
 };
 use self::plugins::{
-    FormSubmitResponse as HostFormSubmit, PluginHost, PluginSnapshot as HostSnapshot,
-    PluginDescriptor as HostPlugin, PluginModelDescriptor as HostModel,
-    PluginProviderDescriptor as HostProvider, PluginResourceDescriptor as HostResource,
-    PluginResourceView as HostResourceView, ResourceState as HostResourceState,
+    FormSubmitResponse as HostFormSubmit, PluginDescriptor as HostPlugin, PluginHost,
+    PluginModelDescriptor as HostModel, PluginProviderDescriptor as HostProvider,
+    PluginResourceDescriptor as HostResource, PluginResourceView as HostResourceView,
+    PluginSnapshot as HostSnapshot, ResourceState as HostResourceState,
 };
 
 /// The proxy port Cursor is pointed at when this app has never bound one.
@@ -53,7 +55,8 @@ fn native(registry: &mut Registry) {
         .module::<Format>()
         .class::<Counter>()
         .class::<Harness>()
-        .class::<Plugins>();
+        .class::<Plugins>()
+        .class::<Calls>();
 }
 
 /// Whether the system trusts the local CA.
@@ -159,7 +162,8 @@ impl Harness {
 
     /// The current state. Also heals a takeover whose proxy went away.
     pub async fn status(this: Instance<Self>) -> Result<HarnessState, HarnessError> {
-        let (harness, mut backend) = this.with(|harness| (harness.inner.clone(), harness.backend.clone()));
+        let (harness, mut backend) =
+            this.with(|harness| (harness.inner.clone(), harness.backend.clone()));
         attach_backend(&harness, &mut backend).await?;
         Ok(harness.status().await.into())
     }
@@ -170,7 +174,8 @@ impl Harness {
         this: Instance<Self>,
         enabled: bool,
     ) -> Result<HarnessState, HarnessError> {
-        let (harness, mut backend) = this.with(|harness| (harness.inner.clone(), harness.backend.clone()));
+        let (harness, mut backend) =
+            this.with(|harness| (harness.inner.clone(), harness.backend.clone()));
         attach_backend(&harness, &mut backend).await?;
         harness.set_enabled(enabled).await.map(Into::into)
     }
@@ -613,6 +618,319 @@ impl Plugins {
     }
 }
 
+/// One recorded Magpie model call.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct CallRecord {
+    /// Invocation id from Cursor.
+    pub call_id: String,
+    /// Owning local run id.
+    pub run_id: String,
+    /// Cursor conversation id.
+    pub conversation_id: String,
+    /// Provider call index inside the run.
+    pub provider_call_index: i64,
+    /// Stable plugin model id.
+    pub model_hash: Option<String>,
+    /// Provider family, such as `"plugin"`.
+    pub provider_type: String,
+    /// Plugin URL used for attribution.
+    pub provider_url: String,
+    /// Request family, such as `"plugin"`.
+    pub request_type: String,
+    /// Plugin URL used for the request.
+    pub request_url: String,
+    /// Upstream model id.
+    pub model_id: String,
+    /// Name shown in the picker.
+    pub display_name: String,
+    /// Effective reasoning effort.
+    pub reasoning_effort: Option<String>,
+    /// Whether the call asked for fast latency.
+    pub fast: bool,
+    /// `running`, `completed`, `error`, or `cancelled`.
+    pub status: String,
+    /// Provider finish reason, when completed.
+    pub finish_reason: Option<String>,
+    /// When the call row was created.
+    pub created_at_ms: i64,
+    /// When the request started.
+    pub request_started_at_ms: Option<i64>,
+    /// When response headers arrived.
+    pub response_headers_at_ms: Option<i64>,
+    /// When the first response event arrived.
+    pub first_event_at_ms: Option<i64>,
+    /// When the first non-empty text arrived.
+    pub first_text_at_ms: Option<i64>,
+    /// When the first valid response event arrived.
+    pub first_valid_response_at_ms: Option<i64>,
+    /// When the call reached a terminal status.
+    pub finished_at_ms: Option<i64>,
+    /// Queue time before the request started.
+    pub queue_ms: Option<i64>,
+    /// Time to the upstream HTTP response headers.
+    pub response_headers_ms: Option<i64>,
+    /// Time to first text.
+    pub ttft_ms: Option<i64>,
+    /// Time to first valid response.
+    pub ttfr_ms: Option<i64>,
+    /// Total duration.
+    pub duration_ms: Option<i64>,
+    /// Input tokens.
+    pub input_tokens: Option<i64>,
+    /// Output tokens.
+    pub output_tokens: Option<i64>,
+    /// Total tokens.
+    pub total_tokens: Option<i64>,
+    /// Cache-read tokens.
+    pub cache_read_tokens: Option<i64>,
+    /// Cache-write tokens.
+    pub cache_write_tokens: Option<i64>,
+    /// Reasoning tokens.
+    pub reasoning_tokens: Option<i64>,
+    /// Message count in the projected history.
+    pub message_count: i64,
+    /// Tool count in the projected prompt.
+    pub tool_count: i64,
+    /// Request body bytes.
+    pub request_bytes: Option<i64>,
+    /// Response bytes, including non-detailed metrics.
+    pub response_bytes: i64,
+    /// Raw network response chunk count.
+    pub response_chunk_count: i64,
+    /// HTTP status of the first plugin network request.
+    pub http_status: Option<i64>,
+    /// Error kind, when failed.
+    pub error_kind: Option<String>,
+    /// Error message, when failed.
+    pub error_message: Option<String>,
+    /// Whether this call asked to store request and response payloads.
+    pub detailed: bool,
+    /// Whether the stored request body was replaced because it exceeded the limit.
+    pub request_truncated: bool,
+    /// Whether later response chunks were omitted after reaching the storage limit.
+    pub response_truncated: bool,
+}
+
+/// Counts of stored call records.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct CallStorageInfo {
+    /// Number of call summaries.
+    pub call_count: i64,
+    /// Number of stored request payloads.
+    pub request_count: i64,
+    /// Number of stored response chunks.
+    pub chunk_count: i64,
+}
+
+/// Call list, detailed-mode setting, and storage counts.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct CallsSnapshot {
+    /// Newest calls first.
+    pub calls: Vec<CallRecord>,
+    /// Whether new calls store request and response payloads.
+    pub detailed: bool,
+    /// Storage counts.
+    pub storage: CallStorageInfo,
+    /// Whether a recent read or write failed.
+    pub degraded: bool,
+}
+
+/// Stored request headers and body for a detailed call.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct CallRequestRecord {
+    /// JSON text of the redacted headers.
+    pub headers_json: String,
+    /// JSON text of the request body.
+    pub body_json: String,
+    /// Request body bytes.
+    pub byte_count: i64,
+}
+
+/// One stored response chunk.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct CallChunkRecord {
+    /// Sequence number.
+    pub seq: i64,
+    /// Offset from request start.
+    pub received_offset_ms: i64,
+    /// Raw chunk text.
+    pub data: String,
+    /// Chunk bytes.
+    pub byte_count: i64,
+}
+
+/// Full call, plus optional request and response payloads.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct CallDetail {
+    /// Call summary.
+    pub call: CallRecord,
+    /// Request payload, present only for detailed calls.
+    pub request: Option<CallRequestRecord>,
+    /// Response chunks in sequence.
+    pub chunks: Vec<CallChunkRecord>,
+}
+
+impl From<calls::LlmCallSummary> for CallRecord {
+    fn from(value: calls::LlmCallSummary) -> Self {
+        Self {
+            call_id: value.call_id,
+            run_id: value.run_id,
+            conversation_id: value.conversation_id,
+            provider_call_index: value.provider_call_index,
+            model_hash: value.model_hash,
+            provider_type: value.provider_type,
+            provider_url: value.provider_url,
+            request_type: value.request_type,
+            request_url: value.request_url,
+            model_id: value.model_id,
+            display_name: value.display_name,
+            reasoning_effort: value.reasoning_effort,
+            fast: value.fast,
+            status: value.status,
+            finish_reason: value.finish_reason,
+            created_at_ms: value.created_at_ms,
+            request_started_at_ms: value.request_started_at_ms,
+            response_headers_at_ms: value.response_headers_at_ms,
+            first_event_at_ms: value.first_event_at_ms,
+            first_text_at_ms: value.first_text_at_ms,
+            first_valid_response_at_ms: value.first_valid_response_at_ms,
+            finished_at_ms: value.finished_at_ms,
+            queue_ms: value.queue_ms,
+            response_headers_ms: value.response_headers_ms,
+            ttft_ms: value.ttft_ms,
+            ttfr_ms: value.ttfr_ms,
+            duration_ms: value.duration_ms,
+            input_tokens: value.input_tokens,
+            output_tokens: value.output_tokens,
+            total_tokens: value.total_tokens,
+            cache_read_tokens: value.cache_read_tokens,
+            cache_write_tokens: value.cache_write_tokens,
+            reasoning_tokens: value.reasoning_tokens,
+            message_count: value.message_count,
+            tool_count: value.tool_count,
+            request_bytes: value.request_bytes,
+            response_bytes: value.response_bytes,
+            response_chunk_count: value.response_chunk_count,
+            http_status: value.http_status,
+            error_kind: value.error_kind,
+            error_message: value.error_message,
+            detailed: value.detailed,
+            request_truncated: value.request_truncated,
+            response_truncated: value.response_truncated,
+        }
+    }
+}
+
+impl From<calls::CallStorage> for CallStorageInfo {
+    fn from(value: calls::CallStorage) -> Self {
+        Self {
+            call_count: value.call_count,
+            request_count: value.request_count,
+            chunk_count: value.chunk_count,
+        }
+    }
+}
+
+impl From<calls::CallSnapshot> for CallsSnapshot {
+    fn from(value: calls::CallSnapshot) -> Self {
+        Self {
+            calls: value.calls.into_iter().map(Into::into).collect(),
+            detailed: value.detailed,
+            storage: value.storage.into(),
+            degraded: value.degraded,
+        }
+    }
+}
+
+impl From<calls::LlmCallRequest> for CallRequestRecord {
+    fn from(value: calls::LlmCallRequest) -> Self {
+        Self {
+            headers_json: value.headers.to_string(),
+            body_json: value.body.to_string(),
+            byte_count: value.byte_count,
+        }
+    }
+}
+
+impl From<calls::LlmCallResponseChunk> for CallChunkRecord {
+    fn from(value: calls::LlmCallResponseChunk) -> Self {
+        Self {
+            seq: value.seq,
+            received_offset_ms: value.received_offset_ms,
+            data: value.data,
+            byte_count: value.byte_count,
+        }
+    }
+}
+
+/// Magpie model-call records.
+///
+/// Create one and keep it for the app's lifetime: it shares the store with the
+/// local loop.
+#[class]
+pub struct Calls {
+    store: CallStore,
+}
+
+#[class]
+impl Calls {
+    /// Opens the shared call store used by the local loop.
+    pub fn new() -> Self {
+        Self {
+            store: shared_call_store(),
+        }
+    }
+
+    /// Newest calls, the detailed-mode setting, and storage counts.
+    pub async fn snapshot(this: Instance<Self>) -> CallsSnapshot {
+        this.with(|calls| calls.store.clone())
+            .snapshot(200)
+            .await
+            .into()
+    }
+
+    /// Full call, or `null` after the record was deleted.
+    pub async fn detail(
+        this: Instance<Self>,
+        call_id: String,
+    ) -> Result<Option<CallDetail>, Error> {
+        let store = this.with(|calls| calls.store.clone());
+        let Some(call) = store.llm_call(&call_id).await? else {
+            return Ok(None);
+        };
+        let request = store.llm_call_request(&call_id).await?;
+        let chunks = store.llm_call_chunks(&call_id).await?;
+        Ok(Some(CallDetail {
+            call: call.into(),
+            request: request.map(Into::into),
+            chunks: chunks.into_iter().map(Into::into).collect(),
+        }))
+    }
+
+    /// Turns detailed recording on or off for later calls.
+    pub async fn set_detailed(this: Instance<Self>, enabled: bool) -> Result<CallsSnapshot, Error> {
+        let store = this.with(|calls| calls.store.clone());
+        store.set_detailed_logging(enabled).await?;
+        Ok(store.snapshot(200).await.into())
+    }
+
+    /// Deletes stored request and response payloads, keeping summaries.
+    pub async fn clear_details(this: Instance<Self>) -> Result<CallsSnapshot, Error> {
+        this.with(|calls| calls.store.clone())
+            .clear_details()
+            .await
+            .map(Into::into)
+    }
+
+    /// Deletes every recorded call.
+    pub async fn clear_all(this: Instance<Self>) -> Result<CallsSnapshot, Error> {
+        this.with(|calls| calls.store.clone())
+            .clear_all()
+            .await
+            .map(Into::into)
+    }
+}
+
 // A component: `<Badge label="…" onPress={…} />`. The function's doc comment
 // is the component's in TS, the fields' its props'.
 /// The props of [`Badge`].
@@ -677,8 +995,9 @@ fn start_backend(plugins: PluginHost) {
     }
     *started = true;
     let sender = watch.sender.clone();
+    let calls = shared_call_store();
     tokio::spawn(async move {
-        match Backend::start(plugins).await {
+        match Backend::start(plugins, calls).await {
             Ok(backend) => {
                 let addr = backend.addr().to_string();
                 let _ = sender.send(Some(addr));
@@ -709,7 +1028,19 @@ async fn attach_backend(
 }
 
 static PLUGIN_HOST: OnceLock<PluginHost> = OnceLock::new();
+static CALL_STORE: OnceLock<CallStore> = OnceLock::new();
 static BACKEND: OnceLock<BackendWatch> = OnceLock::new();
+
+fn shared_call_store() -> CallStore {
+    if let Some(store) = CALL_STORE.get() {
+        return store.clone();
+    }
+    let store = CallStore::managed().unwrap_or_else(|error| {
+        tracing::error!(%error, "cannot open LLM call records");
+        CallStore::at(std::env::temp_dir().join("cursor-byok-next-calls.db"))
+    });
+    CALL_STORE.get_or_init(|| store.clone()).clone()
+}
 
 /// Text helpers.
 #[module]

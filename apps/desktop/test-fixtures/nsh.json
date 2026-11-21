@@ -80,7 +80,7 @@
   "capabilities": {
     "application": true,
     "clipboard": true,
-    "host": ["cursor.*", "plugins.*"],
+    "host": ["cursor.*", "plugins.*", "calls.*"],
     "statusBar": true
   }
 }

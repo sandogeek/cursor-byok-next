@@ -5,8 +5,8 @@ use std::pin::Pin;
 use futures_util::Stream;
 
 use crate::{
-    model::{ProviderReplayState, Usage},
     Result,
+    model::{ProviderReplayState, Usage},
 };
 
 pub type ProviderStream = Pin<Box<dyn Stream<Item = Result<ModelEvent>> + Send>>;
@@ -46,4 +46,17 @@ pub enum ModelEvent {
     ProviderReplayState(ProviderReplayState),
     Usage(Usage),
     Done(FinishReason),
+}
+
+pub fn is_valid_response_event(event: &ModelEvent) -> bool {
+    matches!(
+        event,
+        ModelEvent::TextDelta(_)
+            | ModelEvent::ThinkingStart
+            | ModelEvent::ThinkingDelta(_)
+            | ModelEvent::ThinkingEnd
+            | ModelEvent::ToolCallStart { .. }
+            | ModelEvent::ToolCallArgumentsDelta { .. }
+            | ModelEvent::ToolCallEnd { .. }
+    )
 }

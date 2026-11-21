@@ -1,5 +1,5 @@
 import { host, mount, setColorScheme } from "nsh";
-import type { HarnessState, PluginFormResult, PluginSnapshot } from "cursor-byok-next/native";
+import type { CallDetail, CallsSnapshot, HarnessState, PluginFormResult, PluginSnapshot } from "cursor-byok-next/native";
 import { Cursor } from "../src/screens/Cursor";
 import { restoreLocale } from "../src/screens/Language";
 
@@ -27,6 +27,14 @@ const plugins = {
     host.call<PluginSnapshot>("plugins.refreshCatalog", { pluginId, providerId }),
 };
 
+const calls = {
+  snapshot: () => host.call<CallsSnapshot>("calls.snapshot"),
+  detail: (callId: string) => host.call<CallDetail | null>("calls.detail", { callId }),
+  setDetailed: (enabled: boolean) => host.call<CallsSnapshot>("calls.setDetailed", { enabled }),
+  clearDetails: () => host.call<CallsSnapshot>("calls.clearDetails"),
+  clearAll: () => host.call<CallsSnapshot>("calls.clearAll"),
+};
+
 void restoreLocale().then(() => {
-  mount(() => <Cursor takeover={takeover} plugins={plugins} />);
+  mount(() => <Cursor takeover={takeover} plugins={plugins} calls={calls} />);
 });

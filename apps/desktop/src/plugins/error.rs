@@ -32,4 +32,22 @@ impl From<crate::harness::Error> for Error {
     }
 }
 
+impl From<crate::Error> for Error {
+    fn from(error: crate::Error) -> Self {
+        match error {
+            crate::Error::Config(message) => Self::Config(message),
+            crate::Error::Protocol(message) => Self::Protocol(message),
+            crate::Error::Provider(message) => Self::Provider(message),
+            crate::Error::NotFound(message) => Self::NotFound(message),
+            crate::Error::Cancelled => Self::Cancelled,
+            crate::Error::Json(error) => Self::Json(error),
+            crate::Error::Io(error) => Self::Io(error),
+            crate::Error::Storage(_)
+            | crate::Error::Http(_)
+            | crate::Error::Decode(_)
+            | crate::Error::Encode(_) => Self::Storage(error.to_string()),
+        }
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;

@@ -64,7 +64,7 @@ Local serve()
 | 3 | 知识库 | 上游优先 + journal 回放 | 只本地 md CRUD | 本仓库不做 journal 同步；读失败返回空列表，不阻断 RunInference |
 | 4 | WriteGitCommitMessage | 可配本地模型生成 | 一律转发官方 | 没有 commit settings / Store |
 | 5 | 模型目录 | SQLite 内置模型 + 插件模型 merge | 只 merge Magpie | 没有内置模型表 |
-| 6 | 调用记录 | CallRecorder + SQLite | 不记录 | AGENTS.md 下一项 |
+| 6 | 调用记录 | CallRecorder + SQLite | `calls/` + Magpie 首个 HTTP 观测 | 见 `MODEL_CALLS.md`；只记录本地 Magpie，不记录官方模型 |
 | 7 | Free entitlement 缓存 | Stripe 失败时回落已确认的 free | 本地 token stub，官方 token 原样转发 | 没有 entitlement 缓存 |
 | 8 | HTTP/2 bidi / Poll / WebSocket | 有传输层重映射 | 只实现 SSE + BidiAppend | `GetServerConfig.http2_config=1` 把 Cursor 钉在 HTTP/1.1 |
 | 9 | 运行时 | Deno worker | PATH 上的 Bun | 沿用插件目录移植 |
@@ -95,7 +95,7 @@ Local serve()
 - 真 HTTP/2 bidi `RunInference`、Poll、WebSocket
 - 内置 OpenAI/Anthropic HTTP provider
 - 知识库上游回放
-- 模型调用明细
+- 官方 Cursor 追踪、外部 API 调用记录、首页用量概览（Magpie local loop 记录见 `MODEL_CALLS.md`）
 
 ## 验证
 

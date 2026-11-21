@@ -21,5 +21,11 @@ visualTest("明暗主题下均可渲染，弹窗可用 Escape 关闭", async () 
     await app.press("插件配置");
     expect(app.texts()).toContain("无法读取已保存的网关，请检查插件数据文件后重试。");
     await app.screenshot(`/tmp/cursor-byok-next-${colorScheme}-plugin-storage.png`);
+    await app.press("调用详细");
+    expect(app.texts()).toContain("GPT-5");
+    await app.screenshot(`/tmp/cursor-byok-next-${colorScheme}-calls.png`);
+    await app.press("查看 GPT-5 的详情");
+    expect(app.texts()).toContain("Call ID");
+    await app.screenshot(`/tmp/cursor-byok-next-${colorScheme}-call-details.png`);
   }
 });
