@@ -64,17 +64,6 @@ cursor-byok/server/plugins/build-in/magpie/ apps/desktop/plugins/build-in/magpie
 7. 不改 Cursor 代理白名单，不写 Cursor 文件。
 8. origin 授权只覆盖当前 worker 请求；结果、取消、超时、停止和进程退出都会回收授权。网关失败只显示宿主观察到的 HTTP 状态（如有），不透传任意 worker 错误或响应体。
 
-## Motion inventory
-
-| 状态变化 | 工具与令牌 | 减少动态效果 |
-|---|---|---|
-| 按钮 / 导航 hover | `transition-colors`，`instant` 120ms | 立即切换 |
-| 按钮按下 | `transition`，`fast` 180ms，缩放 0.97 | 不缩放 |
-| 插件页内容到达 | `createMotion` 淡入上移 8pt，`base` 240ms | 直接显示最终帧 |
-| 移除确认弹窗 | 原生 Dialog fade | 平台减少动态效果优先 |
-| 目录刷新 | 状态文案原地更新，按钮显示忙碌；失败时保留旧目录 | 无循环动画 |
-| 运行时与存储错误 | 复用状态卡片与告警文本；重试按钮沿用现有忙碌反馈 | 无新增动画 |
-
 ## 验证
 
 需有 Bun（实测 1.3.14）。`magpie_catalog_through_real_bun` 使用临时数据目录、实际 collector/worker 和两个本地假网关，覆盖添加、去重与媒体过滤、稳定 ID、HTTP 503 回退与脱敏、按资源失效、移除及损坏存储。NSH 交互测试另覆盖插件加载失败重试和存储异常。

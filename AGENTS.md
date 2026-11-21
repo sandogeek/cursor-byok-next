@@ -41,6 +41,7 @@ cursor-byok-nsh/
 上游参照：`../cursor-byok/server/src/local_app/`（同一工作区里的 `jsProject/cursor-byok`）。
 每一步移植都要在 `apps/desktop/docs/` 留下该步的对照文档：目录映射、逐行差异及原因、必须保持的不变量。
 协议字段的用途分析（谁写、谁读、取值、证据）统一放 `docs/protocol/`，不写进移植记录。
+移植记录不写 Motion inventory（状态变化 / 工具与令牌 / 减少动态效果 表格）；动效只在代码与设计清单里体现，不再单独成文。
 
 ## 分工
 

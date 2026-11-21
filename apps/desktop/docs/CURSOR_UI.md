@@ -51,21 +51,6 @@ Cursor-BYOK-Next/apps/desktop/src/            Cursor-BYOK-Next/apps/desktop/
 
 视觉沿用上游的编辑器式灰色层次：中性背景、略亮侧栏、细分隔线、紧凑导航、少量蓝色主操作。绿色只表示接管有效，橙色只表示降级 / 错误。文字同时表达状态，不靠颜色区分。
 
-## Motion inventory（写于屏幕实现前）
-
-| 状态变化 | 工具与令牌 | 减少动态效果 |
-|---|---|---|
-| 按钮 / 导航 / 开关 hover | `transition-colors`，`instant` 120ms，ease-out；仅背景洗涤 | 立即切换 |
-| 按钮 / 图标按钮按下 | `transition`，`fast` 180ms，缩放 0.97 / 0.95 | 不缩放，颜色仍反馈 |
-| 开关 checked / disabled | 轨道颜色过渡 + 滑块位移，`fast` 180ms，ease-in-out | 立即到位 |
-| 当前导航项选择 | 当前页固定，无选择移动；hover 与 selected 分离 | 无动画 |
-| 接管状态、已复制等标签变化 | 状态文字原地位换，不做位移；工作中文案为“处理中…” | 无动画 |
-| CA 门禁出现、刷新结果到达 | `createMotion`，内容淡入并上移 8pt，`base` 240ms，ease-out | 直接显示最终帧 |
-| 命令 / 停用确认弹窗 | 原生 `Dialog animation="fade"`，遮罩与内容淡入淡出 | 平台减少动态效果设置优先 |
-| 内容高度随状态变化 | 非用户布局操作，不强制布局动画 | 立即布局 |
-| 拖动、滑动、连续播放 | 本页无 | 无 |
-| 加载 | 首次状态保留门禁骨架位置，按钮显示真实忙碌文案；不做装饰 spinner | 无循环动画 |
-
 ## 必须保持的不变量
 
 1. CA 非 `ready` 时开关禁用；是否写 Cursor 文件仍由 Rust 最终把关。
@@ -92,7 +77,6 @@ Cursor-BYOK-Next/apps/desktop/src/            Cursor-BYOK-Next/apps/desktop/
 - 颜色：展示代码不含原始颜色或调色板类；明暗截图中前景、辅助文本、按钮和代码块可辨识，成功 / 警告同时有文字。
 - hover / pressed / focus：控件具有语义按钮或开关、原生 focus-visible ring、颜色过渡与按压反馈；禁用项无操作反馈。
 - 状态：缺失、未信任、就绪、无效、降级、加载、错误、复制反馈均有可见文案；未实现导航明确禁用。
-- 动效：按上方 inventory 实现，无拖动、滑动、连续播放或声音。
 
 ### 未完成验证 / 已知限制
 
