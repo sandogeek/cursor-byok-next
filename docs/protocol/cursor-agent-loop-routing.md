@@ -3,6 +3,8 @@
 本文只做**链路选择**层面的分析：一次 agent turn 由谁持有循环、local loop 需要哪些方法、两条 loop 如何互斥与降级。
 逐字段含义见 [`agent-v1.md`](agent-v1.md) / [`aiserver-v1.md`](aiserver-v1.md)；推理链路的形态与降级见 [`cursor-inference-service.md`](cursor-inference-service.md)。
 
+**fail-fast 设计草案**：下文第 5 节描述当前实现：backend loop 的 `AgentService/Run*` 一律直通官方。另立草案要求识别 **backend loop + 非官方模型** 并立即拒绝、写入调用明细，防止该模型 id 落到官方；官方模型仍直通。草案不实现 backend engine、不接管执行，也不改派 local loop，尚未实现。见 [`cursor-backend-loop-interception.md`](cursor-backend-loop-interception.md)。
+
 证据版本：Cursor `3.30.14`，commit `5f54c8173e5552412beb40702adac16275677fa0`，build `2026-11-13T06:31:38Z`
 （`/Applications/Cursor.app/Contents/Resources/app/extensions/cursor-agent-host/dist/agent-host-daemon/dist/bin/build-info.json`）。
 下文 `daemon.cjs` 指 `extensions/cursor-agent-host/dist/agent-host-daemon/dist/bin/daemon.cjs`，`workbench` 指 `out/vs/workbench/workbench.desktop.main.js`。

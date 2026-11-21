@@ -22,6 +22,7 @@ docs/protocol/
 ├── aiserver-v1.md                     aiserver.v1：服务索引，BidiAppend / InferenceStream* 字段
 ├── cursor-inference-service.md        InferenceService 服务级：方法表、传输降级、帧顺序、local loop 开关
 ├── cursor-agent-loop-routing.md       local loop 与 backend loop 的取舍：谁跑循环、何时落到哪条、降级方向
+├── cursor-backend-loop-interception.md 设计草案：backend loop 的非官方模型 fail fast 与调用明细
 └── cursor-prompt-model-metadata.md    RunInferencePromptModelMetadata 的模型身份位（is_opus55 等）
 ```
 
@@ -217,5 +218,5 @@ oneof 类型每个分支单独一行，并额外标注它在客户端侧触发�
 - 抓包与解码：`apps/desktop/docs/CURSOR_CAPTURE.md`
 - 协议提取：`apps/desktop/docs/PROTOCOL_EXTRACTOR.md`
 - local loop 只依赖的两组接口：`InferenceService/RunInferenceSSE`（读）+ `BidiService/BidiAppend`（写）；bidi 与 poll 是它们的替代路径，见 `cursor-inference-service.md`
-- `AgentService/Run*` 属于 backend loop，不接管：见 `cursor-agent-loop-routing.md`
+- `AgentService/Run*` 属于 backend loop，当前代码不接管；非官方模型 fail fast 并记录调用明细的设计草案见 [`cursor-backend-loop-interception.md`](cursor-backend-loop-interception.md)，不实现本地 backend engine
 - 形态 → 方法 → 是否需要 handler 的完整对应见上文「两条 bidi 链路分属两条 loop」；进度与不变量见 `AGENTS.md` 与 `apps/desktop/docs/CURSOR_TAKEOVER.md`
