@@ -2,6 +2,7 @@
 
 本文只做**服务级**分析：方法表、传输形态、方法之间的帧与 id 关联、本仓库差距。
 逐字段含义见 [`aiserver-v1.md`](aiserver-v1.md)；`RunInference` 里 `prompt_model_metadata` 的模型身份位见 [`cursor-prompt-model-metadata.md`](cursor-prompt-model-metadata.md)。
+传输形态术语（bidi / server-stream / unary / poll）见 [`README.md`](README.md#传输形态)；本文出现的 `http2` / `http1_sse` / `http1_poll` 是客户端 `resolveHttpTransportMode` 的**模式标识**，不是形态名。
 
 证据版本：Cursor `3.30.14`，commit `5f54c8173e5552412beb40702adac16275677fa0`，build `2026-11-13T06:31:38Z`
 （`/Applications/Cursor.app/Contents/Resources/app/extensions/cursor-agent-host/dist/agent-host-daemon/dist/bin/build-info.json`）。
@@ -33,14 +34,14 @@ service InferenceService {
 }
 ```
 
-| 方法 | 输入 | 输出 | 流类型 | proto 行 | 接管状态 |
+| 方法 | 输入 | 输出 | 传输形态 | proto 行 | 接管状态 |
 | --- | --- | --- | --- | --- | --- |
-| `Stream` | `InferenceStreamRequest` | `InferenceStreamResponse` | server streaming | 58436 | 直接推理 RPC；local loop 通过适配器折成 `invoke_model`，无需另接 |
+| `Stream` | `InferenceStreamRequest` | `InferenceStreamResponse` | server-stream | 58436 | 直接推理 RPC；local loop 通过适配器折成 `invoke_model`，无需另接 |
 | `RecordAgentFollowupClassification` | `AgentFollowupCategorizationRequest` | `Empty` | unary | 58437 | 埋点，不接管 |
 | `RecordAgentPostTurnLabeling` | `AgentPostTurnLabelingRequest` | `Empty` | unary | 58438 | 埋点，不接管 |
-| `RunInference` | `RunInferenceClientMessage` | `RunInferenceServerMessage` | bidi streaming | 58439 | http2 主通道，未接管 |
-| `RunInferenceSSE` | `BidiRequestId` | `RunInferenceServerMessage` | server streaming | 58440 | 白名单已有、无 handler |
-| `RunInferencePoll` | `BidiPollRequest` | `BidiPollResponse` | server streaming | 58441 | 未接管 |
+| `RunInference` | `RunInferenceClientMessage` | `RunInferenceServerMessage` | bidi | 58439 | http2 主通道，未接管 |
+| `RunInferenceSSE` | `BidiRequestId` | `RunInferenceServerMessage` | server-stream | 58440 | 白名单已有、无 handler |
+| `RunInferencePoll` | `BidiPollRequest` | `BidiPollResponse` | poll | 58441 | 未接管 |
 | `StartRunInferenceImagePrecaption` | `StartRunInferenceImagePrecaptionRequest` | `StartRunInferenceImagePrecaptionResponse` | unary | 58442 | 当前 bundle 无调用点，优先级最低 |
 
 `PrivateInferenceService`（`aiserver_v1.proto:58482`）在 workbench 路由表里也有一份声明（`workbench:17704`），`AdmitRun` / `ReportUsage` 属于私有部署配额，不是推理帧，不接管。
@@ -80,12 +81,15 @@ InferenceService
 
 ## 2. 传输模式与降级
 
+本节三种模式名来自客户端 bundle，注意区分两个概念：`http1_sse` / `http1_poll` 是**客户端模式标识**；它们实际使用的传输形态分别是 server-stream 与 poll，与 `text/event-stream` 无关（术语见 [`README.md`](README.md#命名陷阱runsse-里的-sse)）。
+
 `resolveHttpTransportMode`（`daemon.cjs:9216`）：
 
 ```text
-http2 未禁用           → "http2"        bidi RunInference（HTTP/2 双向流）
-http2 禁用 + SSE 未禁  → "http1_sse"    RunInferenceSSE 读 + BidiAppend 写
-http2 禁用 + SSE 禁用  → "http1_poll"   RunInferencePoll 读 + BidiAppend 写
+模式标识        读方向                              写方向
+http2 未禁用   → "http2"        bidi RunInference（HTTP/2 双向流，同一条连接）
+http2 禁用+SSE 未禁 → "http1_sse"  server-stream RunInferenceSSE  + unary BidiAppend
+http2 禁用+SSE 禁用 → "http1_poll" poll RunInferencePoll          + unary BidiAppend
 ```
 
 - `AGENT_TRANSPORT_MODES = ["http2","http1_sse","http1_poll","websocket"]`（`daemon.cjs:13`），`websocket` 另有单独门控（见 2.5）。
@@ -117,11 +121,13 @@ BidiBaseTransport.stream(service, method, …)       # daemon.cjs:9234
 ├── method    = {...companion, O: 原 method.O}     # RunInference → RunInferenceSSE
 └── outbound  → BidiSSETransport.connectForStartOfStream          # 9241
                 → transport.stream(SSE method, messages=[BidiRequestId{requestId}])
+                   └── 请求内容类型 application/connect+proto；响应按 5 字节帧壳切帧
 ```
 
-- `BIDI_ENDPOINT_TO_SSE_METHOD_MAP`（`daemon.cjs:9366`）有 `[runInference.name] → runInferenceSSE`；`BIDI_ENDPOINT_TO_POLL_METHOD_MAP` 同键，输出类型保持 `RunInferenceServerMessage`。
+- `BIDI_ENDPOINT_TO_SSE_METHOD_MAP`（`daemon.cjs:9366`）有 `[runInference.name] → runInferenceSSE`；`BIDI_ENDPOINT_TO_POLL_METHOD_MAP` 同一行、同键，输出类型保持 `RunInferenceServerMessage`。同一张表还包括 `[AgentService.methods.run.name] → AgentService.methods.runSSE`，即 agent 主链路走同样的降级。
 - 映射只在 `BidiTransportFactory.createTransport` 的 `useHttp2 === false` 分支安装（`daemon.cjs:9244-9245`）；`useHttp2` 来自 `!isHttp2Disabled`。
-- SSE 与 `BidiAppend` 用的是**同一个 request id**：SSE 的请求消息是 `BidiRequestId{requestId}`，append 帧也带 `BidiRequestId{requestId}`，而 `requestId` 就是 SSE 请求头里的 `x-request-id`。服务端正是靠它把两条 HTTP 请求拼成一条逻辑流。
+- 读流与 `BidiAppend` 用的是**同一个 request id**：读流的请求消息是 `BidiRequestId{requestId}`，append 帧也带 `BidiRequestId{requestId}`，而 `requestId` 就是读流请求头里的 `x-request-id`。服务端正是靠它把两条 HTTP 请求拼成一条逻辑流。
+- 本地 handler 的响应 `Content-Type` 可以是 `text/event-stream` 或 `application/connect+proto`，客户端把两者都当「stream + binary」；body 仍是 5 字节帧壳，不是 SSE 文本帧。细节见 [`README.md`](README.md#命名陷阱runsse-里的-sse)。
 - 具名调用点计数（`\.runInference(SSE|Poll)?\(` 与 `\.startRunInferenceImagePrecaption\(`）：
 
 | bundle | `runInference` | `runInferenceSSE` | `runInferencePoll` | `startRunInferenceImagePrecaption` |
@@ -146,11 +152,18 @@ BidiBaseTransport.stream(service, method, …)       # daemon.cjs:9234
 
 ### 2.4 local loop 的独立降级
 
-`withLocalLoopInferenceFallback`（`daemon.cjs:9363`）只包住 **local loop 的 bidi 通道**：`RunInference` 返回 `Unimplemented` / `Unavailable` 时 abort 整条流，把 `RunInference` 与 `StartRunInferenceImagePrecaption` 改回后端 `agenticComposerTransport`（`daemon.cjs:9401`），**不经过 SSE**。这是与 2.1 不同层级的降级。
+`withLocalLoopInferenceFallback`（`daemon.cjs:9363`）只包住 **local loop 的 bidi 通道**：`RunInference` 返回 `Unimplemented` / `Unavailable` 时 abort 整条流，把 `RunInference` 与 `StartRunInferenceImagePrecaption` 改回后端 `agenticComposerTransport`（`daemon.cjs:9401`），**不经过 server-stream / poll 路径**。这是与 2.1 不同层级的降级。
 
 ### 2.5 websocket
 
-`RunInference` 还有一条 WebSocket 路由 `run_inference_websocket_client`（`daemon.cjs:9226-9227`），只在 `isHttp2Disabled` 为真时创建 selection（`daemon.cjs:9400`），是否真正启用由该动态配置与 gate 决定（`daemon.cjs:9404`）。这与“http2 禁用 → SSE”的假设冲突：**接管前必须确认这个 arm 没有接管 `RunInference`**，否则请求会走 `wss://` 而绕过 HTTP 白名单。当前未确认。
+两条 bidi 主链路各有一条 WebSocket 路由，门控彼此独立：
+
+| 路由 | gate / 配置名 | 创建条件 |
+|---|---|---|
+| `AgentService/Run` | `nal_websocket_client`（配套 `agent_websocket_cold_pool_dial`、`nal_websocket_client_pool`） | 独立于 http2 开关 |
+| `RunInference` | `run_inference_websocket_client`（实验臂头 `x-cursor-run-inference-websocket-arm`） | 仅 `isHttp2Disabled` 为真时创建 selection（`daemon.cjs:9400`），是否启用由动态配置与 gate 决定（`daemon.cjs:9404`） |
+
+这与「http2 禁用 → server-stream」的假设冲突：**接管前必须确认这两个 arm 都没有接管**，否则请求会走 `wss://` 而绕过 HTTP 白名单。当前未确认。
 
 ## 3. local loop 的开关：`local_loop_inference_url`
 
@@ -229,7 +242,7 @@ agent-host daemon（数据面）
 | `daemon.cjs` | 9242-9243 | poll 的 seqno 校验与空轮询退避 |
 | `daemon.cjs` | 9244-9245 | `BidiTransportFactory`：`useHttp2` 分支与 SSE/Poll 安装 |
 | `daemon.cjs` | 9363 | `withLocalLoopInferenceFallback` 定义 |
-| `daemon.cjs` | 9366 | `BIDI_ENDPOINT_TO_SSE_METHOD_MAP` / `…_POLL_…` |
+| `daemon.cjs` | 9366 | `BIDI_ENDPOINT_TO_SSE_METHOD_MAP` / `…_POLL_…`（同一行，8 条同键；含 `AgentService/Run`） |
 | `daemon.cjs` | 9369 | `localLoopInferenceRoute` 选择 |
 | `daemon.cjs` | 9395 | 创建 local loop transport 并包 fallback |
 | `daemon.cjs` | 9400 | `RunInference` WebSocket selection（仅 http2 禁用时） |

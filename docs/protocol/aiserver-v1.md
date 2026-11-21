@@ -24,15 +24,17 @@
 
 ## local loop 三组接口
 
+术语见 [`README.md`](README.md#传输形态)。`RunInference` / `RunInferenceSSE` / `RunInferencePoll` 是同一个逻辑流在 http2 / http1+SSE / http1+poll 下的三条落地路径，选择规则见 `cursor-inference-service.md` §2。
+
 | rpc | proto 行 | 请求 | 响应 | 传输形态 | 分析状态 |
 |---|---|---|---|---|---|
 | `BidiService/BidiAppend` | 57256 | `BidiAppendRequest` | `BidiAppendResponse` | unary | 已确认（见下，链路见 `cursor-inference-service.md` §2.1） |
 | `InferenceService/RunInference` | 58439 | `stream RunInferenceClientMessage` | `stream RunInferenceServerMessage` | bidi | 已确认（`cursor-inference-service.md` §1-§2） |
-| `InferenceService/RunInferenceSSE` | 58440 | `BidiRequestId` | `stream RunInferenceServerMessage` | SSE，关联 `RunInference` 的写流 | 已确认（同上 §2.2） |
-| `InferenceService/RunInferencePoll` | 58441 | `BidiPollRequest` | `stream BidiPollResponse` | 轮询兜底 | 已确认（同上 §2.3） |
-| `InferenceService/Stream` | 58436 | `InferenceStreamRequest` | `stream InferenceStreamResponse` | 服务端流 | 已确认：直接推理 RPC；local loop 将其适配成 `RunInference.invoke_model`，见下节 |
+| `InferenceService/RunInferenceSSE` | 58440 | `BidiRequestId` | `stream RunInferenceServerMessage` | server-stream，关联 `RunInference` 的写流 | 已确认（同上 §2.2） |
+| `InferenceService/RunInferencePoll` | 58441 | `BidiPollRequest` | `stream BidiPollResponse` | poll | 已确认（同上 §2.3） |
+| `InferenceService/Stream` | 58436 | `InferenceStreamRequest` | `stream InferenceStreamResponse` | server-stream | 已确认：直接推理 RPC；local loop 将其适配成 `RunInference.invoke_model`，见下节 |
 
-`BidiAppend` 与读流是**并发**的两条 HTTP 请求，共用同一个 `x-request-id`：`BidiBaseTransport.stream()` 先起读流，同时在后台把客户端帧逐条 `BidiAppend`（`daemon.cjs:9234-9235`）。因此不能假设“先 append 再拉 SSE”。`BidiRequestId` 的生成与生命周期见 `cursor-inference-service.md` §2.1。
+`BidiAppend` 与读流是**并发**的两条 HTTP 请求，共用同一个 `x-request-id`：`BidiBaseTransport.stream()` 先起读流，同时在后台把客户端帧逐条 `BidiAppend`（`daemon.cjs:9234-9235`）。因此不能假设「先 append 再拉读流」。`BidiRequestId` 的生成与生命周期见 `cursor-inference-service.md` §2.1。
 
 ## 节内格式
 
@@ -151,7 +153,7 @@ ProtoPromptExecutor.stream                         daemon.cjs:25534-25535
 2. **复用一套 `InferenceStreamRequest → provider` 投影与 `provider event → InferenceStreamResponse` 编码器**；`RunInference` 只额外负责 run、invocation id、cancel/end 与能力协商。
 3. `tools.parameters` 直接就是 JSON Schema；上游 `cursor-byok` 当前 `project.rs` 对外包 `jsonSchema` 的兼容输入仍可取内层，但不应把它误当本机唯一合法形状。
 4. 不广告 `accepts_delta_invocations`、`request_compression`、`prompt_cache_refill` 时，可只处理未压缩全量请求；仍需实现每次 invocation 的 `invocation_end`，包括无错误结束。
-5. `/Stream` 的独立 ConnectRPC server-streaming handler 当前不是最小接管项；若未来启用，应复用同一编码器，而不是返回 `RunInferenceServerMessage` 或在 `RunInferenceSSE` 上模拟它。
+5. `/Stream` 的独立 server-stream handler 当前不是最小接管项；若未来启用，应复用同一编码器，而不是返回 `RunInferenceServerMessage` 或在 `RunInferenceSSE` 上模拟它。
 
 ### `InferenceService/RunInference`
 

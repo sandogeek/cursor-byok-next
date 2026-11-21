@@ -12,13 +12,20 @@
 
 ## AgentService 方法清单
 
-传输形态栏是本目录首先要确认的事情：同一消息在 unary / SSE / bidi 三种形态下字段语义不同。
+传输形态栏是本目录首先要确认的事情：同一消息在不同形态下字段语义不同，术语见 [`README.md`](README.md#传输形态)。
+
+本包有**两条并列的 bidi 主链路**，各自都有 server-stream / poll 伴生方法，由客户端按 `http2` 可用性重映射（映射表见 `README.md#最小接管集合与落点`）：
+
+```text
+AgentService/Run       （bidi）  ──► RunSSE（server-stream） / RunPoll（poll）
+AgentService/RunSSE 只吃 BidiRequestId；写方向在 http1 下折算成 BidiService/BidiAppend
+```
 
 | rpc | proto 行 | 请求 | 响应 | 传输形态 | 分析状态 |
 |---|---|---|---|---|---|
 | `Run` | 12005 | `stream AgentClientMessage` | `stream AgentServerMessage` | bidi | 待分析 |
-| `RunSSE` | 12006 | `BidiRequestId` | `stream AgentServerMessage` | SSE，靠 `BidiRequestId` 关联 `Run` | 待分析（local loop 主路径） |
-| `RunPoll` | 12007 | `BidiPollRequest` | `stream BidiPollResponse` | 轮询兜底 | 待分析 |
+| `RunSSE` | 12006 | `BidiRequestId` | `stream AgentServerMessage` | server-stream，靠 `BidiRequestId` 关联 `Run` / `BidiAppend` | 待分析（local loop 主路径） |
+| `RunPoll` | 12007 | `BidiPollRequest` | `stream BidiPollResponse` | poll | 待分析 |
 | `NameAgent` | 12008 | `NameAgentRequest` | `NameAgentResponse` | unary | 待分析 |
 | `UpdateConversationMetadata` | 12009 | `UpdateConversationMetadataRequest` | `UpdateConversationMetadataResponse` | unary | 待分析 |
 | `CreateTranscriptOverview` | 12010 | `CreateTranscriptOverviewRequest` | `CreateTranscriptOverviewResponse` | unary | 待分析 |
@@ -35,7 +42,7 @@
 | `GetPromptContextUsage` | 12021 | `GetPromptContextUsageRequest` | `GetPromptContextUsageResponse` | unary | 待分析 |
 | `ListLocalSubscriptionTools` | 12022 | `ListLocalSubscriptionToolsRequest` | `ListLocalSubscriptionToolsResponse` | unary | 待分析 |
 | `CallLocalSubscriptionTool` | 12023 | `CallLocalSubscriptionToolRequest` | `CallLocalSubscriptionToolResponse` | unary | 待分析 |
-| `StreamLocalAgentMailbox` | 12024 | `StreamLocalAgentMailboxRequest` | `stream StreamLocalAgentMailboxResponse` | 服务端流 | 待分析 |
+| `StreamLocalAgentMailbox` | 12024 | `StreamLocalAgentMailboxRequest` | `stream StreamLocalAgentMailboxResponse` | server-stream | 待分析 |
 
 ## 方法形状（待逐字段展开）
 
@@ -45,7 +52,9 @@
 
 ### `AgentService/RunSSE`
 
-传输：`RunSSE` 只吃一个 `BidiRequestId`，所以必然先由 `Run`（bidi）或 `aiserver.v1.BidiService/BidiAppend`（unary）建立一条 bidi 流；两条路径的先后与 id 复用规则待抓包确认。
+传输：server-stream。响应体是带 5 字节帧壳的 Connect 帧序列，每帧一条 `AgentServerMessage`（帧壳见 [`README.md`](README.md#帧壳)）。
+
+`RunSSE` 只吃一个 `BidiRequestId`，所以必然先由 `Run`（bidi）或 `aiserver.v1.BidiService/BidiAppend`（unary）建立一条 bidi 流；两条路径的先后与 id 复用规则待抓包确认。
 
 请求 `BidiRequestId`（proto 2578，`aiserver.v1` 同形）：
 
