@@ -4,6 +4,7 @@
   "version": "1.0.0",
   "build": 1,
   "rust": ".",
+  "locales": ["zh-CN", "en-US"],
   "capabilities": {
     "application": true,
     "statusBar": true,

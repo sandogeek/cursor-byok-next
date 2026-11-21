@@ -1,0 +1,116 @@
+common:
+  cancel: 取消
+  close: 关闭
+  retry: 重试
+  refresh: 刷新
+  remove: 移除
+  loading: 处理中…
+
+nav:
+  overview: 数据概览
+  calls: 调用详细
+  modelConfig: 模型配置
+  settings: 设置
+  cursor: Cursor
+  plugins: 插件配置
+  systemSettings: 系统设置
+  tutorial: 使用教程
+
+app:
+  tagline: 本地接管 · NSH
+
+language:
+  label: 界面语言
+  system: 跟随系统
+
+takeover:
+  status:
+    enabled: 已接管
+    disabled: 未接管
+    degraded: 状态异常
+  switch:
+    enable: 开启接管 Cursor
+    disable: 关闭接管 Cursor
+  error:
+    status: 暂时无法读取接管状态
+    copy: "复制失败：%{message}"
+  ca:
+    missing:
+      title: 需要先初始化本地 CA
+      body: CA 仅保存在本机，用于安全解析 Cursor 的 HTTPS 请求。
+    initialize: 初始化 CA
+    untrusted:
+      title: 需要在系统中信任本地 CA
+      body: 复制授权命令，在终端中执行并输入密码，完成后刷新状态。
+    install: 安装本地 CA…
+    refresh: 刷新状态
+    invalid:
+      title: 本地 CA 无效
+      body: 证书或密钥不完整、不匹配或已过期。重新初始化前请检查本地 CA 文件。
+    recheck: 重新检查
+  ready:
+    enabled: Cursor 接管已生效
+    disabled: 本地 CA 已就绪
+    body:
+      enabled: Cursor 正在通过本地代理连接。模型配置将在后续接入。
+      disabled: 开启右上角接管开关后，Cursor 才会使用本地代理。
+      degraded: 本地代理与 Cursor 配置不一致，请刷新状态或重新开启接管。
+  dialog:
+    disable:
+      title: 关闭接管 Cursor？
+      body: 关闭后将移除本应用写入的 Cursor 本地代理配置，其他代理设置不受影响。
+      confirm: 关闭接管
+    ca:
+      title: 安装本地 CA
+      body: 证书授权需要管理员密码。应用只复制命令，不会替你执行。
+      confirm: 复制命令
+      hint: 将下方命令粘贴到终端执行，然后回到此页刷新状态。
+      copied: 命令已复制
+
+plugins:
+  error:
+    status: 暂时无法读取插件状态
+  loading: 正在读取插件状态…
+  runtime:
+    failed: 无法加载 Magpie 插件
+    missingBun: 需要 Bun 才能加载 Magpie 插件
+    retry: 请重试加载内置插件。
+    installBun: 把 bun 放到 PATH 后刷新。
+    refresh: 刷新状态
+  magpie:
+    description: 从 Magpie 网关读取实时模型目录。
+  status:
+    degraded: 状态异常
+    configured: 已配置
+    unconfigured: 未配置
+  action:
+    save: 保存连接
+    refreshCatalog: 刷新目录
+  gateways:
+    title: 网关
+    retry: 重试读取网关
+    empty: 还没有 Magpie 网关。填写地址和 API 密钥后保存。
+  gateway:
+    ready: 可用
+    cooling: 冷却中
+    invalid: 无效
+  models:
+    title: 模型目录
+    count: "%{count} 个模型 · %{note}"
+    stale: 部分目录可能不是最新
+    local: 仅本页可见
+    empty: 连接网关并刷新后，Magpie 模型会出现在这里。Cursor 选择器暂不接入。
+  form:
+    required: 请填写%{field}
+  dialog:
+    remove:
+      title: 移除 Magpie 网关？
+      body: 只会删除本应用保存的网关凭证和目录缓存，不影响 Cursor 官方配置。
+
+plugin:
+  error:
+    bun_missing: 未在 PATH 中找到 Bun。
+    builtin_unavailable: 无法加载内置 Magpie 插件，请检查 Bun 是否可用后重试。
+    storage_unreadable: 无法读取已保存的网关，请检查插件数据文件后重试。
+    storage_save_failed: 无法保存网关，请检查插件数据目录。
+    storage_remove_failed: 无法移除网关，请检查插件数据目录。

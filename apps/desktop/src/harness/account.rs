@@ -130,6 +130,13 @@ pub fn is_local_cursor_authorization(authorization: &str) -> bool {
         .is_some_and(is_local_cursor_token)
 }
 
+pub fn request_uses_local_cursor_token(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_local_cursor_authorization)
+}
+
 fn is_local_cursor_token(token: &str) -> bool {
     let mut segments = token.split('.');
     let Some(header) = segments.next() else {

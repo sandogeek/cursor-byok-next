@@ -75,6 +75,7 @@ function options(initial: HarnessState, calls: string[] = [], plugins: PluginSna
     width: 1100,
     height: 720,
     platform: "macos" as const,
+    locale: "zh-CN" as const,
     host: {
       handlers: {
         "cursor.status": () => current,
@@ -197,4 +198,19 @@ test("网关数据读取失败时不显示首次配置的空状态", async () =>
   expect(app.texts()).toContain("无法读取已保存的网关");
   expect(app.texts()).not.toContain("还没有 Magpie 网关。填写地址和 API 密钥后保存。");
   expect(app.enabled("保存连接")).toBe(false);
+});
+
+test("界面语言跟随设备，切换后立即翻译并记住选择", async () => {
+  const app = await open("./test-fixtures/App.tsx", options(missing));
+  expect(app.texts()).toContain("数据概览");
+  await app.press("界面语言");
+  await app.press("English");
+  expect(app.texts()).toContain("Overview");
+  expect(app.texts()).not.toContain("数据概览");
+  expect(app.texts()).toContain("Initialize the local CA first");
+  expect(app.storage()["cursor-byok-next:locale"]).toBe("en-US");
+  await app.press("Language");
+  await app.press("中文");
+  expect(app.texts()).toContain("数据概览");
+  expect(app.storage()["cursor-byok-next:locale"]).toBe("zh-CN");
 });

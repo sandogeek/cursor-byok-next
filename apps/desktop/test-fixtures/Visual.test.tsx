@@ -9,6 +9,7 @@ visualTest("明暗主题下均可渲染，弹窗可用 Escape 关闭", async () 
       width: 1100,
       height: 720,
       platform: "macos",
+      locale: "zh-CN" as const,
       host: { params: { colorScheme } },
     });
     await app.screenshot(`/tmp/cursor-byok-next-${colorScheme}.png`);

@@ -37,7 +37,9 @@ use self::{
     state::{HarnessState, HarnessStateStore},
 };
 
-pub use self::account::{is_local_cursor_authorization, local_token};
+pub use self::account::{
+    is_local_cursor_authorization, local_token, request_uses_local_cursor_token,
+};
 pub use self::process::terminate_cursor as quit_cursor;
 pub use self::proxy::{Routing as ProxyRouting, UPSTREAM_URL_HEADER, is_cursor_host};
 

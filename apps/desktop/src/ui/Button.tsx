@@ -1,4 +1,5 @@
 import { Text, type JSX } from "nsh";
+import { t } from "nsh/i18n";
 import { Button as BaseButton } from "nsh/base";
 import { colorMotion, controlMotion } from "./motion";
 
@@ -26,7 +27,7 @@ export function Button(props: ButtonProps) {
       onPress={props.onPress}
       class={`min-h-8 flex-row items-center justify-center gap-2 rounded-(--radius) px-3 text-sm ${controlMotion} active:scale-[0.97] focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-45 disabled:active:scale-100 ${variant() === "primary" ? "bg-primary text-primary-foreground hover:bg-primary-hover active:bg-primary-active" : variant() === "ghost" ? "bg-transparent text-muted-foreground hover:bg-muted hover:text-foreground active:bg-accent" : "border border-border bg-card text-card-foreground hover:bg-muted active:bg-secondary"}`}
     >
-      {props.children ?? <Text class={props.size === "sm" ? "text-xs" : "text-sm"}>{props.loading ? "处理中…" : props.label}</Text>}
+      {props.children ?? <Text class={props.size === "sm" ? "text-xs" : "text-sm"}>{props.loading ? t("common.loading") : props.label}</Text>}
     </BaseButton>
   );
 }

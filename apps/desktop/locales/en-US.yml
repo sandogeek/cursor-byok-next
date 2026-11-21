@@ -1,0 +1,116 @@
+common:
+  cancel: Cancel
+  close: Close
+  retry: Retry
+  refresh: Refresh
+  remove: Remove
+  loading: Working…
+
+nav:
+  overview: Overview
+  calls: Calls
+  modelConfig: Models
+  settings: Settings
+  cursor: Cursor
+  plugins: Plugins
+  systemSettings: System settings
+  tutorial: Guide
+
+app:
+  tagline: Local takeover · NSH
+
+language:
+  label: Language
+  system: Follow system
+
+takeover:
+  status:
+    enabled: Taking over
+    disabled: Not taking over
+    degraded: Degraded
+  switch:
+    enable: Take over Cursor
+    disable: Stop taking over Cursor
+  error:
+    status: Could not read takeover state
+    copy: "Copy failed: %{message}"
+  ca:
+    missing:
+      title: Initialize the local CA first
+      body: The CA stays on this Mac and lets the app read Cursor's HTTPS traffic safely.
+    initialize: Initialize CA
+    untrusted:
+      title: Trust the local CA in the system
+      body: Copy the command, run it in a terminal, enter your password, then refresh.
+    install: Install local CA…
+    refresh: Refresh
+    invalid:
+      title: The local CA is invalid
+      body: The certificate or key is incomplete, mismatched, or expired. Check the CA files before initializing again.
+    recheck: Check again
+  ready:
+    enabled: Cursor takeover is active
+    disabled: The local CA is ready
+    body:
+      enabled: Cursor is connecting through the local proxy. Model settings come next.
+      disabled: Turn on takeover in the top right before Cursor uses the local proxy.
+      degraded: The proxy and Cursor's settings disagree. Refresh, or turn takeover off and on again.
+  dialog:
+    disable:
+      title: Stop taking over Cursor?
+      body: This removes the proxy settings this app wrote. Other proxy settings stay as they are.
+      confirm: Stop takeover
+    ca:
+      title: Install the local CA
+      body: Trusting the certificate needs an administrator password. The app only copies the command; it never runs it.
+      confirm: Copy command
+      hint: Paste the command into a terminal, then come back and refresh this page.
+      copied: Command copied
+
+plugins:
+  error:
+    status: Could not read plugin state
+  loading: Reading plugin state…
+  runtime:
+    failed: Magpie could not load
+    missingBun: Bun is required to load Magpie
+    retry: Try loading the built-in plugin again.
+    installBun: Put bun on PATH, then refresh.
+    refresh: Refresh
+  magpie:
+    description: Live model catalog from a Magpie gateway.
+  status:
+    degraded: Degraded
+    configured: Configured
+    unconfigured: Not configured
+  action:
+    save: Save connection
+    refreshCatalog: Refresh catalog
+  gateways:
+    title: Gateways
+    retry: Retry reading gateways
+    empty: No Magpie gateway yet. Fill in the address and API key, then save.
+  gateway:
+    ready: Ready
+    cooling: Cooling down
+    invalid: Invalid
+  models:
+    title: Model catalog
+    count: "%{count} models · %{note}"
+    stale: some entries may be outdated
+    local: shown on this page only
+    empty: Models appear here once a gateway is connected and refreshed. Cursor's picker does not use them yet.
+  form:
+    required: "%{field} is required"
+  dialog:
+    remove:
+      title: Remove the Magpie gateway?
+      body: Removes only the gateway credentials and catalog cache this app saved. Cursor's own settings stay as they are.
+
+plugin:
+  error:
+    bun_missing: Bun is not on PATH.
+    builtin_unavailable: Magpie could not load. Check that Bun is available and try again.
+    storage_unreadable: Could not read saved gateways. Check the plugin data file and try again.
+    storage_save_failed: Could not save the gateway. Check the plugin data directory.
+    storage_remove_failed: Could not remove the gateway. Check the plugin data directory.

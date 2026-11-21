@@ -6,14 +6,30 @@
 //! willing to talk to this app (proxy, CA, local account). The screens that
 //! drive it come next; this file is the typed boundary they will call.
 
+pub mod backend;
+pub mod error;
 pub mod harness;
+pub mod loop_service;
+pub mod model;
 pub mod plugins;
+pub mod protocol;
+pub mod provider;
 
-use std::sync::Arc;
+pub use error::{Error, Result};
+
+use std::sync::{Arc, Mutex, OnceLock};
 
 use nsh_base::theme;
-use nsh_core::prelude::*;
+#[allow(unused_imports)]
+use nsh_core::{
+    JsonValue,
+    element::{JsHost, JsIn, JsOwned, JsValue, PropError, TsTypes},
+    i18n::Translations,
+    prelude::*,
+};
+use tokio::sync::watch;
 
+use self::backend::Backend;
 use self::harness::{
     CaState as HarnessCa, CursorHarness, Error as HarnessError, HarnessPaths, HarnessStatus,
     IntegrationState as HarnessIntegration,
@@ -123,6 +139,7 @@ pub struct HarnessState {
 #[class]
 pub struct Harness {
     inner: Arc<CursorHarness>,
+    backend: watch::Receiver<Option<String>>,
 }
 
 // A class: `new Harness()`, `await harness.status()`, `await harness.setEnabled(true)`.
@@ -131,18 +148,20 @@ impl Harness {
     /// Restores the proxy port and the on/off intent of the previous run.
     pub fn new() -> Result<Self, HarnessError> {
         let paths = HarnessPaths::managed(DEFAULT_PROXY_PORT)?;
+        if let Ok(host) = shared_plugin_host() {
+            start_backend(host);
+        }
         Ok(Self {
             inner: Arc::new(CursorHarness::new(paths)),
+            backend: backend_addr(),
         })
     }
 
     /// The current state. Also heals a takeover whose proxy went away.
     pub async fn status(this: Instance<Self>) -> Result<HarnessState, HarnessError> {
-        Ok(this
-            .with(|harness| harness.inner.clone())
-            .status()
-            .await
-            .into())
+        let (harness, mut backend) = this.with(|harness| (harness.inner.clone(), harness.backend.clone()));
+        attach_backend(&harness, &mut backend).await?;
+        Ok(harness.status().await.into())
     }
 
     /// Turns takeover on or off. Enabling fails, without touching Cursor, when
@@ -151,10 +170,9 @@ impl Harness {
         this: Instance<Self>,
         enabled: bool,
     ) -> Result<HarnessState, HarnessError> {
-        this.with(|harness| harness.inner.clone())
-            .set_enabled(enabled)
-            .await
-            .map(Into::into)
+        let (harness, mut backend) = this.with(|harness| (harness.inner.clone(), harness.backend.clone()));
+        attach_backend(&harness, &mut backend).await?;
+        harness.set_enabled(enabled).await.map(Into::into)
     }
 
     /// Connects the local service after it starts listening. Existing takeover
@@ -196,20 +214,31 @@ impl Harness {
     }
 }
 
-fn localized_text(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Object(map) => map
-            .get("zh-CN")
-            .or_else(|| map.get("en-US"))
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| {
-                map.values()
-                    .find_map(|entry| entry.as_str().filter(|text| !text.trim().is_empty()))
-            })
-            .unwrap_or_default()
-            .to_owned(),
-        _ => String::new(),
+/// Text a plugin localizes: one string for every language, or the string per
+/// language tag (`{ "en-US": "Gateways", "zh-CN": "网关" }`). The screen picks
+/// the tag the app shows; Rust leaves the map as the plugin wrote it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalizedText(pub JsonValue);
+
+impl From<JsonValue> for LocalizedText {
+    fn from(value: JsonValue) -> Self {
+        Self(value)
+    }
+}
+
+impl JsValue for LocalizedText {
+    fn ts_type(types: &mut TsTypes) -> String {
+        types.declare("LocalizedText", |_| {
+            "/** A string, or that string per language tag (`{ \"en-US\": \"Gateways\", \"zh-CN\": \"网关\" }`). */\nexport type LocalizedText = string | { [locale: string]: string };".to_owned()
+        })
+    }
+
+    fn from_js(value: JsIn<'_>) -> Result<Self, PropError> {
+        JsonValue::from_js(value).map(Self)
+    }
+
+    fn to_js<'a>(&self, host: &'a dyn JsHost) -> Result<JsOwned<'a>, PropError> {
+        self.0.to_js(host)
     }
 }
 
@@ -261,8 +290,8 @@ impl From<HostProvider> for PluginProvider {
         Self {
             id: value.id,
             plugin_id: value.plugin_id,
-            display_name: localized_text(&value.display_name),
-            description: localized_text(&value.description),
+            display_name: LocalizedText(value.display_name),
+            description: LocalizedText(value.description),
             provider_type: value.provider_type,
             resource_type: value.resource_type,
             catalog: value.catalog,
@@ -292,7 +321,7 @@ impl From<HostResource> for PluginResource {
     fn from(value: HostResource) -> Self {
         Self {
             resource_type: value.resource_type,
-            display_name: localized_text(&value.display_name),
+            display_name: LocalizedText(value.display_name),
             storage_error: value.storage_error,
             add: value.add.into_iter().map(Into::into).collect(),
             resources: value.resources.into_iter().map(Into::into).collect(),
@@ -304,7 +333,7 @@ impl From<plugins::AddMethodDefinition> for PluginAddMethod {
     fn from(value: plugins::AddMethodDefinition) -> Self {
         Self {
             id: value.id,
-            display_name: localized_text(&value.display_name),
+            display_name: LocalizedText(value.display_name),
             fields: value.fields.into_iter().map(Into::into).collect(),
         }
     }
@@ -314,10 +343,10 @@ impl From<plugins::FormFieldDefinition> for PluginFormField {
     fn from(value: plugins::FormFieldDefinition) -> Self {
         Self {
             id: value.id,
-            label: localized_text(&value.label),
+            label: LocalizedText(value.label),
             field_type: value.field_type,
             required: value.required,
-            placeholder: localized_text(&value.placeholder),
+            placeholder: LocalizedText(value.placeholder),
         }
     }
 }
@@ -329,7 +358,7 @@ impl From<HostResourceView> for PluginResourceView {
             status: resource_status(&value.state),
             message: resource_message(&value.state),
             display_name: value.display_name,
-            description: localized_text(&value.description),
+            description: LocalizedText(value.description),
         }
     }
 }
@@ -386,9 +415,9 @@ pub struct PluginProvider {
     /// Owning plugin id.
     pub plugin_id: String,
     /// Localized display name.
-    pub display_name: String,
+    pub display_name: LocalizedText,
     /// Localized description.
-    pub description: String,
+    pub description: LocalizedText,
     /// Product identity, such as `"magpie"`.
     pub provider_type: String,
     /// Resource type this provider consumes, when any.
@@ -430,7 +459,7 @@ pub struct PluginResource {
     /// Resource type, such as `"gateway"`.
     pub resource_type: String,
     /// Localized type name.
-    pub display_name: String,
+    pub display_name: LocalizedText,
     /// Form methods that add a resource.
     pub add: Vec<PluginAddMethod>,
     /// Why saved resources could not be read, when storage is degraded.
@@ -445,7 +474,7 @@ pub struct PluginAddMethod {
     /// Method id.
     pub id: String,
     /// Localized method name.
-    pub display_name: String,
+    pub display_name: LocalizedText,
     /// Fields the host draws.
     pub fields: Vec<PluginFormField>,
 }
@@ -456,13 +485,13 @@ pub struct PluginFormField {
     /// Field id submitted to the plugin.
     pub id: String,
     /// Localized label.
-    pub label: String,
+    pub label: LocalizedText,
     /// `"url"`, `"secret"` or `"text"`.
     pub field_type: String,
     /// Whether the field is required.
     pub required: bool,
     /// Localized placeholder.
-    pub placeholder: String,
+    pub placeholder: LocalizedText,
 }
 
 /// Whether a saved resource is usable.
@@ -485,7 +514,7 @@ pub struct PluginResourceView {
     /// User-facing name, such as a gateway origin.
     pub display_name: String,
     /// Optional description.
-    pub description: String,
+    pub description: LocalizedText,
 }
 
 /// Result of submitting a plugin form.
@@ -520,8 +549,10 @@ pub struct Plugins {
 impl Plugins {
     /// Restores installed plugins and looks for Bun on PATH.
     pub fn new() -> Result<Self, plugins::Error> {
+        let inner = shared_plugin_host()?;
+        start_backend(inner.clone());
         Ok(Self {
-            inner: Arc::new(PluginHost::managed()?),
+            inner: Arc::new(inner),
         })
     }
 
@@ -610,6 +641,75 @@ pub fn Badge(props: BadgeProps, cx: Scope<BadgeEvent>) -> impl IntoElement {
         .on_press(move || cx.emit(BadgeEvent::Press))
         .child(text(props.label).text_color(move || theme().primary_foreground))
 }
+
+fn shared_plugin_host() -> std::result::Result<PluginHost, plugins::Error> {
+    if let Some(host) = PLUGIN_HOST.get() {
+        return Ok(host.clone());
+    }
+    let host = PluginHost::managed()?;
+    Ok(PLUGIN_HOST.get_or_init(|| host.clone()).clone())
+}
+
+struct BackendWatch {
+    sender: watch::Sender<Option<String>>,
+    started: Mutex<bool>,
+}
+
+fn backend_watch() -> &'static BackendWatch {
+    BACKEND.get_or_init(|| {
+        let (sender, _) = watch::channel(None);
+        BackendWatch {
+            sender,
+            started: Mutex::new(false),
+        }
+    })
+}
+
+fn backend_addr() -> watch::Receiver<Option<String>> {
+    backend_watch().sender.subscribe()
+}
+
+fn start_backend(plugins: PluginHost) {
+    let watch = backend_watch();
+    let mut started = watch.started.lock().expect("backend start lock");
+    if *started {
+        return;
+    }
+    *started = true;
+    let sender = watch.sender.clone();
+    tokio::spawn(async move {
+        match Backend::start(plugins).await {
+            Ok(backend) => {
+                let addr = backend.addr().to_string();
+                let _ = sender.send(Some(addr));
+                std::mem::forget(backend);
+            }
+            Err(error) => {
+                tracing::error!(%error, "cannot start the local loop backend");
+            }
+        }
+    });
+}
+
+async fn attach_backend(
+    harness: &CursorHarness,
+    backend: &mut watch::Receiver<Option<String>>,
+) -> std::result::Result<(), HarnessError> {
+    if backend.borrow().is_none() {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), backend.changed()).await;
+    }
+    if let Some(addr) = backend.borrow().clone() {
+        harness
+            .set_backend_addr(addr.parse().map_err(|error| {
+                HarnessError::Config(format!("invalid local backend address: {error}"))
+            })?)
+            .await?;
+    }
+    Ok(())
+}
+
+static PLUGIN_HOST: OnceLock<PluginHost> = OnceLock::new();
+static BACKEND: OnceLock<BackendWatch> = OnceLock::new();
 
 /// Text helpers.
 #[module]

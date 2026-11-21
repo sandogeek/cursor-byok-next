@@ -19,21 +19,23 @@ cursor-byok-nsh/
 │   └── cursor-capture/            # Cursor API 抓包调试器（Rust 逻辑 + 原版 web）
 └── apps/desktop/                  # nsh mixed 应用：App.tsx + 同目录 Rust crate
     ├── nsh.json                   # "rust": "."，无 "root" ⇒ App.tsx 是入口
-    ├── App.tsx                    # 入口（目前仍是模板）
+    ├── App.tsx                    # 入口：先 restoreLocale() 再 mount
     ├── App.test.tsx               # nsh test
     ├── Cargo.toml                 # crate nsh-app-cursor-byok-next
+    ├── locales/                   # zh-CN.yml / en-US.yml（nsh/i18n 的文案源）
     ├── docs/
     │   ├── CURSOR_TAKEOVER.md     # 接管（local_app）移植记录
     │   ├── PROTOCOL_EXTRACTOR.md  # 协议提取器移植记录
     │   ├── CURSOR_CAPTURE.md      # 协议调试器移植记录
     │   ├── CURSOR_UI.md           # 接管页 UI
+    │   ├── I18N.md                # 界面语言（nsh/i18n）
     │   └── PLUGIN_CATALOG.md      # Magpie 插件目录
     └── src/
         ├── lib.rs                 # #[native_module("cursor-byok-next/native")]：Harness + Plugins
         ├── harness/               # 上游 server/src/local_app 的移植
         ├── plugins/               # 插件宿主、Bun worker、Magpie 目录
-        ├── screens/
-        └── ui/
+        ├── screens/               # Cursor / Plugins / Language
+        └── ui/                    # 样式控件 + localized()
 ```
 
 上游参照：`../cursor-byok/server/src/local_app/`（同一工作区里的 `jsProject/cursor-byok`）。
@@ -64,6 +66,7 @@ cursor-byok-nsh/
 7. **状态只读接口不返回错误。** 自愈失败记日志，让 UI 显示 `degraded`，不要抛错。
 8. **路径与端口发生变化时必须持久化**，否则 Cursor 的 `http.proxy` 会指向死端口。
 9. 不提交任何真实密钥；测试一律指向临时目录，不读 `~/Library/Application Support/Cursor`。
+10. **用户可见文案只放 `locales/`**，界面与 Rust 都走 `t()` / `t!`；插件自带的 locale map 由 `localized()` 运行时解析，不在 Rust 边界提前压平。
 
 ## 与上游不同时的处理
 
@@ -118,7 +121,8 @@ nsh package --target macos
 - [x] 协议调试器：`crates/cursor-capture/`（见 `apps/desktop/docs/CURSOR_CAPTURE.md`）
 - [x] 接管页 UI（`src/ui/` + `src/screens/Cursor.tsx`）
 - [x] Magpie 插件目录（`src/plugins/` + `src/screens/Plugins.tsx`，见 `apps/desktop/docs/PLUGIN_CATALOG.md`）
+- [x] 界面语言（`locales/` + `nsh/i18n`，见 `apps/desktop/docs/I18N.md`）
 - [ ] 协议字段分析（`docs/protocol/`）
-- [ ] local loop 服务端接入（`set_backend_addr`）：只做 `InferenceService/RunInferenceSSE` + `BidiService/BidiAppend`；`AgentService/Run*` 属 backend loop，不接管（见 `docs/protocol/cursor-agent-loop-routing.md`）
-- [ ] 把 Magpie 模型广告给 Cursor picker
+- [x] local loop 服务端接入（`set_backend_addr`）：只做 `InferenceService/RunInferenceSSE` + `BidiService/BidiAppend`；`AgentService/Run*` 属 backend loop，不接管（见 `docs/protocol/cursor-agent-loop-routing.md`、`apps/desktop/docs/LOCAL_LOOP.md`）
+- [x] 把 Magpie 模型广告给 Cursor picker
 - [ ] 模型调用 / 调用记录

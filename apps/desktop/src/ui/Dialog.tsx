@@ -1,4 +1,5 @@
 import { Text, View, type JSX } from "nsh";
+import { t } from "nsh/i18n";
 import { Dialog as BaseDialog } from "nsh/base";
 import { Button } from "./Button";
 
@@ -31,7 +32,7 @@ export function Dialog(props: {
       </View>
       {props.children}
       <View class="flex-row justify-end gap-2">
-        <Button label={props.cancelLabel ?? "取消"} onPress={props.onCancel} />
+        <Button label={props.cancelLabel ?? t("common.cancel")} onPress={props.onCancel} />
         <Button label={props.confirmLabel} variant="primary" onPress={props.onConfirm} />
       </View>
     </BaseDialog>

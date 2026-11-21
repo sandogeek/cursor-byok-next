@@ -1,6 +1,7 @@
 import { host, mount, setColorScheme } from "nsh";
 import type { HarnessState, PluginFormResult, PluginSnapshot } from "cursor-byok-next/native";
 import { Cursor } from "../src/screens/Cursor";
+import { restoreLocale } from "../src/screens/Language";
 
 if (host.params.colorScheme === "light" || host.params.colorScheme === "dark") {
   setColorScheme(host.params.colorScheme);
@@ -26,4 +27,6 @@ const plugins = {
     host.call<PluginSnapshot>("plugins.refreshCatalog", { pluginId, providerId }),
 };
 
-mount(() => <Cursor takeover={takeover} plugins={plugins} />);
+void restoreLocale().then(() => {
+  mount(() => <Cursor takeover={takeover} plugins={plugins} />);
+});

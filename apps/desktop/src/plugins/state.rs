@@ -20,6 +20,16 @@ pub enum ResourceState {
     },
 }
 
+impl ResourceState {
+    pub fn is_ready(&self, now_ms: i64) -> bool {
+        match self {
+            Self::Ready => true,
+            Self::Cooling { retry_at_ms, .. } => retry_at_ms.is_some_and(|at| at <= now_ms),
+            Self::Invalid { .. } => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ResourceRecord {
     pub id: String,
@@ -65,6 +75,15 @@ fn state_json(state: &ResourceState) -> serde_json::Value {
 pub struct ResourceDraft {
     pub key: String,
     pub private_data: serde_json::Value,
+    #[serde(default)]
+    pub state: Option<ResourceStateInput>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourcePatch {
+    #[serde(default)]
+    pub private_data: Option<serde_json::Value>,
     #[serde(default)]
     pub state: Option<ResourceStateInput>,
 }
@@ -156,6 +175,17 @@ impl StoredModel {
                 .unwrap_or(serde_json::Value::Null),
         })
     }
+
+    pub fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "displayName": self.display_name,
+            "description": self.description,
+            "maxOutputTokens": self.max_output_tokens,
+            "capabilities": { "images": self.images },
+            "privateData": self.private_data,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -235,6 +265,29 @@ impl PluginStateStore {
         self.save_resources(plugin_id, resource_type, &records)
             .await?;
         Ok(outcome)
+    }
+
+    pub async fn apply_patch(
+        &self,
+        plugin_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        patch: ResourcePatch,
+    ) -> Result<()> {
+        let mut records = self.resources(plugin_id, resource_type).await?;
+        let record = records
+            .iter_mut()
+            .find(|record| record.id == resource_id)
+            .ok_or_else(|| Error::NotFound(format!("plugin resource {resource_id}")))?;
+        if let Some(private_data) = patch.private_data {
+            record.private_data = private_data;
+        }
+        if let Some(state) = patch.state {
+            record.state = state.into();
+        }
+        record.updated_at_ms = now_ms();
+        self.save_resources(plugin_id, resource_type, &records)
+            .await
     }
 
     pub async fn remove_resource(

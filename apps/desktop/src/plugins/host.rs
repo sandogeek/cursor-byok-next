@@ -9,19 +9,26 @@ use std::{
 
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
+
+use crate::{
+    model::ModelInvocation,
+    provider::{ModelEvent, ProviderStream},
+};
 
 use super::{
     Error, Result,
     catalog::{PluginCatalog, PluginEntry},
     data::PluginDataStore,
     descriptor::{
-        FORM_ADD_METHOD, FORM_FIELD_URL, LIVE_CATALOG, PluginDescriptor, PluginModelDescriptor,
-        PluginProviderDescriptor, PluginResourceDescriptor, PluginResourceView, ProviderDefinition,
-        ResourceDefinition, ResourcePresentation,
+        parse_model_id, FORM_ADD_METHOD, FORM_FIELD_URL, LIVE_CATALOG, PluginDescriptor,
+        PluginModelDescriptor, PluginProviderDescriptor, PluginResourceDescriptor,
+        PluginResourceView, ProviderDefinition, ResourceDefinition, ResourcePresentation,
     },
     origin,
-    state::{PluginStateStore, ResourceDraft, ResourceRecord, StoredModel},
-    worker::PluginWorker,
+    state::{now_ms, PluginStateStore, ResourceDraft, ResourcePatch, ResourceRecord, StoredModel},
+    wire,
+    worker::{PluginWorker, WorkerStreamItem},
 };
 
 const LIVE_CATALOG_TTL: Duration = Duration::from_secs(15);
@@ -93,6 +100,14 @@ impl PluginHost {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(root: &Path) -> Result<Self> {
+        Ok(Self::new(
+            PluginCatalog::for_test(root)?,
+            PluginDataStore::for_test(root.join("data"))?,
+        ))
+    }
+
     pub async fn snapshot(&self) -> PluginSnapshot {
         let _operation = self.inner.operations.lock().await;
         let executable = {
@@ -105,7 +120,7 @@ impl PluginHost {
         let Some(executable) = executable else {
             return PluginSnapshot {
                 runtime_ready: false,
-                runtime_error: Some("bun is not on PATH".into()),
+                runtime_error: Some(super::text("plugin.error.bun_missing")),
                 plugins: self.manifest_plugins(),
             };
         };
@@ -117,7 +132,7 @@ impl PluginHost {
         if plugins.is_empty() {
             return PluginSnapshot {
                 runtime_ready: true,
-                runtime_error: Some("无法加载内置 Magpie 插件，请检查 Bun 是否可用后重试。".into()),
+                runtime_error: Some(super::text("plugin.error.builtin_unavailable")),
                 plugins,
             };
         }
@@ -204,7 +219,7 @@ impl PluginHost {
             .state
             .upsert_resources(plugin_id, resource_type, resources)
             .await
-            .map_err(|_| Error::Storage("无法保存网关，请检查插件数据目录。".into()))?;
+            .map_err(|_| Error::Storage(super::text("plugin.error.storage_save_failed")))?;
         let changed: HashSet<_> = outcome.changed_ids.into_iter().collect();
         self.invalidate_live_catalogs(plugin_id, &changed).await;
         let model_sync_error = self
@@ -233,7 +248,7 @@ impl PluginHost {
             .await
             .map_err(|error| match error {
                 Error::NotFound(_) => error,
-                _ => Error::Storage("无法移除网关，请检查插件数据目录。".into()),
+                _ => Error::Storage(super::text("plugin.error.storage_remove_failed")),
             })?;
         self.invalidate_live_catalogs(plugin_id, &HashSet::from([resource_id.to_owned()]))
             .await;
@@ -250,6 +265,173 @@ impl PluginHost {
         Ok(())
     }
 
+    pub async fn configured_models(&self) -> Vec<PluginModelDescriptor> {
+        let Ok(executable) = self.executable().await else {
+            return Vec::new();
+        };
+        let mut models = Vec::new();
+        for entry in self.entries(&executable).await {
+            for provider in &entry.definition.providers {
+                if !self.provider_configured(&entry, provider).await {
+                    continue;
+                }
+                let (stored, _) = self
+                    .provider_models(&entry, &executable, provider, false, None)
+                    .await;
+                models.extend(stored.into_iter().map(|model| {
+                    PluginModelDescriptor::new(
+                        &entry.manifest.id,
+                        &entry.manifest.name,
+                        provider,
+                        &model,
+                    )
+                }));
+            }
+        }
+        models
+    }
+
+    pub async fn model(&self, model_id: &str) -> Result<Option<PluginModelDescriptor>> {
+        let Some((plugin_id, provider_id, stored_id)) = parse_model_id(model_id) else {
+            return Ok(None);
+        };
+        let executable = self.executable().await?;
+        let entry = self.find_entry(&executable, plugin_id).await?;
+        let provider = find_provider(&entry, provider_id)?;
+        if !self.provider_configured(&entry, provider).await {
+            return Ok(None);
+        }
+        let (stored, _) = self
+            .provider_models(&entry, &executable, provider, false, None)
+            .await;
+        Ok(stored.into_iter().find(|model| model.id == stored_id).map(
+            |model| PluginModelDescriptor::new(plugin_id, &entry.manifest.name, provider, &model),
+        ))
+    }
+
+    pub fn stream_model(
+        &self,
+        invocation: ModelInvocation,
+        cancellation: CancellationToken,
+    ) -> ProviderStream {
+        let host = self.clone();
+        Box::pin(async_stream::try_stream! {
+            let model_id = invocation.request.model.model_id.clone();
+            let (plugin_id, provider_id, upstream_id) = parse_model_id(&model_id)
+                .map(|(plugin, provider, model)| (plugin.to_owned(), provider.to_owned(), model.to_owned()))
+                .ok_or_else(|| Error::Provider(format!("invalid plugin model ID: {model_id}")))?;
+            let executable = host.executable().await?;
+            let entry = host.find_entry(&executable, &plugin_id).await?;
+            let provider = find_provider(&entry, &provider_id)?.clone();
+            let (stored, _) = host
+                .provider_models(&entry, &executable, &provider, false, None)
+                .await;
+            let stored = stored
+                .into_iter()
+                .find(|model| model.id == upstream_id)
+                .ok_or_else(|| Error::NotFound(format!("plugin model {model_id}")))?;
+            let resource = match &provider.resource_type {
+                Some(resource_type) if provider.catalog == LIVE_CATALOG => {
+                    let resource_id = live_resource_id(&upstream_id).ok_or_else(|| {
+                        Error::Provider(format!("invalid live plugin model ID: {model_id}"))
+                    })?;
+                    Some((
+                        resource_type.clone(),
+                        host.find_record(&plugin_id, resource_type, resource_id)
+                            .await?,
+                    ))
+                }
+                Some(resource_type) => Some((
+                    resource_type.clone(),
+                    host.select_resource(&plugin_id, resource_type).await?,
+                )),
+                None => None,
+            };
+            let mut model_snapshot = stored.snapshot();
+            if provider.catalog == LIVE_CATALOG
+                && let Some(upstream) = live_upstream_id(&upstream_id)
+                && let Some(object) = model_snapshot.as_object_mut()
+            {
+                object.insert("id".into(), serde_json::Value::String(upstream.to_owned()));
+            }
+            let request = wire::llm_request(&invocation)?;
+            let params = serde_json::json!({
+                "providerId": provider_id,
+                "model": model_snapshot,
+                "resource": resource.as_ref().map(|(resource_type, record)| record.snapshot(resource_type)),
+                "request": request,
+            });
+            let worker = host.worker(&entry, &executable).await;
+            let origins = host.resource_origins(&entry, resource.as_ref().map(|(_, record)| record));
+            let mut items = worker
+                .invoke_streaming_with_origins(
+                    "provider.invoke",
+                    params,
+                    cancellation.clone(),
+                    origins,
+                )
+                .await?;
+            yield ModelEvent::Start {
+                model_call_id: invocation.call_id.clone(),
+            };
+            while let Some(item) = items.recv().await {
+                match item {
+                    WorkerStreamItem::Event(event) => {
+                        yield wire::model_event(&event)?;
+                    }
+                    WorkerStreamItem::Result(result) => {
+                        let value = result?;
+                        let status = value
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        let patch = value
+                            .get("patch")
+                            .filter(|patch| !patch.is_null())
+                            .map(|patch| serde_json::from_value::<ResourcePatch>(patch.clone()))
+                            .transpose()?;
+                        if let (Some(patch), Some((resource_type, record))) =
+                            (patch, resource.as_ref())
+                        {
+                            if let Err(error) = host
+                                .inner
+                                .state
+                                .apply_patch(&plugin_id, resource_type, &record.id, patch)
+                                .await
+                            {
+                                tracing::warn!(plugin = %plugin_id, %error, "failed to apply plugin resource patch");
+                            } else {
+                                host.invalidate_live_catalogs(
+                                    &plugin_id,
+                                    &HashSet::from([record.id.clone()]),
+                                )
+                                .await;
+                            }
+                        }
+                        match status {
+                            "completed" => return,
+                            "resource-error" | "request-error" => {
+                                let message = value
+                                    .get("message")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("plugin provider call failed");
+                                Err(Error::Provider(message.to_owned()))?;
+                            }
+                            status => {
+                                Err(Error::Protocol(format!(
+                                    "unknown plugin provider result: {status}"
+                                )))?;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(Error::Provider(format!(
+                "plugin '{plugin_id}' worker stopped mid-stream"
+            )))?;
+        })
+    }
+
     fn manifest_plugins(&self) -> Vec<PluginDescriptor> {
         self.inner
             .catalog
@@ -262,7 +444,7 @@ impl PluginHost {
                 author: manifest.author,
                 icon,
                 runtime_ready: false,
-                runtime_error: Some("bun is not on PATH".into()),
+                runtime_error: Some(super::text("plugin.error.bun_missing")),
                 providers: Vec::new(),
                 resources: Vec::new(),
             })
@@ -568,7 +750,7 @@ impl PluginHost {
             .read()
             .await
             .clone()
-            .ok_or_else(|| Error::Runtime("bun is not on PATH".into()))
+            .ok_or_else(|| Error::Runtime(super::text("plugin.error.bun_missing")))
     }
 
     async fn entries(&self, executable: &Path) -> Vec<PluginEntry> {
@@ -603,6 +785,41 @@ impl PluginHost {
             })
             .clone()
     }
+
+    async fn select_resource(
+        &self,
+        plugin_id: &str,
+        resource_type: &str,
+    ) -> Result<ResourceRecord> {
+        let records = self.inner.state.resources(plugin_id, resource_type).await?;
+        if records.is_empty() {
+            return Err(Error::Provider(format!(
+                "plugin '{plugin_id}' has no '{resource_type}' resource; add one first"
+            )));
+        }
+        let now = now_ms();
+        records
+            .iter()
+            .find(|record| record.state.is_ready(now))
+            .or_else(|| records.first())
+            .cloned()
+            .ok_or_else(|| Error::Provider("no plugin resource is available".into()))
+    }
+
+    async fn find_record(
+        &self,
+        plugin_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Result<ResourceRecord> {
+        self.inner
+            .state
+            .resources(plugin_id, resource_type)
+            .await?
+            .into_iter()
+            .find(|record| record.id == resource_id)
+            .ok_or_else(|| Error::NotFound(format!("plugin resource {resource_id}")))
+    }
 }
 
 fn resource_storage_error(plugin_id: &str, error: &Error) -> String {
@@ -614,7 +831,7 @@ fn resource_storage_error(plugin_id: &str, error: &Error) -> String {
         },
         "plugin resource storage unavailable"
     );
-    "无法读取已保存的网关，请检查插件数据文件后重试。".into()
+    super::text("plugin.error.storage_unreadable")
 }
 
 fn find_provider<'a>(entry: &'a PluginEntry, provider_id: &str) -> Result<&'a ProviderDefinition> {
@@ -651,6 +868,16 @@ fn find_resource<'a>(
 fn bind_live_model(mut model: StoredModel, resource_id: &str) -> StoredModel {
     model.id = format!("{resource_id}/{}", model.id);
     model
+}
+
+fn live_resource_id(stored_id: &str) -> Option<&str> {
+    stored_id
+        .split_once('/')
+        .map(|(resource_id, _)| resource_id)
+}
+
+fn live_upstream_id(stored_id: &str) -> Option<&str> {
+    stored_id.split_once('/').map(|(_, upstream)| upstream)
 }
 
 fn find_bun() -> Option<std::path::PathBuf> {

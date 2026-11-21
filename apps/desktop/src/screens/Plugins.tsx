@@ -1,8 +1,10 @@
 import { List, createMotion, resource, Scroll, signal, Text, View } from "nsh";
+import { t } from "nsh/i18n";
 import type { PluginFormResult, PluginSnapshot } from "cursor-byok-next/native";
 import { Button } from "../ui/Button";
 import { Dialog } from "../ui/Dialog";
 import { Field } from "../ui/Field";
+import { localized } from "../ui/localized";
 import { motion } from "../ui/motion";
 import { StatusBadge, Surface } from "../ui/Surface";
 
@@ -46,6 +48,8 @@ export function Plugins(props: { catalog: PluginCatalog }) {
   const models = () => provider()?.models ?? [];
   const runtimeReady = () => current().runtimeReady && (magpie()?.runtimeReady ?? false);
   const storageError = () => resourceType()?.storageError;
+  const resourceStatus = (status: string) =>
+    status === "ready" ? t("plugins.gateway.ready") : status === "cooling" ? t("plugins.gateway.cooling") : status === "invalid" ? t("plugins.gateway.invalid") : status;
 
   const perform = async (operation: () => Promise<PluginSnapshot>) => {
     if (busy()) return;
@@ -72,7 +76,7 @@ export function Plugins(props: { catalog: PluginCatalog }) {
     }));
     const missing = add.fields.find((field) => field.required && !values.find((value) => value.id === field.id)?.value);
     if (missing) {
-      error.set(`请填写${missing.label}`);
+      error.set(t("plugins.form.required", { field: localized(missing.label) }));
       return;
     }
     void perform(async () => {
@@ -86,21 +90,21 @@ export function Plugins(props: { catalog: PluginCatalog }) {
     <View class="min-h-0 flex-1 gap-4">
       <If when={state.error()}>
         <Surface class="gap-2 p-4">
-          <Text role="header" class="text-base font-semibold text-foreground">暂时无法读取插件状态</Text>
+          <Text role="header" class="text-base font-semibold text-foreground">{t("plugins.error.status")}</Text>
           <Text class="text-sm text-muted-foreground">{errorText(state.error())}</Text>
-          <Button label="重试" variant="primary" loading={state.loading()} onPress={() => state.refetch()} />
+          <Button label={t("common.retry")} variant="primary" loading={state.loading()} onPress={() => state.refetch()} />
         </Surface>
       </If>
       <If when={state.loading() && !runtimeReady()}>
         <Surface class="items-center gap-2 p-8">
-          <Text role="header" class="text-base font-semibold text-foreground">正在读取插件状态…</Text>
+          <Text role="header" class="text-base font-semibold text-foreground">{t("plugins.loading")}</Text>
         </Surface>
       </If>
       <If when={!state.loading() && !state.error() && !runtimeReady()}>
         <Surface class="items-center gap-2 p-8">
-          <Text role="header" class="text-base font-semibold text-foreground">{current().runtimeReady ? "无法加载 Magpie 插件" : "需要 Bun 才能加载 Magpie 插件"}</Text>
-          <Text class="max-w-md text-center text-sm text-muted-foreground">{current().runtimeReady ? (current().runtimeError ?? magpie()?.runtimeError ?? "请重试加载内置插件。") : "把 bun 放到 PATH 后刷新。"}</Text>
-          <Button label="刷新状态" loading={state.loading()} disabled={busy()} onPress={() => state.refetch()} />
+          <Text role="header" class="text-base font-semibold text-foreground">{current().runtimeReady ? t("plugins.runtime.failed") : t("plugins.runtime.missingBun")}</Text>
+          <Text class="max-w-md text-center text-sm text-muted-foreground">{current().runtimeReady ? (current().runtimeError ?? magpie()?.runtimeError ?? t("plugins.runtime.retry")) : t("plugins.runtime.installBun")}</Text>
+          <Button label={t("plugins.runtime.refresh")} loading={state.loading()} disabled={busy()} onPress={() => state.refetch()} />
         </Surface>
       </If>
       <If when={!state.error() && runtimeReady() && magpie()}>
@@ -110,16 +114,16 @@ export function Plugins(props: { catalog: PluginCatalog }) {
             <View class="flex-row items-center justify-between gap-3">
               <View class="gap-1">
                 <Text role="header" class="text-base font-semibold text-foreground">{magpie()?.name}</Text>
-                <Text class="text-sm text-muted-foreground">{provider()?.description || "从 Magpie 网关读取实时模型目录。"}</Text>
+                <Text class="text-sm text-muted-foreground">{localized(provider()?.description) || t("plugins.magpie.description")}</Text>
               </View>
-              <StatusBadge label={storageError() ? "状态异常" : provider()?.configured ? "已配置" : "未配置"} tone={!storageError() && provider()?.configured ? "success" : "neutral"} />
+              <StatusBadge label={storageError() ? t("plugins.status.degraded") : provider()?.configured ? t("plugins.status.configured") : t("plugins.status.unconfigured")} tone={!storageError() && provider()?.configured ? "success" : "neutral"} />
             </View>
             <Each of={method()?.fields ?? []} key={(field) => field.id}>
               {(field) => (
                 <Field
-                  label={field().label}
+                  label={localized(field().label)}
                   value={formValues()[field().id] ?? ""}
-                  placeholder={field().placeholder}
+                  placeholder={localized(field().placeholder)}
                   masked={field().fieldType === "secret"}
                   keyboardType={field().fieldType === "url" ? "url" : "default"}
                   onChange={(value) => formValues.update((current) => ({ ...current, [field().id]: value }))}
@@ -127,9 +131,9 @@ export function Plugins(props: { catalog: PluginCatalog }) {
               )}
             </Each>
             <View class="flex-row gap-2">
-              <Button label="保存连接" variant="primary" loading={busy()} disabled={!runtimeReady() || state.loading() || !!storageError()} onPress={submit} />
+              <Button label={t("plugins.action.save")} variant="primary" loading={busy()} disabled={!runtimeReady() || state.loading() || !!storageError()} onPress={submit} />
               <Button
-                label="刷新目录"
+                label={t("plugins.action.refreshCatalog")}
                 loading={busy()}
                 disabled={busy() || state.loading() || !provider()?.configured || !!storageError()}
                 onPress={() => {
@@ -146,23 +150,23 @@ export function Plugins(props: { catalog: PluginCatalog }) {
           </Surface>
 
           <Surface class="gap-3 p-4">
-            <Text role="header" class="text-sm font-semibold text-foreground">网关</Text>
+            <Text role="header" class="text-sm font-semibold text-foreground">{t("plugins.gateways.title")}</Text>
             <If when={storageError()}>
               <Text role="alert" class="text-sm text-warning">{storageError()}</Text>
-              <Button label="重试读取网关" loading={state.loading()} disabled={busy()} onPress={() => state.refetch()} />
+              <Button label={t("plugins.gateways.retry")} loading={state.loading()} disabled={busy()} onPress={() => state.refetch()} />
             </If>
             <If when={!storageError() && gateways().length === 0}>
-              <Text class="text-sm text-muted-foreground">还没有 Magpie 网关。填写地址和 API 密钥后保存。</Text>
+              <Text class="text-sm text-muted-foreground">{t("plugins.gateways.empty")}</Text>
             </If>
             <Each of={gateways()} key={(item) => item.id}>
               {(item) => (
                 <View class="flex-row items-center justify-between gap-3 rounded-(--radius) border border-border px-3 py-2">
                   <View class="min-w-0 gap-1">
                     <Text class="text-sm text-foreground">{item().displayName}</Text>
-                    <Text class="text-xs text-muted-foreground">{item().status === "ready" ? "可用" : item().message || item().status}</Text>
+                    <Text class="text-xs text-muted-foreground">{item().message || resourceStatus(item().status)}</Text>
                   </View>
                   <Button
-                    label="移除"
+                    label={t("common.remove")}
                     size="sm"
                     disabled={busy()}
                     onPress={() => removing.set(item().id)}
@@ -174,11 +178,11 @@ export function Plugins(props: { catalog: PluginCatalog }) {
 
           <Surface class="min-h-48 gap-3 p-4">
             <View class="flex-row items-center justify-between">
-              <Text role="header" class="text-sm font-semibold text-foreground">模型目录</Text>
-              <Text class="text-xs text-muted-foreground">{models().length} 个模型 · {provider()?.catalogError && models().length > 0 ? "部分目录可能不是最新" : "仅本页可见"}</Text>
+              <Text role="header" class="text-sm font-semibold text-foreground">{t("plugins.models.title")}</Text>
+              <Text class="text-xs text-muted-foreground">{t("plugins.models.count", { count: models().length, note: provider()?.catalogError && models().length > 0 ? t("plugins.models.stale") : t("plugins.models.local") })}</Text>
             </View>
             <If when={models().length === 0 && !storageError() && !provider()?.catalogError}>
-              <Text class="text-sm text-muted-foreground">连接网关并刷新后，Magpie 模型会出现在这里。Cursor 选择器暂不接入。</Text>
+              <Text class="text-sm text-muted-foreground">{t("plugins.models.empty")}</Text>
             </If>
             <If when={models().length > 0}>
               <List each={models()} estimatedItemSize={56} class="min-h-40">
@@ -200,10 +204,10 @@ export function Plugins(props: { catalog: PluginCatalog }) {
 
       <Dialog
         open={removing() !== null}
-        title="移除 Magpie 网关？"
-        description="只会删除本应用保存的网关凭证和目录缓存，不影响 Cursor 官方配置。"
-        cancelLabel="取消"
-        confirmLabel="移除"
+        title={t("plugins.dialog.remove.title")}
+        description={t("plugins.dialog.remove.body")}
+        cancelLabel={t("common.cancel")}
+        confirmLabel={t("common.remove")}
         onCancel={() => removing.set(null)}
         onConfirm={() => {
           const plugin = magpie();

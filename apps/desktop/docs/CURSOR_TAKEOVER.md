@@ -22,7 +22,8 @@ cursor-byok/server/src/local_app/          apps/desktop/src/harness/
 
 行数为 `wc -l` 实测，两侧都含 `#[cfg(test)]`。nsh 侧新增 `state.rs`、操作串行化、后端热接线、代理生命周期与状态降级测试。
 
-上游划掉的 `pub(crate)` 辅助（`proxy_host_allowed`、`request_uses_local_cursor_token`、`local_cursor_authorization`）在本仓库没有消费方（`api/cursor/proxy.rs`、`cursor/services/{account,entitlement,compatibility}.rs` 还没移植），因此以公开导出保留：
+`request_uses_local_cursor_token` 现由 `backend/` 账号与兼容 stub 消费。`is_cursor_host` / `UPSTREAM_URL_HEADER` 由转发层读取：
+
 
 ```40:42:apps/desktop/src/harness/mod.rs
 pub use self::account::{is_local_cursor_authorization, local_token};

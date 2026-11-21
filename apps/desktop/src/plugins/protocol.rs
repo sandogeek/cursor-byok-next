@@ -10,7 +10,6 @@ pub enum HostMessage<'a> {
         method: &'a str,
         params: &'a serde_json::Value,
     },
-    #[allow(dead_code)]
     Cancel {
         id: &'a str,
     },

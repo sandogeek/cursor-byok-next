@@ -38,7 +38,7 @@ cursor-byok/server/plugins/build-in/magpie/ apps/desktop/plugins/build-in/magpie
 - Magpie `catalog: "live"`：目录不落盘，按资源短缓存 `models.list`。缓存同时保留旧模型与最近一次刷新错误；资源变更仅失效对应条目。
 - 首期只执行随应用分发的 Magpie，不扫描任意第三方插件。Bun 是同用户子进程，不是 OS 沙箱；origin 权限检查只约束 Rust 提供的 SDK 网络接口。
 - 连接表单属于插件自有资源配置，不是核心模型 CRUD。
-- Cursor picker / local loop 不改；已广告给 Cursor 的模型必须可路由，本步因此不广告 Magpie 模型。
+- Cursor picker 与 local loop 在后续步骤接入：见 `LOCAL_LOOP.md`。本步只保证目录页能列出 Magpie 模型。
 
 ## 差异清单
 
@@ -46,10 +46,10 @@ cursor-byok/server/plugins/build-in/magpie/ apps/desktop/plugins/build-in/magpie
 |---|---|---|---|---|
 | 1 | 运行时 | Deno 子进程 | PATH 上的 `bun` | 用户指定 Bun；首期不捆绑运行时二进制 |
 | 2 | UI 交付 | React 插件页 | 宿主 TSX 插件页，native API 预留给 `.nshpkg` | NSH 签名包是 TSX-only，当前没有 headless package runner |
-| 3 | 能力范围 | `models.list` + `provider.invoke` + OAuth/import | 只实现 form 添加、present、remove、`models.list` | 本期不调用模型 |
-| 4 | 模型广告 | 追加到 Cursor AvailableModels | 只在插件页展示 | 避免 Cursor 选到不可调用的模型 |
+| 3 | 能力范围 | `models.list` + `provider.invoke` + OAuth/import | 只实现 form 添加、present、remove、`models.list` | 调用接到 `LOCAL_LOOP.md` |
+| 4 | 模型广告 | 追加到 Cursor AvailableModels | 本步只在插件页展示 | 广告接到 `LOCAL_LOOP.md` |
 | 5 | 运行时安装 | 下载/校验 Deno | 检测 PATH 上的 bun | 不引入运行时分发 |
-| 6 | SDK 协议 helper | Deno import map 含 openai/anthropic | 文件保留，首期 worker 不调用 | 后续 invoke 阶段再接线 |
+| 6 | SDK 协议 helper | Deno import map 含 openai/anthropic | 文件保留，invoke 由 local loop 接线 | 见 `LOCAL_LOOP.md` |
 | 7 | 内置插件加载 | 从安装目录发现插件 | 内嵌 Magpie，collector 与 worker 共用 `--tsconfig-override` | 修复 Bun specifier 解析，不执行任意安装目录中的代码 |
 | 8 | 失败反馈 | 通用插件错误 | 按资源保留旧目录和失败信息；存储读失败单独提示；不回显网关响应体 | 让用户区分离线、未配置与本地存储故障 |
 

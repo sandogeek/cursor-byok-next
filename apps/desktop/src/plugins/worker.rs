@@ -14,9 +14,10 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::ChildStdin,
-    sync::{Mutex, mpsc, oneshot, watch},
+    sync::{Mutex, mpsc, watch},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::{
     Error, Result,
@@ -28,15 +29,21 @@ use super::{
 
 const INVOCATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_NETWORK_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
 
-type InvocationResult = Result<serde_json::Value>;
+#[derive(Debug)]
+pub enum WorkerStreamItem {
+    Event(serde_json::Value),
+    Result(Result<serde_json::Value>),
+}
+
 type Writer = mpsc::Sender<Vec<u8>>;
+type StreamLines = Arc<Mutex<mpsc::Receiver<Result<String>>>>;
 
-// One registry per process generation. None means the generation cannot accept new requests.
 struct Pending(parking_lot::Mutex<Option<HashMap<String, PendingInvocation>>>);
 
 struct PendingInvocation {
-    result: oneshot::Sender<InvocationResult>,
+    items: mpsc::UnboundedSender<WorkerStreamItem>,
     active: watch::Sender<()>,
     state: Arc<InvocationState>,
 }
@@ -60,9 +67,9 @@ impl Pending {
     fn register(
         self: &Arc<Self>,
         state: InvocationState,
-    ) -> Result<(InvocationGuard, oneshot::Receiver<InvocationResult>)> {
+    ) -> Result<(InvocationGuard, mpsc::UnboundedReceiver<WorkerStreamItem>)> {
         let id = uuid::Uuid::new_v4().to_string();
-        let (result, receiver) = oneshot::channel();
+        let (items, receiver) = mpsc::unbounded_channel();
         let (active, _) = watch::channel(());
         self.0
             .lock()
@@ -71,7 +78,7 @@ impl Pending {
             .insert(
                 id.clone(),
                 PendingInvocation {
-                    result,
+                    items,
                     active,
                     state: Arc::new(state),
                 },
@@ -83,6 +90,10 @@ impl Pending {
             },
             receiver,
         ))
+    }
+
+    fn sender(&self, id: &str) -> Option<mpsc::UnboundedSender<WorkerStreamItem>> {
+        self.0.lock().as_ref()?.get(id).map(|invocation| invocation.items.clone())
     }
 
     fn remove(&self, id: &str) -> Option<PendingInvocation> {
@@ -101,9 +112,9 @@ impl Pending {
 
     fn close(&self, message: &str) {
         let pending = self.0.lock().take();
-        for (_, PendingInvocation { result, active, .. }) in pending.into_iter().flatten() {
+        for (_, PendingInvocation { items, active, .. }) in pending.into_iter().flatten() {
             drop(active);
-            let _ = result.send(Err(Error::Provider(message.into())));
+            let _ = items.send(WorkerStreamItem::Result(Err(Error::Provider(message.into()))));
         }
     }
 }
@@ -138,6 +149,7 @@ impl Drop for WorkerProcess {
 struct InvocationState {
     allowed_origins: HashSet<String>,
     magpie_catalog_status: Option<AtomicU16>,
+    cancellation: CancellationToken,
 }
 
 impl InvocationState {
@@ -161,6 +173,7 @@ struct HostContext {
     plugin_id: String,
     network_hosts: Arc<HashSet<String>>,
     resource_origin: bool,
+    streams: Arc<Mutex<HashMap<String, StreamLines>>>,
 }
 
 impl PluginWorker {
@@ -180,6 +193,7 @@ impl PluginWorker {
                             .collect(),
                     ),
                     resource_origin: plugin.manifest.permissions.resource_origin,
+                    streams: Arc::new(Mutex::new(HashMap::new())),
                 },
                 plugin_id,
                 executable,
@@ -196,27 +210,24 @@ impl PluginWorker {
         params: serde_json::Value,
         allowed_origins: HashSet<String>,
     ) -> Result<serde_json::Value> {
-        match tokio::time::timeout(INVOCATION_TIMEOUT, async {
-            let (writer, pending) = self.connection().await?;
-            let permit = writer
-                .reserve()
-                .await
-                .map_err(|_| Error::Provider("plugin worker stopped".into()))?;
-            let (request, result) = pending.register(InvocationState {
-                allowed_origins,
-                magpie_catalog_status: (self.inner.plugin_id
-                    == "dev.cursorbyoknext.plugins.magpie"
-                    && method == "models.list")
-                    .then(AtomicU16::default),
-            })?;
-            permit.send(encode_message(&HostMessage::Request {
-                id: &request.id,
+        let mut items = self
+            .invoke_streaming_with_origins(
                 method,
-                params: &params,
-            })?);
-            result
-                .await
-                .map_err(|_| Error::Provider("plugin worker stopped".into()))?
+                params,
+                CancellationToken::new(),
+                allowed_origins,
+            )
+            .await?;
+        match tokio::time::timeout(INVOCATION_TIMEOUT, async {
+            while let Some(item) = items.recv().await {
+                if let WorkerStreamItem::Result(result) = item {
+                    return result;
+                }
+            }
+            Err(Error::Provider(format!(
+                "plugin '{}' worker stopped",
+                self.inner.plugin_id
+            )))
         })
         .await
         {
@@ -226,6 +237,65 @@ impl PluginWorker {
                 self.inner.plugin_id
             ))),
         }
+    }
+
+    pub async fn invoke_streaming_with_origins(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        cancellation: CancellationToken,
+        allowed_origins: HashSet<String>,
+    ) -> Result<mpsc::UnboundedReceiver<WorkerStreamItem>> {
+        let (writer, pending) = self.connection().await?;
+        let permit = writer
+            .reserve()
+            .await
+            .map_err(|_| Error::Provider("plugin worker stopped".into()))?;
+        let request_cancellation = CancellationToken::new();
+        let (request, receiver) = pending.register(InvocationState {
+            allowed_origins,
+            magpie_catalog_status: (self.inner.plugin_id
+                == "dev.cursorbyoknext.plugins.magpie"
+                && method == "models.list")
+                .then(AtomicU16::default),
+            cancellation: request_cancellation.clone(),
+        })?;
+        permit.send(encode_message(&HostMessage::Request {
+            id: &request.id,
+            method,
+            params: &params,
+        })?);
+        let Some((.., mut active)) = pending.authorization(&request.id) else {
+            return Err(Error::Provider("plugin worker stopped".into()));
+        };
+        let Some(items) = pending.sender(&request.id) else {
+            return Err(Error::Provider("plugin worker stopped".into()));
+        };
+        let writer = writer.clone();
+        let request_id = request.id.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    request_cancellation.cancel();
+                    if let Ok(bytes) = encode_message(&HostMessage::Cancel { id: &request_id }) {
+                        let _ = writer.send(bytes).await;
+                    }
+                    if let Some(PendingInvocation {
+                        items,
+                        active,
+                        ..
+                    }) = pending.remove(&request_id)
+                    {
+                        drop(active);
+                        let _ = items.send(WorkerStreamItem::Result(Err(Error::Cancelled)));
+                    }
+                }
+                _ = items.closed() => {}
+                _ = active.changed() => {}
+            }
+            drop(request);
+        });
+        Ok(receiver)
     }
 
     #[allow(dead_code)]
@@ -311,7 +381,7 @@ async fn read_stdout(
         match message {
             WorkerMessage::Result { id, result, error } => {
                 if let Some(PendingInvocation {
-                    result: sender,
+                    items,
                     active,
                     state,
                 }) = pending.remove(&id)
@@ -322,12 +392,13 @@ async fn read_stdout(
                     } else {
                         Ok(result)
                     };
-                    let _ = sender.send(value);
+                    let _ = items.send(WorkerStreamItem::Result(value));
                 }
             }
             WorkerMessage::Event { id, event } => {
-                // This caller does not consume streaming model events yet.
-                drop((id, event));
+                if let Some(sender) = pending.sender(&id) {
+                    let _ = sender.send(WorkerStreamItem::Event(event));
+                }
             }
             WorkerMessage::HostCall {
                 id,
@@ -387,11 +458,14 @@ impl HostContext {
     ) -> Result<serde_json::Value> {
         match method {
             "network.fetch" => self.fetch(invocation, params).await,
-            "network.stream.open" | "network.stream.read" | "network.stream.close" => {
-                Err(Error::Protocol(
-                    "plugin streaming is not available until model invocation is implemented"
-                        .into(),
-                ))
+            "network.stream.open" => self.stream_open(invocation, params).await,
+            "network.stream.read" => self.stream_read(params).await,
+            "network.stream.close" => {
+                self.streams
+                    .lock()
+                    .await
+                    .remove(required_string(&params, "streamId")?);
+                Ok(serde_json::Value::Null)
             }
             _ => Err(Error::Protocol(format!(
                 "unsupported plugin host method: {method}"
@@ -399,12 +473,12 @@ impl HostContext {
         }
     }
 
-    async fn fetch(
+    async fn request(
         &self,
         invocation: &InvocationState,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        let raw_url = required_string(&params, "url")?;
+        params: &serde_json::Value,
+    ) -> Result<(reqwest::RequestBuilder, reqwest::Url, reqwest::Method)> {
+        let raw_url = required_string(params, "url")?;
         let url = url::Url::parse(raw_url)
             .map_err(|error| Error::Config(format!("invalid plugin network URL: {error}")))?;
         if !url.username().is_empty() || url.password().is_some() {
@@ -439,14 +513,9 @@ impl HostContext {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(60))
             .build()
             .map_err(|error| Error::Config(format!("cannot build plugin HTTP client: {error}")))?;
-        // Only host-observed status from the bound Magpie catalog GET is exposed on failure.
-        let catalog_status = invocation.magpie_catalog_status.as_ref().filter(|_| {
-            allowed_origin && method == reqwest::Method::GET && url.path() == "/v1/models"
-        });
-        let mut request = client.request(method, url);
+        let mut request = client.request(method.clone(), url.clone());
         if let Some(headers) = params.get("headers").and_then(serde_json::Value::as_object) {
             for (name, value) in headers {
                 let value = value.as_str().ok_or_else(|| {
@@ -458,14 +527,31 @@ impl HostContext {
         if let Some(body) = params.get("body").and_then(serde_json::Value::as_str) {
             request = request.body(body.to_owned());
         }
-        let mut response = request
-            .send()
-            .await
-            .map_err(|_| Error::Provider("plugin network request failed".into()))?;
+        Ok((request, url, method))
+    }
+
+    async fn fetch(
+        &self,
+        invocation: &InvocationState,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let (request, url, method) = self.request(invocation, &params).await?;
+        let origin = origin::request_origin(&url)?;
+        let catalog_status = invocation.magpie_catalog_status.as_ref().filter(|_| {
+            invocation.allowed_origins.contains(&origin)
+                && method == reqwest::Method::GET
+                && url.path() == "/v1/models"
+        });
+        let request = request.timeout(Duration::from_secs(60));
+        let mut response = tokio::select! {
+            _ = invocation.cancellation.cancelled() => return Err(Error::Cancelled),
+            response = request.send() => {
+                response.map_err(|_| Error::Provider("plugin network request failed".into()))?
+            }
+        };
         let status = response.status().as_u16();
         if let Some(catalog_status) = catalog_status {
             catalog_status.store(status, Ordering::Relaxed);
-            // Magpie only needs the status for a failed catalog response.
             if !response.status().is_success() {
                 return Ok(serde_json::json!({"status": status, "headers": {}, "body": ""}));
             }
@@ -478,22 +564,16 @@ impl HostContext {
                 "plugin network response is larger than allowed".into(),
             ));
         }
-        let headers = response
-            .headers()
-            .iter()
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| (name.to_string(), value.to_string()))
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
+        let headers = header_map(&response);
         let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| Error::Provider("cannot read plugin network response".into()))?
-        {
+        loop {
+            let chunk = tokio::select! {
+                _ = invocation.cancellation.cancelled() => return Err(Error::Cancelled),
+                chunk = response.chunk() => {
+                    chunk.map_err(|_| Error::Provider("cannot read plugin network response".into()))?
+                }
+            };
+            let Some(chunk) = chunk else { break };
             if chunk.len() as u64 > MAX_NETWORK_RESPONSE_BYTES - body.len() as u64 {
                 return Err(Error::Provider(
                     "plugin network response is larger than allowed".into(),
@@ -507,6 +587,141 @@ impl HostContext {
             "body": String::from_utf8_lossy(&body),
         }))
     }
+
+    async fn stream_open(
+        &self,
+        invocation: &InvocationState,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let (request, _, _) = self.request(invocation, &params).await?;
+        let cancellation = invocation.cancellation.clone();
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => return Err(Error::Cancelled),
+            response = request.send() => {
+                response.map_err(|_| Error::Provider("plugin network request failed".into()))?
+            }
+        };
+        let status = response.status().as_u16();
+        let headers = header_map(&response);
+        let (sender, receiver) = mpsc::channel::<Result<String>>(256);
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+            let mut body = response.bytes_stream();
+            let mut buffered = Vec::<u8>::new();
+            let mut total = 0_u64;
+            loop {
+                let chunk = tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        let _ = sender.send(Err(Error::Cancelled)).await;
+                        return;
+                    }
+                    chunk = body.next() => chunk,
+                };
+                let Some(chunk) = chunk else { break };
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(_) => {
+                        let _ = sender
+                            .send(Err(Error::Provider(
+                                "cannot read plugin network stream".into(),
+                            )))
+                            .await;
+                        return;
+                    }
+                };
+                total += chunk.len() as u64;
+                if total > MAX_STREAM_BYTES {
+                    let _ = sender
+                        .send(Err(Error::Provider(
+                            "plugin network stream is larger than allowed".into(),
+                        )))
+                        .await;
+                    return;
+                }
+                buffered.extend_from_slice(&chunk);
+                while let Some(position) = buffered.iter().position(|byte| *byte == b'\n') {
+                    let mut line = buffered.drain(..=position).collect::<Vec<u8>>();
+                    line.pop();
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    if sender
+                        .send(Ok(String::from_utf8_lossy(&line).into_owned()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            if !buffered.is_empty() {
+                let _ = sender
+                    .send(Ok(String::from_utf8_lossy(&buffered).into_owned()))
+                    .await;
+            }
+        });
+        let stream_id = uuid::Uuid::new_v4().to_string();
+        self.streams
+            .lock()
+            .await
+            .insert(stream_id.clone(), Arc::new(Mutex::new(receiver)));
+        Ok(serde_json::json!({
+            "streamId": stream_id,
+            "status": status,
+            "headers": headers,
+        }))
+    }
+
+    async fn stream_read(&self, params: serde_json::Value) -> Result<serde_json::Value> {
+        let stream_id = required_string(&params, "streamId")?;
+        let lines_handle = self
+            .streams
+            .lock()
+            .await
+            .get(stream_id)
+            .cloned()
+            .ok_or_else(|| Error::Protocol(format!("unknown plugin stream: {stream_id}")))?;
+        let mut receiver = lines_handle.lock().await;
+        let mut lines = Vec::new();
+        match receiver.recv().await {
+            Some(Ok(line)) => lines.push(line),
+            Some(Err(error)) => {
+                drop(receiver);
+                self.streams.lock().await.remove(stream_id);
+                return Err(error);
+            }
+            None => {
+                drop(receiver);
+                self.streams.lock().await.remove(stream_id);
+                return Ok(serde_json::json!({ "lines": [], "done": true }));
+            }
+        }
+        while lines.len() < 256 {
+            match receiver.try_recv() {
+                Ok(Ok(line)) => lines.push(line),
+                Ok(Err(error)) => {
+                    drop(receiver);
+                    self.streams.lock().await.remove(stream_id);
+                    return Err(error);
+                }
+                Err(_) => break,
+            }
+        }
+        Ok(serde_json::json!({ "lines": lines, "done": false }))
+    }
+}
+
+fn header_map(response: &reqwest::Response) -> std::collections::BTreeMap<String, String> {
+    response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 fn required_string<'a>(params: &'a serde_json::Value, key: &str) -> Result<&'a str> {
@@ -524,17 +739,23 @@ mod tests {
         InvocationState {
             allowed_origins,
             magpie_catalog_status: None,
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    fn host() -> HostContext {
+        HostContext {
+            plugin_id: "test".into(),
+            network_hosts: Arc::new(HashSet::new()),
+            resource_origin: true,
+            streams: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     #[tokio::test]
     async fn resource_origin_allows_bound_http_and_rejects_others() {
         let invocation = invocation(HashSet::from(["http://192.168.1.2:3425".into()]));
-        let host = HostContext {
-            plugin_id: "test".into(),
-            network_hosts: Arc::new(HashSet::new()),
-            resource_origin: true,
-        };
+        let host = host();
         let error = host
             .call(
                 &invocation,
@@ -561,14 +782,11 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let host = HostContext {
-            plugin_id: "test".into(),
-            network_hosts: Arc::new(HashSet::new()),
-            resource_origin: true,
-        };
+        let host = host();
         let invocation = InvocationState {
             allowed_origins: HashSet::from([origin.clone()]),
             magpie_catalog_status: Some(AtomicU16::default()),
+            cancellation: CancellationToken::new(),
         };
         assert!(!invocation.failure().to_string().contains("HTTP"));
         let result = host
@@ -590,24 +808,29 @@ mod tests {
     #[tokio::test]
     async fn pending_authorization_ends_on_completion_and_drop() {
         let pending = Arc::new(Pending::open());
-        let (completed, receiver) = pending.register(invocation(HashSet::new())).unwrap();
+        let (completed, mut receiver) = pending.register(invocation(HashSet::new())).unwrap();
         let (_, mut active) = pending.authorization(&completed.id).unwrap();
         let PendingInvocation {
-            result,
+            items,
             active: signal,
             ..
         } = pending.remove(&completed.id).unwrap();
         drop(signal);
-        result.send(Ok(serde_json::Value::Null)).unwrap();
-        assert!(receiver.await.unwrap().unwrap().is_null());
+        items
+            .send(WorkerStreamItem::Result(Ok(serde_json::Value::Null)))
+            .unwrap();
+        match receiver.recv().await {
+            Some(WorkerStreamItem::Result(Ok(value))) => assert!(value.is_null()),
+            other => panic!("expected result, got {other:?}"),
+        }
         assert!(active.changed().await.is_err());
         assert!(pending.authorization(&completed.id).is_none());
 
-        let (cancelled, receiver) = pending.register(invocation(HashSet::new())).unwrap();
+        let (cancelled, mut receiver) = pending.register(invocation(HashSet::new())).unwrap();
         let id = cancelled.id.clone();
         let (_, mut active) = pending.authorization(&id).unwrap();
         drop(cancelled);
-        assert!(receiver.await.is_err());
+        assert!(receiver.recv().await.is_none());
         assert!(active.changed().await.is_err());
         assert!(pending.authorization(&id).is_none());
     }
@@ -617,9 +840,9 @@ mod tests {
         let pending = Arc::new(Pending::open());
         let mut id = None;
         let timed_out = tokio::time::timeout(Duration::from_millis(1), async {
-            let (request, result) = pending.register(invocation(HashSet::new())).unwrap();
+            let (request, mut result) = pending.register(invocation(HashSet::new())).unwrap();
             id = Some(request.id.clone());
-            result.await
+            result.recv().await
         })
         .await;
         assert!(timed_out.is_err());
@@ -629,26 +852,24 @@ mod tests {
     #[tokio::test]
     async fn closing_one_generation_revokes_only_its_invocations() {
         let old = Arc::new(Pending::open());
-        let (old_request, failed) = old.register(invocation(HashSet::new())).unwrap();
+        let (old_request, mut failed) = old.register(invocation(HashSet::new())).unwrap();
         let (_, mut active) = old.authorization(&old_request.id).unwrap();
         let new = Arc::new(Pending::open());
         let (new_request, mut unaffected) = new.register(invocation(HashSet::new())).unwrap();
         old.close("plugin worker exited");
-        assert!(
-            failed
-                .await
-                .unwrap()
-                .unwrap_err()
-                .to_string()
-                .contains("worker exited")
-        );
+        match failed.recv().await {
+            Some(WorkerStreamItem::Result(Err(error))) => {
+                assert!(error.to_string().contains("worker exited"));
+            }
+            other => panic!("expected failed result, got {other:?}"),
+        }
         assert!(active.changed().await.is_err());
         assert!(old.authorization(&old_request.id).is_none());
         assert!(old.register(invocation(HashSet::new())).is_err());
         assert!(new.authorization(&new_request.id).is_some());
         assert!(matches!(
             unaffected.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
+            Err(mpsc::error::TryRecvError::Empty)
         ));
     }
 }
