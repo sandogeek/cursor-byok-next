@@ -1,10 +1,6 @@
 //! Extract Cursor local-loop protobuf schemas from installed JS bundles.
 
-#![allow(
-    clippy::collapsible_if,
-    clippy::get_first,
-    clippy::too_many_arguments
-)]
+#![allow(clippy::collapsible_if, clippy::get_first, clippy::too_many_arguments)]
 
 mod ast_util;
 mod compact;
@@ -17,13 +13,15 @@ mod types;
 mod validate;
 
 pub use compact::parse_compact_field;
-pub use extract::{extract_from_files, extract_from_sources, write_protos, ExtractError, ExtractResult};
+pub use extract::{
+    ExtractError, ExtractResult, extract_from_files, extract_from_sources, write_protos,
+};
 pub use merge::{
     declaration_coverage, merge_enums_by_type_name, merge_messages_by_type_name,
     merge_services_by_type_name, normalize_type_references, reclassify_enum_fields,
 };
-pub use resolver::{build_alias_index, build_module_imports, TypeResolver};
-pub use scan::{parse_field_object, scan_source, BundleScan};
+pub use resolver::{TypeResolver, build_alias_index, build_module_imports};
+pub use scan::{BundleScan, parse_field_object, scan_source};
 
 pub fn resolver_from_scan(scan: &BundleScan) -> TypeResolver {
     let aliases = build_alias_index(&scan.aliases);
@@ -33,7 +31,7 @@ pub fn resolver_from_scan(scan: &BundleScan) -> TypeResolver {
     resolver
 }
 pub use types::{
-    parse_type_name, Diagnostics, Enum, EnumValue, Field, Message, Method, Service, TypeToken,
+    Diagnostics, Enum, EnumValue, Field, Message, Method, Service, TypeToken, parse_type_name,
 };
 pub use validate::{has_placeholder, validate_required_agent_shapes};
 

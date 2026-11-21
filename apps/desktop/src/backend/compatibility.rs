@@ -7,11 +7,7 @@ use axum::{
 };
 use prost::Message;
 
-use crate::{
-    backend::proxy::CursorProxy,
-    protocol::proto::agent::v1 as agent,
-    Result,
-};
+use crate::{Result, backend::proxy::CursorProxy, protocol::proto::agent::v1 as agent};
 
 #[derive(Clone, Copy, PartialEq, Message)]
 struct EmptyResponse {}
@@ -55,13 +51,13 @@ fn proto(message: impl Message) -> Response<Body> {
 mod tests {
     use super::*;
     use axum::{
-        body::{to_bytes, Bytes},
+        body::{Bytes, to_bytes},
         http::header,
     };
     use futures_util::stream;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     };
 
     #[tokio::test]
@@ -80,7 +76,9 @@ mod tests {
             observed.store(true, Ordering::SeqCst);
             Ok::<_, std::convert::Infallible>(Bytes::from_static(b"request"))
         }));
-        super::super::consume_body(Request::new(body)).await.unwrap();
+        super::super::consume_body(Request::new(body))
+            .await
+            .unwrap();
         assert!(polled.load(Ordering::SeqCst));
     }
 }

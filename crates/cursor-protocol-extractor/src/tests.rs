@@ -1,9 +1,9 @@
 //! Ports of the upstream Go extractor tests that local loop still needs.
 
 use super::{
-    declaration_coverage, extract_from_sources, has_placeholder, merge_messages_by_type_name, parse_field_object_source,
-    reclassify_enum_fields, resolver_from_scan, scan_source, validate_required_agent_shapes, Enum,
-    Field, Message, Service, TypeToken,
+    Enum, Field, Message, Service, TypeToken, declaration_coverage, extract_from_sources,
+    has_placeholder, merge_messages_by_type_name, parse_field_object_source,
+    reclassify_enum_fields, resolver_from_scan, scan_source, validate_required_agent_shapes,
 };
 
 fn field_by_name<'a>(fields: &'a [Field], name: &str) -> Option<&'a Field> {
@@ -16,8 +16,10 @@ fn enum_by_name<'a>(enums: &'a [Enum], type_name: &str) -> Option<&'a Enum> {
 
 #[test]
 fn parse_field_object_supports_shorthand_type() {
-    let field = parse_field_object_source(r#"{no:4,name:"file_not_found",kind:"message",T,oneof:"result"}"#)
-        .expect("parse shorthand T");
+    let field = parse_field_object_source(
+        r#"{no:4,name:"file_not_found",kind:"message",T,oneof:"result"}"#,
+    )
+    .expect("parse shorthand T");
     assert_eq!(field.t, Some(TypeToken::Named("T".into())));
 }
 
@@ -52,7 +54,13 @@ fn webpack_export_alias_resolves_service_message_type() {
             "message",
         )
         .or_else(|| {
-            resolver.resolve_type_name("r.KS", u32::MAX, service.module_start, "agent.v1", "message")
+            resolver.resolve_type_name(
+                "r.KS",
+                u32::MAX,
+                service.module_start,
+                "agent.v1",
+                "message",
+            )
         });
     assert_eq!(type_name.as_deref(), Some("agent.v1.AgentClientMessage"));
 }
@@ -104,7 +112,10 @@ fn modern_factory_syntax_extracts_in_app_ad_service_types() {
         scan.messages.len(),
         3,
         "messages: {:?}",
-        scan.messages.iter().map(|m| (m.type_name.clone(), m.var_name.clone())).collect::<Vec<_>>()
+        scan.messages
+            .iter()
+            .map(|m| (m.type_name.clone(), m.var_name.clone()))
+            .collect::<Vec<_>>()
     );
     assert_eq!(scan.messages[0].fields[0].name, "ad_id");
     assert_eq!(scan.enums.len(), 1);
@@ -164,7 +175,13 @@ fn assignment_alias_resolves_standard_protobuf_type() {
     let scan = scan_source(BUNDLE);
     let resolver = resolver_from_scan(&scan);
     let type_name = resolver
-        .resolve_type_name("ua", u32::MAX, scan.messages.last().map(|m| m.module_start).unwrap_or(0), "aiserver.v1", "message")
+        .resolve_type_name(
+            "ua",
+            u32::MAX,
+            scan.messages.last().map(|m| m.module_start).unwrap_or(0),
+            "aiserver.v1",
+            "message",
+        )
         .expect("alias");
     assert_eq!(type_name, "google.protobuf.Timestamp");
 }
@@ -205,8 +222,7 @@ var Service={typeName:"aiserver.v1.TestService",methods:{}};
 
 #[test]
 fn extract_services_supports_anonymous_descriptors() {
-    const BUNDLE: &str =
-        r#"services.push({typeName:"aiserver.v1.FileSyncService",methods:{sync:{name:"Sync",I:Request,O:Response,kind:n.MethodKind.Unary}}})"#;
+    const BUNDLE: &str = r#"services.push({typeName:"aiserver.v1.FileSyncService",methods:{sync:{name:"Sync",I:Request,O:Response,kind:n.MethodKind.Unary}}})"#;
     let scan = scan_source(BUNDLE);
     assert_eq!(scan.services.len(), 1);
     assert_eq!(scan.services[0].type_name, "aiserver.v1.FileSyncService");
@@ -220,16 +236,20 @@ getBlobMetadataCallback({blobType:{kind:"proto",typeName:"agent.v1.RedactedConve
 var Keep=n.makeMessageType("agent.v1.Keep",()=>[]);
 "#;
     let scan = scan_source(BUNDLE);
-    assert!(!scan
-        .declared
-        .iter()
-        .any(|name| name == "agent.v1.RedactedConversationStateStructure"));
+    assert!(
+        !scan
+            .declared
+            .iter()
+            .any(|name| name == "agent.v1.RedactedConversationStateStructure")
+    );
     assert!(scan.declared.iter().any(|name| name == "agent.v1.Keep"));
 }
 
 #[test]
 fn real_unknown_prefixed_field_names_are_not_placeholders() {
-    assert!(!has_placeholder("  string unknown_tool_error_template = 1;"));
+    assert!(!has_placeholder(
+        "  string unknown_tool_error_template = 1;"
+    ));
     assert!(has_placeholder("  string unknown = 1;"));
     assert!(has_placeholder("  bytes field_12 = 12;"));
 }
@@ -329,12 +349,16 @@ fn merge_messages_prefers_more_complete_definition() {
         fields: vec![
             Field::new(1, "vendor", "scalar"),
             Field {
-                t: Some(TypeToken::Named("aiserver.v1.RunInferenceAgentModeConfig".into())),
+                t: Some(TypeToken::Named(
+                    "aiserver.v1.RunInferenceAgentModeConfig".into(),
+                )),
                 repeated: true,
                 ..Field::new(46, "agent_mode_configs", "message")
             },
             Field {
-                t: Some(TypeToken::Named("aiserver.v1.RunInferenceAskQuestionConfig".into())),
+                t: Some(TypeToken::Named(
+                    "aiserver.v1.RunInferenceAskQuestionConfig".into(),
+                )),
                 opt: true,
                 ..Field::new(48, "ask_question_config", "message")
             },
@@ -397,13 +421,17 @@ var Pf1={typeName:"aiserver.v1.InferenceService",methods:{runInference:{name:"Ru
     assert!(field.repeated);
     assert_eq!(
         field.t,
-        Some(TypeToken::Named("aiserver.v1.RunInferenceAgentModeConfig".into()))
+        Some(TypeToken::Named(
+            "aiserver.v1.RunInferenceAgentModeConfig".into()
+        ))
     );
     let ask = field_by_name(&meta.fields, "ask_question_config").expect("ask_question_config");
     assert!(ask.opt);
     assert_eq!(
         ask.t,
-        Some(TypeToken::Named("aiserver.v1.RunInferenceAskQuestionConfig".into()))
+        Some(TypeToken::Named(
+            "aiserver.v1.RunInferenceAskQuestionConfig".into()
+        ))
     );
     let mode = by_type
         .get("aiserver.v1.RunInferenceAgentModeConfig")
@@ -418,7 +446,10 @@ var Pf1={typeName:"aiserver.v1.InferenceService",methods:{runInference:{name:"Ru
         "result",
     )
     .expect("result");
-    assert_eq!(result.t, Some(TypeToken::Named("google.protobuf.Value".into())));
+    assert_eq!(
+        result.t,
+        Some(TypeToken::Named("google.protobuf.Value".into()))
+    );
     let labels = field_by_name(
         &by_type
             .get("aiserver.v1.RunInferenceRunReady")
@@ -439,16 +470,26 @@ var Pf1={typeName:"aiserver.v1.InferenceService",methods:{runInference:{name:"Ru
         "missing InferenceReason, got {:?}",
         scan.enums
             .iter()
-            .map(|item| (item.type_name.clone(), item.package.clone(), item.var_name.clone()))
+            .map(|item| (
+                item.type_name.clone(),
+                item.package.clone(),
+                item.var_name.clone()
+            ))
             .collect::<Vec<_>>()
     );
     let reason = reason.expect("reason");
-    assert_eq!(reason.values[1].name, "INFERENCE_REASON_GEMINI_VIDEO_SUBAGENT");
+    assert_eq!(
+        reason.values[1].name,
+        "INFERENCE_REASON_GEMINI_VIDEO_SUBAGENT"
+    );
     assert_eq!(scan.services.len(), 1);
     assert_eq!(scan.services[0].type_name, "aiserver.v1.InferenceService");
     let resolver = resolver_from_scan(&scan);
     super::normalize_type_references(&mut scan.messages, &mut scan.services, &resolver);
-    assert_eq!(scan.services[0].methods[2].output_type, "google.protobuf.Empty");
+    assert_eq!(
+        scan.services[0].methods[2].output_type,
+        "google.protobuf.Empty"
+    );
 }
 
 #[test]
@@ -482,7 +523,8 @@ message Other {
   optional RunInferenceAskQuestionConfig ask_question_config = 48;
 }
 "#;
-    let err = validate_required_agent_shapes("aiserver_v1.proto", BODY).expect_err("cross-message leak");
+    let err =
+        validate_required_agent_shapes("aiserver_v1.proto", BODY).expect_err("cross-message leak");
     assert!(err.contains("agent_mode_configs"));
 }
 
@@ -495,10 +537,11 @@ fn scan_records_oxc_parse_errors() {
 #[test]
 fn scan_keeps_valid_factory_after_recoverable_noise() {
     let scan = scan_source("var Keep=n.makeMessageType(\"agent.v1.Keep\",()=>[]);");
-    assert!(scan
-        .messages
-        .iter()
-        .any(|message| message.type_name == "agent.v1.Keep"));
+    assert!(
+        scan.messages
+            .iter()
+            .any(|message| message.type_name == "agent.v1.Keep")
+    );
 }
 
 #[test]
@@ -507,7 +550,8 @@ fn no_strict_extract_keeps_files_when_required_shapes_are_missing() {
 var Keep=n.makeMessageType("aiserver.v1.Keep",()=>[{no:1,name:"id",kind:"scalar",T:9}]);
 var Ads={typeName:"aiserver.v1.InAppAdService",methods:{ping:{name:"Ping",I:Keep,O:Keep,kind:n.MethodKind.Unary}}};
 "#;
-    let result = extract_from_sources(&[("bundle.js", BUNDLE.to_string())], false).expect("extract");
+    let result =
+        extract_from_sources(&[("bundle.js", BUNDLE.to_string())], false).expect("extract");
     assert!(result.files.contains_key("aiserver_v1.proto"));
     assert!(result.diagnostics.shape_errors.is_empty());
 }
@@ -532,9 +576,20 @@ var Keep=n.makeMessageType("agent.v1.Keep",()=>[{no:1,name:"id",kind:"scalar",T:
 var Drop=n.makeMessageType("origin.v1.Drop",()=>[{no:1,name:"id",kind:"scalar",T:9}]);
 var Ads={typeName:"aiserver.v1.InAppAdService",methods:{ping:{name:"Ping",I:Keep,O:Keep,kind:n.MethodKind.Unary}}};
 "#;
-    let result = extract_from_sources(&[("bundle.js", BUNDLE.to_string())], false).expect("extract");
-    assert!(result.messages.iter().any(|message| message.type_name == "agent.v1.Keep"));
-    assert!(!result.messages.iter().any(|message| message.type_name.contains("origin.v1")));
+    let result =
+        extract_from_sources(&[("bundle.js", BUNDLE.to_string())], false).expect("extract");
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|message| message.type_name == "agent.v1.Keep")
+    );
+    assert!(
+        !result
+            .messages
+            .iter()
+            .any(|message| message.type_name.contains("origin.v1"))
+    );
     assert!(result.files.contains_key("agent_v1.proto"));
     assert!(result.files.contains_key("aiserver_v1.proto"));
     assert!(!result.files.keys().any(|name| name.contains("origin")));

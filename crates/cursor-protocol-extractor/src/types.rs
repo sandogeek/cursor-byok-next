@@ -76,7 +76,9 @@ impl TypeToken {
 
     pub fn completeness(&self) -> i32 {
         match self {
-            Self::Named(name) if looks_like_full_type_name(name) || google_well_known(name).is_some() => {
+            Self::Named(name)
+                if looks_like_full_type_name(name) || google_well_known(name).is_some() =>
+            {
                 3
             }
             Self::Named(_) => 1,
@@ -303,11 +305,7 @@ impl fmt::Display for Diagnostics {
             writeln!(f, "占位字段命中:")?;
             for (i, hit) in self.placeholder_hits.iter().enumerate() {
                 if i >= 20 {
-                    writeln!(
-                        f,
-                        "  - ... and {} more",
-                        self.placeholder_hits.len() - 20
-                    )?;
+                    writeln!(f, "  - ... and {} more", self.placeholder_hits.len() - 20)?;
                     break;
                 }
                 writeln!(f, "  - {hit}")?;
@@ -364,12 +362,20 @@ pub fn looks_like_versioned_type(value: &str) -> bool {
 }
 
 pub fn looks_like_package_name(value: &str) -> bool {
-    let trimmed = value.trim().trim_matches(|c| c == '"' || c == '\'').trim_end_matches('.');
+    let trimmed = value
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim_end_matches('.');
     let mut parts = trimmed.split('.');
     let Some(first) = parts.next() else {
         return false;
     };
-    if first.is_empty() || !first.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) || !is_ident(first)
+    if first.is_empty()
+        || !first
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+        || !is_ident(first)
     {
         return false;
     }
@@ -377,8 +383,7 @@ pub fn looks_like_package_name(value: &str) -> bool {
     if rest.is_empty() {
         return false;
     }
-    is_version_token(rest[rest.len() - 1])
-        && rest.iter().all(|part| is_ident(part))
+    is_version_token(rest[rest.len() - 1]) && rest.iter().all(|part| is_ident(part))
 }
 
 pub fn parse_type_name(type_name: &str) -> (String, String) {
@@ -408,10 +413,7 @@ fn split_versioned(type_name: &str) -> Option<(String, String)> {
                     j += 1;
                 }
                 if j < bytes.len() && bytes[j] == b'.' {
-                    return Some((
-                        type_name[..j].to_string(),
-                        type_name[j + 1..].to_string(),
-                    ));
+                    return Some((type_name[..j].to_string(), type_name[j + 1..].to_string()));
                 }
             }
         }

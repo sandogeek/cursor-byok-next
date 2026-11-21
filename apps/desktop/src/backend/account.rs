@@ -3,12 +3,12 @@
 use axum::{
     body::Body,
     extract::Extension,
-    http::{header, HeaderValue, Request, Response},
+    http::{HeaderValue, Request, Response, header},
 };
 use prost::Message;
 use serde_json::Value;
 
-use crate::{backend::proxy, Result};
+use crate::{Result, backend::proxy};
 
 const LOCAL_AUTH_ID: &str = "cursor-local-user";
 const LOCAL_EMAIL: &str = "cursor@ai.com";

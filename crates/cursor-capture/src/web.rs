@@ -28,7 +28,10 @@ pub fn router() -> Router<Arc<Server>> {
     Router::new()
         .route("/", get(static_file))
         .route("/api/status", get(handle_status))
-        .route("/api/exchanges", get(handle_exchange_list).delete(handle_clear_exchanges))
+        .route(
+            "/api/exchanges",
+            get(handle_exchange_list).delete(handle_clear_exchanges),
+        )
         .route("/api/exchanges/{id}", get(handle_exchange_detail))
         .route("/api/conversations", get(handle_conversation_list))
         .route("/api/events", get(handle_events))
@@ -57,18 +60,17 @@ async fn handle_exchange_list(
     State(server): State<Arc<Server>>,
     Query(query): Query<ExchangeQuery>,
 ) -> Response {
-    let conversation_id = query
-        .conversation_id
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let conversation_id = query.conversation_id.unwrap_or_default().trim().to_string();
     match server.store().summaries(&conversation_id) {
         Ok(summaries) => axum::Json(summaries).into_response(),
         Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
 }
 
-async fn handle_exchange_detail(State(server): State<Arc<Server>>, Path(id): Path<String>) -> Response {
+async fn handle_exchange_detail(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> Response {
     match server.store().get(id.trim()) {
         Ok(Some(exchange)) => axum::Json(exchange).into_response(),
         Ok(None) => json_error(StatusCode::NOT_FOUND, "请求记录不存在"),
@@ -90,7 +92,9 @@ async fn handle_conversation_list(State(server): State<Arc<Server>>) -> Response
     }
 }
 
-async fn handle_events(State(server): State<Arc<Server>>) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+async fn handle_events(
+    State(server): State<Arc<Server>>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let rx = server.store().subscribe();
     let stream = async_stream::stream! {
         yield Ok(Event::default().event("ready").data("{}"));
@@ -117,7 +121,11 @@ async fn handle_events(State(server): State<Arc<Server>>) -> Sse<impl futures_ut
             }
         }
     };
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("heartbeat"))
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("heartbeat"),
+    )
 }
 
 async fn static_file(request: Request<Body>) -> Response {

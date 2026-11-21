@@ -68,7 +68,11 @@ pub struct Payload {
     pub raw_truncated: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub decoded_json: String,
-    #[serde(rename = "decodedLanguage", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "decodedLanguage",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub decoded_lang: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub decode_error: String,

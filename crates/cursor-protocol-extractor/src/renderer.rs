@@ -2,9 +2,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::resolver::{fallback_type_token, TypeResolver};
+use crate::resolver::{TypeResolver, fallback_type_token};
 use crate::types::{
-    parse_type_name, scalar_name, Diagnostics, Enum, Field, Message, Service, TypeToken,
+    Diagnostics, Enum, Field, Message, Service, TypeToken, parse_type_name, scalar_name,
 };
 
 #[derive(Default)]
@@ -43,7 +43,11 @@ pub fn generate_proto_file(
 
     let mut root = TypeNode::default();
     for message in messages {
-        insert_message(&mut root, &nested_path(&message.short_name), message.clone());
+        insert_message(
+            &mut root,
+            &nested_path(&message.short_name),
+            message.clone(),
+        );
     }
     for item in enums {
         insert_enum(&mut root, &nested_path(&item.short_name), item.clone());
@@ -78,12 +82,24 @@ pub fn generate_proto_file(
                 diag,
             );
             let line = match method.kind.as_str() {
-                "ServerStreaming" => format!("  rpc {}({}) returns (stream {}) {{}}\n", method.name, input, output),
-                "ClientStreaming" => format!("  rpc {}(stream {}) returns ({}) {{}}\n", method.name, input, output),
+                "ServerStreaming" => format!(
+                    "  rpc {}({}) returns (stream {}) {{}}\n",
+                    method.name, input, output
+                ),
+                "ClientStreaming" => format!(
+                    "  rpc {}(stream {}) returns ({}) {{}}\n",
+                    method.name, input, output
+                ),
                 "BiDiStreaming" => {
-                    format!("  rpc {}(stream {}) returns (stream {}) {{}}\n", method.name, input, output)
+                    format!(
+                        "  rpc {}(stream {}) returns (stream {}) {{}}\n",
+                        method.name, input, output
+                    )
                 }
-                _ => format!("  rpc {}({}) returns ({}) {{}}\n", method.name, input, output),
+                _ => format!(
+                    "  rpc {}({}) returns ({}) {{}}\n",
+                    method.name, input, output
+                ),
             };
             out.push_str(&line);
         }
@@ -145,10 +161,7 @@ fn write_type_tree(
             }
             out.push_str(&format!("{indent_str}enum {name} {{\n"));
             for value in &item.values {
-                out.push_str(&format!(
-                    "{indent_str}  {} = {};\n",
-                    value.name, value.no
-                ));
+                out.push_str(&format!("{indent_str}  {} = {};\n", value.name, value.no));
             }
             out.push_str(&format!("{indent_str}}}\n\n"));
         } else if child.message.is_some() || !child.children.is_empty() {
@@ -254,9 +267,13 @@ fn resolve_method_type(
     copied: &HashMap<String, String>,
     diag: &mut Diagnostics,
 ) -> String {
-    let Some(type_name) =
-        resolver.resolve_type_name(type_ref, context_pos, context_module_start, current_pkg, "message")
-    else {
+    let Some(type_name) = resolver.resolve_type_name(
+        type_ref,
+        context_pos,
+        context_module_start,
+        current_pkg,
+        "message",
+    ) else {
         diag.add_unresolved_type(&format!("method:{type_ref}"));
         return fallback_type_token(type_ref);
     };
@@ -338,26 +355,31 @@ pub fn collect_imports(
     resolver: &TypeResolver,
 ) -> HashSet<String> {
     let mut imports = HashSet::new();
-    let mut add = |r#ref: &str, context_pos: u32, context_module_start: u32, expected_kind: &str| {
-        let Some(type_name) =
-            resolver.resolve_type_name(r#ref, context_pos, context_module_start, current_pkg, expected_kind)
-        else {
-            return;
+    let mut add =
+        |r#ref: &str, context_pos: u32, context_module_start: u32, expected_kind: &str| {
+            let Some(type_name) = resolver.resolve_type_name(
+                r#ref,
+                context_pos,
+                context_module_start,
+                current_pkg,
+                expected_kind,
+            ) else {
+                return;
+            };
+            let (ref_pkg, short_name) = parse_type_name(&type_name);
+            if ref_pkg == "google.protobuf" {
+                imports.insert(google_protobuf_import(&short_name).to_string());
+            } else if ref_pkg == "google.rpc" {
+                imports.insert(
+                    if short_name == "Code" {
+                        "google/rpc/code.proto"
+                    } else {
+                        "google/rpc/status.proto"
+                    }
+                    .to_string(),
+                );
+            }
         };
-        let (ref_pkg, short_name) = parse_type_name(&type_name);
-        if ref_pkg == "google.protobuf" {
-            imports.insert(google_protobuf_import(&short_name).to_string());
-        } else if ref_pkg == "google.rpc" {
-            imports.insert(
-                if short_name == "Code" {
-                    "google/rpc/code.proto"
-                } else {
-                    "google/rpc/status.proto"
-                }
-                .to_string(),
-            );
-        }
-    };
     for message in messages {
         for field in &message.fields {
             if field.kind == "message" || field.kind == "enum" {
@@ -365,18 +387,34 @@ pub fn collect_imports(
                     add(name, message.pos, message.module_start, &field.kind);
                 }
             }
-            if field.kind == "map" && (field.map_value_kind == "message" || field.map_value_kind == "enum")
+            if field.kind == "map"
+                && (field.map_value_kind == "message" || field.map_value_kind == "enum")
             {
                 if let Some(TypeToken::Named(name)) = &field.map_value_t {
-                    add(name, message.pos, message.module_start, &field.map_value_kind);
+                    add(
+                        name,
+                        message.pos,
+                        message.module_start,
+                        &field.map_value_kind,
+                    );
                 }
             }
         }
     }
     for service in services {
         for method in &service.methods {
-            add(&method.input_type, service.pos, service.module_start, "message");
-            add(&method.output_type, service.pos, service.module_start, "message");
+            add(
+                &method.input_type,
+                service.pos,
+                service.module_start,
+                "message",
+            );
+            add(
+                &method.output_type,
+                service.pos,
+                service.module_start,
+                "message",
+            );
         }
     }
     imports

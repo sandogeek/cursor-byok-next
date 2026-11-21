@@ -31,8 +31,11 @@ fn main() {
         write_proto(&aiserver_path, &aiserver);
         match protox::compile([&agent_path, &aiserver_path], [&generated]) {
             Ok(file_descriptor_set) => {
-                std::fs::write(out_dir.join("cursor.bin"), file_descriptor_set.encode_to_vec())
-                    .expect("write cursor descriptor set");
+                std::fs::write(
+                    out_dir.join("cursor.bin"),
+                    file_descriptor_set.encode_to_vec(),
+                )
+                .expect("write cursor descriptor set");
                 return;
             }
             Err(err) => {
@@ -58,8 +61,7 @@ fn read_proto(path: &Path) -> String {
 }
 
 fn write_proto(path: &Path, contents: &str) {
-    std::fs::write(path, contents)
-        .unwrap_or_else(|err| panic!("write {}: {err}", path.display()));
+    std::fs::write(path, contents).unwrap_or_else(|err| panic!("write {}: {err}", path.display()));
 }
 
 fn sanitize(source: &str) -> String {

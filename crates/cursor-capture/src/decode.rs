@@ -19,14 +19,14 @@ pub const UPLOAD_CONVERSATION_BLOBS_PATH: &str = "/agent.v1.AgentService/UploadC
 pub const CPP_AVAILABLE_MODELS_PATH: &str = "/aiserver.v1.CppService/AvailableModels";
 pub const AI_AVAILABLE_MODELS_PATH: &str = "/aiserver.v1.AiService/AvailableModels";
 pub const AI_GET_DEFAULT_MODEL_PATH: &str = "/aiserver.v1.AiService/GetDefaultModel";
-pub const AI_DEFAULT_MODEL_NUDGE_DATA_PATH: &str = "/aiserver.v1.AiService/GetDefaultModelNudgeData";
+pub const AI_DEFAULT_MODEL_NUDGE_DATA_PATH: &str =
+    "/aiserver.v1.AiService/GetDefaultModelNudgeData";
 pub const MCP_GET_KNOWN_SERVERS_PATH: &str = "/aiserver.v1.MCPRegistryService/GetKnownServers";
 pub const SERVER_GET_CONFIG_PATH: &str = "/aiserver.v1.ServerConfigService/GetServerConfig";
 pub const RUN_SSE_PATH: &str = "/agent.v1.AgentService/RunSSE";
 
 static POOL: LazyLock<DescriptorPool> = LazyLock::new(|| {
-    DescriptorPool::decode(CURSOR_DESCRIPTORS)
-        .expect("decode Cursor protobuf descriptors")
+    DescriptorPool::decode(CURSOR_DESCRIPTORS).expect("decode Cursor protobuf descriptors")
 });
 
 static CURSOR_DESCRIPTORS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cursor.bin"));
@@ -70,7 +70,8 @@ impl ConnectFrameDecoder {
         self.buffer.extend_from_slice(payload);
         while self.buffer.len() >= 5 && self.frame_count < self.max_frames {
             let flags = self.buffer[0];
-            let length = u32::from_be_bytes(self.buffer[1..5].try_into().expect("4 bytes")) as usize;
+            let length =
+                u32::from_be_bytes(self.buffer[1..5].try_into().expect("4 bytes")) as usize;
             if length > MAX_CONNECT_FRAME_BYTES {
                 self.emit(FrameView {
                     flags,
@@ -271,8 +272,8 @@ fn decode_bidi_client_message(
     let message = decode_named_message("agent.v1.AgentClientMessage", &binary)
         .ok_or_else(|| "未知的 protobuf 消息类型".to_string())?
         .map_err(|err| format!("decode binary agent client message failed: {err}"))?;
-        let kind = active_oneof_name(&message);
-        Ok(Some((message, kind)))
+    let kind = active_oneof_name(&message);
+    Ok(Some((message, kind)))
 }
 
 fn conversation_id_from_client_message(message: &DynamicMessage) -> String {
@@ -442,8 +443,7 @@ fn hydrate_stored_text_payload(payload: &mut Payload) -> bool {
             return true;
         }
     };
-    let decoded =
-        decode_captured_content(&raw, &payload.content_type, &payload.content_codec);
+    let decoded = decode_captured_content(&raw, &payload.content_type, &payload.content_codec);
     if decoded.text.is_empty() && decoded.error.is_none() {
         return false;
     }

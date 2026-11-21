@@ -7,7 +7,7 @@ use oxc::ast::ast::{
     ArrayExpression, CallExpression, Class, ClassElement, Expression, FormalParameters,
     MethodDefinition, ObjectExpression, ObjectPropertyKind, VariableDeclarator,
 };
-use oxc::ast_visit::{walk, Visit};
+use oxc::ast_visit::{Visit, walk};
 use oxc::parser::Parser;
 use oxc::span::{GetSpan, SourceType, Span};
 use regex::Regex;
@@ -15,18 +15,18 @@ use std::sync::OnceLock;
 
 use crate::ast_util::{
     argument_expr, array_from_expr, assignment_ident, assignment_member, binding_ident,
-    callee_tail, ident_name, is_js_true, last_segment, member_or_ident, number_lit,
-    object_prop, object_prop_shorthand, param_names, property_name, property_numeric_key,
-    returned_expression, string_lit,
+    callee_tail, ident_name, is_js_true, last_segment, member_or_ident, number_lit, object_prop,
+    object_prop_shorthand, param_names, property_name, property_numeric_key, returned_expression,
+    string_lit,
 };
 use crate::compact::{
-    compact_class_name_at, extract_compact_enum_values, finish_compact_messages,
-    package_for_compact_pos, parse_compact_schema_array, resolve_compact_package_expr,
-    CompactClass, CompactPendingMessage, CompactPrefix,
+    CompactClass, CompactPendingMessage, CompactPrefix, compact_class_name_at,
+    extract_compact_enum_values, finish_compact_messages, package_for_compact_pos,
+    parse_compact_schema_array, resolve_compact_package_expr,
 };
 use crate::types::{
-    google_well_known, is_field_name, is_google_pkg, is_ident, is_local_loop_pkg, parse_type_name,
-    Diagnostics, Enum, EnumValue, Field, Message, Method, Service, TypeToken,
+    Diagnostics, Enum, EnumValue, Field, Message, Method, Service, TypeToken, google_well_known,
+    is_field_name, is_google_pkg, is_ident, is_local_loop_pkg, parse_type_name,
 };
 
 #[derive(Default)]
@@ -58,8 +58,7 @@ fn wrapped_scan_is_better(original: &BundleScan, wrapped: &BundleScan) -> bool {
     if wrapped.module_starts.is_empty() && !scan_has_protocol(wrapped) {
         return false;
     }
-    let original_decls =
-        original.messages.len() + original.enums.len() + original.services.len();
+    let original_decls = original.messages.len() + original.enums.len() + original.services.len();
     let wrapped_decls = wrapped.messages.len() + wrapped.enums.len() + wrapped.services.len();
     if wrapped_decls < original_decls {
         return false;
@@ -109,10 +108,7 @@ fn scan_source_once(source: &str) -> BundleScan {
         enum_by_pos: HashMap::new(),
     };
     for error in parsed.diagnostics.errors() {
-        visitor
-            .scan
-            .diagnostics
-            .add_parse_error(&error.to_string());
+        visitor.scan.diagnostics.add_parse_error(&error.to_string());
     }
     visitor.visit_program(&parsed.program);
     visitor.finish()
@@ -234,9 +230,11 @@ impl<'a> Scanner<'a> {
         if alias.is_empty() || target.is_empty() || alias == target {
             return;
         }
-        self.scan
-            .aliases
-            .push((self.module_start_for(pos), alias.to_string(), target.to_string()));
+        self.scan.aliases.push((
+            self.module_start_for(pos),
+            alias.to_string(),
+            target.to_string(),
+        ));
     }
 
     fn maybe_package_prefix(&mut self, name: &str, value: &Expression<'_>, pos: u32) {
@@ -319,19 +317,16 @@ impl<'a> Scanner<'a> {
         var_name: &str,
         pos: u32,
     ) {
-        let type_name = object
-            .properties
-            .iter()
-            .find_map(|property| {
-                let ObjectPropertyKind::ObjectProperty(prop) = property else {
-                    return None;
-                };
-                if property_name(&prop.key) == Some("typeName") {
-                    string_lit(&prop.value).map(str::to_string)
-                } else {
-                    None
-                }
-            });
+        let type_name = object.properties.iter().find_map(|property| {
+            let ObjectPropertyKind::ObjectProperty(prop) = property else {
+                return None;
+            };
+            if property_name(&prop.key) == Some("typeName") {
+                string_lit(&prop.value).map(str::to_string)
+            } else {
+                None
+            }
+        });
         let Some(type_name) = type_name else {
             return;
         };
@@ -403,7 +398,11 @@ impl<'a> Scanner<'a> {
         let pos = call.span.start;
         match name {
             "makeMessageType" => {
-                let Some(type_name) = call.arguments.get(0).and_then(argument_expr).and_then(string_lit)
+                let Some(type_name) = call
+                    .arguments
+                    .get(0)
+                    .and_then(argument_expr)
+                    .and_then(string_lit)
                 else {
                     return;
                 };
@@ -413,16 +412,14 @@ impl<'a> Scanner<'a> {
                     .and_then(argument_expr)
                     .map(|expr| self.extract_fields_from_expr(expr))
                     .unwrap_or_default();
-                self.record_message(
-                    type_name,
-                    assigned.unwrap_or(""),
-                    "",
-                    fields,
-                    pos,
-                );
+                self.record_message(type_name, assigned.unwrap_or(""), "", fields, pos);
             }
             "makeEnum" => {
-                let Some(type_name) = call.arguments.get(0).and_then(argument_expr).and_then(string_lit)
+                let Some(type_name) = call
+                    .arguments
+                    .get(0)
+                    .and_then(argument_expr)
+                    .and_then(string_lit)
                 else {
                     return;
                 };
@@ -441,7 +438,11 @@ impl<'a> Scanner<'a> {
                     .and_then(argument_expr)
                     .and_then(ident_name)
                     .unwrap_or("");
-                let Some(type_name) = call.arguments.get(1).and_then(argument_expr).and_then(string_lit)
+                let Some(type_name) = call
+                    .arguments
+                    .get(1)
+                    .and_then(argument_expr)
+                    .and_then(string_lit)
                 else {
                     return;
                 };
@@ -456,14 +457,24 @@ impl<'a> Scanner<'a> {
             "enumType" | "QT" => self.handle_compact_enum(assigned, call),
             "newFieldList" => {
                 let class = self.current_class.as_ref().map(|class| {
-                    (class.var_name.clone(), class.internal_name.clone(), class.start)
+                    (
+                        class.var_name.clone(),
+                        class.internal_name.clone(),
+                        class.start,
+                    )
                 });
                 if let Some((var_name, internal_name, start)) = class {
                     if let Some(fields_expr) = call.arguments.first().and_then(argument_expr) {
                         let fields = self.extract_fields_from_expr(fields_expr);
                         if let Some(type_name) = self.class_type_name() {
                             let type_name = type_name.to_string();
-                            self.record_message(&type_name, &var_name, &internal_name, fields, start);
+                            self.record_message(
+                                &type_name,
+                                &var_name,
+                                &internal_name,
+                                fields,
+                                start,
+                            );
                         }
                     }
                 }
@@ -544,7 +555,12 @@ impl<'a> Scanner<'a> {
         let Some(pkg_expr) = pkg_expr else {
             return;
         };
-        let Some(short_name) = call.arguments.get(2).and_then(argument_expr).and_then(string_lit) else {
+        let Some(short_name) = call
+            .arguments
+            .get(2)
+            .and_then(argument_expr)
+            .and_then(string_lit)
+        else {
             return;
         };
         let pkg = resolve_compact_package_expr(&pkg_expr, call.span.start, &self.compact_prefixes);
@@ -669,7 +685,10 @@ impl<'a> Scanner<'a> {
                         type_name = prop.value.as_ref().and_then(string_lit).map(str::to_string);
                     }
                     if property_name(&prop.key) == Some("fields") {
-                        fields = prop.value.as_ref().map(|expr| self.extract_fields_from_expr(expr));
+                        fields = prop
+                            .value
+                            .as_ref()
+                            .map(|expr| self.extract_fields_from_expr(expr));
                     }
                 }
                 ClassElement::MethodDefinition(method) if method.r#static => {
@@ -793,7 +812,9 @@ impl<'a> Visit<'a> for Scanner<'a> {
         if let Some(name) = assignment_ident(&expr.left) {
             self.maybe_package_prefix(name, &expr.right, expr.span.start);
             match expr.right.get_inner_expression() {
-                Expression::Identifier(id) => self.add_alias(expr.span.start, name, id.name.as_str()),
+                Expression::Identifier(id) => {
+                    self.add_alias(expr.span.start, name, id.name.as_str())
+                }
                 Expression::ClassExpression(class) => self.collect_class(class, Some(name)),
                 Expression::CallExpression(call) => {
                     self.handle_factory_call(Some(name), call);
@@ -820,31 +841,39 @@ impl<'a> Visit<'a> for Scanner<'a> {
             }
         }
         if let Some((object, prop)) = assignment_member(&expr.left) {
-            let assigned_var = if matches!(object.get_inner_expression(), Expression::ThisExpression(_)) {
-                self.current_class.as_ref().map(|class| class.var_name.clone())
-            } else {
-                ident_name(object).map(str::to_string)
-            };
+            let assigned_var =
+                if matches!(object.get_inner_expression(), Expression::ThisExpression(_)) {
+                    self.current_class
+                        .as_ref()
+                        .map(|class| class.var_name.clone())
+                } else {
+                    ident_name(object).map(str::to_string)
+                };
             if prop == "typeName" {
-                if let (Some(type_name), Some(var_name)) = (string_lit(&expr.right), assigned_var.clone())
+                if let (Some(type_name), Some(var_name)) =
+                    (string_lit(&expr.right), assigned_var.clone())
                 {
                     let internal = self
                         .current_class
                         .as_ref()
                         .map(|class| class.internal_name.clone())
                         .unwrap_or_default();
-                    self.record_message(type_name, &var_name, &internal, Vec::new(), expr.span.start);
+                    self.record_message(
+                        type_name,
+                        &var_name,
+                        &internal,
+                        Vec::new(),
+                        expr.span.start,
+                    );
                 }
             }
             if prop == "fields" {
                 if let Some(var_name) = assigned_var {
                     let fields = self.extract_fields_from_expr(&expr.right);
-                    if let Some(message) = self
-                        .scan
-                        .messages
-                        .iter_mut()
-                        .rev()
-                        .find(|message| message.var_name == var_name && message.fields.is_empty())
+                    if let Some(message) =
+                        self.scan.messages.iter_mut().rev().find(|message| {
+                            message.var_name == var_name && message.fields.is_empty()
+                        })
                     {
                         message.fields = fields;
                     }
@@ -912,11 +941,14 @@ pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, String> {
         .and_then(string_lit)
         .ok_or_else(|| "missing field kind".to_string())?;
     let mut field = Field::new(no, name, kind);
-    if let Some(enum_call) = object_prop(expr, "T").and_then(|value| match value.get_inner_expression()
+    if let Some(enum_call) =
+        object_prop(expr, "T").and_then(|value| match value.get_inner_expression() {
+            Expression::CallExpression(call) if callee_tail(call) == Some("getEnumType") => {
+                Some(call)
+            }
+            _ => None,
+        })
     {
-        Expression::CallExpression(call) if callee_tail(call) == Some("getEnumType") => Some(call),
-        _ => None,
-    }) {
         if let Some(name) = enum_call
             .arguments
             .first()

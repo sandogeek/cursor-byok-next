@@ -137,7 +137,9 @@ pub fn assignment_ident<'a>(target: &'a AssignmentTarget<'a>) -> Option<&'a str>
     target.get_identifier_name()
 }
 
-pub fn assignment_member<'a>(target: &'a AssignmentTarget<'a>) -> Option<(&'a Expression<'a>, &'a str)> {
+pub fn assignment_member<'a>(
+    target: &'a AssignmentTarget<'a>,
+) -> Option<(&'a Expression<'a>, &'a str)> {
     match target {
         AssignmentTarget::StaticMemberExpression(member) => {
             Some((&member.object, member.property.name.as_str()))
@@ -147,9 +149,7 @@ pub fn assignment_member<'a>(target: &'a AssignmentTarget<'a>) -> Option<(&'a Ex
 }
 
 pub fn binding_ident<'a>(pattern: &'a BindingPattern<'a>) -> Option<&'a str> {
-    pattern
-        .get_identifier_name()
-        .map(|name| name.as_str())
+    pattern.get_identifier_name().map(|name| name.as_str())
 }
 
 pub fn returned_expression<'a>(body: &'a FunctionBody<'a>) -> Option<&'a Expression<'a>> {

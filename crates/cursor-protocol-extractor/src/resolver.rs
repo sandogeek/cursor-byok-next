@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::ast_util::last_segment;
 use crate::types::{
-    google_well_known, looks_like_full_type_name, parse_type_name, Enum, Message, SymbolDef,
+    Enum, Message, SymbolDef, google_well_known, looks_like_full_type_name, parse_type_name,
 };
 
 pub type AliasIndex = HashMap<u32, HashMap<String, Vec<String>>>;
@@ -77,24 +77,12 @@ impl TypeResolver {
                 "enum",
             );
             for alias in aliases_for_symbols(aliases.get(&item.module_start), &[&item.var_name]) {
-                resolver.add_alias(
-                    &alias,
-                    &item.type_name,
-                    item.pos,
-                    item.module_start,
-                    "enum",
-                );
+                resolver.add_alias(&alias, &item.type_name, item.pos, item.module_start, "enum");
             }
             for alias in
                 aliases_for_symbols(export_aliases.get(&item.module_start), &[&item.var_name])
             {
-                resolver.add_alias(
-                    &alias,
-                    &item.type_name,
-                    item.pos,
-                    item.module_start,
-                    "enum",
-                );
+                resolver.add_alias(&alias, &item.type_name, item.pos, item.module_start, "enum");
             }
         }
         resolver
@@ -142,18 +130,28 @@ impl TypeResolver {
         }
     }
 
-    fn add_alias(&mut self, symbol: &str, type_name: &str, pos: u32, module_start: u32, kind: &str) {
+    fn add_alias(
+        &mut self,
+        symbol: &str,
+        type_name: &str,
+        pos: u32,
+        module_start: u32,
+        kind: &str,
+    ) {
         let symbol = symbol.trim();
         let type_name = type_name.trim();
         if symbol.is_empty() || type_name.is_empty() {
             return;
         }
-        self.by_alias.entry(symbol.to_string()).or_default().push(SymbolDef {
-            type_name: type_name.to_string(),
-            pos,
-            kind: kind.to_string(),
-            module_start,
-        });
+        self.by_alias
+            .entry(symbol.to_string())
+            .or_default()
+            .push(SymbolDef {
+                type_name: type_name.to_string(),
+                pos,
+                kind: kind.to_string(),
+                module_start,
+            });
     }
 
     pub fn resolve_type_name(
@@ -177,9 +175,14 @@ impl TypeResolver {
             }
         }
         let prefer_same = !trimmed.contains('.');
-        if let Some(name) =
-            self.resolve_by_symbol(trimmed, context_pos, context_module_start, preferred_pkg, expected_kind, prefer_same)
-        {
+        if let Some(name) = self.resolve_by_symbol(
+            trimmed,
+            context_pos,
+            context_module_start,
+            preferred_pkg,
+            expected_kind,
+            prefer_same,
+        ) {
             return Some(name);
         }
         if let Some(name) =
@@ -187,9 +190,14 @@ impl TypeResolver {
         {
             return Some(name);
         }
-        if let Some(name) =
-            self.resolve_by_short(trimmed, context_pos, context_module_start, preferred_pkg, expected_kind, prefer_same)
-        {
+        if let Some(name) = self.resolve_by_short(
+            trimmed,
+            context_pos,
+            context_module_start,
+            preferred_pkg,
+            expected_kind,
+            prefer_same,
+        ) {
             return Some(name);
         }
         if trimmed.contains('.') {
@@ -201,24 +209,43 @@ impl TypeResolver {
                 .and_then(|imports| imports.get(first))
                 .copied()
                 .unwrap_or(0);
-            if let Some(name) =
-                self.resolve_by_alias(last, context_pos, target_module, preferred_pkg, expected_kind)
-            {
+            if let Some(name) = self.resolve_by_alias(
+                last,
+                context_pos,
+                target_module,
+                preferred_pkg,
+                expected_kind,
+            ) {
                 return Some(name);
             }
-            if let Some(name) =
-                self.resolve_by_symbol(last, context_pos, context_module_start, preferred_pkg, expected_kind, false)
-            {
+            if let Some(name) = self.resolve_by_symbol(
+                last,
+                context_pos,
+                context_module_start,
+                preferred_pkg,
+                expected_kind,
+                false,
+            ) {
                 return Some(name);
             }
-            if let Some(name) =
-                self.resolve_by_short(last, context_pos, context_module_start, preferred_pkg, expected_kind, false)
-            {
+            if let Some(name) = self.resolve_by_short(
+                last,
+                context_pos,
+                context_module_start,
+                preferred_pkg,
+                expected_kind,
+                false,
+            ) {
                 return Some(name);
             }
-            if let Some(name) =
-                self.resolve_by_symbol(first, context_pos, context_module_start, preferred_pkg, expected_kind, false)
-            {
+            if let Some(name) = self.resolve_by_symbol(
+                first,
+                context_pos,
+                context_module_start,
+                preferred_pkg,
+                expected_kind,
+                false,
+            ) {
                 return Some(name);
             }
             if let Some(name) = well_known_type_name(last) {
@@ -245,8 +272,14 @@ impl TypeResolver {
         } else {
             0
         };
-        pick_best_definition(candidates, context_pos, module_start, preferred_pkg, expected_kind)
-            .map(|def| def.type_name.clone())
+        pick_best_definition(
+            candidates,
+            context_pos,
+            module_start,
+            preferred_pkg,
+            expected_kind,
+        )
+        .map(|def| def.type_name.clone())
     }
 
     fn resolve_by_alias(
@@ -283,8 +316,14 @@ impl TypeResolver {
         } else {
             0
         };
-        pick_best_definition(candidates, context_pos, module_start, preferred_pkg, expected_kind)
-            .map(|def| def.type_name.clone())
+        pick_best_definition(
+            candidates,
+            context_pos,
+            module_start,
+            preferred_pkg,
+            expected_kind,
+        )
+        .map(|def| def.type_name.clone())
     }
 }
 
@@ -398,7 +437,10 @@ fn resolve_root(direct: &HashMap<String, String>, symbol: &str) -> String {
     }
 }
 
-fn aliases_for_symbols(aliases: Option<&HashMap<String, Vec<String>>>, symbols: &[&str]) -> Vec<String> {
+fn aliases_for_symbols(
+    aliases: Option<&HashMap<String, Vec<String>>>,
+    symbols: &[&str],
+) -> Vec<String> {
     let Some(aliases) = aliases else {
         return Vec::new();
     };
@@ -419,8 +461,15 @@ fn aliases_for_symbols(aliases: Option<&HashMap<String, Vec<String>>>, symbols: 
     result
 }
 
-pub fn build_module_imports(entries: &[(u32, String, u32)], module_starts: &[(u32, u32)]) -> ModuleImports {
-    let id_to_start: HashMap<u32, u32> = module_starts.iter().copied().map(|(start, id)| (id, start)).collect();
+pub fn build_module_imports(
+    entries: &[(u32, String, u32)],
+    module_starts: &[(u32, u32)],
+) -> ModuleImports {
+    let id_to_start: HashMap<u32, u32> = module_starts
+        .iter()
+        .copied()
+        .map(|(start, id)| (id, start))
+        .collect();
     let mut imports = ModuleImports::new();
     for (module_start, alias, target) in entries {
         if alias.is_empty() {

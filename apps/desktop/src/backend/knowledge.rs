@@ -7,7 +7,7 @@ use std::{
 };
 
 use axum::{
-    body::{to_bytes, Body, Bytes},
+    body::{Body, Bytes, to_bytes},
     extract::Extension,
     http::{Request, Response},
 };
@@ -15,8 +15,8 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    protocol::{connect, proto::agent::v1 as pb},
     Error, Result,
+    protocol::{connect, proto::agent::v1 as pb},
 };
 
 const META_FILE: &str = "meta.json";

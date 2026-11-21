@@ -379,7 +379,11 @@ mod tests {
             "/aiserver.v1.InferenceService/RunInferenceSSE",
             "/aiserver.v1.BidiService/BidiAppend",
         ] {
-            assert_eq!(routing.routes("api2.cursor.sh", path), Some(backend), "{path}");
+            assert_eq!(
+                routing.routes("api2.cursor.sh", path),
+                Some(backend),
+                "{path}"
+            );
         }
     }
 

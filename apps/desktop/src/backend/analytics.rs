@@ -3,15 +3,15 @@
 use axum::{
     body::{Body, Bytes},
     extract::Extension,
-    http::{header, HeaderValue, Request, Response, StatusCode},
+    http::{HeaderValue, Request, Response, StatusCode, header},
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::{BufMut, BytesMut};
 use prost::Message;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{backend::proxy, Error, Result};
+use crate::{Error, Result, backend::proxy};
 
 pub const BOOTSTRAP_STATSIG_PATH: &str = "/aiserver.v1.AnalyticsService/BootstrapStatsig";
 const AGENT_GATES: [(&str, bool); 2] =

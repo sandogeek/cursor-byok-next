@@ -13,7 +13,9 @@ pub fn validate_required_agent_shapes(file: &str, body: &str) -> Result<(), Stri
     }
     if let Some(block) = proto_block(body, "message", "ShellStream") {
         if !block.contains("ShellStreamStdout stdout = 1;") {
-            return Err(format!("{file}: ShellStream.stdout must be ShellStreamStdout"));
+            return Err(format!(
+                "{file}: ShellStream.stdout must be ShellStreamStdout"
+            ));
         }
     }
     if let Some(block) = proto_block(body, "message", "RunInferencePromptModelMetadata") {
@@ -31,7 +33,8 @@ pub fn validate_required_agent_shapes(file: &str, body: &str) -> Result<(), Stri
     if let Some(block) = proto_block(body, "message", "RunInferenceAgentModeConfig") {
         if !(block.contains("string mode_id = 1;")
             && block.contains("bool enable_ask_question_tool = 2;")
-            && block.contains("optional RunInferenceSwitchModeToolConfig switch_mode_tool_config = 3;"))
+            && block
+                .contains("optional RunInferenceSwitchModeToolConfig switch_mode_tool_config = 3;"))
         {
             return Err(format!(
                 "{file}: RunInferenceAgentModeConfig must include mode_id, enable_ask_question_tool, and switch_mode_tool_config"
@@ -40,10 +43,14 @@ pub fn validate_required_agent_shapes(file: &str, body: &str) -> Result<(), Stri
     }
     if let Some(block) = proto_block(body, "service", "InferenceService") {
         if !run_inference().is_match(block) {
-            return Err(format!("{file}: InferenceService must expose bidi RunInference"));
+            return Err(format!(
+                "{file}: InferenceService must expose bidi RunInference"
+            ));
         }
         if !run_inference_sse().is_match(block) {
-            return Err(format!("{file}: InferenceService must expose RunInferenceSSE"));
+            return Err(format!(
+                "{file}: InferenceService must expose RunInferenceSSE"
+            ));
         }
     }
     Ok(())

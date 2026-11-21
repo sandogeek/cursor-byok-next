@@ -3,17 +3,17 @@
 use axum::{
     body::{Body, Bytes},
     extract::Extension,
-    http::{header, HeaderValue, Request, Response, StatusCode},
+    http::{HeaderValue, Request, Response, StatusCode, header},
 };
 use bytes::{BufMut, BytesMut};
 use prost::Message;
 
 use crate::{
+    Error, Result,
     backend::proxy::{self, CursorProxy},
     model::{format_token_count, parse_token_count},
     plugins::{PluginHost, PluginModelDescriptor},
     protocol::proto::agent::v1 as agent,
-    Error, Result,
 };
 
 const CLI_LOCAL_MODEL_API_KEY: &str = "cursor-byok-next-local";

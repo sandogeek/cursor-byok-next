@@ -12,10 +12,10 @@ use crate::merge::{
     reclassify_enum_fields, record_empty_messages,
 };
 use crate::renderer::generate_proto_file;
-use crate::resolver::{build_alias_index, build_module_imports, TypeResolver};
-use crate::scan::{scan_source, BundleScan};
+use crate::resolver::{TypeResolver, build_alias_index, build_module_imports};
+use crate::scan::{BundleScan, scan_source};
 use crate::types::{
-    is_google_pkg, is_local_loop_pkg, parse_type_name, Diagnostics, Enum, Message, Service,
+    Diagnostics, Enum, Message, Service, is_google_pkg, is_local_loop_pkg, parse_type_name,
 };
 use crate::validate::{has_placeholder, validate_required_agent_shapes};
 
@@ -46,7 +46,10 @@ pub struct ExtractResult {
     pub diagnostics: Diagnostics,
 }
 
-pub fn extract_from_sources(sources: &[(&str, String)], strict: bool) -> Result<ExtractResult, ExtractError> {
+pub fn extract_from_sources(
+    sources: &[(&str, String)],
+    strict: bool,
+) -> Result<ExtractResult, ExtractError> {
     let mut all_messages = Vec::new();
     let mut all_enums = Vec::new();
     let mut all_services = Vec::new();
@@ -60,7 +63,8 @@ pub fn extract_from_sources(sources: &[(&str, String)], strict: bool) -> Result<
         remap_module_imports(&mut scan);
         let aliases = build_alias_index(&scan.aliases);
         let export_aliases = build_alias_index(&scan.export_aliases);
-        let mut resolver = TypeResolver::new(&scan.messages, &scan.enums, &aliases, &export_aliases);
+        let mut resolver =
+            TypeResolver::new(&scan.messages, &scan.enums, &aliases, &export_aliases);
         resolver.module_imports = build_module_imports(&scan.module_imports, &scan.module_starts);
         reclassify_enum_fields(&mut scan.messages, &scan.enums);
         normalize_type_references(&mut scan.messages, &mut scan.services, &resolver);
@@ -118,7 +122,10 @@ pub fn extract_from_files(
     Ok(result)
 }
 
-pub fn write_protos(output_dir: impl AsRef<Path>, files: &HashMap<String, String>) -> Result<(), ExtractError> {
+pub fn write_protos(
+    output_dir: impl AsRef<Path>,
+    files: &HashMap<String, String>,
+) -> Result<(), ExtractError> {
     let output_dir = output_dir.as_ref();
     let parent = output_dir.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|source| ExtractError::Write {
@@ -217,13 +224,25 @@ fn generate_local_loop_protos(
 ) -> HashMap<String, String> {
     let mut packages: HashMap<String, Package> = HashMap::new();
     for message in messages {
-        packages.entry(message.package.clone()).or_default().messages.push(message.clone());
+        packages
+            .entry(message.package.clone())
+            .or_default()
+            .messages
+            .push(message.clone());
     }
     for item in enums {
-        packages.entry(item.package.clone()).or_default().enums.push(item.clone());
+        packages
+            .entry(item.package.clone())
+            .or_default()
+            .enums
+            .push(item.clone());
     }
     for service in services {
-        packages.entry(service.package.clone()).or_default().services.push(service.clone());
+        packages
+            .entry(service.package.clone())
+            .or_default()
+            .services
+            .push(service.clone());
     }
 
     let mut all_messages = HashMap::new();
@@ -254,7 +273,8 @@ fn generate_local_loop_protos(
             &copied,
             diag,
         );
-        if let Err(err) = validate_required_agent_shapes(&format!("{}.proto", pkg_name.replace('.', "_")), &body)
+        if let Err(err) =
+            validate_required_agent_shapes(&format!("{}.proto", pkg_name.replace('.', "_")), &body)
         {
             diag.add_shape_error(&err);
         }
@@ -287,7 +307,10 @@ fn copy_external_types(
     let mut local_types = HashSet::new();
     for message in &package.messages {
         local_types.insert(message.short_name.clone());
-        copied.insert(message.short_name.clone(), format!("local:{}", message.type_name));
+        copied.insert(
+            message.short_name.clone(),
+            format!("local:{}", message.type_name),
+        );
     }
     for item in &package.enums {
         local_types.insert(item.short_name.clone());

@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::resolver::TypeResolver;
 use crate::types::{
-    is_google_pkg, is_local_loop_pkg, parse_type_name, Diagnostics, Enum, Field, Message, Service,
-    TypeToken,
+    Diagnostics, Enum, Field, Message, Service, TypeToken, is_google_pkg, is_local_loop_pkg,
+    parse_type_name,
 };
 
 pub fn keep_local_loop_messages(messages: Vec<Message>) -> Vec<Message> {
@@ -130,7 +130,8 @@ pub fn normalize_type_references(
                     resolver,
                 );
             }
-            if field.kind == "map" && (field.map_value_kind == "message" || field.map_value_kind == "enum")
+            if field.kind == "map"
+                && (field.map_value_kind == "message" || field.map_value_kind == "enum")
             {
                 field.map_value_t = resolve_token(
                     field.map_value_t.take(),
@@ -334,15 +335,20 @@ fn collect_field_refs(
             refs.push((name.as_str(), field.kind.as_str()));
         }
     }
-    if field.kind == "map" && (field.map_value_kind == "message" || field.map_value_kind == "enum") {
+    if field.kind == "map" && (field.map_value_kind == "message" || field.map_value_kind == "enum")
+    {
         if let Some(TypeToken::Named(name)) = &field.map_value_t {
             refs.push((name.as_str(), field.map_value_kind.as_str()));
         }
     }
     for (r#ref, kind) in refs {
-        let Some(type_name) =
-            resolver.resolve_type_name(r#ref, context_pos, context_module_start, preferred_pkg, kind)
-        else {
+        let Some(type_name) = resolver.resolve_type_name(
+            r#ref,
+            context_pos,
+            context_module_start,
+            preferred_pkg,
+            kind,
+        ) else {
             continue;
         };
         let (ref_pkg, short_name) = parse_type_name(&type_name);
@@ -365,9 +371,13 @@ fn collect_method_ref(
     needed: &mut HashSet<String>,
     local_types: &HashSet<String>,
 ) {
-    let Some(type_name) =
-        resolver.resolve_type_name(r#ref, context_pos, context_module_start, current_pkg, "message")
-    else {
+    let Some(type_name) = resolver.resolve_type_name(
+        r#ref,
+        context_pos,
+        context_module_start,
+        current_pkg,
+        "message",
+    ) else {
         return;
     };
     let (ref_pkg, short_name) = parse_type_name(&type_name);

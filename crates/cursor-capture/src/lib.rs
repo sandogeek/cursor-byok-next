@@ -8,7 +8,7 @@ mod store;
 mod types;
 mod web;
 
-pub use config::{Config, DEFAULT_SERVICE_ADDR, DEFAULT_UPSTREAM_URL, DEBUG_BASE_PATH};
+pub use config::{Config, DEBUG_BASE_PATH, DEFAULT_SERVICE_ADDR, DEFAULT_UPSTREAM_URL};
 pub use proxy::Server;
 pub use types::{ConversationSummary, Exchange, ExchangeSummary, FrameView, Header, Payload};
 

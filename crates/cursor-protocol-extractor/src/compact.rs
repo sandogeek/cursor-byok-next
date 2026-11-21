@@ -1,8 +1,8 @@
 //! Compact protobuf `$()` schema and `enumType` / `QT` value parsing.
 
 use crate::types::{
-    google_well_known, is_field_name, is_scalar_id, looks_like_full_type_name,
-    looks_like_package_name, Diagnostics, Enum, EnumValue, Field, Message, TypeToken,
+    Diagnostics, Enum, EnumValue, Field, Message, TypeToken, google_well_known, is_field_name,
+    is_scalar_id, looks_like_full_type_name, looks_like_package_name,
 };
 
 #[derive(Debug, Clone)]
@@ -75,11 +75,7 @@ pub fn compact_class_name_at(pos: u32, classes: &[CompactClass]) -> String {
         .unwrap_or_default()
 }
 
-pub fn resolve_compact_package_expr(
-    expr: &str,
-    pos: u32,
-    prefixes: &[CompactPrefix],
-) -> String {
+pub fn resolve_compact_package_expr(expr: &str, pos: u32, prefixes: &[CompactPrefix]) -> String {
     let expr = expr
         .trim()
         .trim_matches(|c| c == '"' || c == '\'')
@@ -238,7 +234,10 @@ fn split_compact_type_and_oneof(spec: &str) -> (&str, Option<String>) {
 fn split_compact_flag(spec: &str) -> (&str, Option<char>) {
     let bytes = spec.as_bytes();
     match bytes.last() {
-        Some(b'*' | b'?') => (&spec[..spec.len() - 1], Some(bytes[bytes.len() - 1] as char)),
+        Some(b'*' | b'?') => (
+            &spec[..spec.len() - 1],
+            Some(bytes[bytes.len() - 1] as char),
+        ),
         _ => (spec, None),
     }
 }
@@ -259,7 +258,10 @@ fn compact_type_token(token: &str) -> (String, TypeToken) {
 pub fn compact_type_index(
     pending: &[CompactPendingMessage],
     enums: &[Enum],
-) -> (std::collections::HashMap<String, String>, std::collections::HashMap<String, String>) {
+) -> (
+    std::collections::HashMap<String, String>,
+    std::collections::HashMap<String, String>,
+) {
     let mut by_var = std::collections::HashMap::new();
     let mut by_short = std::collections::HashMap::new();
     let mut add = |var_name: &str, short_name: &str, type_name: &str| {

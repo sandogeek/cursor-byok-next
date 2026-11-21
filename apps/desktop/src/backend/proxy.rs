@@ -3,12 +3,12 @@
 use std::time::Instant;
 
 use axum::{
-    body::{to_bytes, Body, Bytes},
+    body::{Body, Bytes, to_bytes},
     extract::Extension,
-    http::{header, Request, Response},
+    http::{Request, Response, header},
 };
 
-use crate::{harness, Result};
+use crate::{Result, harness};
 
 const CURSOR_UPSTREAM: &str = "https://api2.cursor.sh";
 
