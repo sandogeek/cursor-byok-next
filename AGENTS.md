@@ -3,6 +3,7 @@
 当前目标：
 - 逐步移植 cursor-byok 到 nsh 版本，产物名为 **Cursor-BYOK-Next**
 - 不做 engine 部分，只做 agent local loop
+- 当前仍是 beta：不考虑向后兼容。破坏性改动直接改，不写兼容层、旧路径回退、数据迁移或双份默认值；旧的配置/CA/数据库需要重建就重建。
 
 ## 仓库结构
 
@@ -29,12 +30,15 @@ cursor-byok-nsh/
     │   ├── CURSOR_CAPTURE.md      # 协议调试器移植记录
     │   ├── CURSOR_UI.md           # 接管页 UI
     │   ├── I18N.md                # 界面语言（nsh/i18n）
-    │   └── PLUGIN_CATALOG.md      # Magpie 插件目录
+    │   ├── PLUGIN_CATALOG.md      # Magpie 插件目录
+    │   ├── LOCAL_LOOP.md          # local loop 服务端接入
+    │   └── MODEL_CALLS.md         # Magpie 调用记录
     └── src/
-        ├── lib.rs                 # #[native_module("cursor-byok-next/native")]：Harness + Plugins
+        ├── lib.rs                 # #[native_module("cursor-byok-next/native")]：Harness + Plugins + Calls
         ├── harness/               # 上游 server/src/local_app 的移植
         ├── plugins/               # 插件宿主、Bun worker、Magpie 目录
-        ├── screens/               # Cursor / Plugins / Language
+        ├── calls/                 # 调用记录 SQLite 与生命周期
+        ├── screens/               # Cursor / Plugins / Language / Calls / CallDetails
         └── ui/                    # 样式控件 + localized()
 ```
 
@@ -126,4 +130,4 @@ nsh package --target macos
 - [ ] 协议字段分析（`docs/protocol/`）
 - [x] local loop 服务端接入（`set_backend_addr`）：只做 `InferenceService/RunInferenceSSE` + `BidiService/BidiAppend`；`AgentService/Run*` 属 backend loop，不接管（见 `docs/protocol/cursor-agent-loop-routing.md`、`apps/desktop/docs/LOCAL_LOOP.md`）
 - [x] 把 Magpie 模型广告给 Cursor picker
-- [ ] 模型调用 / 调用记录
+- [x] 模型调用 / 调用记录（见 `apps/desktop/docs/MODEL_CALLS.md`）
