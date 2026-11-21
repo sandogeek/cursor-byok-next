@@ -7,28 +7,33 @@ use futures_util::StreamExt;
 use parking_lot::Mutex;
 use prost::Message;
 use tokio::{
-    sync::{mpsc, Mutex as AsyncMutex, Notify},
+    sync::{Mutex as AsyncMutex, Notify, mpsc},
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    Error, Result,
     backend::KnowledgeService,
-    loop_service::{overflow, output::OutputHub, project, subagent_models::{self, ByokModel}},
+    loop_service::{
+        output::OutputHub,
+        overflow, project,
+        subagent_models::{self, ByokModel},
+    },
     model::{ModelInvocation, Usage},
-    plugins::{PluginHost, PluginModelDescriptor, ADAPTER_ID_PREFIX},
+    plugins::{ADAPTER_ID_PREFIX, PluginHost, PluginModelDescriptor},
     protocol::{
         connect,
         proto::{agent::v1 as agent, inference as pb},
     },
     provider::ModelEvent,
-    Error, Result,
 };
 
 const SUBAGENT_FORCE_POLICY_NONE: &str = "none";
 const SUMMARY_UNUSED_WINDOW_PERCENT: f64 = 0.1;
 const DEFAULT_SUMMARY_PROMPT_CHARS: i32 = 2_800_000;
 const SUMMARY_PROMPT_SCALE_WINDOW: u64 = 1_000_000;
+const DISCONNECTED_RUN_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Clone)]
 pub(crate) struct InferenceService {
@@ -49,6 +54,7 @@ pub(crate) struct Run {
     output: Arc<OutputHub>,
     next_seqno: AsyncMutex<i64>,
     subscriptions: Mutex<Subscriptions>,
+    cancellation: CancellationToken,
 }
 
 #[derive(Default)]
@@ -75,14 +81,23 @@ impl Drop for Subscription {
         let run = Arc::downgrade(&self.run);
         let request_id = self.request_id.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-            if let (Some(state), Some(run)) = (state.upgrade(), run.upgrade()) {
-                let mut routes = state.lock();
-                if matches!(routes.get(&request_id), Some(InferenceRoute::Local(current)) if Arc::ptr_eq(current, &run))
-                    && run.subscriptions.lock().generation == generation
-                {
-                    routes.remove(&request_id);
-                }
+            tokio::time::sleep(DISCONNECTED_RUN_GRACE).await;
+            let (Some(state), Some(run)) = (state.upgrade(), run.upgrade()) else {
+                return;
+            };
+            let expired = {
+                let subscriptions = run.subscriptions.lock();
+                subscriptions.active == 0 && subscriptions.generation == generation
+            };
+            if !expired {
+                return;
+            }
+            run.cancellation.cancel();
+            run.output.close();
+            let mut routes = state.lock();
+            if matches!(routes.get(&request_id), Some(InferenceRoute::Local(current)) if Arc::ptr_eq(current, &run))
+            {
+                routes.remove(&request_id);
             }
         });
     }
@@ -184,6 +199,7 @@ impl InferenceService {
                 output: output.clone(),
                 next_seqno: AsyncMutex::new(0),
                 subscriptions: Mutex::default(),
+                cancellation: CancellationToken::new(),
             });
             tokio::spawn(serve(
                 ServeContext {
@@ -200,6 +216,7 @@ impl InferenceService {
                     knowledge: self.knowledge.clone(),
                 },
                 receiver,
+                run.cancellation.clone(),
             ));
             InferenceRoute::Local(run)
         } else {
@@ -284,7 +301,11 @@ impl Run {
     }
 }
 
-async fn serve(context: ServeContext, mut input: mpsc::Receiver<pb::RunInferenceClientMessage>) {
+async fn serve(
+    context: ServeContext,
+    mut input: mpsc::Receiver<pb::RunInferenceClientMessage>,
+    cancellation: CancellationToken,
+) {
     let ServeContext {
         output,
         plugins,
@@ -297,11 +318,22 @@ async fn serve(context: ServeContext, mut input: mpsc::Receiver<pb::RunInference
     let invocations = Arc::new(Mutex::new(HashMap::<String, CancellationToken>::new()));
     let mut tasks = JoinSet::new();
     let mut finished = false;
+    let mut disconnected = false;
     let mut provider_call_index = 0;
     let configured_context_window = model.as_ref().and_then(|model| model.context_window_tokens);
     let mut run_context_window = configured_context_window;
     let models = plugins.configured_models().await;
-    while let Some(message) = input.recv().await {
+    loop {
+        let message = tokio::select! {
+            _ = cancellation.cancelled() => {
+                disconnected = true;
+                break;
+            }
+            message = input.recv() => message,
+        };
+        let Some(message) = message else {
+            break;
+        };
         use pb::run_inference_client_message::Message;
         match message.message {
             Some(Message::RunRequest(request)) => {
@@ -344,16 +376,16 @@ async fn serve(context: ServeContext, mut input: mpsc::Receiver<pb::RunInference
                     );
                     continue;
                 }
-                let request = match project::project(&request, &model_id, run_context_window, &models)
-                {
-                    Ok(request) => request,
-                    Err(error) => {
-                        invocation_error(&output, id, &error.to_string());
-                        continue;
-                    }
-                };
+                let request =
+                    match project::project(&request, &model_id, run_context_window, &models) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            invocation_error(&output, id, &error.to_string());
+                            continue;
+                        }
+                    };
                 let context_window_tokens = request.model.context_window_tokens;
-                let cancellation = CancellationToken::new();
+                let cancellation = cancellation.child_token();
                 invocations.lock().insert(id.clone(), cancellation.clone());
                 tasks.spawn(serve_invocation(
                     plugins.clone(),
@@ -407,7 +439,9 @@ async fn serve(context: ServeContext, mut input: mpsc::Receiver<pb::RunInference
         }
     }
     while tasks.join_next().await.is_some() {}
-    output.emit(connect::encode_end_stream());
+    if !disconnected {
+        output.emit(connect::encode_end_stream());
+    }
     output.close();
 }
 
@@ -608,10 +642,13 @@ async fn serve_invocation(
     context_window_tokens: Option<u64>,
 ) {
     let id = invocation.call_id.clone();
-    let mut stream = plugins.stream_model(invocation, cancellation);
+    let mut stream = plugins.stream_model(invocation, cancellation.clone());
     let mut tool_calls = HashMap::<usize, (String, String, String)>::new();
     let mut error = None;
-    while let Some(next) = stream.next().await {
+    while let Some(next) = tokio::select! {
+        _ = cancellation.cancelled() => None,
+        next = stream.next() => next,
+    } {
         match next {
             Ok(event) => {
                 for response in model_responses(event, &mut tool_calls, context_window_tokens) {
@@ -856,4 +893,71 @@ fn emit(output: &OutputHub, message: pb::run_inference_server_message::Message) 
 
 pub(crate) fn decode_append(data: &[u8]) -> Result<pb::RunInferenceClientMessage> {
     pb::RunInferenceClientMessage::decode(data).map_err(Error::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invocation_cancellation_propagates_from_the_run() {
+        let run = CancellationToken::new();
+        let invocation = run.child_token();
+        assert!(!invocation.is_cancelled());
+        run.cancel();
+        assert!(invocation.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_last_subscription_cancels_a_disconnected_run_after_its_grace_period() {
+        let root = tempfile::tempdir().unwrap();
+        let service = InferenceService::new(
+            PluginHost::for_test(root.path()).unwrap(),
+            KnowledgeService::with_root(root.path().join("rules")).unwrap(),
+        );
+        let (sender, _receiver) = mpsc::channel(1);
+        let run = Arc::new(Run {
+            input: sender,
+            output: Arc::new(OutputHub::default()),
+            next_seqno: AsyncMutex::new(0),
+            subscriptions: Mutex::default(),
+            cancellation: CancellationToken::new(),
+        });
+        service
+            .state
+            .lock()
+            .insert("run".into(), InferenceRoute::Local(run.clone()));
+        let (_receiver, subscription) = service.subscribe("run".into(), &run);
+        drop(subscription);
+        tokio::task::yield_now().await;
+        assert!(!run.cancellation.is_cancelled());
+        let (_receiver, subscription) = service.subscribe("run".into(), &run);
+        tokio::time::advance(DISCONNECTED_RUN_GRACE).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !run.cancellation.is_cancelled(),
+            "reconnecting must keep the run alive"
+        );
+        drop(subscription);
+        tokio::task::yield_now().await;
+        assert!(!run.cancellation.is_cancelled());
+        tokio::time::advance(DISCONNECTED_RUN_GRACE).await;
+        tokio::task::yield_now().await;
+        assert!(run.cancellation.is_cancelled());
+        assert!(run.output.is_closed());
+        assert!(service.route("run").is_none());
+    }
+
+    #[test]
+    fn output_replays_until_close_then_releases_its_history() {
+        let output = OutputHub::default();
+        output.emit(Bytes::from_static(b"first"));
+        let mut receiver = output.subscribe();
+        assert_eq!(receiver.try_recv().unwrap(), Bytes::from_static(b"first"));
+        output.close();
+        assert!(output.is_closed());
+        assert!(!output.has_history());
+        assert!(receiver.try_recv().is_err());
+        assert!(!output.emit(Bytes::from_static(b"late")));
+    }
 }

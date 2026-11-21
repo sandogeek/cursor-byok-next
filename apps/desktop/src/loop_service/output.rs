@@ -47,7 +47,17 @@ impl OutputHub {
         }
         state.closed = true;
         state.subscribers.clear();
-        drop(state);
+        state.history.clear();
         true
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_closed(&self) -> bool {
+        self.state.lock().closed
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_history(&self) -> bool {
+        !self.state.lock().history.is_empty()
     }
 }

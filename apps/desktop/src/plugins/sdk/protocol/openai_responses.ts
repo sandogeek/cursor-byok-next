@@ -37,11 +37,20 @@ function contentParts(parts: LlmContentPart[], textType: "input_text" | "output_
   for (const part of parts) {
     if (part.type === "text") {
       if (part.text) content.push({ type: textType, text: part.text });
-    } else {
+    } else if (part.type === "image") {
       content.push({
         type: "input_image",
         detail: "auto",
         image_url: `data:${part.mediaType};base64,${part.dataBase64}`,
+      });
+    } else {
+      if (textType !== "input_text") {
+        throw new Error("OpenAI Responses does not accept files in assistant messages");
+      }
+      content.push({
+        type: "input_file",
+        filename: part.filename ?? "attachment",
+        file_data: `data:${part.mediaType};base64,${part.dataBase64}`,
       });
     }
   }

@@ -1,6 +1,6 @@
 //! Translates between core model types and the plugin SDK wire contract.
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 
 use crate::{
     model::{
@@ -98,6 +98,16 @@ fn wire_parts(parts: &[ContentPart]) -> Vec<serde_json::Value> {
                 "mediaType": mime_type,
                 "dataBase64": STANDARD.encode(data),
             }),
+            ContentPart::File {
+                mime_type,
+                filename,
+                data,
+            } => serde_json::json!({
+                "type": "file",
+                "mediaType": mime_type,
+                "filename": filename,
+                "dataBase64": STANDARD.encode(data),
+            }),
         })
         .collect()
 }
@@ -107,7 +117,7 @@ fn joined_text(parts: &[ContentPart]) -> String {
         .iter()
         .filter_map(|part| match part {
             ContentPart::Text { text } => Some(text.as_str()),
-            ContentPart::Image { .. } => None,
+            ContentPart::Image { .. } | ContentPart::File { .. } => None,
         })
         .collect()
 }
@@ -163,13 +173,13 @@ pub fn model_event(value: &serde_json::Value) -> Result<ModelEvent> {
             reason => {
                 return Err(Error::Protocol(format!(
                     "unknown plugin finish reason: {reason}"
-                )))
+                )));
             }
         }),
         kind => {
             return Err(Error::Protocol(format!(
                 "unknown plugin model event: {kind}"
-            )))
+            )));
         }
     };
     Ok(event)

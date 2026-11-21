@@ -21,12 +21,12 @@ use super::{
     catalog::{PluginCatalog, PluginEntry},
     data::PluginDataStore,
     descriptor::{
-        parse_model_id, FORM_ADD_METHOD, FORM_FIELD_URL, LIVE_CATALOG, PluginDescriptor,
-        PluginModelDescriptor, PluginProviderDescriptor, PluginResourceDescriptor,
-        PluginResourceView, ProviderDefinition, ResourceDefinition, ResourcePresentation,
+        FORM_ADD_METHOD, FORM_FIELD_URL, LIVE_CATALOG, PluginDescriptor, PluginModelDescriptor,
+        PluginProviderDescriptor, PluginResourceDescriptor, PluginResourceView, ProviderDefinition,
+        ResourceDefinition, ResourcePresentation, parse_model_id,
     },
     origin,
-    state::{now_ms, PluginStateStore, ResourceDraft, ResourcePatch, ResourceRecord, StoredModel},
+    state::{PluginStateStore, ResourceDraft, ResourcePatch, ResourceRecord, StoredModel, now_ms},
     wire,
     worker::{PluginWorker, WorkerStreamItem},
 };
@@ -304,9 +304,12 @@ impl PluginHost {
         let (stored, _) = self
             .provider_models(&entry, &executable, provider, false, None)
             .await;
-        Ok(stored.into_iter().find(|model| model.id == stored_id).map(
-            |model| PluginModelDescriptor::new(plugin_id, &entry.manifest.name, provider, &model),
-        ))
+        Ok(stored
+            .into_iter()
+            .find(|model| model.id == stored_id)
+            .map(|model| {
+                PluginModelDescriptor::new(plugin_id, &entry.manifest.name, provider, &model)
+            }))
     }
 
     pub fn stream_model(
@@ -905,8 +908,13 @@ fn which(name: &str) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ModelRequest, ModelSpec, PromptSpec};
+    use futures_util::StreamExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+        sync::Notify,
+    };
 
     const MAGPIE: &str = "dev.cursorbyoknext.plugins.magpie";
     const FAKE_KEY: &str = "integration-test-placeholder-key";
@@ -1050,6 +1058,211 @@ mod tests {
         assert!(degraded.plugins[0].resources[0].storage_error.is_some());
         server.abort();
         second_server.abort();
+    }
+
+    async fn invocation_gateway(
+        endpoint: &'static str,
+        events: &'static str,
+    ) -> (
+        String,
+        Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+        Arc<Notify>,
+        Arc<Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let received = Arc::new(Notify::new());
+        let disconnected = Arc::new(Notify::new());
+        let task = tokio::spawn({
+            let requests = requests.clone();
+            let received = received.clone();
+            let disconnected = disconnected.clone();
+            async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut header = vec![0_u8; 16 * 1024];
+                    let read = socket.read(&mut header).await.unwrap();
+                    let text = String::from_utf8_lossy(&header[..read]);
+                    if text.starts_with("GET /v1/models ") {
+                        let body = format!(
+                            r#"{{"data":[{{"id":"model","display_name":"Model","native_endpoints":["{endpoint}"]}}]}}"#
+                        );
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                        continue;
+                    }
+                    assert!(text.starts_with(&format!("POST {endpoint} ")), "{text}");
+                    let body_start = text.find("\r\n\r\n").unwrap() + 4;
+                    let body: serde_json::Value =
+                        serde_json::from_str(&text[body_start..]).unwrap();
+                    requests.lock().await.push(body);
+                    received.notify_waiters();
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                    if socket.write_all(events.as_bytes()).await.is_err() {
+                        disconnected.notify_waiters();
+                        continue;
+                    }
+                    let mut buffer = [0_u8; 1024];
+                    while socket.read(&mut buffer).await.unwrap_or(0) > 0 {}
+                    disconnected.notify_waiters();
+                }
+            }
+        });
+        (origin, requests, received, disconnected, task)
+    }
+
+    async fn configured_invocation_host(root: &Path, origin: String) -> (PluginHost, String) {
+        std::fs::create_dir_all(root).unwrap();
+        let host = PluginHost::new(
+            PluginCatalog::for_test(root).unwrap(),
+            PluginDataStore::for_test(root.join("data")).unwrap(),
+        );
+        host.form_submit(
+            MAGPIE,
+            "gateway",
+            "connect",
+            serde_json::json!({"base-url": origin, "api-key": FAKE_KEY}),
+        )
+        .await
+        .unwrap();
+        let model_id = host.configured_models().await[0].id.clone();
+        (host, model_id)
+    }
+
+    fn invocation(model_id: String, parts: Vec<crate::model::ContentPart>) -> ModelInvocation {
+        ModelInvocation {
+            call_id: "call".into(),
+            run_id: "run".into(),
+            conversation_id: "conversation".into(),
+            provider_call_index: 0,
+            request: ModelRequest {
+                prompt: PromptSpec {
+                    instructions: String::new(),
+                    tools: Vec::new(),
+                },
+                model: ModelSpec::new(model_id),
+                history: vec![crate::model::ProjectedMessage {
+                    message_id: "message".into(),
+                    role: crate::model::Role::User,
+                    content: crate::model::ProjectedContent::Parts(parts),
+                }],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn magpie_invocation_serializes_files_and_propagates_cancellation() {
+        assert!(
+            find_bun().is_some(),
+            "install Bun on PATH to run the Magpie integration test"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let responses = invocation_gateway(
+            "/v1/responses",
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+            ),
+        )
+        .await;
+        let responses_host =
+            configured_invocation_host(&temp.path().join("responses"), responses.0).await;
+        let file = crate::model::ContentPart::File {
+            mime_type: "application/pdf".into(),
+            filename: Some("report.pdf".into()),
+            data: b"%PDF-1".to_vec(),
+        };
+        let mut stream = responses_host.0.stream_model(
+            invocation(responses_host.1, vec![file]),
+            CancellationToken::new(),
+        );
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+        let requests = responses.1.lock().await;
+        assert_eq!(requests[0]["input"][0]["content"][0]["type"], "input_file");
+        assert_eq!(
+            requests[0]["input"][0]["content"][0]["filename"],
+            "report.pdf"
+        );
+        assert_eq!(
+            requests[0]["input"][0]["content"][0]["file_data"],
+            "data:application/pdf;base64,JVBERi0x"
+        );
+        drop(requests);
+        responses.4.abort();
+
+        let chat = invocation_gateway("/v1/chat/completions", "data: [DONE]\n\n").await;
+        let chat_host = configured_invocation_host(&temp.path().join("chat"), chat.0).await;
+        let file = crate::model::ContentPart::File {
+            mime_type: "application/pdf".into(),
+            filename: Some("report.pdf".into()),
+            data: b"%PDF-1".to_vec(),
+        };
+        let mut stream = chat_host.0.stream_model(
+            invocation(chat_host.1, vec![file]),
+            CancellationToken::new(),
+        );
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+        let requests = chat.1.lock().await;
+        assert_eq!(requests[0]["messages"][0]["content"][0]["type"], "file");
+        assert_eq!(
+            requests[0]["messages"][0]["content"][0]["file"]["filename"],
+            "report.pdf"
+        );
+        drop(requests);
+        chat.4.abort();
+
+        let messages = invocation_gateway("/v1/messages", "").await;
+        let messages_host =
+            configured_invocation_host(&temp.path().join("messages"), messages.0).await;
+        let file = crate::model::ContentPart::File {
+            mime_type: "text/plain".into(),
+            filename: Some("notes.txt".into()),
+            data: b"attachment text".to_vec(),
+        };
+        let cancellation = CancellationToken::new();
+        let mut stream = messages_host.0.stream_model(
+            invocation(messages_host.1, vec![file]),
+            cancellation.clone(),
+        );
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(ModelEvent::Start { .. }))
+        ));
+        tokio::time::timeout(Duration::from_secs(3), messages.2.notified())
+            .await
+            .expect("the invocation must reach the test gateway");
+        let requests = messages.1.lock().await;
+        assert_eq!(requests[0]["messages"][0]["content"][0]["type"], "document");
+        assert_eq!(
+            requests[0]["messages"][0]["content"][0]["source"]["type"],
+            "plain_text"
+        );
+        assert_eq!(
+            requests[0]["messages"][0]["content"][0]["source"]["data"],
+            "attachment text"
+        );
+        assert_eq!(
+            requests[0]["messages"][0]["content"][0]["title"],
+            "notes.txt"
+        );
+        drop(requests);
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(3), messages.3.notified())
+            .await
+            .expect("cancelling an invocation must close its upstream HTTP stream");
+        messages.4.abort();
     }
 
     #[test]

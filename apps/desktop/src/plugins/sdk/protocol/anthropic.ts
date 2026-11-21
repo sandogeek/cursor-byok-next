@@ -56,17 +56,37 @@ function requiredType(value: Record<string, unknown>): string {
   return kind;
 }
 
-function anthropicParts(parts: LlmContentPart[], allowImages: boolean): JsonValue[] {
+function anthropicParts(parts: LlmContentPart[], allowAttachments: boolean): JsonValue[] {
   const content: JsonValue[] = [];
   for (const part of parts) {
     if (part.type === "text") {
       if (part.text) content.push({ type: "text", text: part.text });
       continue;
     }
-    if (!allowImages) throw new Error("Anthropic only accepts images in user messages");
+    if (part.type === "image") {
+      if (!allowAttachments) throw new Error("Anthropic only accepts attachments in user messages");
+      content.push({
+        type: "image",
+        source: { type: "base64", media_type: part.mediaType, data: part.dataBase64 },
+      });
+      continue;
+    }
+    if (!allowAttachments) throw new Error("Anthropic only accepts attachments in user messages");
+    if (part.mediaType === "application/pdf") {
+      content.push({
+        type: "document",
+        source: { type: "base64", media_type: part.mediaType, data: part.dataBase64 },
+      });
+      continue;
+    }
+    if (!part.mediaType.startsWith("text/")) {
+      throw new Error("Anthropic Messages only supports PDF and plain-text file attachments");
+    }
+    const data = Uint8Array.from(atob(part.dataBase64), (character) => character.charCodeAt(0));
     content.push({
-      type: "image",
-      source: { type: "base64", media_type: part.mediaType, data: part.dataBase64 },
+      type: "document",
+      source: { type: "plain_text", media_type: "text/plain", data: new TextDecoder().decode(data) },
+      ...(part.filename ? { title: part.filename } : {}),
     });
   }
   return content;
@@ -125,7 +145,7 @@ function markCacheBreakpoint(messages: JsonValue[]): void {
     for (let blockIndex = message.content.length - 1; blockIndex >= 0; blockIndex -= 1) {
       const block = record(message.content[blockIndex]);
       if (!block) continue;
-      if (block.type !== "text" && block.type !== "image" && block.type !== "tool_result") continue;
+      if (block.type !== "text" && block.type !== "image" && block.type !== "document" && block.type !== "tool_result") continue;
       block.cache_control = CACHE_CONTROL;
       return;
     }

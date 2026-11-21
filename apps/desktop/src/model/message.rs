@@ -48,10 +48,16 @@ pub enum ContentPart {
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
+    File {
+        mime_type: String,
+        filename: Option<String>,
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+    },
 }
 
 mod base64_bytes {
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
@@ -60,8 +66,6 @@ mod base64_bytes {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
         let encoded = String::deserialize(deserializer)?;
-        STANDARD
-            .decode(encoded)
-            .map_err(serde::de::Error::custom)
+        STANDARD.decode(encoded).map_err(serde::de::Error::custom)
     }
 }

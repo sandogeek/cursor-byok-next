@@ -1,19 +1,20 @@
 //! Projects client-owned model calls into the provider-independent request.
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value};
 
 use crate::{
+    Error, Result,
     model::{
-        parse_token_count, ContentPart, ModelRequest, ModelSpec, ProjectedContent, ProjectedMessage,
-        PromptSpec, ProviderReplayState, Role, ToolCallContent, ToolDefinition, ToolResultContent,
+        ContentPart, ModelRequest, ModelSpec, ProjectedContent, ProjectedMessage, PromptSpec,
+        ProviderReplayState, Role, ToolCallContent, ToolDefinition, ToolResultContent,
+        parse_token_count,
     },
     plugins::PluginModelDescriptor,
     protocol::{
         json::{prost_json, prost_struct},
         proto::inference as pb,
     },
-    Error, Result,
 };
 
 pub(crate) fn project(
@@ -91,7 +92,7 @@ pub(crate) fn project(
             value => {
                 return Err(Error::Protocol(format!(
                     "RunInference message {index} has unsupported role {value}"
-                )))
+                )));
             }
         };
         let parts = parts(message.content.as_ref())?;
@@ -272,10 +273,14 @@ fn parts_from_wire(parts: &[pb::InferenceContentPart]) -> Result<Vec<ContentPart
                 let (mime_type, data) = image_data(&image.data, image.mime_type.as_deref())?;
                 Ok(ContentPart::Image { mime_type, data })
             }
-            Some(pb::inference_content_part::Part::File(file)) => Err(Error::Protocol(format!(
-                "RunInference file content is not supported: {}",
-                file.filename.as_deref().unwrap_or(&file.media_type)
-            ))),
+            Some(pb::inference_content_part::Part::File(file)) => {
+                let (mime_type, data) = file_data(&file.data, &file.media_type)?;
+                Ok(ContentPart::File {
+                    mime_type,
+                    filename: file.filename.clone(),
+                    data,
+                })
+            }
             None => Err(Error::Protocol("RunInference content part is empty".into())),
         })
         .collect()
@@ -296,19 +301,39 @@ fn image_data(value: &str, fallback_mime: Option<&str>) -> Result<(String, Vec<u
     Ok((mime_type.into(), data))
 }
 
+fn file_data(value: &str, fallback_mime: &str) -> Result<(String, Vec<u8>)> {
+    let (mime_type, encoded) = if let Some((metadata, data)) = value
+        .strip_prefix("data:")
+        .and_then(|value| value.split_once(","))
+    {
+        (metadata.trim_end_matches(";base64"), data)
+    } else {
+        (fallback_mime, value)
+    };
+    if mime_type.is_empty() {
+        return Err(Error::Protocol(
+            "RunInference file content requires a media type".into(),
+        ));
+    }
+    let data = STANDARD
+        .decode(encoded)
+        .map_err(|error| Error::Protocol(format!("invalid RunInference file: {error}")))?;
+    Ok((mime_type.into(), data))
+}
+
 fn text_parts(parts: &[ContentPart]) -> String {
     parts
         .iter()
         .filter_map(|part| match part {
             ContentPart::Text { text } => Some(text.as_str()),
-            ContentPart::Image { .. } => None,
+            ContentPart::Image { .. } | ContentPart::File { .. } => None,
         })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use prost_types::{value::Kind, Struct, Value as ProtoValue};
+    use prost_types::{Struct, Value as ProtoValue, value::Kind};
 
     use super::*;
 
@@ -361,6 +386,40 @@ mod tests {
         assert_eq!(
             request.prompt.tools[0].parameters,
             serde_json::json!({"type":"object"})
+        );
+    }
+
+    #[test]
+    fn projects_file_parts_with_their_filename_media_type_and_bytes() {
+        let input = pb::InferenceStreamRequest {
+            messages: vec![pb::InferenceCoreMessage {
+                role: 1,
+                content: Some(pb::inference_core_message::Content::Parts(
+                    pb::InferenceContentParts {
+                        parts: vec![pb::InferenceContentPart {
+                            part: Some(pb::inference_content_part::Part::File(
+                                pb::InferenceFilePart {
+                                    data: "data:application/pdf;base64,JVBERi0x".into(),
+                                    media_type: "application/octet-stream".into(),
+                                    filename: Some("report.pdf".into()),
+                                    ..Default::default()
+                                },
+                            )),
+                        }],
+                    },
+                )),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let request = project(&input, "test-model", None, &[]).unwrap();
+        assert_eq!(
+            request.history[0].content,
+            ProjectedContent::Parts(vec![ContentPart::File {
+                mime_type: "application/pdf".into(),
+                filename: Some("report.pdf".into()),
+                data: b"%PDF-1".to_vec(),
+            }])
         );
     }
 

@@ -9,19 +9,19 @@
 
 ```text
 cursor-byok/server/src/                         apps/desktop/src/
-├── cursor/inference/service.rs                 loop_service/service.rs     859  按 request_id 路由 Local/Upstream
-├── cursor/inference/project.rs                 loop_service/project.rs     374  InferenceStreamRequest → ModelRequest
-├── cursor/inference/output.rs                  loop_service/output.rs       53  可重放的 Connect 帧广播
+├── cursor/inference/service.rs                 loop_service/service.rs     963  按 request_id 路由 Local/Upstream
+├── cursor/inference/project.rs                 loop_service/project.rs     433  InferenceStreamRequest → ModelRequest
+├── cursor/inference/output.rs                  loop_service/output.rs       63  可重放的 Connect 帧广播
 ├── cursor/inference/overflow.rs                loop_service/overflow.rs     23  context overflow 分类
 ├── cursor/inference/subagent_models.rs         loop_service/subagent_models.rs 77  Task 模型解析
 ├── cursor/protocol/connect.rs                  protocol/connect.rs          55  Connect 5 字节帧
 ├── cursor/protocol/json.rs                     protocol/json.rs             73  prost JSON
 ├── cursor/protocol/proto.rs                    protocol/proto.rs            44  agent.v1 + run_inference
-├── plugin/wire.rs                              plugins/wire.rs             281  LlmRequest / ModelEvent
+├── plugin/wire.rs                              plugins/wire.rs             287  LlmRequest / ModelEvent
 ├── plugin/worker.rs                            plugins/worker.rs           875  JSONL + Event + SSE 流
-├── plugin/registry.rs stream_model             plugins/host.rs            1081  Magpie invoke
+├── plugin/registry.rs stream_model             plugins/host.rs            1294  Magpie invoke
 ├── api/cursor/handlers.rs                      backend/mod.rs              468  路由、RunInferenceSSE、BidiAppend
-├── api/cursor/proxy.rs                         backend/proxy.rs            208  只转发 *.cursor.sh HTTPS
+├── api/cursor/proxy.rs                         backend/proxy.rs            209  只转发 *.cursor.sh HTTPS
 ├── cursor/services/account.rs                  backend/account.rs          336  本地 token → Ultra stub
 ├── cursor/services/analytics.rs                backend/analytics.rs        200  Statsig agent_host_local_loop
 ├── cursor/services/server_config.rs            backend/server_config.rs     52  http2_config=FORCE_ALL_DISABLED
@@ -49,6 +49,7 @@ Local serve()
 ├── InvokeModel → PluginHost.stream_model → Magpie provider.invoke
 │                  → network.stream.open/read → ModelEvent → InferenceStreamResponse
 ├── CancelInvocation / FinishRun → CancellationToken
+├── 最后读流断开 → 300s 重连宽限期；超时取消 Run / 插件 HTTP 并释放输出
 └── ResolveSubagentModels → 已配置 Magpie hash
 ```
 
@@ -68,6 +69,8 @@ Local serve()
 | 8 | HTTP/2 bidi / Poll / WebSocket | 有传输层重映射 | 只实现 SSE + BidiAppend | `GetServerConfig.http2_config=1` 把 Cursor 钉在 HTTP/1.1 |
 | 9 | 运行时 | Deno worker | PATH 上的 Bun | 沿用插件目录移植 |
 | 10 | 账号 stub | 本地 token 或已确认 free | 只认本应用签发的 token | 真实登录不覆盖（不变量 4） |
+| 11 | 断流生命周期 | 只移除路由 | 最后读流断开保留 300s 重连；超时取消所有子 invocation、关闭输出并释放重放历史 | 客户端异常断开后不能继续消耗模型额度；短暂断线仍可恢复同一 Run |
+| 12 | 文件附件 | 拒绝 `InferenceFilePart` | 保留 bytes / media type / filename；Responses 发 `input_file`，Chat 仅 PDF，Messages 仅 PDF 或 `text/*` | 按 provider 协议支持范围透传，不把未知二进制伪装成图片或文本；不支持的类型明确报错 |
 
 ## 必须保持的不变量
 
@@ -82,6 +85,8 @@ Local serve()
 9. 测试用临时目录，不读 `~/Library/Application Support/Cursor` 或 `~/.cursor-byok-next`。
 10. Statsig bootstrap 必须把 `agent_host_local_loop=true`，否则 Cursor 不会走 local loop。
 11. `NetworkService/IsConnected` 必须空 proto 成功，否则 Cursor 会当断网并取消在途生成。
+12. 多个读流订阅并存时不能互相取消；只有最后一个订阅断开且超过重连宽限期，才允许取消整个 Run。
+13. Run 正常结束仍保留末帧供迟到的读流重放；超时断开则关闭输出并释放历史，不能留下可重连的空 Run。
 
 ## 刻意不做
 
@@ -99,4 +104,4 @@ cargo test -p nsh-app-cursor-byok-next --lib
 cd apps/desktop && nsh check && nsh test
 ```
 
-`plugin_model_starts_a_local_inference_run` 覆盖：`plugin:` id 的 BidiAppend 开本地 Run，RunInferenceSSE 立刻给出 `RunReady`。Magpie 真调用仍走 `magpie_catalog_through_real_bun` 的 worker 路径；invoke 需要已配置网关。
+`plugin_model_starts_a_local_inference_run` 覆盖：`plugin:` id 的 BidiAppend 开本地 Run，RunInferenceSSE 立刻给出 `RunReady`。`the_last_subscription_cancels_a_disconnected_run_after_its_grace_period` 用虚拟时钟覆盖重连与超时清理；`magpie_invocation_serializes_files_and_propagates_cancellation` 走真实 Bun + 本地假网关，验证 Responses / Chat 的 PDF、Messages 的纯文本文档，以及取消后关闭上游 HTTP。`magpie_catalog_through_real_bun` 继续覆盖模型目录 worker 路径；真实 Cursor + 已配置 Magpie 网关的端到端 turn 仍需单独验收。
