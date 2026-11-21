@@ -35,7 +35,7 @@ service InferenceService {
 
 | 方法 | 输入 | 输出 | 流类型 | proto 行 | 接管状态 |
 | --- | --- | --- | --- | --- | --- |
-| `Stream` | `InferenceStreamRequest` | `InferenceStreamResponse` | server streaming | 58436 | 旧一代接口，未接管 |
+| `Stream` | `InferenceStreamRequest` | `InferenceStreamResponse` | server streaming | 58436 | 直接推理 RPC；local loop 通过适配器折成 `invoke_model`，无需另接 |
 | `RecordAgentFollowupClassification` | `AgentFollowupCategorizationRequest` | `Empty` | unary | 58437 | 埋点，不接管 |
 | `RecordAgentPostTurnLabeling` | `AgentPostTurnLabelingRequest` | `Empty` | unary | 58438 | 埋点，不接管 |
 | `RunInference` | `RunInferenceClientMessage` | `RunInferenceServerMessage` | bidi streaming | 58439 | http2 主通道，未接管 |
@@ -47,11 +47,11 @@ service InferenceService {
 
 ### 消息复用结构
 
-`RunInference` 的主线是「建会话 → 发起调用」，一次模型调用的载荷其实是 `InferenceStreamRequest`，与旧 `Stream` 方法共用：
+`RunInference` 的主线是「建会话 → 发起调用」，一次模型调用的载荷其实是 `InferenceStreamRequest`，与直接推理 `Stream` 方法共用：
 
 ```text
 InferenceService
-├── Stream(stream InferenceStreamRequest) ─────────────► stream InferenceStreamResponse      # 旧接口
+├── Stream(stream InferenceStreamRequest) ─────────────► stream InferenceStreamResponse      # 直接推理 RPC
 └── RunInference(stream RunInferenceClientMessage) ───► stream RunInferenceServerMessage
     ├── client  (oneof message, 41145-41158；8 缺失)
     │   ├── RunInferenceRunRequest            = 1   建会话：conversation_id / requested_model / agent_mode
@@ -72,10 +72,11 @@ InferenceService
         └── RunInferenceSubagentModelsResolved= 5
 ```
 
-两点结构结论：
+三点结构结论：
 
 - `InferenceStreamRequest`（`aiserver_v1.proto:26314`，30 field）才是“一次模型调用”的载荷；`RunInferenceRunRequest`（41471，23 field）只建会话，字段号有跳号（13/14/23/24 缺失）。
 - `InferenceStreamResponse`（26348，12 field）是 token / 工具 / thinking 的通用容器，被 `Stream` 与 `RunInferenceInvocationResponse` 共用，因此只需要一套编码器。
+- **本机 local loop 不直接调用 `/Stream`**：`createInvocationClient` 把业务层的 `.stream(InferenceStreamRequest)` 适配为 `RunInference.invoke_model`，再拆掉 `invocation_response` 外层返回给原调用方（`daemon.cjs:25620-25623`）。普通调用、上下文总结、thinking note 和 prompt-cache refill 都使用这层适配，区别是外层 `purpose`（`daemon.cjs:25626-25627`）。字段级对照见 `aiserver-v1.md` §`InferenceService/Stream`。
 
 ## 2. 传输模式与降级
 
@@ -233,7 +234,12 @@ agent-host daemon（数据面）
 | `daemon.cjs` | 9395 | 创建 local loop transport 并包 fallback |
 | `daemon.cjs` | 9400 | `RunInference` WebSocket selection（仅 http2 禁用时） |
 | `daemon.cjs` | 9401 | `fallBackLocalLoopInference` |
+| `daemon.cjs` | 25594 | `sanitizeInvokeRequest`：从 `invoke_model.request` 清除 run 级模型/会话字段 |
 | `daemon.cjs` | 25608 | 唯一的 `client.runInference(...)` 调用点 |
+| `daemon.cjs` | 25620-25623 | `createInvocationClient`：`.stream()` ↔ `invoke_model` / `invocation_response` 适配 |
+| `daemon.cjs` | 25626-25627 | 普通、总结、thinking note、cache refill 四种 invocation 的 `purpose` |
+| `daemon.cjs` | 25631 / 25635 | prompt-cache refill 复用同一 `.stream()` 适配器，不证明直接调用 `/Stream` |
+| `daemon.cjs` | 25636 | `withFirstStreamObserved`：消费 `first_output_timing` |
 | `daemon.cjs` | 27002 | `inferenceClient:createClient(InferenceService, backendTransport)` |
 
 ## 6. 本仓库现状与差距
