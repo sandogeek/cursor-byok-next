@@ -26,13 +26,13 @@
 
 | rpc | proto 行 | 请求 | 响应 | 传输形态 | 分析状态 |
 |---|---|---|---|---|---|
-| `BidiService/BidiAppend` | 57256 | `BidiAppendRequest` | `BidiAppendResponse` | unary | 待分析 |
-| `InferenceService/RunInference` | 58439 | `stream RunInferenceClientMessage` | `stream RunInferenceServerMessage` | bidi | 待分析 |
-| `InferenceService/RunInferenceSSE` | 58440 | `BidiRequestId` | `stream RunInferenceServerMessage` | SSE，关联 `RunInference` | 待分析 |
-| `InferenceService/RunInferencePoll` | 58441 | `BidiPollRequest` | `stream BidiPollResponse` | 轮询兜底 | 待分析 |
+| `BidiService/BidiAppend` | 57256 | `BidiAppendRequest` | `BidiAppendResponse` | unary | 已确认（见下，链路见 `cursor-inference-service.md` §2.1） |
+| `InferenceService/RunInference` | 58439 | `stream RunInferenceClientMessage` | `stream RunInferenceServerMessage` | bidi | 已确认（`cursor-inference-service.md` §1-§2） |
+| `InferenceService/RunInferenceSSE` | 58440 | `BidiRequestId` | `stream RunInferenceServerMessage` | SSE，关联 `RunInference` 的写流 | 已确认（同上 §2.2） |
+| `InferenceService/RunInferencePoll` | 58441 | `BidiPollRequest` | `stream BidiPollResponse` | 轮询兜底 | 已确认（同上 §2.3） |
 | `InferenceService/Stream` | 58436 | `InferenceStreamRequest` | `stream InferenceStreamResponse` | 服务端流 | 待分析（与 `RunInference` 的字段差异） |
 
-`BidiAppend` 是 `Run*` 的前置：客户端先把首帧塞进 bidi 队列，再用 `BidiRequestId` 拉 SSE（待抓包确认这一顺序）。所以 `BidiRequestId` 的生成与生命周期要在 `BidiAppend` 一节先写清楚，再在 `RunSSE` / `RunInferenceSSE` 里引用。
+`BidiAppend` 与读流是**并发**的两条 HTTP 请求，共用同一个 `x-request-id`：`BidiBaseTransport.stream()` 先起读流，同时在后台把客户端帧逐条 `BidiAppend`（`daemon.cjs:9234-9235`）。因此不能假设“先 append 再拉 SSE”。`BidiRequestId` 的生成与生命周期见 `cursor-inference-service.md` §2.1。
 
 ## 节内格式
 
@@ -44,10 +44,10 @@
 
 | # | 类型 | 含义 | 方向 | 取值 | 证据 |
 |---|---|---|---|---|---|
-| 1 | `string data` | 待确认：首帧的 JSON / proto 文本 | 客户端→服务端 | 待抓包 | proto 4269 |
-| 2 | `BidiRequestId request_id` | 待确认：客户端生成还是服务端下发 | 客户端→服务端 | 见 `BidiRequestId` | proto 4270 |
-| 3 | `int64 append_seqno` | 待确认：追加序号是否从 0 起、断号是否报错 | 客户端→服务端 | 待抓包 | proto 4271 |
-| 4 | `bytes data_binary` | 待确认：与 `data` 二选一还是并存（line 1 与 4 的优先级） | 客户端→服务端 | 待抓包 | proto 4272 |
+| 1 | `string data` | 客户端帧的 hex 文本；与 `data_binary` 二选一 | 客户端→服务端 | 空串表示改用 `data_binary` | proto 4269；`daemon.cjs:9238` |
+| 2 | `BidiRequestId request_id` | 逻辑流 id，等于读流请求头里的 `x-request-id` | 客户端→服务端 | UUID 字符串 | proto 4270；`daemon.cjs:9230 / 9238` |
+| 3 | `int64 append_seqno` | 追加序号，从 0 起逐帧 +1，服务端需按序拼接 | 客户端→服务端 | 0,1,2,… | proto 4271；`daemon.cjs:9236 / 9238` |
+| 4 | `bytes data_binary` | 客户端帧的二进制编码；kill switch `bidi_append_binary_encoding_disabled` 打开时改用 field 1 | 客户端→服务端 | 未压缩 protobuf 字节 | proto 4272；`daemon.cjs:9232 / 9392` |
 
 `BidiAppendResponse` 当前为空消息（proto 4276），因此 ack 语义只能体现在 HTTP 状态码上。
 
@@ -57,28 +57,29 @@
 
 | # | 分支 | 分析状态 |
 |---|---|---|
-| 1 | `RunInferenceRunRequest` | 待分析（会话、模型、agent mode 的入口） |
-| 2 | `RunInferenceInvokeModel` | 待分析（真正发起一次模型调用） |
-| 3 | `RunInferenceCancelInvocation` | 待分析 |
-| 4 | `RunInferenceFinishRun` | 待分析 |
-| 5 | `RunInferenceClientHeartbeat` | 待分析（与 `run_ready.accepts_client_heartbeat` 配对） |
-| 6 | `RunInferenceAgentEvent` | 待分析（工具事件回传） |
-| 7 | `RunInferenceRunRequestLog` | 待分析 |
-| 9 | `RunInferenceResolveSubagentModels` | 待分析 |
-| 10 | `RunInferenceClientFirstCallTimings` | 待分析（遥测，可忽略） |
-| 11 | `RunInferenceDeltaBaseSeed` | 待分析（prompt 前缀复用） |
+| 1 | `RunInferenceRunRequest` | 建会话；字段见 `cursor-inference-service.md` §1 |
+| 2 | `RunInferenceInvokeModel` | 真正发起一次模型调用，载荷是 `InferenceStreamRequest`（`request=2`） |
+| 3 | `RunInferenceCancelInvocation` | 仅 `invocation_id` |
+| 4 | `RunInferenceFinishRun` | `aborted` / `turn_completed` / `tool_call_batches`；是否带 `aborted` 取决于 `accepts_aborted_finish` |
+| 5 | `RunInferenceClientHeartbeat` | 与 `run_ready.accepts_client_heartbeat` 配对，客户端默认 5s 一次 |
+| 6 | `RunInferenceAgentEvent` | 工具事件回传，受 `accepts_agent_events` 控制 |
+| 7 | `RunInferenceRunRequestLog` | `agent_run_request` 原样字节，受 `agent_run_request_log_requested` 控制 |
+| 9 | `RunInferenceResolveSubagentModels` | 子代理模型解析请求，响应在 server 分支 5 |
+| 10 | `RunInferenceClientFirstCallTimings` | 遥测；`http1_sse/poll` 下改用 client heartbeat 携带 |
+| 11 | `RunInferenceDeltaBaseSeed` | prompt 前缀复用，受 `accepts_delta_invocations` + `accepts_delta_base_seeds` 双重控制 |
 
 服务端 → 客户端 `RunInferenceServerMessage`（proto 41503）：
 
 | # | 分支 | 分析状态 |
 |---|---|---|
-| 1 | `RunInferenceHeartbeat` | 待分析 |
-| 2 | `RunInferenceRunReady` | 待分析（握手：模型解析结果 + 能力开关） |
-| 3 | `RunInferenceInvocationResponse` | 待分析（真正的 token / 工具调用流） |
-| 4 | `RunInferenceInvocationEnd` | 待分析（结束或错误） |
-| 5 | `RunInferenceSubagentModelsResolved` | 待分析 |
+| 1 | `RunInferenceHeartbeat` | `accepts_speculative_invocations` 等预写协商，非 speculative 场景可空 |
+| 2 | `RunInferenceRunReady` | 握手；`resolved_model` 必须存在，`accepts_*` 位见 `cursor-inference-service.md` §4 |
+| 3 | `RunInferenceInvocationResponse` | `response: InferenceStreamResponse`，真正的 token / 工具调用流 |
+| 4 | `RunInferenceInvocationEnd` | `error` / `delta_refused`；`refusal=CONFIG_MISMATCH` 会使客户端整轮失败 |
+| 5 | `RunInferenceSubagentModelsResolved` | 与 client 分支 9 的 `resolution_id` 配对 |
 
-`RunInferenceRunReady` 里的 `accepts_*` 布尔位决定客户端后续发哪些帧，逐位含义必须和客户端行为对齐后再动，否则客户端会停发或错发。`RunInferenceInvocationResponse.response` 复用 `aiserver.v1.InferenceStreamResponse`，与 `AiService/StreamChat` 同一形状，需要判断 local loop 能否共用一套编码。
+`RunInferenceRunReady` 里的 `accepts_*` 布尔位决定客户端后续发哪些帧，逐位含义必须和客户端行为对齐后再动，否则客户端会停发或错发。逐位契约见 `cursor-inference-service.md` §4。
+`RunInferenceInvocationResponse.response` 就是 `aiserver.v1.InferenceStreamResponse`，与 `Stream` 方法共用同一形状，因此 local loop 只需要一套 `InferenceStreamResponse` 编码器。
 
 ## 关联
 

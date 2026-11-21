@@ -19,14 +19,18 @@
 docs/protocol/
 ├── README.md           本文件：范围、写法和证据要求
 ├── agent-v1.md         agent.v1：AgentService / RunSSE 及其消息
-└── aiserver-v1.md      aiserver.v1：InferenceService、BidiService、模型列表等
+├── aiserver-v1.md      aiserver.v1：InferenceService、BidiService、模型列表等
+├── cursor-inference-service.md        InferenceService 服务级分析：方法表、传输模式、local loop 开关
+└── cursor-prompt-model-metadata.md    RunInferencePromptModelMetadata 的模型身份位（is_opus55 等）
 ```
 
 新增一个方法/消息的分析时，优先在对应包文件里加一节；只有新包才新建文件，并在上表登记。
+`cursor-inference-service.md` 是 `aiserver-v1.md` 里 `InferenceService` 小节的服务级展开（方法表、传输模式、帧顺序、local loop 开关）；字段级内容仍写回 `aiserver-v1.md`。
 
 ## 每节写法
 
 按「方法 → 消息 → 字段」自外向内展开。方法一节要写清传输形态（ConnectRPC unary / SSE / WebSocket / REST），因为同一消息在不同形态下的字段语义会变。
+多个方法共用一条链路（同一个 `BidiRequestId`、同一套重映射）时，把链路级结论单独成文（如 `cursor-inference-service.md`），包文件里只留索引与字段表。
 
 字段表固定这几列：
 
