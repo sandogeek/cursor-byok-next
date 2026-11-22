@@ -30,7 +30,7 @@ cursor-byok/server/plugins/build-in/magpie/ apps/desktop/plugins/build-in/magpie
 └── magpie_test.ts                            生产解析与表单由真实 Bun 集成测试覆盖
 ```
 
-按 `wc -l` 统计，含测试和空行、不含生成代码：Rust 宿主（不含 adapters）约 5000 行，协议适配器约 2658 行，Magpie 插件 TS 312 行，SDK 核心/worker TS 779 行。nsh 侧新增 `src/screens/Plugins.tsx`：NSH mixed 应用当前没有 `.nshpkg` 加载 API，插件配置页先做在宿主 TSX 里；`PluginHost` 的 native 导出仍是后续签名包可复用的边界。协议转发见 `PLUGIN_PROTOCOL_ADAPTERS.md`。
+按 `wc -l` 统计，含测试和空行、不含生成代码：Rust 宿主（不含 adapters）约 5000 行，协议适配器约 2892 行，Magpie 插件 TS 312 行，SDK 核心/worker TS 787 行。nsh 侧新增 `src/screens/Plugins.tsx`：NSH mixed 应用当前没有 `.nshpkg` 加载 API，插件配置页先做在宿主 TSX 里；`PluginHost` 的 native 导出仍是后续签名包可复用的边界。协议转发见 `PLUGIN_PROTOCOL_ADAPTERS.md`。
 
 ## 本步边界
 

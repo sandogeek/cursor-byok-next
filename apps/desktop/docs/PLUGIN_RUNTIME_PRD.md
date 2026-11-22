@@ -42,8 +42,8 @@ apps/desktop/
 │   │   │   ├── responses.rs # Responses：请求体 + SSE → ModelEvent
 │   │   │   └── anthropic.rs # Messages：请求体 + SSE → ModelEvent
 │   │   ├── worker.rs      # Bun 检测、JSONL、network 服务；新增 protocol.stream 宿主调用
-│   │   ├── host.rs        # 现有编排；provider.invoke 时登记本次规范请求
-│   │   ├── wire.rs        # 现有 core ↔ SDK JSON 投影；适配器输入复用同一 schema
+│   │   ├── host.rs        # 现有编排；provider.invoke 时登记 Arc<ModelInvocation>
+│   │   ├── wire.rs        # 按需 core → SDK JSON 投影；标准 adapter 不走此路径
 │   │   └── sdk/
 │   │       ├── plugin.ts  # 增 protocol 能力与 ProtocolHttpError；删除 protocol/ 目录
 │   │       ├── worker.ts  # 转接 protocol.stream 宿主调用；host_error 带 status 时抛 ProtocolHttpError
@@ -56,11 +56,12 @@ apps/desktop/
 ```text
 目录：Magpie TS models.list → context.network.fetch → TS 解析 /v1/models → 宿主 live 缓存
 推理：Cursor local loop → PluginHost.stream_model
-     → Bun Magpie provider.invoke
+     → Bun Magpie provider.invoke（仅 providerId / model / resource）
        ├─ TS：选协议、选端点、组鉴权头、401/协议错误分类
        └─ hostCall "protocol.stream" {protocol, url, model, headers}
-          → Rust 适配器：宿主登记的规范请求 → 请求体 → 网关 HTTP/SSE → ModelEvent
+          → Rust 适配器：宿主登记的 ModelInvocation → 请求体 → 网关 HTTP/SSE → ModelEvent
           → 事件直写本次 invocation 流；HTTP 状态/错误回给 TS
+     自定义 TS 协议：显式 await input.readRequest() 才投影 SDK JSON
      → local loop 生成 Cursor 响应帧
 观测：适配器的首个请求 claim CallRecorder → calls.db → 调用记录页
 ```
@@ -104,9 +105,7 @@ export type PluginContext = {
 
 ### 5.3 请求体来源
 
-适配器**只**使用宿主在 `invoke` 时投影的规范请求：`PluginHost::stream_model` 把 `wire::llm_request(&invocation)` 的结果登记进本次 invocation 状态，`protocol.stream` 参数里不含消息体或工具定义。理由：请求投影只有一个所有者（宿主），插件不能篡改会话；同时避免附件 base64 在 JSONL 上二次传输。
-
-Rust 适配器的输入类型与 SDK `LlmRequest` 同 schema，由 `serde_json::from_value(wire::llm_request(...))` 得到，并有 round-trip 测试保证两侧字段一致。
+已被 [local loop 请求 PRD](LOCAL_LOOP_REQUEST_PRD.md) 替代：标准协议路径不再构造 SDK `LlmRequest`。适配器**只**使用宿主在 `invoke` 时登记的 `Arc<ModelInvocation>`；`protocol.stream` 参数里不含消息体或工具定义。自定义 TS 协议显式 `await input.readRequest()` 才投影 SDK JSON。理由：请求投影只有一个所有者（宿主），长历史和附件不再为了选端点而序列化进 Bun。
 
 ### 5.4 执行语义（沿用现有 worker 网络调用）
 
@@ -118,7 +117,7 @@ Rust 适配器的输入类型与 SDK `LlmRequest` 同 schema，由 `serde_json::
 ## 6. 功能要求与不变量
 
 1. **策略在 TS，协议在 Rust。** 协议选择、端点拼装、鉴权头、资源有效性（`401` → `invalid`）、目录解析一律留在 TS；Rust 只做请求体、HTTP/SSE 与事件归一化。两边都不引入第三条路径。
-2. **同一份输入产出同一份输出。** 对同一 `LlmRequest` 与上游响应，Rust 适配器的请求体与事件序列必须与迁移前 TS helper 等价；等价性由迁移前抓取的 golden fixture（请求体 + 事件序列，脱敏、无凭证）锁定。
+2. **同一份输入产出同一份输出。** 对同一核心 `ModelInvocation` 与上游响应，Rust 适配器的请求体与事件序列必须与迁移前 TS helper 等价；等价性由 golden fixture（请求体 + 事件序列，脱敏、无凭证）锁定。标准路径不经过 SDK JSON；「adapter 输入必须与 SDK 同 schema」已由 [local loop 请求 PRD](LOCAL_LOOP_REQUEST_PRD.md) 替代。
 3. **事件帧边界不变。** 文本 / 思考 / 每个工具的 start → delta → end 顺序、回放状态在流结束前一次发出、`usage` 与 `done` 的先后都与现行为一致。
 4. **网络与凭证边界不放宽。** Magpie 只请求本次绑定的网关 origin 和固定路径；密钥不出现在 UI、日志、测试快照与插件目录错误里；目录错误不展示网关响应原文。
 5. **生命周期归宿主。** 一次 `InvokeModel` 建立一条调用记录；配置页关闭不取消推理；短暂断线在现有宽限期内重连同一 Run 且不重发上游请求。

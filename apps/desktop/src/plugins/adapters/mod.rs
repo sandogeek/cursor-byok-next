@@ -15,7 +15,13 @@ use super::{
     Error, Result,
     worker::{HostContext, InvocationState},
 };
-use crate::provider::ModelEvent;
+use crate::{
+    model::{
+        ContentPart, ProjectedContent, ProjectedMessage, ProviderReplayState, Role,
+        ToolCallContent, ToolResultContent,
+    },
+    provider::ModelEvent,
+};
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
@@ -64,11 +70,11 @@ pub(super) async fn stream(
         Error::Protocol(format!("invalid protocol.stream params: {error}"))
     })?;
     let protocol = ProtocolKind::parse(&input.protocol)?;
-    let request = invocation.llm_request()?;
+    let model = invocation.model()?;
     let body = match protocol {
-        ProtocolKind::OpenAiChat => chat::build_body(&input.model, &request)?,
-        ProtocolKind::OpenAiResponses => responses::build_body(&input.model, &request)?,
-        ProtocolKind::Anthropic => anthropic::build_body(&input.model, &request)?,
+        ProtocolKind::OpenAiChat => chat::build_body(&input.model, model)?,
+        ProtocolKind::OpenAiResponses => responses::build_body(&input.model, model)?,
+        ProtocolKind::Anthropic => anthropic::build_body(&input.model, model)?,
     };
     let body_text = serde_json::to_string(&body)?;
     let mut headers = HashMap::from([
@@ -264,6 +270,64 @@ fn parse_object(payload: &str, label: &str) -> Result<Value> {
     }
 }
 
+fn encode_base64(data: &[u8]) -> String {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    STANDARD.encode(data)
+}
+
+fn data_url(mime_type: &str, data: &[u8]) -> String {
+    format!("data:{mime_type};base64,{}", encode_base64(data))
+}
+
+fn joined_text(parts: &[ContentPart]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.as_str()),
+            ContentPart::Image { .. } | ContentPart::File { .. } => None,
+        })
+        .collect()
+}
+
+enum CoreMessage<'a> {
+    System(&'a [ContentPart]),
+    User(&'a [ContentPart]),
+    Assistant {
+        text: std::borrow::Cow<'a, str>,
+        replay_state: Option<&'a ProviderReplayState>,
+        tool_calls: &'a [ToolCallContent],
+    },
+    Tool(&'a ToolResultContent),
+}
+
+fn core_message(message: &ProjectedMessage) -> Result<CoreMessage<'_>> {
+    match &message.content {
+        ProjectedContent::Parts(parts) => match message.role {
+            Role::System => Ok(CoreMessage::System(parts)),
+            Role::User => Ok(CoreMessage::User(parts)),
+            Role::Assistant => Ok(CoreMessage::Assistant {
+                text: std::borrow::Cow::Owned(joined_text(parts)),
+                replay_state: None,
+                tool_calls: &[],
+            }),
+            Role::Tool => Err(Error::Protocol(
+                "tool messages must carry a tool result".into(),
+            )),
+        },
+        ProjectedContent::Assistant {
+            text,
+            replay_state,
+            calls,
+            ..
+        } => Ok(CoreMessage::Assistant {
+            text: std::borrow::Cow::Borrowed(text),
+            replay_state: replay_state.as_ref(),
+            tool_calls: calls,
+        }),
+        ProjectedContent::ToolResult(result) => Ok(CoreMessage::Tool(result)),
+    }
+}
+
 fn usage_event(
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
@@ -300,24 +364,154 @@ fn collect_events(
 
 #[cfg(test)]
 mod tests {
-    use crate::plugins::wire::{LlmContentPart, LlmMessage, LlmReasoning, LlmRequest};
+    use crate::model::{
+        ContentPart, ModelInvocation, ModelRequest, ModelSpec, ProjectedContent, ProjectedMessage,
+        PromptSpec, Role,
+    };
 
-    pub(crate) fn request() -> LlmRequest {
-        LlmRequest {
-            instructions: "You are concise.".into(),
-            messages: vec![LlmMessage::User {
-                content: vec![LlmContentPart::Text {
-                    text: "hello".into(),
+    pub(crate) fn invocation() -> ModelInvocation {
+        ModelInvocation {
+            call_id: "call-1".into(),
+            run_id: "run-1".into(),
+            conversation_id: "conversation-1".into(),
+            provider_call_index: 0,
+            request: ModelRequest {
+                prompt: PromptSpec {
+                    instructions: "You are concise.".into(),
+                    tools: Vec::new(),
+                },
+                model: ModelSpec::new("plugin:p/c/m"),
+                history: vec![ProjectedMessage {
+                    message_id: "m1".into(),
+                    role: Role::User,
+                    content: ProjectedContent::Parts(vec![ContentPart::Text {
+                        text: "hello".into(),
+                    }]),
                 }],
-            }],
-            tools: Vec::new(),
-            reasoning: LlmReasoning {
-                enabled: false,
-                effort: None,
             },
-            latency: "standard".into(),
-            max_output_tokens: None,
-            cache_key: Some("conversation-1".into()),
         }
+    }
+
+    fn tool_roundtrip() -> ModelInvocation {
+        use crate::model::{ProviderReplayState, ToolCallContent, ToolDefinition, ToolResultContent};
+        let mut invocation = invocation();
+        invocation.request.prompt.tools = vec![ToolDefinition {
+            name: "lookup".into(),
+            description: "Look up".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }];
+        invocation.request.history = vec![
+            ProjectedMessage {
+                message_id: "m1".into(),
+                role: Role::User,
+                content: ProjectedContent::Parts(vec![ContentPart::Text { text: "ask".into() }]),
+            },
+            ProjectedMessage {
+                message_id: "m2".into(),
+                role: Role::Assistant,
+                content: ProjectedContent::Assistant {
+                    text: String::new(),
+                    thinking: String::new(),
+                    replay_state: Some(ProviderReplayState {
+                        provider_kind: "openai_chat".into(),
+                        value: serde_json::json!({ "reasoning_content": "why" }),
+                    }),
+                    calls: vec![ToolCallContent {
+                        index: 0,
+                        call_id: "call-1".into(),
+                        name: "lookup".into(),
+                        arguments: serde_json::json!({ "q": "a" }),
+                    }],
+                },
+            },
+            ProjectedMessage {
+                message_id: "m3".into(),
+                role: Role::Tool,
+                content: ProjectedContent::ToolResult(ToolResultContent {
+                    call_id: "call-1".into(),
+                    name: "lookup".into(),
+                    content: "data".into(),
+                    is_error: false,
+                    image: None,
+                    provider_parts: Vec::new(),
+                }),
+            },
+            ProjectedMessage {
+                message_id: "m4".into(),
+                role: Role::User,
+                content: ProjectedContent::Parts(vec![
+                    ContentPart::Text { text: "see".into() },
+                    ContentPart::Image {
+                        mime_type: "image/png".into(),
+                        data: vec![0, 1, 2, 3],
+                    },
+                    ContentPart::File {
+                        mime_type: "application/pdf".into(),
+                        filename: Some("report.pdf".into()),
+                        data: b"%PDF-1".to_vec(),
+                    },
+                ]),
+            },
+        ];
+        invocation
+    }
+
+    fn illegal_tool() -> ModelInvocation {
+        let mut invocation = invocation();
+        invocation.request.history = vec![ProjectedMessage {
+            message_id: "m1".into(),
+            role: Role::Tool,
+            content: ProjectedContent::Parts(vec![ContentPart::Text { text: "oops".into() }]),
+        }];
+        invocation
+    }
+
+    #[test]
+    fn omits_empty_optional_fields() {
+        let body = super::chat::build_body("gpt-4.1", &invocation()).unwrap();
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("service_tier").is_none());
+        assert!(body.get("tools").is_none());
+        let body = super::responses::build_body("gpt-5", &invocation()).unwrap();
+        assert!(body.get("max_output_tokens").is_none());
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("service_tier").is_none());
+        assert!(body.get("tools").is_none());
+        let body = super::anthropic::build_body("claude", &invocation()).unwrap();
+        assert!(body.get("tools").is_none());
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn rejects_tool_messages_without_a_result_before_any_protocol_body() {
+        let invocation = illegal_tool();
+        let chat = super::chat::build_body("gpt-4.1", &invocation).unwrap_err();
+        let responses = super::responses::build_body("gpt-5", &invocation).unwrap_err();
+        let anthropic = super::anthropic::build_body("claude", &invocation).unwrap_err();
+        assert_eq!(chat.to_string(), "tool messages must carry a tool result");
+        assert_eq!(responses.to_string(), chat.to_string());
+        assert_eq!(anthropic.to_string(), chat.to_string());
+    }
+
+    #[test]
+    fn builds_equivalent_bodies_from_the_same_core_fixture() {
+        let invocation = tool_roundtrip();
+        let chat = super::chat::build_body("gpt-4.1", &invocation).unwrap();
+        assert_eq!(chat["messages"][0]["role"], "system");
+        assert_eq!(chat["messages"][3]["role"], "tool");
+        assert_eq!(chat["messages"][3]["tool_call_id"], "call-1");
+        assert_eq!(chat["messages"][4]["content"][1]["type"], "image_url");
+        let responses = super::responses::build_body("gpt-5", &invocation).unwrap();
+        assert_eq!(responses["input"][1]["type"], "function_call");
+        assert_eq!(responses["input"][2]["type"], "function_call_output");
+        assert_eq!(responses["input"][3]["content"][1]["type"], "input_image");
+        assert_eq!(responses["input"][3]["content"][2]["type"], "input_file");
+        let anthropic = super::anthropic::build_body("claude", &invocation).unwrap();
+        assert_eq!(anthropic["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(anthropic["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(anthropic["messages"][2]["content"][2]["type"], "image");
+        assert_eq!(anthropic["messages"][2]["content"][3]["type"], "document");
     }
 }

@@ -109,11 +109,15 @@ async function dispatch(message: { id: string; method: string; params?: JsonValu
         const output = {
           emit: (event: ModelEvent) => void send({ type: "event", id: message.id, event }),
         };
+        let request: Promise<unknown> | undefined;
         result = await provider(params.providerId).invoke(
           {
             model: params.model as never,
             resource: (params.resource ?? null) as never,
-            request: params.request as never,
+            readRequest: () => {
+              request ??= hostCall(message.id, "provider.readRequest", null);
+              return request as never;
+            },
           },
           output,
           context,

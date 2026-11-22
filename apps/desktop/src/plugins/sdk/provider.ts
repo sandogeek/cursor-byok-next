@@ -100,7 +100,11 @@ export type ProviderInvokeInput = {
   model: ModelSnapshot;
   /** 宿主为本次调用选中的资源;无资源 Provider 为 null。 */
   resource: ResourceSnapshot | null;
-  request: LlmRequest;
+  /**
+   * 按需读取宿主登记的规范请求。仅首次调用才向宿主取正文;
+   * 同一次 invoke 内复用 Promise。标准协议路径不要调用。
+   */
+  readRequest(): Promise<LlmRequest>;
 };
 
 /**

@@ -2,12 +2,13 @@
 
 use serde_json::{Value, json};
 
-use super::{ProtocolParser, count_usize, object, parse_object, text, usage_event};
+use super::{
+    CoreMessage, ProtocolParser, core_message, count_usize, encode_base64, object, parse_object,
+    text, usage_event,
+};
 use crate::{
-    plugins::{
-        Error, Result,
-        wire::{LlmContentPart, LlmMessage, LlmRequest},
-    },
+    model::{ContentPart, ModelInvocation},
+    plugins::{Error, Result},
     provider::{FinishReason, ModelEvent},
 };
 
@@ -274,15 +275,16 @@ impl ProtocolParser for Parser {
     }
 }
 
-pub(super) fn build_body(model: &str, request: &LlmRequest) -> Result<Value> {
-    let mut messages = anthropic_messages(&request.messages)?;
+pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Value> {
+    let request = &invocation.request;
+    let mut messages = anthropic_messages(&request.history)?;
     mark_cache_breakpoint(&mut messages);
-    let system = if request.instructions.is_empty() {
+    let system = if request.prompt.instructions.is_empty() {
         Value::String(String::new())
     } else {
         json!([{
             "type": "text",
-            "text": request.instructions,
+            "text": request.prompt.instructions,
             "cache_control": { "type": "ephemeral" },
         }])
     };
@@ -290,14 +292,15 @@ pub(super) fn build_body(model: &str, request: &LlmRequest) -> Result<Value> {
         "model": model,
         "system": system,
         "messages": messages,
-        "max_tokens": request.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        "max_tokens": request.model.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         "stream": true,
     });
     let object = body.as_object_mut().unwrap();
-    if !request.tools.is_empty() {
+    if !request.prompt.tools.is_empty() {
         object.insert(
             "tools".into(),
             request
+                .prompt
                 .tools
                 .iter()
                 .enumerate()
@@ -307,7 +310,7 @@ pub(super) fn build_body(model: &str, request: &LlmRequest) -> Result<Value> {
                         "description": tool.description,
                         "input_schema": tool.parameters,
                     });
-                    if index + 1 == request.tools.len() {
+                    if index + 1 == request.prompt.tools.len() {
                         value.as_object_mut().unwrap().insert(
                             "cache_control".into(),
                             json!({ "type": "ephemeral" }),
@@ -318,31 +321,28 @@ pub(super) fn build_body(model: &str, request: &LlmRequest) -> Result<Value> {
                 .collect::<Value>(),
         );
     }
-    if request.reasoning.enabled {
+    if request.model.reasoning.enabled {
         object.insert(
             "thinking".into(),
             json!({ "type": "adaptive", "display": "summarized" }),
         );
     }
-    if let Some(effort) = &request.reasoning.effort {
+    if let Some(effort) = &request.model.reasoning.effort {
         object.insert("output_config".into(), json!({ "effort": effort }));
     }
     Ok(body)
 }
 
-fn anthropic_parts(parts: &[LlmContentPart], allow_attachments: bool) -> Result<Vec<Value>> {
+fn anthropic_parts(parts: &[ContentPart], allow_attachments: bool) -> Result<Vec<Value>> {
     let mut content = Vec::new();
     for part in parts {
         match part {
-            LlmContentPart::Text { text } => {
+            ContentPart::Text { text } => {
                 if !text.is_empty() {
                     content.push(json!({ "type": "text", "text": text }));
                 }
             }
-            LlmContentPart::Image {
-                media_type,
-                data_base64,
-            } => {
+            ContentPart::Image { mime_type, data } => {
                 if !allow_attachments {
                     return Err(Error::Provider(
                         "Anthropic only accepts attachments in user messages".into(),
@@ -352,49 +352,44 @@ fn anthropic_parts(parts: &[LlmContentPart], allow_attachments: bool) -> Result<
                     "type": "image",
                     "source": {
                         "type": "base64",
-                        "media_type": media_type,
-                        "data": data_base64,
+                        "media_type": mime_type,
+                        "data": encode_base64(data),
                     },
                 }));
             }
-            LlmContentPart::File {
-                media_type,
+            ContentPart::File {
+                mime_type,
                 filename,
-                data_base64,
+                data,
             } => {
                 if !allow_attachments {
                     return Err(Error::Provider(
                         "Anthropic only accepts attachments in user messages".into(),
                     ));
                 }
-                if media_type == "application/pdf" {
+                if mime_type == "application/pdf" {
                     content.push(json!({
                         "type": "document",
                         "source": {
                             "type": "base64",
-                            "media_type": media_type,
-                            "data": data_base64,
+                            "media_type": mime_type,
+                            "data": encode_base64(data),
                         },
                     }));
                     continue;
                 }
-                if !media_type.starts_with("text/") {
+                if !mime_type.starts_with("text/") {
                     return Err(Error::Provider(
                         "Anthropic Messages only supports PDF and plain-text file attachments"
                             .into(),
                     ));
                 }
-                let decoded = base64::Engine::decode(
-                    &base64::engine::general_purpose::STANDARD,
-                    data_base64,
-                )
-                .map_err(|error| Error::Provider(format!("invalid Anthropic text attachment: {error}")))?;
                 let mut document = json!({
                     "type": "document",
                     "source": {
                         "type": "plain_text",
                         "media_type": "text/plain",
-                        "data": String::from_utf8_lossy(&decoded),
+                        "data": String::from_utf8_lossy(data),
                     },
                 });
                 if let Some(filename) = filename {
@@ -432,15 +427,14 @@ fn push_anthropic(output: &mut Vec<Value>, role: &str, content: Vec<Value>) {
     output.push(json!({ "role": role, "content": content }));
 }
 
-fn anthropic_messages(messages: &[LlmMessage]) -> Result<Vec<Value>> {
+fn anthropic_messages(messages: &[crate::model::ProjectedMessage]) -> Result<Vec<Value>> {
     let mut output = Vec::new();
     for message in messages {
-        match message {
-            LlmMessage::Assistant {
+        match core_message(message)? {
+            CoreMessage::Assistant {
                 text,
                 replay_state,
                 tool_calls,
-                ..
             } => {
                 let mut content = Vec::new();
                 if let Some(state) = replay_state
@@ -449,7 +443,7 @@ fn anthropic_messages(messages: &[LlmMessage]) -> Result<Vec<Value>> {
                     content.extend(replay_blocks(&state.value));
                 }
                 if !text.is_empty() {
-                    content.push(json!({ "type": "text", "text": text }));
+                    content.push(json!({ "type": "text", "text": text.as_ref() }));
                 }
                 for tool_call in tool_calls {
                     content.push(json!({
@@ -463,29 +457,29 @@ fn anthropic_messages(messages: &[LlmMessage]) -> Result<Vec<Value>> {
                     push_anthropic(&mut output, "assistant", content);
                 }
             }
-            LlmMessage::Tool {
-                call_id,
-                content,
-                parts,
-                ..
-            } => {
+            CoreMessage::Tool(result) => {
                 push_anthropic(
                     &mut output,
                     "user",
                     vec![json!({
                         "type": "tool_result",
-                        "tool_use_id": call_id,
-                        "content": if parts.is_empty() {
-                            Value::String(content.clone())
+                        "tool_use_id": result.call_id,
+                        "content": if result.provider_parts.is_empty() {
+                            Value::String(result.content.clone())
                         } else {
-                            anthropic_parts(parts, true)?.into()
+                            anthropic_parts(&result.provider_parts, true)?.into()
                         },
                     })],
                 );
             }
-            LlmMessage::System { content } | LlmMessage::User { content } => {
-                let allow = matches!(message, LlmMessage::User { .. });
-                let parts = anthropic_parts(content, allow)?;
+            CoreMessage::System(content) => {
+                let parts = anthropic_parts(content, false)?;
+                if !parts.is_empty() {
+                    push_anthropic(&mut output, "user", parts);
+                }
+            }
+            CoreMessage::User(content) => {
+                let parts = anthropic_parts(content, true)?;
                 if !parts.is_empty() {
                     push_anthropic(&mut output, "user", parts);
                 }
@@ -633,22 +627,25 @@ fn required_type(value: &serde_json::Map<String, Value>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::{
-        adapters::{collect_events, tests::request},
-        wire::{LlmContentPart, LlmMessage, LlmReplayState, LlmTool, LlmToolCall},
+    use crate::{
+        model::{
+            ContentPart, ProjectedContent, ProjectedMessage, ProviderReplayState, Role,
+            ToolCallContent, ToolDefinition, ToolResultContent,
+        },
+        plugins::adapters::{collect_events, tests::invocation},
     };
 
     #[test]
     fn marks_cache_breakpoints_and_defaults_max_tokens() {
-        let mut request = request();
-        request.tools = vec![LlmTool {
+        let mut invocation = invocation();
+        invocation.request.prompt.tools = vec![ToolDefinition {
             name: "lookup".into(),
             description: "Look up".into(),
             parameters: json!({ "type": "object" }),
         }];
-        request.reasoning.enabled = true;
-        request.reasoning.effort = Some("high".into());
-        let body = build_body("claude-sonnet-4-5", &request).unwrap();
+        invocation.request.model.reasoning.enabled = true;
+        invocation.request.model.reasoning.effort = Some("high".into());
+        let body = build_body("claude-sonnet-4-5", &invocation).unwrap();
         assert_eq!(body["max_tokens"], 65_000);
         assert_eq!(
             body["system"],
@@ -670,48 +667,63 @@ mod tests {
 
     #[test]
     fn replays_thinking_and_merges_roles() {
-        let mut request = request();
-        request.instructions.clear();
-        request.messages = vec![
-            LlmMessage::System {
-                content: vec![LlmContentPart::Text { text: "sys".into() }],
+        let mut invocation = invocation();
+        invocation.request.prompt.instructions.clear();
+        invocation.request.history = vec![
+            ProjectedMessage {
+                message_id: "m1".into(),
+                role: Role::System,
+                content: ProjectedContent::Parts(vec![ContentPart::Text { text: "sys".into() }]),
             },
-            LlmMessage::User {
-                content: vec![LlmContentPart::Text { text: "ask".into() }],
+            ProjectedMessage {
+                message_id: "m2".into(),
+                role: Role::User,
+                content: ProjectedContent::Parts(vec![ContentPart::Text { text: "ask".into() }]),
             },
-            LlmMessage::Assistant {
-                text: "ok".into(),
-                thinking: String::new(),
-                replay_state: Some(LlmReplayState {
-                    provider_kind: REPLAY_KIND.into(),
-                    value: json!({
-                        "blocks": [
-                            { "type": "thinking", "thinking": "", "signature": "sig" },
-                            { "type": "redacted_thinking", "data": "opaque" },
-                        ]
+            ProjectedMessage {
+                message_id: "m3".into(),
+                role: Role::Assistant,
+                content: ProjectedContent::Assistant {
+                    text: "ok".into(),
+                    thinking: String::new(),
+                    replay_state: Some(ProviderReplayState {
+                        provider_kind: REPLAY_KIND.into(),
+                        value: json!({
+                            "blocks": [
+                                { "type": "thinking", "thinking": "", "signature": "sig" },
+                                { "type": "redacted_thinking", "data": "opaque" },
+                            ]
+                        }),
                     }),
-                }),
-                tool_calls: vec![LlmToolCall {
-                    index: 0,
+                    calls: vec![ToolCallContent {
+                        index: 0,
+                        call_id: "call-1".into(),
+                        name: "lookup".into(),
+                        arguments: json!({ "q": "weather" }),
+                    }],
+                },
+            },
+            ProjectedMessage {
+                message_id: "m4".into(),
+                role: Role::Tool,
+                content: ProjectedContent::ToolResult(ToolResultContent {
                     call_id: "call-1".into(),
                     name: "lookup".into(),
-                    arguments: json!({ "q": "weather" }),
-                }],
+                    content: "sunny".into(),
+                    is_error: false,
+                    image: None,
+                    provider_parts: Vec::new(),
+                }),
             },
-            LlmMessage::Tool {
-                call_id: "call-1".into(),
-                name: "lookup".into(),
-                content: "sunny".into(),
-                is_error: false,
-                parts: Vec::new(),
-            },
-            LlmMessage::User {
-                content: vec![LlmContentPart::Text {
+            ProjectedMessage {
+                message_id: "m5".into(),
+                role: Role::User,
+                content: ProjectedContent::Parts(vec![ContentPart::Text {
                     text: "thanks".into(),
-                }],
+                }]),
             },
         ];
-        let body = build_body("claude-sonnet-4-5", &request).unwrap();
+        let body = build_body("claude-sonnet-4-5", &invocation).unwrap();
         assert_eq!(body["system"], "");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 2);
@@ -725,26 +737,30 @@ mod tests {
 
     #[test]
     fn accepts_user_images_and_rejects_system_images() {
-        let mut request = request();
-        request.messages = vec![LlmMessage::User {
-            content: vec![
-                LlmContentPart::Text { text: "see".into() },
-                LlmContentPart::Image {
-                    media_type: "image/png".into(),
-                    data_base64: "AAECAw==".into(),
+        let mut invocation = invocation();
+        invocation.request.history = vec![ProjectedMessage {
+            message_id: "m1".into(),
+            role: Role::User,
+            content: ProjectedContent::Parts(vec![
+                ContentPart::Text { text: "see".into() },
+                ContentPart::Image {
+                    mime_type: "image/png".into(),
+                    data: vec![0, 1, 2, 3],
                 },
-            ],
+            ]),
         }];
-        let body = build_body("claude-sonnet-4-5", &request).unwrap();
+        let body = build_body("claude-sonnet-4-5", &invocation).unwrap();
         assert_eq!(body["messages"][0]["content"][1]["type"], "image");
 
-        request.messages = vec![LlmMessage::System {
-            content: vec![LlmContentPart::Image {
-                media_type: "image/png".into(),
-                data_base64: "AAECAw==".into(),
-            }],
+        invocation.request.history = vec![ProjectedMessage {
+            message_id: "m1".into(),
+            role: Role::System,
+            content: ProjectedContent::Parts(vec![ContentPart::Image {
+                mime_type: "image/png".into(),
+                data: vec![0, 1, 2, 3],
+            }]),
         }];
-        let error = build_body("claude-sonnet-4-5", &request).unwrap_err();
+        let error = build_body("claude-sonnet-4-5", &invocation).unwrap_err();
         assert_eq!(
             error.to_string(),
             "Anthropic only accepts attachments in user messages"

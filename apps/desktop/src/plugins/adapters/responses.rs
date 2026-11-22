@@ -2,12 +2,13 @@
 
 use serde_json::{Value, json};
 
-use super::{ProtocolParser, count_usize, object, parse_object, text, usage_event};
+use super::{
+    CoreMessage, ProtocolParser, core_message, count_usize, data_url, object, parse_object, text,
+    usage_event,
+};
 use crate::{
-    plugins::{
-        Error, Result,
-        wire::{LlmContentPart, LlmMessage, LlmRequest},
-    },
+    model::{ContentPart, ModelInvocation, ModelLatency},
+    plugins::{Error, Result},
     provider::{FinishReason, ModelEvent},
 };
 
@@ -295,15 +296,15 @@ impl ProtocolParser for Parser {
     }
 }
 
-pub(super) fn build_body(model: &str, request: &LlmRequest) -> Result<Value> {
+pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Value> {
+    let request = &invocation.request;
     let mut input = Vec::new();
-    for message in &request.messages {
-        match message {
-            LlmMessage::Assistant {
+    for message in &request.history {
+        match core_message(message)? {
+            CoreMessage::Assistant {
                 text,
                 replay_state,
                 tool_calls,
-                ..
             } => {
                 if let Some(state) = replay_state
                     && state.provider_kind == REPLAY_KIND
@@ -314,7 +315,7 @@ pub(super) fn build_body(model: &str, request: &LlmRequest) -> Result<Value> {
                     input.push(json!({
                         "type": "message",
                         "role": "assistant",
-                        "content": [{ "type": "output_text", "text": text }],
+                        "content": [{ "type": "output_text", "text": text.as_ref() }],
                     }));
                 }
                 for tool_call in tool_calls {
@@ -326,33 +327,33 @@ pub(super) fn build_body(model: &str, request: &LlmRequest) -> Result<Value> {
                     }));
                 }
             }
-            LlmMessage::Tool {
-                call_id,
-                content,
-                parts,
-                ..
-            } => {
+            CoreMessage::Tool(result) => {
                 input.push(json!({
                     "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": if parts.is_empty() {
-                        Value::String(content.clone())
+                    "call_id": result.call_id,
+                    "output": if result.provider_parts.is_empty() {
+                        Value::String(result.content.clone())
                     } else {
-                        content_parts(parts, "input_text")?.into()
+                        content_parts(&result.provider_parts, "input_text")?.into()
                     },
                 }));
             }
-            LlmMessage::System { content } | LlmMessage::User { content } => {
-                let role = if matches!(message, LlmMessage::System { .. }) {
-                    "system"
-                } else {
-                    "user"
-                };
+            CoreMessage::System(content) => {
                 let parts = content_parts(content, "input_text")?;
                 if !parts.is_empty() {
                     input.push(json!({
                         "type": "message",
-                        "role": role,
+                        "role": "system",
+                        "content": parts,
+                    }));
+                }
+            }
+            CoreMessage::User(content) => {
+                let parts = content_parts(content, "input_text")?;
+                if !parts.is_empty() {
+                    input.push(json!({
+                        "type": "message",
+                        "role": "user",
                         "content": parts,
                     }));
                 }
@@ -363,14 +364,15 @@ pub(super) fn build_body(model: &str, request: &LlmRequest) -> Result<Value> {
         "model": model,
         "input": input,
         "stream": true,
-        "instructions": request.instructions,
+        "instructions": request.prompt.instructions,
         "include": ["reasoning.encrypted_content"],
     });
     let object = body.as_object_mut().unwrap();
-    if !request.tools.is_empty() {
+    if !request.prompt.tools.is_empty() {
         object.insert(
             "tools".into(),
             request
+                .prompt
                 .tools
                 .iter()
                 .map(|tool| {
@@ -385,12 +387,12 @@ pub(super) fn build_body(model: &str, request: &LlmRequest) -> Result<Value> {
                 .collect::<Value>(),
         );
     }
-    if let Some(tokens) = request.max_output_tokens {
+    if let Some(tokens) = request.model.max_output_tokens {
         object.insert("max_output_tokens".into(), tokens.into());
     }
-    if request.reasoning.enabled || request.reasoning.effort.is_some() {
+    if request.model.reasoning.enabled || request.model.reasoning.effort.is_some() {
         let mut reasoning = json!({ "summary": "auto" });
-        if let Some(effort) = &request.reasoning.effort {
+        if let Some(effort) = &request.model.reasoning.effort {
             reasoning
                 .as_object_mut()
                 .unwrap()
@@ -398,36 +400,34 @@ pub(super) fn build_body(model: &str, request: &LlmRequest) -> Result<Value> {
         }
         object.insert("reasoning".into(), reasoning);
     }
-    if request.latency == "fast" {
+    if request.model.latency == ModelLatency::Fast {
         object.insert("service_tier".into(), "priority".into());
     }
-    if let Some(cache_key) = &request.cache_key {
-        object.insert("prompt_cache_key".into(), cache_key.clone().into());
-    }
+    object.insert(
+        "prompt_cache_key".into(),
+        invocation.conversation_id.clone().into(),
+    );
     Ok(body)
 }
 
-fn content_parts(parts: &[LlmContentPart], text_type: &str) -> Result<Vec<Value>> {
+fn content_parts(parts: &[ContentPart], text_type: &str) -> Result<Vec<Value>> {
     let mut content = Vec::new();
     for part in parts {
         match part {
-            LlmContentPart::Text { text } => {
+            ContentPart::Text { text } => {
                 if !text.is_empty() {
                     content.push(json!({ "type": text_type, "text": text }));
                 }
             }
-            LlmContentPart::Image {
-                media_type,
-                data_base64,
-            } => content.push(json!({
+            ContentPart::Image { mime_type, data } => content.push(json!({
                 "type": "input_image",
                 "detail": "auto",
-                "image_url": format!("data:{media_type};base64,{data_base64}"),
+                "image_url": data_url(mime_type, data),
             })),
-            LlmContentPart::File {
-                media_type,
+            ContentPart::File {
+                mime_type,
                 filename,
-                data_base64,
+                data,
             } => {
                 if text_type != "input_text" {
                     return Err(Error::Provider(
@@ -437,7 +437,7 @@ fn content_parts(parts: &[LlmContentPart], text_type: &str) -> Result<Vec<Value>
                 content.push(json!({
                     "type": "input_file",
                     "filename": filename.clone().unwrap_or_else(|| "attachment".into()),
-                    "file_data": format!("data:{media_type};base64,{data_base64}"),
+                    "file_data": data_url(mime_type, data),
                 }));
             }
         }
@@ -578,23 +578,26 @@ fn responses_usage(value: &Value) -> ModelEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::{
-        adapters::{collect_events, tests::request},
-        wire::{LlmContentPart, LlmMessage, LlmReplayState, LlmTool, LlmToolCall},
+    use crate::{
+        model::{
+            ContentPart, ModelLatency, ProjectedContent, ProjectedMessage, ProviderReplayState,
+            Role, ToolCallContent, ToolDefinition,
+        },
+        plugins::adapters::{collect_events, tests::invocation},
     };
 
     #[test]
     fn builds_responses_body_with_priority_tier() {
-        let mut request = request();
-        request.latency = "fast".into();
-        request.reasoning.enabled = true;
-        request.reasoning.effort = Some("high".into());
-        request.tools = vec![LlmTool {
+        let mut invocation = invocation();
+        invocation.request.model.latency = ModelLatency::Fast;
+        invocation.request.model.reasoning.enabled = true;
+        invocation.request.model.reasoning.effort = Some("high".into());
+        invocation.request.prompt.tools = vec![ToolDefinition {
             name: "lookup".into(),
             description: "Look up".into(),
             parameters: json!({ "type": "object" }),
         }];
-        let body = build_body("gpt-5", &request).unwrap();
+        let body = build_body("gpt-5", &invocation).unwrap();
         assert_eq!(body["instructions"], "You are concise.");
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
         assert_eq!(body["service_tier"], "priority");
@@ -607,29 +610,33 @@ mod tests {
 
     #[test]
     fn replays_only_reasoning_items() {
-        let mut request = request();
-        request.instructions.clear();
-        request.messages = vec![LlmMessage::Assistant {
-            text: "ok".into(),
-            thinking: String::new(),
-            replay_state: Some(LlmReplayState {
-                provider_kind: REPLAY_KIND.into(),
-                value: json!({
-                    "items": [{
-                        "type": "reasoning",
-                        "id": "r1",
-                        "encrypted_content": "enc"
-                    }]
+        let mut invocation = invocation();
+        invocation.request.prompt.instructions.clear();
+        invocation.request.history = vec![ProjectedMessage {
+            message_id: "m1".into(),
+            role: Role::Assistant,
+            content: ProjectedContent::Assistant {
+                text: "ok".into(),
+                thinking: String::new(),
+                replay_state: Some(ProviderReplayState {
+                    provider_kind: REPLAY_KIND.into(),
+                    value: json!({
+                        "items": [{
+                            "type": "reasoning",
+                            "id": "r1",
+                            "encrypted_content": "enc"
+                        }]
+                    }),
                 }),
-            }),
-            tool_calls: vec![LlmToolCall {
-                index: 0,
-                call_id: "call-1".into(),
-                name: "lookup".into(),
-                arguments: json!({ "q": "a" }),
-            }],
+                calls: vec![ToolCallContent {
+                    index: 0,
+                    call_id: "call-1".into(),
+                    name: "lookup".into(),
+                    arguments: json!({ "q": "a" }),
+                }],
+            },
         }];
-        let body = build_body("gpt-5", &request).unwrap();
+        let body = build_body("gpt-5", &invocation).unwrap();
         assert_eq!(body["input"][0]["type"], "reasoning");
         assert_eq!(body["input"][0]["encrypted_content"], "enc");
         assert_eq!(body["input"][1]["type"], "message");
@@ -638,17 +645,21 @@ mod tests {
 
     #[test]
     fn rejects_non_reasoning_replay() {
-        let mut request = request();
-        request.messages = vec![LlmMessage::Assistant {
-            text: String::new(),
-            thinking: String::new(),
-            replay_state: Some(LlmReplayState {
-                provider_kind: REPLAY_KIND.into(),
-                value: json!({ "items": [{ "type": "message" }] }),
-            }),
-            tool_calls: Vec::new(),
+        let mut invocation = invocation();
+        invocation.request.history = vec![ProjectedMessage {
+            message_id: "m1".into(),
+            role: Role::Assistant,
+            content: ProjectedContent::Assistant {
+                text: String::new(),
+                thinking: String::new(),
+                replay_state: Some(ProviderReplayState {
+                    provider_kind: REPLAY_KIND.into(),
+                    value: json!({ "items": [{ "type": "message" }] }),
+                }),
+                calls: Vec::new(),
+            },
         }];
-        let error = build_body("gpt-5", &request).unwrap_err();
+        let error = build_body("gpt-5", &invocation).unwrap_err();
         assert_eq!(
             error.to_string(),
             "OpenAI Responses replay state contains a non-reasoning item"
@@ -657,22 +668,24 @@ mod tests {
 
     #[test]
     fn serializes_files_and_images() {
-        let mut request = request();
-        request.instructions.clear();
-        request.messages = vec![LlmMessage::User {
-            content: vec![
-                LlmContentPart::Image {
-                    media_type: "image/png".into(),
-                    data_base64: "AA==".into(),
+        let mut invocation = invocation();
+        invocation.request.prompt.instructions.clear();
+        invocation.request.history = vec![ProjectedMessage {
+            message_id: "m1".into(),
+            role: Role::User,
+            content: ProjectedContent::Parts(vec![
+                ContentPart::Image {
+                    mime_type: "image/png".into(),
+                    data: vec![0],
                 },
-                LlmContentPart::File {
-                    media_type: "application/pdf".into(),
+                ContentPart::File {
+                    mime_type: "application/pdf".into(),
                     filename: Some("report.pdf".into()),
-                    data_base64: "JVBERi0x".into(),
+                    data: b"%PDF-1".to_vec(),
                 },
-            ],
+            ]),
         }];
-        let body = build_body("gpt-5", &request).unwrap();
+        let body = build_body("gpt-5", &invocation).unwrap();
         assert_eq!(body["input"][0]["content"][0]["type"], "input_image");
         assert_eq!(body["input"][0]["content"][1]["type"], "input_file");
         assert_eq!(body["input"][0]["content"][1]["filename"], "report.pdf");

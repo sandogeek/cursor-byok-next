@@ -19,19 +19,30 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+
 use super::{
     Error, Result,
     catalog::PluginEntry,
     definition::{PluginDefinitionLoader, file_url},
     origin,
     protocol::{HostMessage, WorkerMessage},
-    wire::{self, LlmRequest},
+    wire,
 };
-use crate::{calls::CallRecorder, provider::ModelEvent};
+use crate::{calls::CallRecorder, model::ModelInvocation, provider::ModelEvent};
 
 const INVOCATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_NETWORK_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
+
+#[cfg(test)]
+static LAST_INVOKE_FRAME: parking_lot::Mutex<Vec<u8>> = parking_lot::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn last_invoke_frame() -> Vec<u8> {
+    LAST_INVOKE_FRAME.lock().clone()
+}
 
 #[derive(Debug)]
 pub enum WorkerStreamItem {
@@ -161,7 +172,7 @@ pub(super) struct InvocationState {
     pub(super) cancellation: CancellationToken,
     recorder: Option<CallRecorder>,
     recorder_claimed: AtomicBool,
-    llm_request: Option<LlmRequest>,
+    model: Option<Arc<ModelInvocation>>,
     events: parking_lot::Mutex<Option<mpsc::UnboundedSender<WorkerStreamItem>>>,
 }
 
@@ -181,8 +192,8 @@ impl InvocationState {
         }
     }
 
-    pub(super) fn llm_request(&self) -> Result<&LlmRequest> {
-        self.llm_request.as_ref().ok_or_else(|| {
+    pub(super) fn model(&self) -> Result<&ModelInvocation> {
+        self.model.as_deref().ok_or_else(|| {
             Error::Protocol("protocol.stream requires a registered model request".into())
         })
     }
@@ -208,6 +219,8 @@ pub(super) struct HostContext {
     network_hosts: Arc<HashSet<String>>,
     resource_origin: bool,
     streams: Arc<Mutex<HashMap<String, StreamLines>>>,
+    #[cfg(test)]
+    sdk_projections: Arc<AtomicUsize>,
 }
 
 impl PluginWorker {
@@ -228,6 +241,8 @@ impl PluginWorker {
                     ),
                     resource_origin: plugin.manifest.permissions.resource_origin,
                     streams: Arc::new(Mutex::new(HashMap::new())),
+                    #[cfg(test)]
+                    sdk_projections: Arc::new(AtomicUsize::new(0)),
                 },
                 plugin_id,
                 executable,
@@ -282,7 +297,7 @@ impl PluginWorker {
         cancellation: CancellationToken,
         recorder: Option<CallRecorder>,
         allowed_origins: HashSet<String>,
-        llm_request: Option<LlmRequest>,
+        model: Option<Arc<ModelInvocation>>,
     ) -> Result<mpsc::UnboundedReceiver<WorkerStreamItem>> {
         let (writer, pending) = self.connection().await?;
         let permit = writer
@@ -298,14 +313,21 @@ impl PluginWorker {
             cancellation: request_cancellation.clone(),
             recorder,
             recorder_claimed: AtomicBool::new(false),
-            llm_request,
+            model,
             events: parking_lot::Mutex::new(None),
         })?;
-        permit.send(encode_message(&HostMessage::Request {
-            id: &request.id,
-            method,
-            params: &params,
-        })?);
+        permit.send({
+            let bytes = encode_message(&HostMessage::Request {
+                id: &request.id,
+                method,
+                params: &params,
+            })?;
+            #[cfg(test)]
+            if method == "provider.invoke" {
+                *LAST_INVOKE_FRAME.lock() = bytes.clone();
+            }
+            bytes
+        });
         let Some((.., mut active)) = pending.authorization(&request.id) else {
             return Err(Error::Provider("plugin worker stopped".into()));
         };
@@ -342,6 +364,11 @@ impl PluginWorker {
     #[allow(dead_code)]
     pub async fn stop(&self) {
         self.inner.process.lock().await.take();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sdk_projection_count(&self) -> usize {
+        self.inner.host.sdk_projection_count()
     }
 
     async fn connection(&self) -> Result<(Writer, Arc<Pending>)> {
@@ -455,6 +482,13 @@ async fn read_stdout(
                 params,
             } => {
                 let Some((invocation, mut active)) = pending.authorization(&request_id) else {
+                    if let Ok(bytes) = encode_message(&HostMessage::HostError {
+                        id: &id,
+                        error: "plugin invocation is no longer active",
+                        status: None,
+                    }) {
+                        let _ = writer.send(bytes).await;
+                    }
                     continue;
                 };
                 let host = host.clone();
@@ -462,7 +496,15 @@ async fn read_stdout(
                 tokio::spawn(async move {
                     tokio::select! {
                         biased;
-                        _ = active.changed() => {},
+                        _ = active.changed() => {
+                            if let Ok(bytes) = encode_message(&HostMessage::HostError {
+                                id: &id,
+                                error: "plugin invocation is no longer active",
+                                status: None,
+                            }) {
+                                let _ = writer.send(bytes).await;
+                            }
+                        }
                         _ = async {
                             let response = match host.call(&invocation, &method, params).await {
                                 Ok(result) => encode_message(&HostMessage::HostResult { id: &id, result: &result }),
@@ -529,10 +571,22 @@ impl HostContext {
                 Ok(serde_json::Value::Null)
             }
             "protocol.stream" => super::adapters::stream(self, invocation, params).await,
+            "provider.readRequest" => self.read_request(invocation),
             _ => Err(Error::Protocol(format!(
                 "unsupported plugin host method: {method}"
             ))),
         }
+    }
+
+    fn read_request(&self, invocation: &InvocationState) -> Result<serde_json::Value> {
+        #[cfg(test)]
+        self.sdk_projections.fetch_add(1, Ordering::SeqCst);
+        wire::llm_request(invocation.model()?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sdk_projection_count(&self) -> usize {
+        self.sdk_projections.load(Ordering::SeqCst)
     }
 
     pub(super) async fn prepare_request(
@@ -883,7 +937,7 @@ mod tests {
             cancellation: CancellationToken::new(),
             recorder: None,
             recorder_claimed: AtomicBool::new(false),
-            llm_request: None,
+            model: None,
             events: parking_lot::Mutex::new(None),
         }
     }
@@ -894,6 +948,7 @@ mod tests {
             network_hosts: Arc::new(HashSet::new()),
             resource_origin: true,
             streams: Arc::new(Mutex::new(HashMap::new())),
+            sdk_projections: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -930,18 +985,20 @@ mod tests {
         assert!(missing.to_string().contains("registered model request"));
 
         let mut registered = invocation(HashSet::from(["http://127.0.0.1:1".into()]));
-        registered.llm_request = Some(crate::plugins::wire::LlmRequest {
-            instructions: String::new(),
-            messages: Vec::new(),
-            tools: Vec::new(),
-            reasoning: crate::plugins::wire::LlmReasoning {
-                enabled: false,
-                effort: None,
+        registered.model = Some(Arc::new(crate::model::ModelInvocation {
+            call_id: "call".into(),
+            run_id: "run".into(),
+            conversation_id: "conversation".into(),
+            provider_call_index: 0,
+            request: crate::model::ModelRequest {
+                prompt: crate::model::PromptSpec {
+                    instructions: String::new(),
+                    tools: Vec::new(),
+                },
+                model: crate::model::ModelSpec::new("plugin:p/c/m"),
+                history: Vec::new(),
             },
-            latency: "standard".into(),
-            max_output_tokens: None,
-            cache_key: None,
-        });
+        }));
         let foreign = host
             .call(
                 &registered,
@@ -968,6 +1025,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(credentials.to_string().contains("must not contain credentials"));
+
+        let projected = host
+            .call(&registered, "provider.readRequest", serde_json::Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(projected["cacheKey"], "conversation");
+        assert_eq!(host.sdk_projection_count(), 1);
+        let again = host
+            .call(&registered, "provider.readRequest", serde_json::Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(again, projected);
+        assert_eq!(host.sdk_projection_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn catalog_invocations_cannot_read_the_model_request() {
+        let error = host()
+            .call(
+                &invocation(HashSet::new()),
+                "provider.readRequest",
+                serde_json::Value::Null,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("registered model request"));
     }
 
     #[tokio::test]
@@ -992,7 +1075,7 @@ mod tests {
             cancellation: CancellationToken::new(),
             recorder: None,
             recorder_claimed: AtomicBool::new(false),
-            llm_request: None,
+            model: None,
             events: parking_lot::Mutex::new(None),
         };
         assert!(!invocation.failure().to_string().contains("HTTP"));
@@ -1134,7 +1217,7 @@ mod tests {
             cancellation: CancellationToken::new(),
             recorder: Some(recorder),
             recorder_claimed: AtomicBool::new(false),
-            llm_request: None,
+            model: None,
             events: parking_lot::Mutex::new(None),
         }
     }
@@ -1145,6 +1228,7 @@ mod tests {
             network_hosts: Arc::new(HashSet::from(["example.com".into()])),
             resource_origin: false,
             streams: Arc::new(Mutex::new(HashMap::new())),
+            sdk_projections: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1240,5 +1324,264 @@ mod tests {
         assert_eq!(summary.request_bytes, Some(request_bytes));
         assert_eq!(summary.response_bytes, 14);
         assert!(!summary.detailed);
+    }
+
+    fn find_bun() -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path).find_map(|directory| {
+            let candidate = directory.join("bun");
+            candidate.is_file().then_some(candidate)
+        })
+    }
+
+    async fn echo_worker(
+        root: &std::path::Path,
+        source: &str,
+    ) -> (super::super::definition::PluginDefinitionLoader, PluginWorker) {
+        let executable = find_bun().expect("install Bun on PATH to run plugin worker tests");
+        let plugin_dir = root.join("echo");
+        std::fs::create_dir_all(plugin_dir.join("assets")).unwrap();
+        std::fs::write(
+            plugin_dir.join("assets/icon.svg"),
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8"/></svg>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{
+              "apiVersion": 1,
+              "id": "dev.cursorbyoknext.plugins.echo",
+              "name": "Echo",
+              "version": "0.1.0",
+              "icon": "assets/icon.svg",
+              "entry": "main.ts",
+              "permissions": { "network": [], "resourceOrigin": false }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(plugin_dir.join("main.ts"), source).unwrap();
+        let loader = super::super::definition::PluginDefinitionLoader::in_temporary_workspace(root)
+            .unwrap();
+        let entry = plugin_dir.join("main.ts").canonicalize().unwrap();
+        let definition = loader.load(&executable, &entry).await.unwrap();
+        let plugin = super::super::catalog::PluginEntry {
+            entry,
+            manifest: serde_json::from_slice(&std::fs::read(plugin_dir.join("plugin.json")).unwrap())
+                .unwrap(),
+            definition,
+            icon: String::new(),
+        };
+        (loader.clone(), PluginWorker::new(&plugin, executable, loader))
+    }
+
+    fn echo_invocation(text: &str) -> Arc<crate::model::ModelInvocation> {
+        Arc::new(crate::model::ModelInvocation {
+            call_id: "call".into(),
+            run_id: "run".into(),
+            conversation_id: "conversation".into(),
+            provider_call_index: 0,
+            request: crate::model::ModelRequest {
+                prompt: crate::model::PromptSpec {
+                    instructions: "be brief".into(),
+                    tools: Vec::new(),
+                },
+                model: crate::model::ModelSpec::new("plugin:echo/echo/echo"),
+                history: vec![crate::model::ProjectedMessage {
+                    message_id: "m1".into(),
+                    role: crate::model::Role::User,
+                    content: crate::model::ProjectedContent::Parts(vec![
+                        crate::model::ContentPart::Text {
+                            text: text.into(),
+                        },
+                    ]),
+                }],
+            },
+        })
+    }
+
+    const ECHO_PLUGIN: &str = r#"
+import { defineProviderPlugin } from "cursor-byok-next:plugin";
+import type { ProviderSupport } from "cursor-byok-next:provider";
+
+const provider: ProviderSupport = {
+  id: "echo",
+  displayName: "Echo",
+  providerType: "echo",
+  async invoke(input, output) {
+    const first = await input.readRequest();
+    const second = await input.readRequest();
+    output.emit({ type: "text-start" });
+    output.emit({
+      type: "text-delta",
+      text: JSON.stringify({
+        same: JSON.stringify(first) === JSON.stringify(second),
+        instructions: first.instructions,
+        text: first.messages[0].content[0].text,
+        cacheKey: first.cacheKey,
+      }),
+    });
+    output.emit({ type: "text-end" });
+    output.emit({ type: "done", reason: "stop" });
+    return { status: "completed" };
+  },
+};
+
+export default defineProviderPlugin({ providers: [provider] });
+"#;
+
+    async fn invoke_echo(
+        worker: &PluginWorker,
+        invocation: Arc<crate::model::ModelInvocation>,
+        cancellation: CancellationToken,
+    ) -> Vec<crate::provider::ModelEvent> {
+        let mut items = worker
+            .invoke_streaming_with_origins(
+                "provider.invoke",
+                serde_json::json!({
+                    "providerId": "echo",
+                    "model": { "id": "echo", "displayName": "Echo" },
+                    "resource": null
+                }),
+                cancellation,
+                None,
+                HashSet::new(),
+                Some(invocation),
+            )
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(item) = items.recv().await {
+            match item {
+                WorkerStreamItem::Event(event) => events.push(event),
+                WorkerStreamItem::Result(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn custom_plugin_reads_the_sdk_request_once_per_invoke() {
+        assert!(
+            find_bun().is_some(),
+            "install Bun on PATH to run plugin worker tests"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let (_loader, worker) = echo_worker(temp.path(), ECHO_PLUGIN).await;
+        let events = invoke_echo(
+            &worker,
+            echo_invocation("hello"),
+            CancellationToken::new(),
+        )
+        .await;
+        let text = events.iter().find_map(|event| match event {
+            crate::provider::ModelEvent::TextDelta(text) => Some(text.as_str()),
+            _ => None,
+        });
+        let payload: serde_json::Value = serde_json::from_str(text.unwrap()).unwrap();
+        assert_eq!(payload["same"], true);
+        assert_eq!(payload["instructions"], "be brief");
+        assert_eq!(payload["text"], "hello");
+        assert_eq!(payload["cacheKey"], "conversation");
+        assert_eq!(worker.sdk_projection_count(), 1);
+        worker.stop().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_invokes_cannot_read_each_others_requests() {
+        assert!(
+            find_bun().is_some(),
+            "install Bun on PATH to run plugin worker tests"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let (_loader, worker) = echo_worker(temp.path(), ECHO_PLUGIN).await;
+        let first = invoke_echo(
+            &worker,
+            echo_invocation("alpha"),
+            CancellationToken::new(),
+        );
+        let second = invoke_echo(
+            &worker,
+            echo_invocation("beta"),
+            CancellationToken::new(),
+        );
+        let (first, second) = tokio::join!(first, second);
+        let texts = |events: &[crate::provider::ModelEvent]| {
+            events
+                .iter()
+                .find_map(|event| match event {
+                    crate::provider::ModelEvent::TextDelta(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap()
+                .to_owned()
+        };
+        let first: serde_json::Value = serde_json::from_str(&texts(&first)).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&texts(&second)).unwrap();
+        assert_eq!(first["text"], "alpha");
+        assert_eq!(second["text"], "beta");
+        worker.stop().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_invokes_cannot_read_the_model_request() {
+        assert!(
+            find_bun().is_some(),
+            "install Bun on PATH to run plugin worker tests"
+        );
+        let source = r#"
+import { defineProviderPlugin } from "cursor-byok-next:plugin";
+import type { ProviderSupport } from "cursor-byok-next:provider";
+
+const provider: ProviderSupport = {
+  id: "echo",
+  displayName: "Echo",
+  providerType: "echo",
+  async invoke(input) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    try {
+      await input.readRequest();
+      return { status: "completed" };
+    } catch (error) {
+      return { status: "request-error", message: error instanceof Error ? error.message : String(error) };
+    }
+  },
+};
+
+export default defineProviderPlugin({ providers: [provider] });
+"#;
+        let temp = tempfile::tempdir().unwrap();
+        let (_loader, worker) = echo_worker(temp.path(), source).await;
+        let cancellation = CancellationToken::new();
+        let mut items = worker
+            .invoke_streaming_with_origins(
+                "provider.invoke",
+                serde_json::json!({
+                    "providerId": "echo",
+                    "model": { "id": "echo", "displayName": "Echo" },
+                    "resource": null
+                }),
+                cancellation.clone(),
+                None,
+                HashSet::new(),
+                Some(echo_invocation("hello")),
+            )
+            .await
+            .unwrap();
+        cancellation.cancel();
+        let result = loop {
+            match items.recv().await {
+                Some(WorkerStreamItem::Result(result)) => break result,
+                Some(WorkerStreamItem::Event(_)) => continue,
+                None => panic!("worker stopped before returning a result"),
+            }
+        };
+        match result {
+            Err(error) => assert!(error.to_string().contains("cancelled")),
+            Ok(value) => assert_eq!(value["status"], "request-error"),
+        }
+        worker.stop().await;
     }
 }

@@ -28,7 +28,6 @@ use super::{
     },
     origin,
     state::{PluginStateStore, ResourceDraft, ResourcePatch, ResourceRecord, StoredModel, now_ms},
-    wire,
     worker::{PluginWorker, WorkerStreamItem},
 };
 
@@ -359,16 +358,14 @@ impl PluginHost {
             {
                 object.insert("id".into(), serde_json::Value::String(upstream.to_owned()));
             }
-            let request = wire::llm_request(&invocation)?;
-            let llm_request = serde_json::from_value(request.clone())?;
             let params = serde_json::json!({
                 "providerId": provider_id,
                 "model": model_snapshot,
                 "resource": resource.as_ref().map(|(resource_type, record)| record.snapshot(resource_type)),
-                "request": request,
             });
             let worker = host.worker(&entry, &executable).await;
             let origins = host.resource_origins(&entry, resource.as_ref().map(|(_, record)| record));
+            let invocation = Arc::new(invocation);
             let mut items = worker
                 .invoke_streaming_with_origins(
                     "provider.invoke",
@@ -376,7 +373,7 @@ impl PluginHost {
                     cancellation.clone(),
                     recorder.clone(),
                     origins,
-                    Some(llm_request),
+                    Some(invocation.clone()),
                 )
                 .await?;
             yield ModelEvent::Start {
@@ -792,6 +789,17 @@ impl PluginHost {
                 ))
             })
             .clone()
+    }
+
+    #[cfg(test)]
+    async fn sdk_projection_count(&self, plugin_id: &str) -> usize {
+        self.inner
+            .workers
+            .lock()
+            .await
+            .get(plugin_id)
+            .map(|worker| worker.sdk_projection_count())
+            .unwrap_or(0)
     }
 
     async fn select_resource(
@@ -1456,6 +1464,95 @@ mod tests {
             }
             other => panic!("expected invalid resource, got {other:?}"),
         }
+        gateway.4.abort();
+    }
+
+    fn invoke_frame_params(frame: &[u8]) -> serde_json::Value {
+        let value: serde_json::Value = serde_json::from_slice(frame.trim_ascii()).unwrap();
+        assert_eq!(value["method"], "provider.invoke");
+        value["params"].clone()
+    }
+
+    fn assert_invoke_frame_has_no_body(params: &serde_json::Value) {
+        assert!(params.get("request").is_none());
+        assert!(params.get("messages").is_none());
+        assert!(params.get("tools").is_none());
+        assert!(params.get("instructions").is_none());
+        let encoded = serde_json::to_string(params).unwrap();
+        assert!(!encoded.contains("dataBase64"));
+        assert!(!encoded.contains("attachment"));
+        assert!(!encoded.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn magpie_invoke_frame_does_not_include_or_grow_with_the_model_body() {
+        assert!(
+            find_bun().is_some(),
+            "install Bun on PATH to run the Magpie integration test"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let gateway = invocation_gateway(
+            "/v1/responses",
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+            ),
+        )
+        .await;
+        let host = configured_invocation_host(&temp.path().join("frames"), gateway.0).await;
+        let mut short = host.0.stream_model(
+            invocation(host.1.clone(), vec![crate::model::ContentPart::Text {
+                text: "hello".into(),
+            }]),
+            CancellationToken::new(),
+            None,
+        );
+        assert!(matches!(
+            short.next().await,
+            Some(Ok(ModelEvent::Start { .. }))
+        ));
+        let short_frame = super::super::worker::last_invoke_frame();
+        let short_params = invoke_frame_params(&short_frame);
+        assert_invoke_frame_has_no_body(&short_params);
+        drop(short);
+
+        let mut long_history = Vec::new();
+        for index in 0..40 {
+            long_history.push(crate::model::ProjectedMessage {
+                message_id: format!("m{index:02}"),
+                role: crate::model::Role::User,
+                content: crate::model::ProjectedContent::Parts(vec![
+                    crate::model::ContentPart::Text {
+                        text: format!("turn-{index}-{}", "x".repeat(256)),
+                    },
+                ]),
+            });
+        }
+        long_history.push(crate::model::ProjectedMessage {
+            message_id: "file".into(),
+            role: crate::model::Role::User,
+            content: crate::model::ProjectedContent::Parts(vec![crate::model::ContentPart::File {
+                mime_type: "application/pdf".into(),
+                filename: Some("blob.pdf".into()),
+                data: vec![0_u8; 1024 * 1024],
+            }]),
+        });
+        let mut long_invocation = invocation(host.1.clone(), Vec::new());
+        long_invocation.request.history = long_history;
+        let mut long = host
+            .0
+            .stream_model(long_invocation, CancellationToken::new(), None);
+        assert!(matches!(
+            long.next().await,
+            Some(Ok(ModelEvent::Start { .. }))
+        ));
+        let long_frame = super::super::worker::last_invoke_frame();
+        let long_params = invoke_frame_params(&long_frame);
+        assert_invoke_frame_has_no_body(&long_params);
+        assert_eq!(short_frame.len(), long_frame.len());
+        assert_eq!(short_params, long_params);
+        assert_eq!(host.0.sdk_projection_count(MAGPIE).await, 0);
+        drop(long);
         gateway.4.abort();
     }
 
