@@ -3,8 +3,8 @@
 use serde_json::{Value, json};
 
 use super::{
-    CoreMessage, ProtocolParser, core_message, count_usize, encode_base64, object, parse_object,
-    text,
+    CoreMessage, ProtocolParser, ToolNames, core_message, count_usize, encode_base64, object,
+    parse_object, text,
 };
 use crate::{
     model::{ContentPart, ModelInvocation},
@@ -25,6 +25,7 @@ struct UsageState {
 }
 
 pub(super) struct Parser {
+    tool_names: ToolNames,
     block_types: std::collections::BTreeMap<usize, String>,
     thinking_text: std::collections::BTreeMap<usize, String>,
     thinking_signatures: std::collections::BTreeMap<usize, String>,
@@ -37,8 +38,9 @@ pub(super) struct Parser {
 }
 
 impl Parser {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(tool_names: ToolNames) -> Self {
         Self {
+            tool_names,
             block_types: std::collections::BTreeMap::new(),
             thinking_text: std::collections::BTreeMap::new(),
             thinking_signatures: std::collections::BTreeMap::new(),
@@ -184,7 +186,7 @@ impl ProtocolParser for Parser {
                         emit(ModelEvent::ToolCallStart {
                             index,
                             call_id: super::truncated_call_id(call_id).to_owned(),
-                            name: name.to_owned(),
+                            name: self.tool_names.restore(name),
                         });
                     }
                     _ => {}
@@ -296,9 +298,13 @@ impl ProtocolParser for Parser {
     }
 }
 
-pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Value> {
+pub(super) fn build_body(
+    model: &str,
+    invocation: &ModelInvocation,
+    tool_names: &ToolNames,
+) -> Result<Value> {
     let request = &invocation.request;
-    let mut messages = anthropic_messages(&request.history)?;
+    let mut messages = anthropic_messages(&request.history, tool_names)?;
     mark_cache_breakpoint(&mut messages);
     let system = if request.prompt.instructions.is_empty() {
         Value::String(String::new())
@@ -328,7 +334,7 @@ pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Va
                     .enumerate()
                     .map(|(index, tool)| {
                         let mut value = json!({
-                            "name": tool.name,
+                            "name": tool_names.alias(&tool.name),
                             "description": tool.description,
                             "input_schema": tool.parameters,
                         });
@@ -452,7 +458,10 @@ fn push_anthropic(output: &mut Vec<Value>, role: &str, content: Vec<Value>) {
     output.push(json!({ "role": role, "content": content }));
 }
 
-fn anthropic_messages(messages: &[crate::model::ProjectedMessage]) -> Result<Vec<Value>> {
+fn anthropic_messages(
+    messages: &[crate::model::ProjectedMessage],
+    tool_names: &ToolNames,
+) -> Result<Vec<Value>> {
     let mut output = Vec::new();
     for message in messages {
         match core_message(message)? {
@@ -474,7 +483,7 @@ fn anthropic_messages(messages: &[crate::model::ProjectedMessage]) -> Result<Vec
                     content.push(json!({
                         "type": "tool_use",
                         "id": super::truncated_call_id(&tool_call.call_id),
-                        "name": tool_call.name,
+                        "name": tool_names.alias(&tool_call.name),
                         "input": tool_call.arguments,
                     }));
                 }
@@ -658,8 +667,12 @@ mod tests {
             ContentPart, ProjectedContent, ProjectedMessage, ProviderReplayState, Role,
             ToolCallContent, ToolDefinition, ToolResultContent,
         },
-        plugins::adapters::{collect_events, tests::invocation},
+        plugins::adapters::{ToolNames, collect_events, tests::invocation},
     };
+
+    fn names(invocation: &crate::model::ModelInvocation) -> ToolNames {
+        ToolNames::new(invocation)
+    }
 
     #[test]
     fn marks_cache_breakpoints_and_defaults_max_tokens() {
@@ -671,7 +684,7 @@ mod tests {
         }];
         invocation.request.model.reasoning.enabled = true;
         invocation.request.model.reasoning.effort = Some("high".into());
-        let body = build_body("claude-sonnet-4-5", &invocation).unwrap();
+        let body = build_body("claude-sonnet-4-5", &invocation, &names(&invocation)).unwrap();
         assert_eq!(body["max_tokens"], 65_000);
         assert_eq!(
             body["system"],
@@ -749,7 +762,7 @@ mod tests {
                 }]),
             },
         ];
-        let body = build_body("claude-sonnet-4-5", &invocation).unwrap();
+        let body = build_body("claude-sonnet-4-5", &invocation, &names(&invocation)).unwrap();
         assert_eq!(body["system"], "");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 2);
@@ -775,7 +788,7 @@ mod tests {
                 },
             ]),
         }];
-        let body = build_body("claude-sonnet-4-5", &invocation).unwrap();
+        let body = build_body("claude-sonnet-4-5", &invocation, &names(&invocation)).unwrap();
         assert_eq!(body["messages"][0]["content"][1]["type"], "image");
 
         invocation.request.history = vec![ProjectedMessage {
@@ -786,7 +799,7 @@ mod tests {
                 data: vec![0, 1, 2, 3],
             }]),
         }];
-        let error = build_body("claude-sonnet-4-5", &invocation).unwrap_err();
+        let error = build_body("claude-sonnet-4-5", &invocation, &names(&invocation)).unwrap_err();
         assert_eq!(
             error.to_string(),
             "Anthropic only accepts attachments in user messages"
@@ -796,7 +809,7 @@ mod tests {
     #[test]
     fn parses_text_thinking_usage_and_stop() {
         let events = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(names(&invocation())),
             &[
                 r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":30}}}"#,
                 r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
@@ -842,7 +855,7 @@ mod tests {
     #[test]
     fn replays_empty_thinking_with_signature_and_redacted() {
         let events = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(names(&invocation())),
             &[
                 r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
                 r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-only"}}"#,
@@ -872,7 +885,7 @@ mod tests {
     #[test]
     fn maps_tool_use_and_length() {
         let events = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(names(&invocation())),
             &[
                 r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"lookup"}}"#,
                 r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":"}}"#,
@@ -889,7 +902,7 @@ mod tests {
     #[test]
     fn finishes_after_message_delta_without_stop() {
         let events = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(names(&invocation())),
             &[
                 r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
                 r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
@@ -906,7 +919,7 @@ mod tests {
     #[test]
     fn missing_message_stop_fails() {
         let error = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(names(&invocation())),
             &[r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#],
         )
         .unwrap_err();

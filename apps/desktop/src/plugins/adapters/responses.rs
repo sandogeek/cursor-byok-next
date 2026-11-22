@@ -610,11 +610,11 @@ mod tests {
             ContentPart, ModelLatency, ProjectedContent, ProjectedMessage, ProviderReplayState,
             Role, ToolCallContent, ToolDefinition,
         },
-        plugins::adapters::{ProtocolKind, ToolNames, collect_events, tests::invocation},
+        plugins::adapters::{ToolNames, collect_events, tests::invocation},
     };
 
     fn names(invocation: &ModelInvocation) -> ToolNames {
-        ToolNames::new(ProtocolKind::OpenAiResponses, invocation)
+        ToolNames::new(invocation)
     }
 
     #[test]

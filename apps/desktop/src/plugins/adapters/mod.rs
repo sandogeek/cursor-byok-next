@@ -9,6 +9,7 @@ use std::{collections::HashMap, time::Duration};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -74,11 +75,11 @@ pub(super) async fn stream(
     })?;
     let protocol = ProtocolKind::parse(&input.protocol)?;
     let model = invocation.model()?;
-    let tool_names = ToolNames::new(protocol, model);
+    let tool_names = ToolNames::new(model);
     let body = match protocol {
         ProtocolKind::OpenAiChat => chat::build_body(&input.model, model, &tool_names)?,
         ProtocolKind::OpenAiResponses => responses::build_body(&input.model, model, &tool_names)?,
-        ProtocolKind::Anthropic => anthropic::build_body(&input.model, model)?,
+        ProtocolKind::Anthropic => anthropic::build_body(&input.model, model, &tool_names)?,
     };
     let body_text = serde_json::to_string(&body)?;
     let mut headers = HashMap::from([
@@ -119,7 +120,7 @@ pub(super) async fn stream(
     let mut parser: Box<dyn ProtocolParser> = match protocol {
         ProtocolKind::OpenAiChat => Box::new(chat::Parser::new(tool_names)),
         ProtocolKind::OpenAiResponses => Box::new(responses::Parser::new(tool_names)),
-        ProtocolKind::Anthropic => Box::new(anthropic::Parser::new()),
+        ProtocolKind::Anthropic => Box::new(anthropic::Parser::new(tool_names)),
     };
     read_sse(
         response,
@@ -442,7 +443,14 @@ fn truncated_call_id(call_id: &str) -> &str {
     }
 }
 
-fn openai_tool_name(name: &str) -> String {
+/// OpenAI accepts `^[a-zA-Z0-9_-]{1,64}$`; Anthropic accepts a longer but
+/// equally character-restricted pattern. 64 satisfies both.
+const MAX_TOOL_NAME_CHARS: usize = 64;
+const TOOL_NAME_HASH_CHARS: usize = 7;
+
+/// Cursor names MCP tools `${serverIdentifier}-${toolName}` and passes provider
+/// names through untouched, so `.`, `:` and spaces reach this layer verbatim.
+fn provider_tool_name(name: &str) -> String {
     let normalized = name
         .chars()
         .map(|character| {
@@ -453,16 +461,31 @@ fn openai_tool_name(name: &str) -> String {
             }
         })
         .collect::<String>();
-    if normalized.is_empty() {
-        "_".into()
+    let base = if normalized.is_empty() {
+        "_".to_owned()
     } else {
         normalized
-    }
+    };
+    truncated_tool_name(&base)
 }
 
-/// One-to-one mapping between Cursor's tool names and the names the OpenAI
-/// protocols accept. The provider only ever sees the alias; events sent back to
-/// Cursor carry the original name.
+/// Long names keep their first 57 characters plus a content hash, so two names
+/// that differ only past the cut still map to distinct aliases.
+fn truncated_tool_name(name: &str) -> String {
+    if name.chars().count() <= MAX_TOOL_NAME_CHARS {
+        return name.to_owned();
+    }
+    let digest = hex::encode(Sha256::digest(name.as_bytes()));
+    let prefix: String = name
+        .chars()
+        .take(MAX_TOOL_NAME_CHARS - TOOL_NAME_HASH_CHARS)
+        .collect();
+    format!("{prefix}{}", &digest[..TOOL_NAME_HASH_CHARS])
+}
+
+/// One-to-one mapping between Cursor's tool names and the names providers
+/// accept. The provider only ever sees the alias; events sent back to Cursor
+/// carry the original name.
 #[derive(Clone, Debug, Default)]
 pub(super) struct ToolNames {
     by_name: HashMap<String, String>,
@@ -470,11 +493,8 @@ pub(super) struct ToolNames {
 }
 
 impl ToolNames {
-    fn new(protocol: ProtocolKind, invocation: &ModelInvocation) -> Self {
+    fn new(invocation: &ModelInvocation) -> Self {
         let mut names = Self::default();
-        if protocol == ProtocolKind::Anthropic {
-            return names;
-        }
         for tool in &invocation.request.prompt.tools {
             names.insert(&tool.name);
         }
@@ -492,12 +512,12 @@ impl ToolNames {
         if self.by_name.contains_key(name) {
             return;
         }
-        let base = openai_tool_name(name);
+        let base = provider_tool_name(name);
         let mut alias = base.clone();
         let mut suffix = 1;
         while self.by_alias.contains_key(&alias) {
             suffix += 1;
-            alias = format!("{base}_{suffix}");
+            alias = truncated_tool_name(&format!("{base}_{suffix}"));
         }
         self.by_alias.insert(alias.clone(), name.to_owned());
         self.by_name.insert(name.to_owned(), alias);
@@ -507,7 +527,7 @@ impl ToolNames {
         self.by_name
             .get(name)
             .cloned()
-            .unwrap_or_else(|| openai_tool_name(name))
+            .unwrap_or_else(|| provider_tool_name(name))
     }
 
     fn restore(&self, alias: &str) -> String {
@@ -600,7 +620,7 @@ mod tests {
         ContentPart, ModelInvocation, ModelRequest, ModelSpec, ProjectedContent, ProjectedMessage,
         PromptSpec, ProviderReplayState, Role, ToolCallContent, ToolDefinition, ToolResultContent,
     };
-    use crate::plugins::adapters::{ProtocolKind, ToolNames, collect_events};
+    use crate::plugins::adapters::{ToolNames, collect_events};
     use crate::provider::ModelEvent;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
@@ -719,7 +739,9 @@ mod tests {
         assert!(body.get("service_tier").is_none());
         assert!(body.get("tools").is_none());
         assert!(body.get("stop").is_none());
-        let body = super::anthropic::build_body("claude", &invocation()).unwrap();
+        let body =
+            super::anthropic::build_body("claude", &invocation(), &ToolNames::new(&invocation()))
+                .unwrap();
         assert!(body.get("tools").is_none());
         assert!(body.get("thinking").is_none());
         assert!(body.get("output_config").is_none());
@@ -735,7 +757,9 @@ mod tests {
         let responses = super::responses::build_body("gpt-5", &invocation, &names()).unwrap();
         assert!(responses.get("stop").is_none());
         assert!(responses.get("stop_sequences").is_none());
-        let anthropic = super::anthropic::build_body("claude", &invocation).unwrap();
+        let anthropic =
+            super::anthropic::build_body("claude", &invocation, &ToolNames::new(&invocation))
+                .unwrap();
         assert_eq!(
             anthropic["stop_sequences"],
             serde_json::json!(["STOP", "\n\nUser:"])
@@ -758,7 +782,7 @@ mod tests {
                 parameters: serde_json::json!({ "type": "object" }),
             },
         ];
-        let names = ToolNames::new(ProtocolKind::OpenAiChat, &invocation);
+        let names = ToolNames::new(&invocation);
         assert_eq!(names.alias("a.b"), "a_b");
         assert_eq!(names.alias("a_b"), "a_b_2");
         assert_eq!(names.restore("a_b"), "a.b");
@@ -798,19 +822,65 @@ mod tests {
     }
 
     #[test]
-    fn keeps_anthropic_tool_names_unaliased() {
+    fn aliases_anthropic_tool_names_like_the_openai_protocols() {
         let mut invocation = invocation();
         invocation.request.prompt.tools = vec![ToolDefinition {
             name: "a.b".into(),
             description: String::new(),
             parameters: serde_json::json!({ "type": "object" }),
         }];
-        let names = ToolNames::new(ProtocolKind::Anthropic, &invocation);
-        assert_eq!(names.restore("a.b"), "a.b");
-        assert_eq!(
-            super::anthropic::build_body("claude", &invocation).unwrap()["tools"][0]["name"],
-            "a.b"
-        );
+        let names = ToolNames::new(&invocation);
+        assert_eq!(names.alias("a.b"), "a_b");
+        assert_eq!(names.restore("a_b"), "a.b");
+        let body = super::anthropic::build_body("claude", &invocation, &names).unwrap();
+        assert_eq!(body["tools"][0]["name"], "a_b");
+
+        let events = collect_events(
+            &mut super::anthropic::Parser::new(names),
+            &[
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"a_b"}}"#,
+                r#"{"type":"content_block_stop","index":0}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        )
+        .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ModelEvent::ToolCallStart { name, .. } if name == "a.b"
+        )));
+    }
+
+    #[test]
+    fn truncates_long_tool_names_to_the_provider_limit() {
+        let long_server = "user-eamodio.gitlens-extension-GitKraken-pull_request_create_review";
+        let sibling = "user-eamodio.gitlens-extension-GitKraken-pull_request_create_views";
+        let mut invocation = invocation();
+        invocation.request.prompt.tools = vec![
+            ToolDefinition {
+                name: long_server.into(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
+            ToolDefinition {
+                name: sibling.into(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
+        ];
+        let names = ToolNames::new(&invocation);
+        let first = names.alias(long_server);
+        let second = names.alias(sibling);
+        assert_eq!(first.chars().count(), super::MAX_TOOL_NAME_CHARS);
+        assert_eq!(second.chars().count(), super::MAX_TOOL_NAME_CHARS);
+        assert_ne!(first, second);
+        assert_eq!(names.restore(&first), long_server);
+        assert_eq!(names.restore(&second), sibling);
+        for alias in [&first, &second] {
+            assert!(alias.chars().all(
+                |character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            ));
+        }
     }
 
     #[test]
@@ -818,7 +888,9 @@ mod tests {
         let invocation = illegal_tool();
         let chat = super::chat::build_body("gpt-4.1", &invocation, &names()).unwrap_err();
         let responses = super::responses::build_body("gpt-5", &invocation, &names()).unwrap_err();
-        let anthropic = super::anthropic::build_body("claude", &invocation).unwrap_err();
+        let anthropic =
+            super::anthropic::build_body("claude", &invocation, &ToolNames::new(&invocation))
+                .unwrap_err();
         assert_eq!(chat.to_string(), "tool messages must carry a tool result");
         assert_eq!(responses.to_string(), chat.to_string());
         assert_eq!(anthropic.to_string(), chat.to_string());
@@ -827,7 +899,7 @@ mod tests {
     #[test]
     fn builds_equivalent_bodies_from_the_same_core_fixture() {
         let invocation = tool_roundtrip();
-        let names = ToolNames::new(ProtocolKind::OpenAiChat, &invocation);
+        let names = ToolNames::new(&invocation);
         let chat = super::chat::build_body("gpt-4.1", &invocation, &names).unwrap();
         assert_eq!(chat["messages"][0]["role"], "system");
         assert_eq!(chat["messages"][3]["role"], "tool");
@@ -838,9 +910,14 @@ mod tests {
         assert_eq!(responses["input"][2]["type"], "function_call_output");
         assert_eq!(responses["input"][3]["content"][1]["type"], "input_image");
         assert_eq!(responses["input"][3]["content"][2]["type"], "input_file");
-        let anthropic = super::anthropic::build_body("claude", &invocation).unwrap();
+        let anthropic =
+            super::anthropic::build_body("claude", &invocation, &ToolNames::new(&invocation))
+                .unwrap();
         assert_eq!(anthropic["messages"][1]["content"][0]["type"], "tool_use");
-        assert_eq!(anthropic["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            anthropic["messages"][2]["content"][0]["type"],
+            "tool_result"
+        );
         assert_eq!(anthropic["messages"][2]["content"][2]["type"], "image");
         assert_eq!(anthropic["messages"][2]["content"][3]["type"], "document");
     }
