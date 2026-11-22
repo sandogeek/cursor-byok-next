@@ -69,7 +69,7 @@ struct Observation {
     elapsed_ms: i64,
 }
 
-const OBSERVATION_QUEUE_BYTES: usize = 2 * 1024 * 1024;
+const OBSERVATION_QUEUE: usize = 256;
 const MAX_BUFFERED_CHUNKS: usize = 32;
 const MAX_BUFFERED_BYTES: usize = 256 * 1024;
 const MAX_BUFFER_AGE: std::time::Duration = std::time::Duration::from_millis(50);
@@ -175,7 +175,7 @@ impl CallRecorder {
             tracing::warn!(call_id = %call.call_id, %error, "cannot start LLM call record");
             store.mark_degraded();
         }
-        let (sender, receiver) = mpsc::channel(OBSERVATION_QUEUE_BYTES);
+        let (sender, receiver) = mpsc::channel(OBSERVATION_QUEUE);
         let started = Instant::now();
         let writer = tokio::spawn(
             ObservationWriter::new(

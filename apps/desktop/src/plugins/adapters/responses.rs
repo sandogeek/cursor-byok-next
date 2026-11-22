@@ -105,7 +105,12 @@ impl Parser {
 }
 
 impl ProtocolParser for Parser {
-    fn push_data(&mut self, payload: &str, emit: &mut dyn FnMut(ModelEvent)) -> Result<bool> {
+    fn push_data(
+        &mut self,
+        payload: &str,
+        _event: &str,
+        emit: &mut dyn FnMut(ModelEvent),
+    ) -> Result<bool> {
         if payload == "[DONE]" {
             return Ok(true);
         }
@@ -264,6 +269,11 @@ impl ProtocolParser for Parser {
                     "OpenAI Responses failed: {payload}"
                 )));
             }
+            Some("error") => {
+                return Err(Error::Provider(format!(
+                    "OpenAI Responses error: {payload}"
+                )));
+            }
             _ => {}
         }
         Ok(false)
@@ -321,8 +331,8 @@ pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Va
                 for tool_call in tool_calls {
                     input.push(json!({
                         "type": "function_call",
-                        "call_id": tool_call.call_id,
-                        "name": tool_call.name,
+                        "call_id": super::truncated_call_id(&tool_call.call_id),
+                        "name": super::openai_tool_name(&tool_call.name),
                         "arguments": serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".into()),
                     }));
                 }
@@ -330,7 +340,7 @@ pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Va
             CoreMessage::Tool(result) => {
                 input.push(json!({
                     "type": "function_call_output",
-                    "call_id": result.call_id,
+                    "call_id": super::truncated_call_id(&result.call_id),
                     "output": if result.provider_parts.is_empty() {
                         Value::String(result.content.clone())
                     } else {
@@ -367,46 +377,46 @@ pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Va
         "instructions": request.prompt.instructions,
         "include": ["reasoning.encrypted_content"],
     });
-    let object = body.as_object_mut().unwrap();
-    if !request.prompt.tools.is_empty() {
-        object.insert(
-            "tools".into(),
-            request
-                .prompt
-                .tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "type": "function",
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                        "strict": false,
+    {
+        let object = body.as_object_mut().unwrap();
+        if !request.prompt.tools.is_empty() {
+            object.insert(
+                "tools".into(),
+                request
+                    .prompt
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        json!({
+                            "type": "function",
+                            "name": super::openai_tool_name(&tool.name),
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                            "strict": false,
+                        })
                     })
-                })
-                .collect::<Value>(),
-        );
-    }
-    if let Some(tokens) = request.model.max_output_tokens {
-        object.insert("max_output_tokens".into(), tokens.into());
-    }
-    if request.model.reasoning.enabled || request.model.reasoning.effort.is_some() {
-        let mut reasoning = json!({ "summary": "auto" });
-        if let Some(effort) = &request.model.reasoning.effort {
-            reasoning
-                .as_object_mut()
-                .unwrap()
-                .insert("effort".into(), effort.clone().into());
+                    .collect::<Value>(),
+            );
         }
-        object.insert("reasoning".into(), reasoning);
+        if let Some(tokens) = request.model.max_output_tokens {
+            object.insert("max_output_tokens".into(), tokens.into());
+        }
+        if request.model.reasoning.enabled || request.model.reasoning.effort.is_some() {
+            let mut reasoning = json!({ "summary": "auto" });
+            if let Some(effort) = &request.model.reasoning.effort {
+                reasoning
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("effort".into(), effort.clone().into());
+            }
+            object.insert("reasoning".into(), reasoning);
+        }
+        if request.model.latency == ModelLatency::Fast {
+            object.insert("service_tier".into(), "priority".into());
+        }
     }
-    if request.model.latency == ModelLatency::Fast {
-        object.insert("service_tier".into(), "priority".into());
-    }
-    object.insert(
-        "prompt_cache_key".into(),
-        invocation.conversation_id.clone().into(),
-    );
+    super::apply_openai_prompt_cache_key(&mut body, model, &invocation.conversation_id);
+    super::merge_extra_params(&mut body, &request.model.extra_params)?;
     Ok(body)
 }
 
@@ -518,8 +528,8 @@ fn update_tool(
         tool.started = true;
         events.push(ModelEvent::ToolCallStart {
             index,
-            call_id: tool.call_id.clone().unwrap(),
-            name: tool.name.clone().unwrap(),
+            call_id: super::truncated_call_id(tool.call_id.as_deref().unwrap()).to_owned(),
+            name: super::openai_tool_name(tool.name.as_deref().unwrap()),
         });
     }
     if tool.started && tool.emitted < tool.arguments.len() {
@@ -814,5 +824,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(events.last(), Some(&ModelEvent::Done(FinishReason::Stop)));
+    }
+
+    #[test]
+    fn omits_prompt_cache_key_for_non_gpt_models() {
+        let body = build_body("claude-sonnet", &invocation()).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
     }
 }

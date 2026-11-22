@@ -4,7 +4,7 @@ mod anthropic;
 mod chat;
 mod responses;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -25,6 +25,8 @@ use crate::{
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolKind {
@@ -124,7 +126,12 @@ pub(super) async fn stream(
 }
 
 trait ProtocolParser: Send {
-    fn push_data(&mut self, payload: &str, emit: &mut dyn FnMut(ModelEvent)) -> Result<bool>;
+    fn push_data(
+        &mut self,
+        payload: &str,
+        event: &str,
+        emit: &mut dyn FnMut(ModelEvent),
+    ) -> Result<bool>;
     fn finish(&mut self, emit: &mut dyn FnMut(ModelEvent)) -> Result<()>;
 }
 
@@ -134,8 +141,14 @@ async fn send_cancellable(
 ) -> Result<reqwest::Response> {
     tokio::select! {
         _ = cancellation.cancelled() => Err(Error::Cancelled),
+        () = tokio::time::sleep(REQUEST_TIMEOUT) => Err(Error::Provider(format!(
+            "plugin network request timed out after {} seconds",
+            REQUEST_TIMEOUT.as_secs()
+        ))),
         response = request.send() => {
-            response.map_err(|_| Error::Provider("plugin network request failed".into()))
+            response.map_err(|error| {
+                Error::Provider(format!("plugin network request failed: {error}"))
+            })
         }
     }
 }
@@ -150,7 +163,9 @@ async fn read_error_body(
         let chunk = tokio::select! {
             _ = cancellation.cancelled() => return Err(Error::Cancelled),
             chunk = response.chunk() => {
-                chunk.map_err(|_| Error::Provider("cannot read plugin network response".into()))?
+                chunk.map_err(|error| {
+                    Error::Provider(format!("cannot read plugin network response: {error}"))
+                })?
             }
         };
         let Some(chunk) = chunk else { break };
@@ -174,14 +189,23 @@ async fn read_sse(
 ) -> Result<()> {
     let mut body = response.bytes_stream();
     let mut buffered = Vec::<u8>::new();
+    let mut frame = SseFrame::default();
     let mut total = 0_u64;
     loop {
         let chunk = tokio::select! {
             _ = cancellation.cancelled() => return Err(Error::Cancelled),
+            () = tokio::time::sleep(STREAM_IDLE_TIMEOUT) => {
+                return Err(Error::Provider(format!(
+                    "plugin network stream idle timeout: no events received for {} seconds",
+                    STREAM_IDLE_TIMEOUT.as_secs()
+                )));
+            }
             chunk = body.next() => chunk,
         };
         let Some(chunk) = chunk else { break };
-        let chunk = chunk.map_err(|_| Error::Provider("cannot read plugin network stream".into()))?;
+        let chunk = chunk.map_err(|error| {
+            Error::Provider(format!("cannot read plugin network stream: {error}"))
+        })?;
         total += chunk.len() as u64;
         if total > MAX_STREAM_BYTES {
             return Err(Error::Provider(
@@ -192,50 +216,106 @@ async fn read_sse(
             recorder.response_chunk(&chunk).await?;
         }
         buffered.extend_from_slice(&chunk);
-        while let Some(position) = buffered.iter().position(|byte| *byte == b'\n') {
-            let mut line = buffered.drain(..=position).collect::<Vec<u8>>();
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            if push_line(
-                parser,
-                &String::from_utf8_lossy(&line),
-                &mut emit,
-            )? {
-                return Ok(());
-            }
+        if push_buffered_lines(parser, &mut buffered, &mut frame, &mut emit)? {
+            return Ok(());
         }
     }
-    if !buffered.is_empty() {
-        push_line(
+    if !buffered.is_empty()
+        && push_sse_line(
             parser,
+            &mut frame,
             &String::from_utf8_lossy(&buffered),
             &mut emit,
-        )?;
+        )?
+    {
+        return Ok(());
+    }
+    if let Some((event, payload)) = frame.take() {
+        parser.push_data(&payload, &event, &mut emit)?;
     }
     Ok(())
 }
 
-fn push_line(
+fn push_buffered_lines(
     parser: &mut dyn ProtocolParser,
+    buffered: &mut Vec<u8>,
+    frame: &mut SseFrame,
+    emit: &mut dyn FnMut(ModelEvent),
+) -> Result<bool> {
+    let mut consumed = 0;
+    while let Some(relative) = buffered[consumed..].iter().position(|byte| *byte == b'\n') {
+        let end = consumed + relative;
+        let mut line = buffered[consumed..end].to_vec();
+        consumed = end + 1;
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if push_sse_line(parser, frame, &String::from_utf8_lossy(&line), emit)? {
+            buffered.drain(..consumed);
+            return Ok(true);
+        }
+    }
+    if consumed > 0 {
+        buffered.copy_within(consumed.., 0);
+        buffered.truncate(buffered.len() - consumed);
+    }
+    Ok(false)
+}
+
+fn push_sse_line(
+    parser: &mut dyn ProtocolParser,
+    frame: &mut SseFrame,
     line: &str,
     emit: &mut dyn FnMut(ModelEvent),
 ) -> Result<bool> {
-    let Some(payload) = sse_payload(line) else {
+    let Some((event, payload)) = frame.push_line(line) else {
         return Ok(false);
     };
-    parser.push_data(payload, emit)
+    parser.push_data(&payload, &event, emit)
 }
 
-fn sse_payload(line: &str) -> Option<&str> {
-    let rest = line.strip_prefix("data:")?;
-    let payload = rest.trim();
-    if payload.is_empty() {
+#[derive(Default)]
+struct SseFrame {
+    event: String,
+    data: Vec<String>,
+}
+
+impl SseFrame {
+    fn push_line(&mut self, line: &str) -> Option<(String, String)> {
+        if line.is_empty() {
+            return self.take();
+        }
+        if line.starts_with(':') {
+            return None;
+        }
+        if let Some(rest) = line.strip_prefix("event:") {
+            self.event = sse_field(rest).to_owned();
+            return None;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            self.data.push(sse_field(rest).to_owned());
+        }
         None
-    } else {
-        Some(payload)
     }
+
+    fn take(&mut self) -> Option<(String, String)> {
+        if self.data.is_empty() {
+            self.event.clear();
+            return None;
+        }
+        let payload = self.data.join("\n");
+        self.data.clear();
+        let event = std::mem::take(&mut self.event);
+        if payload.trim().is_empty() {
+            None
+        } else {
+            Some((event, payload))
+        }
+    }
+}
+
+fn sse_field(value: &str) -> &str {
+    value.strip_prefix(' ').unwrap_or(value)
 }
 
 fn object(value: &Value) -> Option<&serde_json::Map<String, Value>> {
@@ -347,6 +427,79 @@ fn usage_event(
     })
 }
 
+fn truncated_call_id(call_id: &str) -> &str {
+    match call_id.char_indices().nth(64) {
+        Some((end, _)) => &call_id[..end],
+        None => call_id,
+    }
+}
+
+fn openai_tool_name(name: &str) -> String {
+    let normalized = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if normalized.is_empty() {
+        "_".into()
+    } else {
+        normalized
+    }
+}
+
+fn merge_extra_params(body: &mut Value, extra: &Value) -> Result<()> {
+    let Some(extra) = extra.as_object() else {
+        if extra.is_null() {
+            return Ok(());
+        }
+        return Err(Error::Protocol(
+            "model extra params must be an object".into(),
+        ));
+    };
+    if extra.is_empty() {
+        return Ok(());
+    }
+    let body = body.as_object_mut().ok_or_else(|| {
+        Error::Provider("provider request body must be an object".into())
+    })?;
+    for (name, value) in extra {
+        if matches!(
+            name.as_str(),
+            "model"
+                | "stream"
+                | "messages"
+                | "input"
+                | "tools"
+                | "system"
+                | "instructions"
+                | "prompt_cache_key"
+        ) {
+            return Err(Error::Protocol(format!(
+                "model extra params cannot replace {name}"
+            )));
+        }
+        body.insert(name.clone(), value.clone());
+    }
+    Ok(())
+}
+
+fn apply_openai_prompt_cache_key(body: &mut Value, model_id: &str, conversation_id: &str) {
+    if !model_id.to_ascii_lowercase().contains("gpt") {
+        return;
+    }
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "prompt_cache_key".into(),
+            conversation_id.to_owned().into(),
+        );
+    }
+}
+
 #[cfg(test)]
 fn collect_events(
     parser: &mut dyn ProtocolParser,
@@ -354,7 +507,7 @@ fn collect_events(
 ) -> Result<Vec<ModelEvent>> {
     let mut events = Vec::new();
     for payload in payloads {
-        if parser.push_data(payload, &mut |event| events.push(event))? {
+        if parser.push_data(payload, "", &mut |event| events.push(event))? {
             break;
         }
     }
@@ -513,5 +666,33 @@ mod tests {
         assert_eq!(anthropic["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(anthropic["messages"][2]["content"][2]["type"], "image");
         assert_eq!(anthropic["messages"][2]["content"][3]["type"], "document");
+    }
+
+    #[test]
+    fn merges_sampling_params_and_rejects_core_field_overrides() {
+        let mut invocation = invocation();
+        invocation.request.model.extra_params = serde_json::json!({
+            "temperature": 0.2,
+            "top_p": 0.9,
+        });
+        let chat = super::chat::build_body("gpt-4.1", &invocation).unwrap();
+        assert_eq!(chat["temperature"], 0.2);
+        assert_eq!(chat["top_p"], 0.9);
+        invocation.request.model.extra_params = serde_json::json!({ "messages": [] });
+        let error = super::chat::build_body("gpt-4.1", &invocation).unwrap_err();
+        assert_eq!(error.to_string(), "model extra params cannot replace messages");
+    }
+
+    #[test]
+    fn sse_frames_join_multiline_data_and_named_events() {
+        let mut frame = super::SseFrame::default();
+        assert!(frame.push_line("event: message").is_none());
+        assert!(frame.push_line("data: {\"type\":").is_none());
+        assert!(frame.push_line("data: \"error\"}").is_none());
+        let (event, payload) = frame.push_line("").unwrap();
+        assert_eq!(event, "message");
+        assert_eq!(payload, "{\"type\":\n\"error\"}");
+        assert!(frame.push_line(": keep-alive").is_none());
+        assert!(frame.push_line("").is_none());
     }
 }

@@ -365,6 +365,10 @@ impl PluginHost {
             });
             let worker = host.worker(&entry, &executable).await;
             let origins = host.resource_origins(&entry, resource.as_ref().map(|(_, record)| record));
+            let mut invocation = invocation;
+            if invocation.request.model.max_output_tokens.is_none() {
+                invocation.request.model.max_output_tokens = stored.max_output_tokens;
+            }
             let invocation = Arc::new(invocation);
             let mut items = worker
                 .invoke_streaming_with_origins(
@@ -1222,8 +1226,10 @@ mod tests {
             filename: Some("report.pdf".into()),
             data: b"%PDF-1".to_vec(),
         };
+        let mut file_invocation = invocation(responses_host.1, vec![file]);
+        file_invocation.request.model.max_output_tokens = Some(8192);
         let mut stream = responses_host.0.stream_model(
-            invocation(responses_host.1, vec![file]),
+            file_invocation,
             CancellationToken::new(),
             None,
         );
@@ -1231,6 +1237,7 @@ mod tests {
             event.unwrap();
         }
         let requests = responses.1.lock().await;
+        assert_eq!(requests[0]["max_output_tokens"], 8192);
         assert_eq!(requests[0]["input"][0]["content"][0]["type"], "input_file");
         assert_eq!(
             requests[0]["input"][0]["content"][0]["filename"],

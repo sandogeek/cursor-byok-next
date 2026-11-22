@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use super::{
     CoreMessage, ProtocolParser, core_message, count_usize, encode_base64, object, parse_object,
-    text, usage_event,
+    text,
 };
 use crate::{
     model::{ContentPart, ModelInvocation},
@@ -57,14 +57,15 @@ impl Parser {
             "thinking" => {
                 let thinking = self.thinking_text.remove(&index).unwrap_or_default();
                 let signature = self.thinking_signatures.remove(&index).unwrap_or_default();
+                emit(ModelEvent::ThinkingEnd);
                 if !signature.is_empty() {
                     self.thinking_blocks.push(json!({
                         "type": "thinking",
                         "thinking": thinking,
                         "signature": signature,
                     }));
+                    emit(ModelEvent::ThinkingSignature(signature));
                 }
-                emit(ModelEvent::ThinkingEnd);
             }
             "tool_use" => emit(ModelEvent::ToolCallEnd { index }),
             _ => {}
@@ -95,21 +96,36 @@ impl Parser {
             self.thinking_blocks.clear();
         }
         if self.saw_usage {
-            emit(usage_event(
-                self.usage.input_tokens,
-                self.usage.output_tokens,
-                self.usage.total_tokens,
-                self.usage.cache_read_tokens,
-                self.usage.cache_write_tokens,
-                self.usage.reasoning_tokens,
-            ));
+            let context_input_tokens = self.usage.input_tokens.map(|input| {
+                input
+                    .saturating_add(self.usage.cache_read_tokens.unwrap_or_default())
+                    .saturating_add(self.usage.cache_write_tokens.unwrap_or_default())
+            });
+            emit(ModelEvent::Usage(crate::model::Usage {
+                input_tokens: self.usage.input_tokens,
+                context_input_tokens,
+                output_tokens: self.usage.output_tokens,
+                total_tokens: self.usage.total_tokens.or_else(|| {
+                    context_input_tokens
+                        .zip(self.usage.output_tokens)
+                        .map(|(input, output)| input.saturating_add(output))
+                }),
+                cache_read_tokens: self.usage.cache_read_tokens,
+                cache_write_tokens: self.usage.cache_write_tokens,
+                reasoning_tokens: self.usage.reasoning_tokens,
+            }));
         }
         emit(ModelEvent::Done(final_reason(self.finish, self.saw_tool)));
     }
 }
 
 impl ProtocolParser for Parser {
-    fn push_data(&mut self, payload: &str, emit: &mut dyn FnMut(ModelEvent)) -> Result<bool> {
+    fn push_data(
+        &mut self,
+        payload: &str,
+        event: &str,
+        emit: &mut dyn FnMut(ModelEvent),
+    ) -> Result<bool> {
         if payload == "[DONE]" {
             return Ok(false);
         }
@@ -117,8 +133,12 @@ impl ProtocolParser for Parser {
         if let Some(error) = event_error(&value) {
             return Err(Error::Provider(format!("Anthropic error: {error}")));
         }
-        match text(value.get("type").unwrap_or(&Value::Null)) {
-            Some("message_start") => {
+        let kind = match event {
+            "" | "message" => text(value.get("type").unwrap_or(&Value::Null)).unwrap_or(event),
+            kind => kind,
+        };
+        match kind {
+            "message_start" => {
                 if let Some(message_usage) = value
                     .get("message")
                     .and_then(object)
@@ -128,7 +148,7 @@ impl ProtocolParser for Parser {
                     merge_usage(&mut self.usage, anthropic_usage(message_usage));
                 }
             }
-            Some("content_block_start") => {
+            "content_block_start" => {
                 let index = required_index(&value)?;
                 let block = value
                     .get("content_block")
@@ -150,6 +170,7 @@ impl ProtocolParser for Parser {
                         )?;
                         self.thinking_blocks
                             .push(json!({ "type": "redacted_thinking", "data": data }));
+                        emit(ModelEvent::RedactedThinking(data.to_owned()));
                     }
                     "tool_use" => {
                         let call_id = text(block.get("id").unwrap_or(&Value::Null));
@@ -162,14 +183,14 @@ impl ProtocolParser for Parser {
                         self.saw_tool = true;
                         emit(ModelEvent::ToolCallStart {
                             index,
-                            call_id: call_id.to_owned(),
+                            call_id: super::truncated_call_id(call_id).to_owned(),
                             name: name.to_owned(),
                         });
                     }
                     _ => {}
                 }
             }
-            Some("content_block_delta") => {
+            "content_block_delta" => {
                 let index = required_index(&value)?;
                 let delta = value
                     .get("delta")
@@ -229,13 +250,13 @@ impl ProtocolParser for Parser {
                     _ => {}
                 }
             }
-            Some("content_block_stop") => {
+            "content_block_stop" => {
                 let index = required_index(&value)?;
                 if let Some(kind) = self.block_types.remove(&index) {
                     self.close_block(index, &kind, emit);
                 }
             }
-            Some("message_delta") => {
+            "message_delta" => {
                 if !value.get("usage").is_none_or(Value::is_null) {
                     self.saw_usage = true;
                     merge_usage(
@@ -251,7 +272,7 @@ impl ProtocolParser for Parser {
                     self.finish = Some(map_stop(reason, self.saw_tool));
                 }
             }
-            Some("message_stop") => {
+            "message_stop" => {
                 self.terminal = true;
                 self.finish_stream(emit);
                 return Ok(true);
@@ -295,41 +316,44 @@ pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Va
         "max_tokens": request.model.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         "stream": true,
     });
-    let object = body.as_object_mut().unwrap();
-    if !request.prompt.tools.is_empty() {
-        object.insert(
-            "tools".into(),
-            request
-                .prompt
-                .tools
-                .iter()
-                .enumerate()
-                .map(|(index, tool)| {
-                    let mut value = json!({
-                        "name": tool.name,
-                        "description": tool.description,
-                        "input_schema": tool.parameters,
-                    });
-                    if index + 1 == request.prompt.tools.len() {
-                        value.as_object_mut().unwrap().insert(
-                            "cache_control".into(),
-                            json!({ "type": "ephemeral" }),
-                        );
-                    }
-                    value
-                })
-                .collect::<Value>(),
-        );
+    {
+        let object = body.as_object_mut().unwrap();
+        if !request.prompt.tools.is_empty() {
+            object.insert(
+                "tools".into(),
+                request
+                    .prompt
+                    .tools
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tool)| {
+                        let mut value = json!({
+                            "name": tool.name,
+                            "description": tool.description,
+                            "input_schema": tool.parameters,
+                        });
+                        if index + 1 == request.prompt.tools.len() {
+                            value.as_object_mut().unwrap().insert(
+                                "cache_control".into(),
+                                json!({ "type": "ephemeral" }),
+                            );
+                        }
+                        value
+                    })
+                    .collect::<Value>(),
+            );
+        }
+        if request.model.reasoning.enabled {
+            object.insert(
+                "thinking".into(),
+                json!({ "type": "adaptive", "display": "summarized" }),
+            );
+        }
+        if let Some(effort) = &request.model.reasoning.effort {
+            object.insert("output_config".into(), json!({ "effort": effort }));
+        }
     }
-    if request.model.reasoning.enabled {
-        object.insert(
-            "thinking".into(),
-            json!({ "type": "adaptive", "display": "summarized" }),
-        );
-    }
-    if let Some(effort) = &request.model.reasoning.effort {
-        object.insert("output_config".into(), json!({ "effort": effort }));
-    }
+    super::merge_extra_params(&mut body, &request.model.extra_params)?;
     Ok(body)
 }
 
@@ -448,7 +472,7 @@ fn anthropic_messages(messages: &[crate::model::ProjectedMessage]) -> Result<Vec
                 for tool_call in tool_calls {
                     content.push(json!({
                         "type": "tool_use",
-                        "id": tool_call.call_id,
+                        "id": super::truncated_call_id(&tool_call.call_id),
                         "name": tool_call.name,
                         "input": tool_call.arguments,
                     }));
@@ -463,7 +487,7 @@ fn anthropic_messages(messages: &[crate::model::ProjectedMessage]) -> Result<Vec
                     "user",
                     vec![json!({
                         "type": "tool_result",
-                        "tool_use_id": result.call_id,
+                        "tool_use_id": super::truncated_call_id(&result.call_id),
                         "content": if result.provider_parts.is_empty() {
                             Value::String(result.content.clone())
                         } else {
@@ -578,10 +602,11 @@ fn merge_usage(total: &mut UsageState, update: UsageState) {
     total.cache_read_tokens = merge_usage_field(total.cache_read_tokens, update.cache_read_tokens);
     total.cache_write_tokens = merge_usage_field(total.cache_write_tokens, update.cache_write_tokens);
     let context = total.input_tokens.map(|input| {
-        input + total.cache_read_tokens.unwrap_or(0) + total.cache_write_tokens.unwrap_or(0)
+        input.saturating_add(total.cache_read_tokens.unwrap_or(0))
+            + total.cache_write_tokens.unwrap_or(0)
     });
     if let (Some(context), Some(output)) = (context, total.output_tokens) {
-        total.total_tokens = Some(context + output);
+        total.total_tokens = Some(context.saturating_add(output));
     }
 }
 
@@ -791,6 +816,7 @@ mod tests {
                 ModelEvent::ThinkingStart,
                 ModelEvent::ThinkingDelta("why".into()),
                 ModelEvent::ThinkingEnd,
+                ModelEvent::ThinkingSignature("sig".into()),
                 ModelEvent::TextStart,
                 ModelEvent::TextDelta("Hi".into()),
                 ModelEvent::TextEnd,
@@ -800,7 +826,7 @@ mod tests {
                 }),
                 ModelEvent::Usage(crate::model::Usage {
                     input_tokens: Some(10),
-                    context_input_tokens: Some(10),
+                    context_input_tokens: Some(60),
                     output_tokens: Some(2),
                     total_tokens: Some(62),
                     cache_read_tokens: Some(20),
@@ -831,6 +857,14 @@ mod tests {
             event,
             ModelEvent::ProviderReplayState(state)
                 if state.value["blocks"].as_array().unwrap().len() == 2
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ModelEvent::ThinkingSignature(signature) if signature == "sig-only"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ModelEvent::RedactedThinking(data) if data == "opaque"
         )));
     }
 

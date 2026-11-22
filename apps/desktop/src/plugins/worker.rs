@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     process::Stdio,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU16, Ordering},
     },
     time::Duration,
@@ -80,10 +80,15 @@ impl Pending {
     fn register(
         self: &Arc<Self>,
         state: InvocationState,
-    ) -> Result<(InvocationGuard, mpsc::UnboundedReceiver<WorkerStreamItem>)> {
+    ) -> Result<(
+        InvocationGuard,
+        mpsc::UnboundedReceiver<WorkerStreamItem>,
+        mpsc::UnboundedSender<WorkerStreamItem>,
+        watch::Receiver<()>,
+    )> {
         let id = uuid::Uuid::new_v4().to_string();
         let (items, receiver) = mpsc::unbounded_channel();
-        let (active, _) = watch::channel(());
+        let (active, active_rx) = watch::channel(());
         *state.events.lock() = Some(items.clone());
         self.0
             .lock()
@@ -92,7 +97,7 @@ impl Pending {
             .insert(
                 id.clone(),
                 PendingInvocation {
-                    items,
+                    items: items.clone(),
                     active,
                     state: Arc::new(state),
                 },
@@ -103,6 +108,8 @@ impl Pending {
                 pending: self.clone(),
             },
             receiver,
+            items,
+            active_rx,
         ))
     }
 
@@ -219,6 +226,7 @@ pub(super) struct HostContext {
     network_hosts: Arc<HashSet<String>>,
     resource_origin: bool,
     streams: Arc<Mutex<HashMap<String, StreamLines>>>,
+    http: OnceLock<reqwest::Client>,
     #[cfg(test)]
     sdk_projections: Arc<AtomicUsize>,
 }
@@ -241,6 +249,7 @@ impl PluginWorker {
                     ),
                     resource_origin: plugin.manifest.permissions.resource_origin,
                     streams: Arc::new(Mutex::new(HashMap::new())),
+                    http: OnceLock::new(),
                     #[cfg(test)]
                     sdk_projections: Arc::new(AtomicUsize::new(0)),
                 },
@@ -305,7 +314,7 @@ impl PluginWorker {
             .await
             .map_err(|_| Error::Provider("plugin worker stopped".into()))?;
         let request_cancellation = CancellationToken::new();
-        let (request, receiver) = pending.register(InvocationState {
+        let (request, receiver, items, mut active) = pending.register(InvocationState {
             allowed_origins,
             magpie_catalog_status: (self.inner.plugin_id == "dev.cursorbyoknext.plugins.magpie"
                 && method == "models.list")
@@ -328,12 +337,6 @@ impl PluginWorker {
             }
             bytes
         });
-        let Some((.., mut active)) = pending.authorization(&request.id) else {
-            return Err(Error::Provider("plugin worker stopped".into()));
-        };
-        let Some(items) = pending.sender(&request.id) else {
-            return Err(Error::Provider("plugin worker stopped".into()));
-        };
         let writer = writer.clone();
         let request_id = request.id.clone();
         tokio::spawn(async move {
@@ -353,7 +356,9 @@ impl PluginWorker {
                         let _ = items.send(WorkerStreamItem::Result(Err(Error::Cancelled)));
                     }
                 }
-                _ = items.closed() => {}
+                _ = items.closed() => {
+                    request_cancellation.cancel();
+                }
                 _ = active.changed() => {}
             }
             drop(request);
@@ -391,7 +396,7 @@ impl PluginWorker {
             .arg(entry_url.as_str())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = command.spawn().map_err(|error| {
             Error::Config(format!(
@@ -407,6 +412,15 @@ impl PluginWorker {
             .stdout
             .take()
             .ok_or_else(|| Error::Config("cannot open plugin worker stdout".into()))?;
+        if let Some(stderr) = child.stderr.take() {
+            let plugin_id = self.inner.plugin_id.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::warn!(plugin = %plugin_id, "{line}");
+                }
+            });
+        }
         let pending = Arc::new(Pending::open());
         let (writer, messages) = mpsc::channel(32);
         let task = tokio::spawn({
@@ -622,11 +636,7 @@ impl HostContext {
                 self.plugin_id
             )));
         }
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|error| Error::Config(format!("cannot build plugin HTTP client: {error}")))?;
+        let client = self.http_client()?.clone();
         let mut request = client.request(method, url);
         for (name, value) in headers {
             request = request.header(name, value);
@@ -650,6 +660,19 @@ impl HostContext {
                 .await?;
         }
         Ok((request, recorder))
+    }
+
+    fn http_client(&self) -> Result<&reqwest::Client> {
+        if let Some(client) = self.http.get() {
+            return Ok(client);
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .map_err(|error| Error::Config(format!("cannot build plugin HTTP client: {error}")))?;
+        Ok(self.http.get_or_init(|| client))
     }
 
     async fn request(
@@ -948,6 +971,7 @@ mod tests {
             network_hosts: Arc::new(HashSet::new()),
             resource_origin: true,
             streams: Arc::new(Mutex::new(HashMap::new())),
+            http: OnceLock::new(),
             sdk_projections: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -1098,7 +1122,7 @@ mod tests {
     #[tokio::test]
     async fn pending_authorization_ends_on_completion_and_drop() {
         let pending = Arc::new(Pending::open());
-        let (completed, mut receiver) = pending.register(invocation(HashSet::new())).unwrap();
+        let (completed, mut receiver, ..) = pending.register(invocation(HashSet::new())).unwrap();
         let (_, mut active) = pending.authorization(&completed.id).unwrap();
         let PendingInvocation {
             items,
@@ -1116,7 +1140,7 @@ mod tests {
         assert!(active.changed().await.is_err());
         assert!(pending.authorization(&completed.id).is_none());
 
-        let (cancelled, mut receiver) = pending.register(invocation(HashSet::new())).unwrap();
+        let (cancelled, mut receiver, ..) = pending.register(invocation(HashSet::new())).unwrap();
         let id = cancelled.id.clone();
         let (_, mut active) = pending.authorization(&id).unwrap();
         drop(cancelled);
@@ -1130,7 +1154,7 @@ mod tests {
         let pending = Arc::new(Pending::open());
         let mut id = None;
         let timed_out = tokio::time::timeout(Duration::from_millis(1), async {
-            let (request, mut result) = pending.register(invocation(HashSet::new())).unwrap();
+            let (request, mut result, ..) = pending.register(invocation(HashSet::new())).unwrap();
             id = Some(request.id.clone());
             result.recv().await
         })
@@ -1142,10 +1166,10 @@ mod tests {
     #[tokio::test]
     async fn closing_one_generation_revokes_only_its_invocations() {
         let old = Arc::new(Pending::open());
-        let (old_request, mut failed) = old.register(invocation(HashSet::new())).unwrap();
+        let (old_request, mut failed, ..) = old.register(invocation(HashSet::new())).unwrap();
         let (_, mut active) = old.authorization(&old_request.id).unwrap();
         let new = Arc::new(Pending::open());
-        let (new_request, mut unaffected) = new.register(invocation(HashSet::new())).unwrap();
+        let (new_request, mut unaffected, ..) = new.register(invocation(HashSet::new())).unwrap();
         old.close("plugin worker exited");
         match failed.recv().await {
             Some(WorkerStreamItem::Result(Err(error))) => {
@@ -1228,6 +1252,7 @@ mod tests {
             network_hosts: Arc::new(HashSet::from(["example.com".into()])),
             resource_origin: false,
             streams: Arc::new(Mutex::new(HashMap::new())),
+            http: OnceLock::new(),
             sdk_projections: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -1583,5 +1608,21 @@ export default defineProviderPlugin({ providers: [provider] });
             Ok(value) => assert_eq!(value["status"], "request-error"),
         }
         worker.stop().await;
+    }
+
+    #[test]
+    fn invoke_handles_are_taken_before_the_request_is_sent() {
+        let pending = Arc::new(Pending::open());
+        let (guard, mut receiver, items, active) = pending
+            .register(invocation(HashSet::new()))
+            .unwrap();
+        pending.remove(&guard.id);
+        let _ = items.send(WorkerStreamItem::Result(Ok(serde_json::json!({"ok": true}))));
+        drop(active);
+        let Some(WorkerStreamItem::Result(Ok(value))) = receiver.try_recv().ok() else {
+            panic!("pre-send handles must still receive the worker result");
+        };
+        assert_eq!(value["ok"], true);
+        drop(guard);
     }
 }

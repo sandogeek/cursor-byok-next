@@ -50,7 +50,7 @@ cursor-byok/server/plugins/build-in/magpie/
 | 3 | 事件通道 | worker JSONL `event` | 适配器直写 `WorkerStreamItem::Event(ModelEvent)` | 避免事件二次编解码 |
 | 4 | 非 2xx | 三个 `HttpError` | 统一 `ProtocolHttpError`，`host_error.status` | 删除 helper 后 Magpie 只需一种分类 |
 | 5 | 错误体上限 | 读完整响应体 | 64 KiB 截断 | 避免超长响应进入调用记录与错误链 |
-| 6 | extraBody | helper 可合并额外字段 | 不实现 | PRD：不移植 extraParams / body allowlist |
+| 6 | extraBody / extraParams | helper 可合并额外字段 | 合并 Cursor `temperature` / `top_p` / `stop`；禁止覆盖核心字段 | 对齐上游 Rust `merge_extra_params`，不移植任意 extraBody allowlist |
 | 7 | Anthropic 系统图 | 上游测试文案 “only accepts images” | 现 helper 与 Rust 均为 “only accepts attachments” | 对齐本仓库迁移前 helper，不回退上游旧文案 |
 | 8 | SDK specifier | `:protocol/openai-chat` 等 | 删除，无别名 | PRD：删除即完成 |
 | 9 | 标准路径 JSON | invoke 时构造 SDK `LlmRequest` 并 `from_value` | 标准路径不构造 SDK JSON；Rust `LlmRequest` 类型族已删；自定义插件显式 `readRequest()` | `LOCAL_LOOP_REQUEST_PRD.md` 替代「adapter 输入必须与 SDK 同 schema」 |
@@ -59,7 +59,7 @@ cursor-byok/server/plugins/build-in/magpie/
 
 1. 策略在 TS，协议在 Rust：协议选择、端点、鉴权头、`401 → invalid`、目录解析留在 Magpie TS。
 2. 同一核心 `ModelInvocation` 与上游 SSE，请求体字段和事件序列与迁移前 helper 等价（适配器 golden 锁定）。标准路径不经过 SDK JSON。
-3. 文本 / 思考 / 每个工具的 start → delta → end、回放在流结束前一次发出、`usage` 与 `done` 先后不变。
+3. 文本 / 思考 / 每个工具的 start → delta → end、回放在流结束前一次发出、`usage` 与 `done` 先后不变。Anthropic 必须发出 `ThinkingSignature` / `RedactedThinking`，并把缓存 token 计入 `context_input_tokens`。
 4. Magpie 只请求本次绑定的网关 origin；密钥不出现在 UI、日志、测试快照。
 5. 一次 `InvokeModel` 认领首个协议请求写入 `CallRecorder`；观测失败不阻断推理。
 6. URL 白名单、拒绝凭证、不跟随重定向与 `network.fetch/stream` 相同。
@@ -71,12 +71,12 @@ cursor-byok/server/plugins/build-in/magpie/
 | 覆盖 | 位置 |
 |---|---|
 | Chat / Responses / Anthropic 请求体与 SSE golden | `plugins/adapters/{chat,responses,anthropic}.rs` |
-| 同一核心 fixture 的三协议 body、空可选字段、非法 tool 消息 | `plugins/adapters/mod.rs` |
+| 同一核心 fixture 的三协议 body、空可选字段、非法 tool 消息、extra params、SSE 分帧 | `plugins/adapters/mod.rs` |
 | 按需 SDK 投影与非法 tool 消息 | `plugins/wire.rs` |
 | `host_error.status` 序列化 | `plugins/protocol.rs` |
-| 附件、取消关上游、完成/取消落库 | `host.rs` 既有 Magpie 假网关测试 |
+| 附件、取消关上游、完成/取消落库、目录 max tokens | `host.rs` 既有 Magpie 假网关测试 |
 | Magpie invoke 帧不含正文且不随历史/附件增大 | `magpie_invoke_frame_does_not_include_or_grow_with_the_model_body` |
-| 自定义插件 `readRequest` 复用、并发隔离、取消后不可读 | `plugins/worker.rs` |
+| 自定义插件 `readRequest` 复用、并发隔离、取消后不可读、invoke 句柄先于发送取得 | `plugins/worker.rs` |
 | `401` → 资源 `invalid` | `magpie_invocation_marks_resource_invalid_on_http_401` |
 | 目录仍走 TS `network.fetch` | `magpie_catalog_through_real_bun` |
 
