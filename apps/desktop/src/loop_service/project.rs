@@ -28,15 +28,13 @@ pub(crate) fn project(
         model.max_output_tokens = config
             .max_tokens
             .and_then(|value| u64::try_from(value).ok());
+        model.stop_sequences = config.stop_sequences.clone();
         let mut extra = Map::new();
         if let Some(value) = config.temperature {
             extra.insert("temperature".into(), Value::from(value));
         }
         if let Some(value) = config.top_p {
             extra.insert("top_p".into(), Value::from(value));
-        }
-        if !config.stop_sequences.is_empty() {
-            extra.insert("stop".into(), Value::from(config.stop_sequences.clone()));
         }
         model.extra_params = Value::Object(extra);
     }
@@ -336,6 +334,25 @@ mod tests {
     use prost_types::{Struct, Value as ProtoValue, value::Kind};
 
     use super::*;
+
+    #[test]
+    fn sampling_config_projects_stop_sequences_out_of_extra_params() {
+        let input = pb::InferenceStreamRequest {
+            messages: vec![text(1, "hello")],
+            model_config: Some(pb::InferenceModelConfig {
+                temperature: Some(0.3),
+                top_p: Some(0.7),
+                stop_sequences: vec!["STOP".into(), "END".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let request = project(&input, "test-model", None, &[]).unwrap();
+        assert_eq!(request.model.stop_sequences, vec!["STOP", "END"]);
+        assert_eq!(request.model.extra_params["temperature"], 0.3_f32);
+        assert_eq!(request.model.extra_params["top_p"], 0.7_f32);
+        assert!(request.model.extra_params.get("stop").is_none());
+    }
 
     #[test]
     fn unchanged_client_history_remains_an_exact_provider_prefix() {

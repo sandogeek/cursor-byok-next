@@ -3,8 +3,8 @@
 use serde_json::{Value, json};
 
 use super::{
-    CoreMessage, ProtocolParser, core_message, count_usize, data_url, object, parse_object, text,
-    usage_event,
+    CoreMessage, ProtocolParser, ToolNames, core_message, count_usize, data_url, object,
+    parse_object, text, usage_event,
 };
 use crate::{
     model::{ContentPart, ModelInvocation, ModelLatency},
@@ -34,6 +34,7 @@ pub(super) struct Parser {
     streamed_text: String,
     thinking_open: bool,
     tools: std::collections::BTreeMap<usize, ToolState>,
+    tool_names: ToolNames,
     reasoning_items: Vec<Value>,
     saw_tool: bool,
     saw_completed_item: bool,
@@ -41,12 +42,13 @@ pub(super) struct Parser {
 }
 
 impl Parser {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(tool_names: ToolNames) -> Self {
         Self {
             text_open: false,
             streamed_text: String::new(),
             thinking_open: false,
             tools: std::collections::BTreeMap::new(),
+            tool_names,
             reasoning_items: Vec::new(),
             saw_tool: false,
             saw_completed_item: false,
@@ -159,6 +161,7 @@ impl ProtocolParser for Parser {
                     ToolArguments::None,
                     false,
                     &mut self.tools,
+                    &self.tool_names,
                 )? {
                     emit(event);
                 }
@@ -196,6 +199,7 @@ impl ProtocolParser for Parser {
                             args,
                             true,
                             &mut self.tools,
+                            &self.tool_names,
                         )? {
                             emit(event);
                         }
@@ -214,6 +218,7 @@ impl ProtocolParser for Parser {
                     ToolArguments::Delta(delta.to_owned()),
                     false,
                     &mut self.tools,
+                    &self.tool_names,
                 )? {
                     emit(event);
                 }
@@ -225,9 +230,14 @@ impl ProtocolParser for Parser {
                     Some(snapshot) => ToolArguments::Snapshot(snapshot.to_owned()),
                 };
                 let done = snapshot.is_some_and(|snapshot| !snapshot.is_empty());
-                for event in
-                    update_tool(required_index(&value)?, None, args, done, &mut self.tools)?
-                {
+                for event in update_tool(
+                    required_index(&value)?,
+                    None,
+                    args,
+                    done,
+                    &mut self.tools,
+                    &self.tool_names,
+                )? {
                     emit(event);
                 }
             }
@@ -306,7 +316,11 @@ impl ProtocolParser for Parser {
     }
 }
 
-pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Value> {
+pub(super) fn build_body(
+    model: &str,
+    invocation: &ModelInvocation,
+    tool_names: &ToolNames,
+) -> Result<Value> {
     let request = &invocation.request;
     let mut input = Vec::new();
     for message in &request.history {
@@ -332,7 +346,7 @@ pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Va
                     input.push(json!({
                         "type": "function_call",
                         "call_id": super::truncated_call_id(&tool_call.call_id),
-                        "name": super::openai_tool_name(&tool_call.name),
+                        "name": tool_names.alias(&tool_call.name),
                         "arguments": serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".into()),
                     }));
                 }
@@ -389,7 +403,7 @@ pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Va
                     .map(|tool| {
                         json!({
                             "type": "function",
-                            "name": super::openai_tool_name(&tool.name),
+                            "name": tool_names.alias(&tool.name),
                             "description": tool.description,
                             "parameters": tool.parameters,
                             "strict": false,
@@ -416,6 +430,8 @@ pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Va
         }
     }
     super::apply_openai_prompt_cache_key(&mut body, model, &invocation.conversation_id);
+    // OpenAI Responses has no stop-sequence field; a `stop` key would be rejected
+    // by strict gateways, so Cursor's stop sequences are dropped for this protocol.
     super::merge_extra_params(&mut body, &request.model.extra_params)?;
     Ok(body)
 }
@@ -491,6 +507,7 @@ fn update_tool(
     args: ToolArguments,
     done: bool,
     tools: &mut std::collections::BTreeMap<usize, ToolState>,
+    tool_names: &ToolNames,
 ) -> Result<Vec<ModelEvent>> {
     let tool = tools.entry(index).or_insert_with(|| ToolState {
         call_id: None,
@@ -529,7 +546,7 @@ fn update_tool(
         events.push(ModelEvent::ToolCallStart {
             index,
             call_id: super::truncated_call_id(tool.call_id.as_deref().unwrap()).to_owned(),
-            name: super::openai_tool_name(tool.name.as_deref().unwrap()),
+            name: tool_names.restore(tool.name.as_deref().unwrap()),
         });
     }
     if tool.started && tool.emitted < tool.arguments.len() {
@@ -593,8 +610,12 @@ mod tests {
             ContentPart, ModelLatency, ProjectedContent, ProjectedMessage, ProviderReplayState,
             Role, ToolCallContent, ToolDefinition,
         },
-        plugins::adapters::{collect_events, tests::invocation},
+        plugins::adapters::{ProtocolKind, ToolNames, collect_events, tests::invocation},
     };
+
+    fn names(invocation: &ModelInvocation) -> ToolNames {
+        ToolNames::new(ProtocolKind::OpenAiResponses, invocation)
+    }
 
     #[test]
     fn builds_responses_body_with_priority_tier() {
@@ -607,7 +628,7 @@ mod tests {
             description: "Look up".into(),
             parameters: json!({ "type": "object" }),
         }];
-        let body = build_body("gpt-5", &invocation).unwrap();
+        let body = build_body("gpt-5", &invocation, &names(&invocation)).unwrap();
         assert_eq!(body["instructions"], "You are concise.");
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
         assert_eq!(body["service_tier"], "priority");
@@ -646,7 +667,7 @@ mod tests {
                 }],
             },
         }];
-        let body = build_body("gpt-5", &invocation).unwrap();
+        let body = build_body("gpt-5", &invocation, &names(&invocation)).unwrap();
         assert_eq!(body["input"][0]["type"], "reasoning");
         assert_eq!(body["input"][0]["encrypted_content"], "enc");
         assert_eq!(body["input"][1]["type"], "message");
@@ -669,7 +690,7 @@ mod tests {
                 calls: Vec::new(),
             },
         }];
-        let error = build_body("gpt-5", &invocation).unwrap_err();
+        let error = build_body("gpt-5", &invocation, &names(&invocation)).unwrap_err();
         assert_eq!(
             error.to_string(),
             "OpenAI Responses replay state contains a non-reasoning item"
@@ -695,7 +716,7 @@ mod tests {
                 },
             ]),
         }];
-        let body = build_body("gpt-5", &invocation).unwrap();
+        let body = build_body("gpt-5", &invocation, &names(&invocation)).unwrap();
         assert_eq!(body["input"][0]["content"][0]["type"], "input_image");
         assert_eq!(body["input"][0]["content"][1]["type"], "input_file");
         assert_eq!(body["input"][0]["content"][1]["filename"], "report.pdf");
@@ -704,7 +725,7 @@ mod tests {
     #[test]
     fn parses_text_thinking_usage_and_completed() {
         let events = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(ToolNames::default()),
             &[
                 r#"{"type":"response.reasoning_summary_text.delta","delta":"why"}"#,
                 r#"{"type":"response.reasoning_summary_text.done"}"#,
@@ -744,7 +765,7 @@ mod tests {
     #[test]
     fn reconciles_output_text_suffix() {
         let events = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(ToolNames::default()),
             &[
                 r#"{"type":"response.output_text.delta","delta":"Hel"}"#,
                 r#"{"type":"response.output_text.done","text":"Hello"}"#,
@@ -767,7 +788,7 @@ mod tests {
     #[test]
     fn maps_function_call_and_incomplete() {
         let events = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(ToolNames::default()),
             &[
                 r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call-1","name":"lookup"}}"#,
                 r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"q\":"}"#,
@@ -786,7 +807,7 @@ mod tests {
     #[test]
     fn mismatched_final_arguments_fail() {
         let error = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(ToolNames::default()),
             &[
                 r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call-1","name":"lookup"}}"#,
                 r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"q\":"}"#,
@@ -803,7 +824,7 @@ mod tests {
     #[test]
     fn missing_terminal_event_fails() {
         let error = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(ToolNames::default()),
             &[r#"{"type":"response.output_text.delta","delta":"Hi"}"#],
         )
         .unwrap_err();
@@ -816,7 +837,7 @@ mod tests {
     #[test]
     fn saw_completed_item_fallback() {
         let events = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(ToolNames::default()),
             &[
                 r#"{"type":"response.output_text.delta","delta":"Hi"}"#,
                 r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"Hi"}]}}"#,
@@ -828,7 +849,7 @@ mod tests {
 
     #[test]
     fn omits_prompt_cache_key_for_non_gpt_models() {
-        let body = build_body("claude-sonnet", &invocation()).unwrap();
+        let body = build_body("claude-sonnet", &invocation(), &names(&invocation())).unwrap();
         assert!(body.get("prompt_cache_key").is_none());
     }
 }

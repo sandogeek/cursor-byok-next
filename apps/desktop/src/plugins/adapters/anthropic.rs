@@ -354,6 +354,7 @@ pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Va
         }
     }
     super::merge_extra_params(&mut body, &request.model.extra_params)?;
+    super::apply_stop_sequences(&mut body, "stop_sequences", &request.model.stop_sequences)?;
     Ok(body)
 }
 

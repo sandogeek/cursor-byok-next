@@ -9,9 +9,9 @@
 
 ```text
 cursor-byok/server/src/plugin/sdk/protocol/     apps/desktop/src/plugins/
-├── openai_chat.ts      Chat 请求体 + SSE      adapters/chat.rs       674
-├── openai_responses.ts Responses 请求体 + SSE adapters/responses.rs  818
-├── anthropic.ts        Messages 请求体 + SSE  adapters/anthropic.rs  883
+├── openai_chat.ts      Chat 请求体 + SSE      adapters/chat.rs       713
+├── openai_responses.ts Responses 请求体 + SSE adapters/responses.rs  855
+├── anthropic.ts        Messages 请求体 + SSE  adapters/anthropic.rs  918
 └── anthropic_test.ts   Deno 对照              adapters/* 内 #[cfg(test)]
 
 cursor-byok/server/src/plugin/                  apps/desktop/src/plugins/
@@ -49,11 +49,14 @@ cursor-byok/server/plugins/build-in/magpie/
 | 2 | 请求体来源 | helper 参数带完整 `LlmRequest` | invoke 时登记 `Arc<ModelInvocation>`；适配器直接读核心请求；`protocol.stream` 不含消息 | 会话投影只有一个所有者；长历史和附件不再为了选端点而序列化进 Bun |
 | 3 | 事件通道 | worker JSONL `event` | 适配器直写 `WorkerStreamItem::Event(ModelEvent)` | 避免事件二次编解码 |
 | 4 | 非 2xx | 三个 `HttpError` | 统一 `ProtocolHttpError`，`host_error.status` | 删除 helper 后 Magpie 只需一种分类 |
-| 5 | 错误体上限 | 读完整响应体 | 64 KiB 截断 | 避免超长响应进入调用记录与错误链 |
-| 6 | extraBody / extraParams | helper 可合并额外字段 | 合并 Cursor `temperature` / `top_p` / `stop`；禁止覆盖核心字段 | 对齐上游 Rust `merge_extra_params`，不移植任意 extraBody allowlist |
+| 5 | 错误体上限 | 读完整响应体 | 64 KiB 截断 + 短 deadline | 避免超长响应进入调用记录与错误链，且不让半开的 body 拖住状态码 |
+| 6 | extraBody / extraParams | helper 可合并额外字段 | `ModelSpec.stop_sequences` + 合并 Cursor `temperature` / `top_p`；禁止覆盖核心字段 | 对齐上游 Rust `merge_extra_params`，不移植任意 extraBody allowlist |
 | 7 | Anthropic 系统图 | 上游测试文案 “only accepts images” | 现 helper 与 Rust 均为 “only accepts attachments” | 对齐本仓库迁移前 helper，不回退上游旧文案 |
 | 8 | SDK specifier | `:protocol/openai-chat` 等 | 删除，无别名 | PRD：删除即完成 |
 | 9 | 标准路径 JSON | invoke 时构造 SDK `LlmRequest` 并 `from_value` | 标准路径不构造 SDK JSON；Rust `LlmRequest` 类型族已删；自定义插件显式 `readRequest()` | `LOCAL_LOOP_REQUEST_PRD.md` 替代「adapter 输入必须与 SDK 同 schema」 |
+| 10 | 停止序列 | 上游 helper 无该字段（Cursor `InferenceModelConfig.stop_sequences` 未投影） | `project.rs` 只把 `stop_sequences` 放进 `ModelSpec`，由适配器按协议写：Chat `stop`、Anthropic `stop_sequences`、Responses 无停止字段故丢弃 | 三个协议字段名不同；原样合并 `stop` 会让 Anthropic/Responses 在严格网关 400 |
+| 11 | OpenAI 工具名 | helper 直接使用 `tool.name` | `ToolNames` 每次调用建无冲突双向映射：请求体用别名（`a.b` → `a_b`，撞名加 `_2`），回给 Cursor 的 `ToolCallStart` 还原原名；Anthropic 不改写 | 保留 Cursor 注册名，避免 `a.b` 与 `a_b` 撞成同一名字 |
+| 12 | 非 2xx 错误体 | 读完整响应体，等待 EOF | 64 KiB 上限 + 10s deadline；先记录 HTTP 状态，再读错误体，超时/读失败只截断文本，状态码照常回给 Magpie | 网关可能发完 401 头却不结束 body；状态码不能因为错误体延迟而丢失 |
 
 ## 必须保持的不变量
 
@@ -65,12 +68,17 @@ cursor-byok/server/plugins/build-in/magpie/
 6. URL 白名单、拒绝凭证、不跟随重定向与 `network.fetch/stream` 相同。
 7. 生产代码与 SDK 中不再出现 `cursor-byok-next:protocol/`。
 8. 测试用临时目录和假网关，不读真实 `~/.cursor-byok-next`。
+9. 工具名只在 provider 请求体内改写；`ToolCallStart`、`tool_calls` 与 `tool_use` 回放一律是 Cursor 的原名。
+10. 停止序列按协议字段名落地，未知字段不写入请求体；非 2xx 先留住 HTTP 状态，错误体读取不阻塞状态回传。
 
 ## 测试映射
 
 | 覆盖 | 位置 |
 |---|---|
 | Chat / Responses / Anthropic 请求体与 SSE golden | `plugins/adapters/{chat,responses,anthropic}.rs` |
+| 停止序列按协议映射（Chat `stop`、Anthropic `stop_sequences`、Responses 丢弃） | `plugins/adapters::tests::maps_stop_sequences_per_protocol`、`loop_service::project` |
+| OpenAI 工具名别名去冲突并还原原名（Chat + Responses），Anthropic 不改写 | `plugins/adapters::tests::restores_original_tool_names_after_openai_aliasing`、`keeps_anthropic_tool_names_unaliased` |
+| 非 2xx 错误体读到 deadline/字节上限即返回，HTTP 状态仍可回传 | `plugins/adapters::tests::error_body_read_keeps_the_status_and_never_waits_for_eof` |
 | 同一核心 fixture 的三协议 body、空可选字段、非法 tool 消息、extra params、SSE 分帧 | `plugins/adapters/mod.rs` |
 | 按需 SDK 投影与非法 tool 消息 | `plugins/wire.rs` |
 | `host_error.status` 序列化 | `plugins/protocol.rs` |

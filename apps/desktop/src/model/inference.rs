@@ -27,6 +27,8 @@ pub struct ModelSpec {
     pub max_output_tokens: Option<u64>,
     pub context_window_tokens: Option<u64>,
     #[serde(default)]
+    pub stop_sequences: Vec<String>,
+    #[serde(default)]
     pub extra_params: serde_json::Value,
 }
 
@@ -39,6 +41,7 @@ impl ModelSpec {
             latency: ModelLatency::Standard,
             max_output_tokens: None,
             context_window_tokens: None,
+            stop_sequences: Vec::new(),
             extra_params: serde_json::json!({}),
         }
     }

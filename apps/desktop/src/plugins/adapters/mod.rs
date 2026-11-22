@@ -17,8 +17,8 @@ use super::{
 };
 use crate::{
     model::{
-        ContentPart, ProjectedContent, ProjectedMessage, ProviderReplayState, Role,
-        ToolCallContent, ToolResultContent,
+        ContentPart, ModelInvocation, ProjectedContent, ProjectedMessage, ProviderReplayState,
+        Role, ToolCallContent, ToolResultContent,
     },
     provider::ModelEvent,
 };
@@ -27,6 +27,7 @@ const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolKind {
@@ -73,9 +74,10 @@ pub(super) async fn stream(
     })?;
     let protocol = ProtocolKind::parse(&input.protocol)?;
     let model = invocation.model()?;
+    let tool_names = ToolNames::new(protocol, model);
     let body = match protocol {
-        ProtocolKind::OpenAiChat => chat::build_body(&input.model, model)?,
-        ProtocolKind::OpenAiResponses => responses::build_body(&input.model, model)?,
+        ProtocolKind::OpenAiChat => chat::build_body(&input.model, model, &tool_names)?,
+        ProtocolKind::OpenAiResponses => responses::build_body(&input.model, model, &tool_names)?,
         ProtocolKind::Anthropic => anthropic::build_body(&input.model, model)?,
     };
     let body_text = serde_json::to_string(&body)?;
@@ -105,12 +107,18 @@ pub(super) async fn stream(
         recorder.response_headers(status).await?;
     }
     if !(200..300).contains(&status) {
-        let body = read_error_body(&mut response, &cancellation, recorder.as_ref()).await?;
+        let body = read_error_body(
+            &mut response,
+            &cancellation,
+            recorder.as_ref(),
+            ERROR_BODY_TIMEOUT,
+        )
+        .await?;
         return Err(Error::HttpStatus { status, body });
     }
     let mut parser: Box<dyn ProtocolParser> = match protocol {
-        ProtocolKind::OpenAiChat => Box::new(chat::Parser::new()),
-        ProtocolKind::OpenAiResponses => Box::new(responses::Parser::new()),
+        ProtocolKind::OpenAiChat => Box::new(chat::Parser::new(tool_names)),
+        ProtocolKind::OpenAiResponses => Box::new(responses::Parser::new(tool_names)),
         ProtocolKind::Anthropic => Box::new(anthropic::Parser::new()),
     };
     read_sse(
@@ -157,25 +165,25 @@ async fn read_error_body(
     response: &mut reqwest::Response,
     cancellation: &CancellationToken,
     recorder: Option<&crate::calls::CallRecorder>,
+    timeout: Duration,
 ) -> Result<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut body = Vec::new();
-    loop {
+    while body.len() < MAX_ERROR_BODY_BYTES {
         let chunk = tokio::select! {
             _ = cancellation.cancelled() => return Err(Error::Cancelled),
-            chunk = response.chunk() => {
-                chunk.map_err(|error| {
-                    Error::Provider(format!("cannot read plugin network response: {error}"))
-                })?
-            }
+            _ = tokio::time::sleep_until(deadline) => break,
+            chunk = response.chunk() => match chunk {
+                Ok(chunk) => chunk,
+                Err(_) => break,
+            },
         };
         let Some(chunk) = chunk else { break };
         if let Some(recorder) = recorder {
-            recorder.response_chunk(&chunk).await?;
+            let _ = recorder.response_chunk(&chunk).await;
         }
-        let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
-        if remaining > 0 {
-            body.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
-        }
+        let remaining = MAX_ERROR_BODY_BYTES - body.len();
+        body.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
     }
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
@@ -452,6 +460,75 @@ fn openai_tool_name(name: &str) -> String {
     }
 }
 
+/// One-to-one mapping between Cursor's tool names and the names the OpenAI
+/// protocols accept. The provider only ever sees the alias; events sent back to
+/// Cursor carry the original name.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ToolNames {
+    by_name: HashMap<String, String>,
+    by_alias: HashMap<String, String>,
+}
+
+impl ToolNames {
+    fn new(protocol: ProtocolKind, invocation: &ModelInvocation) -> Self {
+        let mut names = Self::default();
+        if protocol == ProtocolKind::Anthropic {
+            return names;
+        }
+        for tool in &invocation.request.prompt.tools {
+            names.insert(&tool.name);
+        }
+        for message in &invocation.request.history {
+            if let ProjectedContent::Assistant { calls, .. } = &message.content {
+                for call in calls {
+                    names.insert(&call.name);
+                }
+            }
+        }
+        names
+    }
+
+    fn insert(&mut self, name: &str) {
+        if self.by_name.contains_key(name) {
+            return;
+        }
+        let base = openai_tool_name(name);
+        let mut alias = base.clone();
+        let mut suffix = 1;
+        while self.by_alias.contains_key(&alias) {
+            suffix += 1;
+            alias = format!("{base}_{suffix}");
+        }
+        self.by_alias.insert(alias.clone(), name.to_owned());
+        self.by_name.insert(name.to_owned(), alias);
+    }
+
+    fn alias(&self, name: &str) -> String {
+        self.by_name
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| openai_tool_name(name))
+    }
+
+    fn restore(&self, alias: &str) -> String {
+        self.by_alias
+            .get(alias)
+            .cloned()
+            .unwrap_or_else(|| alias.to_owned())
+    }
+}
+
+fn apply_stop_sequences(body: &mut Value, key: &str, sequences: &[String]) -> Result<()> {
+    if sequences.is_empty() {
+        return Ok(());
+    }
+    let body = body
+        .as_object_mut()
+        .ok_or_else(|| Error::Provider("provider request body must be an object".into()))?;
+    body.insert(key.to_owned(), Value::from(sequences));
+    Ok(())
+}
+
 fn merge_extra_params(body: &mut Value, extra: &Value) -> Result<()> {
     let Some(extra) = extra.as_object() else {
         if extra.is_null() {
@@ -478,6 +555,8 @@ fn merge_extra_params(body: &mut Value, extra: &Value) -> Result<()> {
                 | "system"
                 | "instructions"
                 | "prompt_cache_key"
+                | "stop"
+                | "stop_sequences"
         ) {
             return Err(Error::Protocol(format!(
                 "model extra params cannot replace {name}"
@@ -519,8 +598,16 @@ fn collect_events(
 mod tests {
     use crate::model::{
         ContentPart, ModelInvocation, ModelRequest, ModelSpec, ProjectedContent, ProjectedMessage,
-        PromptSpec, Role,
+        PromptSpec, ProviderReplayState, Role, ToolCallContent, ToolDefinition, ToolResultContent,
     };
+    use crate::plugins::adapters::{ProtocolKind, ToolNames, collect_events};
+    use crate::provider::ModelEvent;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    fn names() -> ToolNames {
+        ToolNames::default()
+    }
 
     pub(crate) fn invocation() -> ModelInvocation {
         ModelInvocation {
@@ -546,7 +633,6 @@ mod tests {
     }
 
     fn tool_roundtrip() -> ModelInvocation {
-        use crate::model::{ProviderReplayState, ToolCallContent, ToolDefinition, ToolResultContent};
         let mut invocation = invocation();
         invocation.request.prompt.tools = vec![ToolDefinition {
             name: "lookup".into(),
@@ -621,27 +707,117 @@ mod tests {
 
     #[test]
     fn omits_empty_optional_fields() {
-        let body = super::chat::build_body("gpt-4.1", &invocation()).unwrap();
+        let body = super::chat::build_body("gpt-4.1", &invocation(), &names()).unwrap();
         assert!(body.get("max_completion_tokens").is_none());
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("service_tier").is_none());
         assert!(body.get("tools").is_none());
-        let body = super::responses::build_body("gpt-5", &invocation()).unwrap();
+        assert!(body.get("stop").is_none());
+        let body = super::responses::build_body("gpt-5", &invocation(), &names()).unwrap();
         assert!(body.get("max_output_tokens").is_none());
         assert!(body.get("reasoning").is_none());
         assert!(body.get("service_tier").is_none());
         assert!(body.get("tools").is_none());
+        assert!(body.get("stop").is_none());
         let body = super::anthropic::build_body("claude", &invocation()).unwrap();
         assert!(body.get("tools").is_none());
         assert!(body.get("thinking").is_none());
         assert!(body.get("output_config").is_none());
+        assert!(body.get("stop_sequences").is_none());
+    }
+
+    #[test]
+    fn maps_stop_sequences_per_protocol() {
+        let mut invocation = invocation();
+        invocation.request.model.stop_sequences = vec!["STOP".into(), "\n\nUser:".into()];
+        let chat = super::chat::build_body("gpt-4.1", &invocation, &names()).unwrap();
+        assert_eq!(chat["stop"], serde_json::json!(["STOP", "\n\nUser:"]));
+        let responses = super::responses::build_body("gpt-5", &invocation, &names()).unwrap();
+        assert!(responses.get("stop").is_none());
+        assert!(responses.get("stop_sequences").is_none());
+        let anthropic = super::anthropic::build_body("claude", &invocation).unwrap();
+        assert_eq!(
+            anthropic["stop_sequences"],
+            serde_json::json!(["STOP", "\n\nUser:"])
+        );
+        assert!(anthropic.get("stop").is_none());
+    }
+
+    #[test]
+    fn restores_original_tool_names_after_openai_aliasing() {
+        let mut invocation = invocation();
+        invocation.request.prompt.tools = vec![
+            ToolDefinition {
+                name: "a.b".into(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
+            ToolDefinition {
+                name: "a_b".into(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
+        ];
+        let names = ToolNames::new(ProtocolKind::OpenAiChat, &invocation);
+        assert_eq!(names.alias("a.b"), "a_b");
+        assert_eq!(names.alias("a_b"), "a_b_2");
+        assert_eq!(names.restore("a_b"), "a.b");
+        assert_eq!(names.restore("a_b_2"), "a_b");
+        let chat = super::chat::build_body("gpt-4.1", &invocation, &names).unwrap();
+        assert_eq!(chat["tools"][0]["function"]["name"], "a_b");
+        assert_eq!(chat["tools"][1]["function"]["name"], "a_b_2");
+        let events = collect_events(
+            &mut super::chat::Parser::new(names.clone()),
+            &[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"a_b_2","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+                "[DONE]",
+            ],
+        )
+        .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ModelEvent::ToolCallStart { name, .. } if name == "a_b"
+        )));
+
+        let responses = super::responses::build_body("gpt-5", &invocation, &names).unwrap();
+        assert_eq!(responses["tools"][0]["name"], "a_b");
+        assert_eq!(responses["tools"][1]["name"], "a_b_2");
+        let events = collect_events(
+            &mut super::responses::Parser::new(names),
+            &[
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call-1","name":"a_b"}}"#,
+                r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{}"}"#,
+                r#"{"type":"response.completed","response":{}}"#,
+            ],
+        )
+        .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ModelEvent::ToolCallStart { name, .. } if name == "a.b"
+        )));
+    }
+
+    #[test]
+    fn keeps_anthropic_tool_names_unaliased() {
+        let mut invocation = invocation();
+        invocation.request.prompt.tools = vec![ToolDefinition {
+            name: "a.b".into(),
+            description: String::new(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }];
+        let names = ToolNames::new(ProtocolKind::Anthropic, &invocation);
+        assert_eq!(names.restore("a.b"), "a.b");
+        assert_eq!(
+            super::anthropic::build_body("claude", &invocation).unwrap()["tools"][0]["name"],
+            "a.b"
+        );
     }
 
     #[test]
     fn rejects_tool_messages_without_a_result_before_any_protocol_body() {
         let invocation = illegal_tool();
-        let chat = super::chat::build_body("gpt-4.1", &invocation).unwrap_err();
-        let responses = super::responses::build_body("gpt-5", &invocation).unwrap_err();
+        let chat = super::chat::build_body("gpt-4.1", &invocation, &names()).unwrap_err();
+        let responses = super::responses::build_body("gpt-5", &invocation, &names()).unwrap_err();
         let anthropic = super::anthropic::build_body("claude", &invocation).unwrap_err();
         assert_eq!(chat.to_string(), "tool messages must carry a tool result");
         assert_eq!(responses.to_string(), chat.to_string());
@@ -651,12 +827,13 @@ mod tests {
     #[test]
     fn builds_equivalent_bodies_from_the_same_core_fixture() {
         let invocation = tool_roundtrip();
-        let chat = super::chat::build_body("gpt-4.1", &invocation).unwrap();
+        let names = ToolNames::new(ProtocolKind::OpenAiChat, &invocation);
+        let chat = super::chat::build_body("gpt-4.1", &invocation, &names).unwrap();
         assert_eq!(chat["messages"][0]["role"], "system");
         assert_eq!(chat["messages"][3]["role"], "tool");
         assert_eq!(chat["messages"][3]["tool_call_id"], "call-1");
         assert_eq!(chat["messages"][4]["content"][1]["type"], "image_url");
-        let responses = super::responses::build_body("gpt-5", &invocation).unwrap();
+        let responses = super::responses::build_body("gpt-5", &invocation, &names).unwrap();
         assert_eq!(responses["input"][1]["type"], "function_call");
         assert_eq!(responses["input"][2]["type"], "function_call_output");
         assert_eq!(responses["input"][3]["content"][1]["type"], "input_image");
@@ -675,12 +852,15 @@ mod tests {
             "temperature": 0.2,
             "top_p": 0.9,
         });
-        let chat = super::chat::build_body("gpt-4.1", &invocation).unwrap();
+        let chat = super::chat::build_body("gpt-4.1", &invocation, &names()).unwrap();
         assert_eq!(chat["temperature"], 0.2);
         assert_eq!(chat["top_p"], 0.9);
         invocation.request.model.extra_params = serde_json::json!({ "messages": [] });
-        let error = super::chat::build_body("gpt-4.1", &invocation).unwrap_err();
+        let error = super::chat::build_body("gpt-4.1", &invocation, &names()).unwrap_err();
         assert_eq!(error.to_string(), "model extra params cannot replace messages");
+        invocation.request.model.extra_params = serde_json::json!({ "stop": [] });
+        let error = super::chat::build_body("gpt-4.1", &invocation, &names()).unwrap_err();
+        assert_eq!(error.to_string(), "model extra params cannot replace stop");
     }
 
     #[test]
@@ -694,5 +874,68 @@ mod tests {
         assert_eq!(payload, "{\"type\":\n\"error\"}");
         assert!(frame.push_line(": keep-alive").is_none());
         assert!(frame.push_line("").is_none());
+    }
+
+    async fn stalled_error_response(
+        body: &'static [u8],
+        content_length: usize,
+        stall: bool,
+    ) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let header = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {content_length}\r\nConnection: keep-alive\r\n\r\n"
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+            if stall {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(&origin)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn error_body_read_keeps_the_status_and_never_waits_for_eof() {
+        // The gateway announced more bytes than it sent and keeps the body open:
+        // without a deadline this would hang until the run timed out.
+        let mut stalled = stalled_error_response(b"unauthorized", 4096, true).await;
+        let started = tokio::time::Instant::now();
+        let body = super::read_error_body(
+            &mut stalled,
+            &CancellationToken::new(),
+            None,
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body, "unauthorized");
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let oversized =
+            Box::leak(vec![b'x'; super::MAX_ERROR_BODY_BYTES + 1024].into_boxed_slice());
+        let mut capped = stalled_error_response(oversized, oversized.len(), false).await;
+        let body = super::read_error_body(
+            &mut capped,
+            &CancellationToken::new(),
+            None,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body.len(), super::MAX_ERROR_BODY_BYTES);
     }
 }

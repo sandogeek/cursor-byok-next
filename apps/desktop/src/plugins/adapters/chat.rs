@@ -3,8 +3,8 @@
 use serde_json::{Value, json};
 
 use super::{
-    CoreMessage, ProtocolParser, core_message, count_usize, data_url, object, parse_object, text,
-    usage_event,
+    CoreMessage, ProtocolParser, ToolNames, core_message, count_usize, data_url, object,
+    parse_object, text, usage_event,
 };
 use crate::{
     model::{ContentPart, ModelInvocation, ModelLatency},
@@ -27,18 +27,20 @@ pub(super) struct Parser {
     thinking_open: bool,
     reasoning: String,
     tools: std::collections::BTreeMap<usize, ToolState>,
+    tool_names: ToolNames,
     final_usage: Option<ModelEvent>,
     finish: Option<FinishReason>,
     saw_done_marker: bool,
 }
 
 impl Parser {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(tool_names: ToolNames) -> Self {
         Self {
             text_open: false,
             thinking_open: false,
             reasoning: String::new(),
             tools: std::collections::BTreeMap::new(),
+            tool_names,
             final_usage: None,
             finish: None,
             saw_done_marker: false,
@@ -115,6 +117,7 @@ impl ProtocolParser for Parser {
                     function
                         .and_then(|function| text(function.get("arguments").unwrap_or(&Value::Null))),
                     &mut self.tools,
+                    &self.tool_names,
                 ) {
                     emit(event);
                 }
@@ -147,7 +150,7 @@ impl ProtocolParser for Parser {
                 emit(ModelEvent::ToolCallStart {
                     index: *index,
                     call_id: super::truncated_call_id(&tool.call_id).to_owned(),
-                    name: super::openai_tool_name(&tool.name),
+                    name: self.tool_names.restore(&tool.name),
                 });
                 if !tool.arguments.is_empty() {
                     tool.emitted = tool.arguments.len();
@@ -187,7 +190,11 @@ impl ProtocolParser for Parser {
     }
 }
 
-pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Value> {
+pub(super) fn build_body(
+    model: &str,
+    invocation: &ModelInvocation,
+    tool_names: &ToolNames,
+) -> Result<Value> {
     let request = &invocation.request;
     let mut messages = Vec::new();
     if !request.prompt.instructions.is_empty() {
@@ -232,7 +239,7 @@ pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Va
                                     "id": super::truncated_call_id(&tool_call.call_id),
                                     "type": "function",
                                     "function": {
-                                        "name": super::openai_tool_name(&tool_call.name),
+                                        "name": tool_names.alias(&tool_call.name),
                                         "arguments": serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".into()),
                                     },
                                 })
@@ -286,7 +293,7 @@ pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Va
                         json!({
                             "type": "function",
                             "function": {
-                                "name": super::openai_tool_name(&tool.name),
+                                "name": tool_names.alias(&tool.name),
                                 "description": tool.description,
                                 "parameters": tool.parameters,
                             },
@@ -307,6 +314,7 @@ pub(super) fn build_body(model: &str, invocation: &ModelInvocation) -> Result<Va
     }
     super::apply_openai_prompt_cache_key(&mut body, model, &invocation.conversation_id);
     super::merge_extra_params(&mut body, &request.model.extra_params)?;
+    super::apply_stop_sequences(&mut body, "stop", &request.model.stop_sequences)?;
     Ok(body)
 }
 
@@ -368,6 +376,7 @@ fn update_tool(
     name: Option<&str>,
     arguments_delta: Option<&str>,
     tools: &mut std::collections::BTreeMap<usize, ToolState>,
+    tool_names: &ToolNames,
 ) -> Vec<ModelEvent> {
     let tool = tools.entry(index).or_insert_with(|| ToolState {
         call_id: String::new(),
@@ -391,7 +400,7 @@ fn update_tool(
         events.push(ModelEvent::ToolCallStart {
             index,
             call_id: super::truncated_call_id(&tool.call_id).to_owned(),
-            name: super::openai_tool_name(&tool.name),
+            name: tool_names.restore(&tool.name),
         });
     }
     if tool.started && tool.emitted < tool.arguments.len() {
@@ -455,8 +464,12 @@ mod tests {
             ContentPart, ModelLatency, ProjectedContent, ProjectedMessage, ProviderReplayState,
             Role, ToolCallContent, ToolDefinition,
         },
-        plugins::adapters::{collect_events, tests::invocation},
+        plugins::adapters::{ProtocolKind, ToolNames, collect_events, tests::invocation},
     };
+
+    fn names(invocation: &ModelInvocation) -> ToolNames {
+        ToolNames::new(ProtocolKind::OpenAiChat, invocation)
+    }
 
     #[test]
     fn builds_chat_body_with_usage_and_fast_tier() {
@@ -469,7 +482,7 @@ mod tests {
             description: "Look up".into(),
             parameters: json!({ "type": "object" }),
         }];
-        let body = build_body("gpt-4.1", &invocation).unwrap();
+        let body = build_body("gpt-4.1", &invocation, &names(&invocation)).unwrap();
         assert_eq!(body["model"], "gpt-4.1");
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
@@ -498,7 +511,7 @@ mod tests {
                 },
             ]),
         }];
-        let body = build_body("gpt-4.1", &invocation).unwrap();
+        let body = build_body("gpt-4.1", &invocation, &names(&invocation)).unwrap();
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         assert_eq!(
             body["messages"][0]["content"][1]["image_url"]["url"],
@@ -518,7 +531,7 @@ mod tests {
                 data: b"f".to_vec(),
             }]),
         }];
-        let error = build_body("gpt-4.1", &invocation).unwrap_err();
+        let error = build_body("gpt-4.1", &invocation, &names(&invocation)).unwrap_err();
         assert_eq!(
             error.to_string(),
             "OpenAI Chat Completions only supports PDF file attachments"
@@ -546,7 +559,7 @@ mod tests {
                 content: ProjectedContent::Parts(vec![ContentPart::Text { text: "hi".into() }]),
             },
         ];
-        let body = build_body("gpt-4.1", &invocation).unwrap();
+        let body = build_body("gpt-4.1", &invocation, &names(&invocation)).unwrap();
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
         assert_eq!(body["messages"][0]["role"], "user");
     }
@@ -573,7 +586,7 @@ mod tests {
                 }],
             },
         }];
-        let body = build_body("gpt-4.1", &invocation).unwrap();
+        let body = build_body("gpt-4.1", &invocation, &names(&invocation)).unwrap();
         assert_eq!(body["messages"][0]["content"], Value::Null);
         assert_eq!(body["messages"][0]["reasoning_content"], "why");
         assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call-1");
@@ -582,7 +595,7 @@ mod tests {
     #[test]
     fn parses_thinking_text_tools_usage_and_done() {
         let events = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(ToolNames::default()),
             &[
                 r#"{"choices":[{"delta":{"reasoning_content":"why"}}]}"#,
                 r#"{"choices":[{"delta":{"content":"Hi"}}]}"#,
@@ -637,7 +650,7 @@ mod tests {
     #[test]
     fn done_without_finish_reason_infers_stop() {
         let events = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(ToolNames::default()),
             &[r#"{"choices":[{"delta":{"content":"Hi"}}]}"#, "[DONE]"],
         )
         .unwrap();
@@ -647,7 +660,7 @@ mod tests {
     #[test]
     fn missing_done_and_finish_reason_fails() {
         let error = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(ToolNames::default()),
             &[r#"{"choices":[{"delta":{"content":"Hi"}}]}"#],
         )
         .unwrap_err();
@@ -660,7 +673,7 @@ mod tests {
     #[test]
     fn merges_repeated_tool_id_fragments() {
         let events = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(ToolNames::default()),
             &[
                 r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call"}]}}]}"#,
                 r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"n","arguments":"{}"}}]},"finish_reason":"stop"}]}"#,
@@ -685,7 +698,7 @@ mod tests {
     #[test]
     fn typed_error_events_fail_the_stream() {
         let error = collect_events(
-            &mut Parser::new(),
+            &mut Parser::new(ToolNames::default()),
             &[r#"{"type":"error","message":"quota exceeded"}"#],
         )
         .unwrap_err();
@@ -694,7 +707,7 @@ mod tests {
 
     #[test]
     fn omits_prompt_cache_key_for_non_gpt_models() {
-        let body = build_body("claude-sonnet", &invocation()).unwrap();
+        let body = build_body("claude-sonnet", &invocation(), &names(&invocation())).unwrap();
         assert!(body.get("prompt_cache_key").is_none());
     }
 }
