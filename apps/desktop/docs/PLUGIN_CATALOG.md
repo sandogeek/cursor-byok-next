@@ -52,6 +52,7 @@ cursor-byok/server/plugins/build-in/magpie/ apps/desktop/plugins/build-in/magpie
 | 6 | SDK 协议 helper | Deno import map 含 openai/anthropic | 已删除；`context.protocol.stream` 走 Rust 适配器 | 见 `PLUGIN_PROTOCOL_ADAPTERS.md` |
 | 7 | 内置插件加载 | 从安装目录发现插件 | 内嵌 Magpie，collector 与 worker 共用 `--tsconfig-override` | 修复 Bun specifier 解析，不执行任意安装目录中的代码 |
 | 8 | 失败反馈 | 通用插件错误 | 按资源保留旧目录和失败信息；存储读失败单独提示；不回显网关响应体 | 让用户区分离线、未配置与本地存储故障 |
+| 9 | 插件源类型检查 | 桌面端单独 `tsconfig.node.json`，`include: ["plugins/**/*.ts"]` | 应用 `tsconfig.json` 纳入 `plugins/**` 并映射四个 SDK specifier | NSH 应用只有一份 tsconfig；插件源不再落在任何 TS 工程外，编辑器与 `tsc` 才能解析 `cursor-byok-next:*` |
 
 ## 必须保持的不变量
 

@@ -1,6 +1,5 @@
 {
   "compilerOptions": {
-    "baseUrl": ".",
     "paths": {
       "cursor-byok-next:plugin": ["./plugin.ts"],
       "cursor-byok-next:provider": ["./provider.ts"],

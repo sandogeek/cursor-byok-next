@@ -1,5 +1,19 @@
 {
   "extends": "./.nsh/tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    // `paths` replaces the inherited map instead of merging, so the nsh entries are restated.
+    // Built-in plugins are Bun code outside the nsh program: they resolve the SDK specifiers here.
+    "paths": {
+      "nsh": ["./.nsh/types/nsh/index.d.ts"],
+      "nsh/*": ["./.nsh/types/nsh/*.d.ts"],
+      "*": ["./.nsh/types/*.d.ts"],
+      "cursor-byok-next:plugin": ["./src/plugins/sdk/plugin.ts"],
+      "cursor-byok-next:provider": ["./src/plugins/sdk/provider.ts"],
+      "cursor-byok-next:model": ["./src/plugins/sdk/model.ts"],
+      "cursor-byok-next:resource": ["./src/plugins/sdk/resource.ts"]
+    }
+  },
   "include": ["**/*.ts", "**/*.tsx"],
-  "exclude": ["plugins/**", "src/plugins/sdk/**"]
+  "exclude": ["src/plugins/sdk/**"]
 }
