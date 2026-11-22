@@ -16,6 +16,8 @@ pub enum Error {
     Runtime(String),
     #[error("{0}")]
     NotFound(String),
+    #[error("HTTP {status}: {body}")]
+    HttpStatus { status: u16, body: String },
     #[error("run was cancelled")]
     Cancelled,
     #[error(transparent)]

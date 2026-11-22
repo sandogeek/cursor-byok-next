@@ -4,14 +4,8 @@ import type {
   ProviderResult,
   ProviderSupport,
 } from "cursor-byok-next:provider";
-import type { PluginContext } from "cursor-byok-next:plugin";
+import { ProtocolHttpError, type PluginContext } from "cursor-byok-next:plugin";
 import type { ModelSnapshot } from "cursor-byok-next:model";
-import { HttpError as ChatHttpError, streamOpenAiChat } from "cursor-byok-next:protocol/openai-chat";
-import {
-  HttpError as ResponsesHttpError,
-  streamOpenAiResponses,
-} from "cursor-byok-next:protocol/openai-responses";
-import { HttpError as AnthropicHttpError, streamAnthropic } from "cursor-byok-next:protocol/anthropic";
 import { magpieModels } from "./catalog.ts";
 import { gatewayData, gatewayHeaders, RESOURCE_TYPE } from "./resources.ts";
 
@@ -48,6 +42,12 @@ export function endpointFor(
   return { protocol, url: `${origin}/v1/chat/completions` };
 }
 
+function protocolName(protocol: MagpieProtocol): "openai-chat" | "openai-responses" | "anthropic" {
+  if (protocol === "responses") return "openai-responses";
+  if (protocol === "messages") return "anthropic";
+  return "openai-chat";
+}
+
 function invalidResult(message: string, stateMessage: string): ProviderResult {
   return {
     status: "resource-error",
@@ -57,10 +57,7 @@ function invalidResult(message: string, stateMessage: string): ProviderResult {
 }
 
 function requestError(error: unknown): ProviderResult {
-  if (
-    error instanceof ChatHttpError || error instanceof ResponsesHttpError ||
-    error instanceof AnthropicHttpError
-  ) {
+  if (error instanceof ProtocolHttpError) {
     if (error.status === 401) {
       return invalidResult(error.message, "Magpie authorization failed; check the API key");
     }
@@ -72,7 +69,7 @@ function requestError(error: unknown): ProviderResult {
 
 async function invoke(
   input: ProviderInvokeInput,
-  output: ProviderOutput,
+  _output: ProviderOutput,
   context: PluginContext,
 ): Promise<ProviderResult> {
   if (!input.resource) {
@@ -89,11 +86,13 @@ async function invoke(
     return invalidResult(message, message);
   }
   const { protocol, url } = endpointFor(origin, nativeEndpoints(input.model));
-  const call = { url, model: input.model.id, request: input.request, headers };
   try {
-    if (protocol === "responses") await streamOpenAiResponses(call, output, context);
-    else if (protocol === "messages") await streamAnthropic(call, output, context);
-    else await streamOpenAiChat(call, output, context);
+    await context.protocol.stream({
+      protocol: protocolName(protocol),
+      url,
+      model: input.model.id,
+      headers,
+    });
     return { status: "completed" };
   } catch (error) {
     return requestError(error);

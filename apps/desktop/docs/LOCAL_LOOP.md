@@ -17,9 +17,10 @@ cursor-byok/server/src/                         apps/desktop/src/
 ├── cursor/protocol/connect.rs                  protocol/connect.rs          55  Connect 5 字节帧
 ├── cursor/protocol/json.rs                     protocol/json.rs             73  prost JSON
 ├── cursor/protocol/proto.rs                    protocol/proto.rs            44  agent.v1 + run_inference
-├── plugin/wire.rs                              plugins/wire.rs             287  LlmRequest / ModelEvent
-├── plugin/worker.rs                            plugins/worker.rs           875  JSONL + Event + SSE 流
-├── plugin/registry.rs stream_model             plugins/host.rs            1294  Magpie invoke
+├── plugin/wire.rs                              plugins/wire.rs             382  LlmRequest / ModelEvent
+├── plugin/worker.rs                            plugins/worker.rs          1185  JSONL + protocol.stream
+├── plugin/registry.rs stream_model             plugins/host.rs            1481  Magpie invoke + 请求登记
+├── plugin/sdk/protocol/*.ts                    plugins/adapters/          2658  Chat / Responses / Anthropic
 ├── api/cursor/handlers.rs                      backend/mod.rs              468  路由、RunInferenceSSE、BidiAppend
 ├── api/cursor/proxy.rs                         backend/proxy.rs            209  只转发 *.cursor.sh HTTPS
 ├── cursor/services/account.rs                  backend/account.rs          336  本地 token → Ultra stub
@@ -47,7 +48,7 @@ Cursor agent-host（managed-local）
 Local serve()
 ├── RunRequest → RunReady（vendor / summarization / subagent / 本地 rules）
 ├── InvokeModel → PluginHost.stream_model → Magpie provider.invoke
-│                  → network.stream.open/read → ModelEvent → InferenceStreamResponse
+│                  → protocol.stream → Rust 适配器 HTTP/SSE → ModelEvent → InferenceStreamResponse
 ├── CancelInvocation / FinishRun → CancellationToken
 ├── 最后读流断开 → 300s 重连宽限期；超时取消 Run / 插件 HTTP 并释放输出
 └── ResolveSubagentModels → 已配置 Magpie hash
@@ -59,7 +60,7 @@ Local serve()
 
 | # | 主题 | 上游 | nsh 版 | 原因 |
 |---|---|---|---|---|
-| 1 | Provider | 内置 OpenAI/Anthropic HTTP + Magpie | 只 Magpie `provider.invoke` | AGENTS.md：不做 engine，也不引入内置 HTTP provider |
+| 1 | Provider | 内置 OpenAI/Anthropic HTTP + Magpie | Magpie `provider.invoke` + 宿主协议适配器 | AGENTS.md：不做 engine；标准协议在 `plugins/adapters/`，见 `PLUGIN_PROTOCOL_ADAPTERS.md` |
 | 2 | AgentService/Run* | 有 RunSSE handler + RunEngine | 不进白名单，无 handler | backend loop 需要 engine；local loop 拒绝的 turn 必须仍可达官方 |
 | 3 | 知识库 | 上游优先 + journal 回放 | 只本地 md CRUD | 本仓库不做 journal 同步；读失败返回空列表，不阻断 RunInference |
 | 4 | WriteGitCommitMessage | 可配本地模型生成 | 一律转发官方 | 没有 commit settings / Store |
@@ -104,4 +105,4 @@ cargo test -p nsh-app-cursor-byok-next --lib
 cd apps/desktop && nsh check && nsh test
 ```
 
-`plugin_model_starts_a_local_inference_run` 覆盖：`plugin:` id 的 BidiAppend 开本地 Run，RunInferenceSSE 立刻给出 `RunReady`。`the_last_subscription_cancels_a_disconnected_run_after_its_grace_period` 用虚拟时钟覆盖重连与超时清理；`magpie_invocation_serializes_files_and_propagates_cancellation` 走真实 Bun + 本地假网关，验证 Responses / Chat 的 PDF、Messages 的纯文本文档，以及取消后关闭上游 HTTP。`magpie_catalog_through_real_bun` 继续覆盖模型目录 worker 路径；真实 Cursor + 已配置 Magpie 网关的端到端 turn 仍需单独验收。
+`plugin_model_starts_a_local_inference_run` 覆盖：`plugin:` id 的 BidiAppend 开本地 Run，RunInferenceSSE 立刻给出 `RunReady`。`the_last_subscription_cancels_a_disconnected_run_after_its_grace_period` 用虚拟时钟覆盖重连与超时清理；`magpie_invocation_serializes_files_and_propagates_cancellation` 走真实 Bun + 本地假网关，验证 Responses / Chat 的 PDF、Messages 的纯文本文档，以及取消后关闭上游 HTTP。`magpie_invocation_marks_resource_invalid_on_http_401` 覆盖鉴权失败把资源标为 `invalid`。`magpie_catalog_through_real_bun` 继续覆盖模型目录 worker 路径；协议请求体与 SSE 等价性见 `PLUGIN_PROTOCOL_ADAPTERS.md`。真实 Cursor + 已配置 Magpie 网关的端到端 turn 仍需单独验收。

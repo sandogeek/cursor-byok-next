@@ -31,12 +31,13 @@ cursor-byok-nsh/
     │   ├── CURSOR_UI.md           # 接管页 UI
     │   ├── I18N.md                # 界面语言（nsh/i18n）
     │   ├── PLUGIN_CATALOG.md      # Magpie 插件目录
+    │   ├── PLUGIN_PROTOCOL_ADAPTERS.md # 协议适配器下沉 Rust
     │   ├── LOCAL_LOOP.md          # local loop 服务端接入
     │   └── MODEL_CALLS.md         # Magpie 调用记录
     └── src/
         ├── lib.rs                 # #[native_module("cursor-byok-next/native")]：Harness + Plugins + Calls
         ├── harness/               # 上游 server/src/local_app 的移植
-        ├── plugins/               # 插件宿主、Bun worker、Magpie 目录
+        ├── plugins/               # 插件宿主、Bun worker、Magpie 目录、协议适配器
         ├── calls/                 # 调用记录 SQLite 与生命周期
         ├── screens/               # Cursor / Plugins / Language / Calls / CallDetails
         └── ui/                    # 样式控件 + localized()
@@ -93,7 +94,7 @@ cursor-byok-nsh/
 | CA 主题 | `Cursor-BYOK-Next Local CA` / `Cursor-BYOK-Next` |
 | Linux 锚文件 | `cursor-byok-next-local-ca.crt` |
 | Magpie 插件 id | `dev.cursorbyoknext.plugins.magpie` |
-| 插件 SDK specifier | `cursor-byok-next:plugin` / `:provider` / `:model` / `:resource` / `:protocol/*` |
+| 插件 SDK specifier | `cursor-byok-next:plugin` / `:provider` / `:model` / `:resource` |
 | descriptor 前缀 | `CURSOR_BYOK_NEXT_PLUGIN_DEFINITION:` |
 
 上游 `cursor-byok` 的名字只作为移植来源出现在对照表里，不作为本应用的标识。
@@ -131,3 +132,4 @@ nsh package --target macos
 - [x] local loop 服务端接入（`set_backend_addr`）：只做 `InferenceService/RunInferenceSSE` + `BidiService/BidiAppend`；`AgentService/Run*` 属 backend loop，不接管（见 `docs/protocol/cursor-agent-loop-routing.md`、`apps/desktop/docs/LOCAL_LOOP.md`）
 - [x] 把 Magpie 模型广告给 Cursor picker
 - [x] 模型调用 / 调用记录（见 `apps/desktop/docs/MODEL_CALLS.md`）
+- [x] 插件协议适配器下沉 Rust（见 `apps/desktop/docs/PLUGIN_PROTOCOL_ADAPTERS.md`）

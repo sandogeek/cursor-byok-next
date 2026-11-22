@@ -23,14 +23,14 @@ cursor-byok/server/src/plugin/              apps/desktop/src/plugins/
 └── sdk/            Deno import map           └── sdk/             Bun `tsconfig` 路径映射
     ├── plugin.ts / model.ts / resource.ts
     ├── collect.ts / worker.ts
-    └── protocol/*.ts                         （首期不调用，仅保持 SDK 完整）
+    （`:protocol/*` 已删除，见 PLUGIN_PROTOCOL_ADAPTERS.md）
 
 cursor-byok/server/plugins/build-in/magpie/ apps/desktop/plugins/build-in/magpie/
 ├── plugin.json / main.ts / catalog.ts / resources.ts / provider.ts
 └── magpie_test.ts                            生产解析与表单由真实 Bun 集成测试覆盖
 ```
 
-按 `wc -l` 统计，含测试和空行、不含生成代码：Rust 宿主约 3400 行，Magpie 插件 TS 313 行，SDK 核心/worker TS 742 行，另有未接入调用链的协议 helper TS 1175 行。nsh 侧新增 `src/screens/Plugins.tsx`：NSH mixed 应用当前没有 `.nshpkg` 加载 API，插件配置页先做在宿主 TSX 里；`PluginHost` 的 native 导出仍是后续签名包可复用的边界。
+按 `wc -l` 统计，含测试和空行、不含生成代码：Rust 宿主（不含 adapters）约 5000 行，协议适配器约 2658 行，Magpie 插件 TS 312 行，SDK 核心/worker TS 779 行。nsh 侧新增 `src/screens/Plugins.tsx`：NSH mixed 应用当前没有 `.nshpkg` 加载 API，插件配置页先做在宿主 TSX 里；`PluginHost` 的 native 导出仍是后续签名包可复用的边界。协议转发见 `PLUGIN_PROTOCOL_ADAPTERS.md`。
 
 ## 本步边界
 
@@ -46,10 +46,10 @@ cursor-byok/server/plugins/build-in/magpie/ apps/desktop/plugins/build-in/magpie
 |---|---|---|---|---|
 | 1 | 运行时 | Deno 子进程 | PATH 上的 `bun` | 用户指定 Bun；首期不捆绑运行时二进制 |
 | 2 | UI 交付 | React 插件页 | 宿主 TSX 插件页，native API 预留给 `.nshpkg` | NSH 签名包是 TSX-only，当前没有 headless package runner |
-| 3 | 能力范围 | `models.list` + `provider.invoke` + OAuth/import | 只实现 form 添加、present、remove、`models.list` | 调用接到 `LOCAL_LOOP.md` |
+| 3 | 能力范围 | `models.list` + `provider.invoke` + OAuth/import | form 添加、present、remove、`models.list`、invoke | invoke 接到 `LOCAL_LOOP.md`；协议适配器见 `PLUGIN_PROTOCOL_ADAPTERS.md` |
 | 4 | 模型广告 | 追加到 Cursor AvailableModels | 本步只在插件页展示 | 广告接到 `LOCAL_LOOP.md` |
 | 5 | 运行时安装 | 下载/校验 Deno | 检测 PATH 上的 bun | 不引入运行时分发 |
-| 6 | SDK 协议 helper | Deno import map 含 openai/anthropic | 文件保留，invoke 由 local loop 接线 | 见 `LOCAL_LOOP.md` |
+| 6 | SDK 协议 helper | Deno import map 含 openai/anthropic | 已删除；`context.protocol.stream` 走 Rust 适配器 | 见 `PLUGIN_PROTOCOL_ADAPTERS.md` |
 | 7 | 内置插件加载 | 从安装目录发现插件 | 内嵌 Magpie，collector 与 worker 共用 `--tsconfig-override` | 修复 Bun specifier 解析，不执行任意安装目录中的代码 |
 | 8 | 失败反馈 | 通用插件错误 | 按资源保留旧目录和失败信息；存储读失败单独提示；不回显网关响应体 | 让用户区分离线、未配置与本地存储故障 |
 

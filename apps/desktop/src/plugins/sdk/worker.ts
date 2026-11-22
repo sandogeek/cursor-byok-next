@@ -1,5 +1,11 @@
 import { argv, stdin, stdout } from "node:process";
-import { __getRegisteredPlugin, type JsonValue, type NetworkEventStream, type PluginContext } from "cursor-byok-next:plugin";
+import {
+  ProtocolHttpError,
+  __getRegisteredPlugin,
+  type JsonValue,
+  type NetworkEventStream,
+  type PluginContext,
+} from "cursor-byok-next:plugin";
 import type { ModelEvent, ProviderSupport } from "cursor-byok-next:provider";
 import type { ResourceAddMethod, ResourceSupport } from "cursor-byok-next:resource";
 
@@ -65,6 +71,9 @@ function contextFor(requestId: string, signal: AbortSignal): PluginContext {
           lines: streamLines(requestId, opened.streamId),
         };
       },
+    },
+    protocol: {
+      stream: (input) => hostCall(requestId, "protocol.stream", input).then(() => undefined),
     },
     signal,
   };
@@ -216,7 +225,14 @@ function handleLine(line: string) {
     const pending = pendingHost.get(message.id);
     if (!pending) return;
     pendingHost.delete(message.id);
-    pending.reject(new Error(message.error));
+    pending.reject(
+      typeof message.status === "number"
+        ? new ProtocolHttpError(
+          message.status,
+          String(message.error ?? "").replace(new RegExp(`^HTTP ${message.status}: `), ""),
+        )
+        : new Error(message.error),
+    );
   }
 }
 

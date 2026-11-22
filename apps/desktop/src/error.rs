@@ -47,6 +47,9 @@ impl From<crate::plugins::Error> for Error {
             crate::plugins::Error::Protocol(message) => Self::Protocol(message),
             crate::plugins::Error::Provider(message) => Self::Provider(message),
             crate::plugins::Error::NotFound(message) => Self::NotFound(message),
+            crate::plugins::Error::HttpStatus { status, body } => {
+                Self::Provider(format!("HTTP {status}: {body}"))
+            }
             crate::plugins::Error::Cancelled => Self::Cancelled,
             crate::plugins::Error::Json(error) => Self::Json(error),
             crate::plugins::Error::Io(error) => Self::Io(error),

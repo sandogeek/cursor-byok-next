@@ -40,8 +40,28 @@ export type PluginContext = {
     fetch(url: string, init?: NetworkRequestInit): Promise<NetworkResponse>;
     stream(url: string, init?: NetworkRequestInit): Promise<NetworkEventStream>;
   };
+  protocol: {
+    /** 宿主构建请求体、发起 HTTP、解析 SSE；事件写入本次 invocation 流。 */
+    stream(input: ProtocolStreamInput): Promise<void>;
+  };
   signal: AbortSignal;
 };
+
+export type ProtocolStreamInput = {
+  protocol: "openai-chat" | "openai-responses" | "anthropic";
+  /** 上游固定端点；origin 必须是本次绑定资源或 plugin.json 声明的 HTTPS 主机。 */
+  url: string;
+  /** 发给网关的裸上游模型 ID。 */
+  model: string;
+  headers?: Record<string, string>;
+};
+
+/** 上游返回非 2xx 时抛出，携带截断后的响应体供调用方分类。 */
+export class ProtocolHttpError extends Error {
+  constructor(readonly status: number, readonly body: string) {
+    super(`HTTP ${status}: ${body}`);
+  }
+}
 
 /**
  * Provider 插件定义:一组能力实现的集合。插件不持有任何持久状态——

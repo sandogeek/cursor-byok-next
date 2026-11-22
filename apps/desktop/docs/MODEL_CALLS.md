@@ -13,7 +13,7 @@ cursor-byok/server/src/                         apps/desktop/src/
 ├── store/storage.rs              111  清理计数      calls/store.rs          无官方 trace
 ├── provider/recorder.rs          463  调用生命周期  calls/recorder.rs       观测失败不阻断模型
 ├── provider/event.rs              55  TTFR 判定     provider.rs             is_valid_response_event
-├── plugin/worker.rs              首个 HTTP 认领     plugins/worker.rs       脱敏头 + 原始 chunk
+├── plugin/worker.rs              首个 HTTP 认领     plugins/worker.rs       脱敏头 + 原始 chunk；protocol.stream 共用 prepare_request
 ├── plugin/registry.rs            传入 recorder      plugins/host.rs         stream_model(..., recorder)
 ├── cursor/inference/service.rs   InvokeModel        loop_service/service.rs 开始 / 事件 / 终态
 └── control/service.rs            HTTP API           lib.rs Calls class      native 查询与命令
@@ -31,7 +31,7 @@ cursor-byok/apps/desktop/src/features/calls/    apps/desktop/src/screens/
 InvokeModel
   → CallRecorder::start（运行中，快照详细模式）
   → PluginHost.stream_model(recorder)
-  → 插件首个 network.fetch / network.stream.open
+  → 插件首个 protocol.stream（或仍走 network.fetch / network.stream.open 的自定义协议）
       → 脱敏请求头 + 请求体、HTTP 状态、原始响应字节
   → 每个 ModelEvent → TTFR / TTFT / Usage
   → 网络分块进入有界观测队列，独立 writer 批量落库

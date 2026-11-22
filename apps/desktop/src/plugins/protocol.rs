@@ -20,6 +20,8 @@ pub enum HostMessage<'a> {
     HostError {
         id: &'a str,
         error: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
     },
 }
 
@@ -74,5 +76,24 @@ mod tests {
             }
             _ => panic!("expected host call"),
         }
+    }
+
+    #[test]
+    fn serializes_host_error_status_only_when_present() {
+        let with_status = serde_json::to_value(&HostMessage::HostError {
+            id: "host-1",
+            error: "HTTP 401: unauthorized",
+            status: Some(401),
+        })
+        .unwrap();
+        assert_eq!(with_status["type"], "host_error");
+        assert_eq!(with_status["status"], 401);
+        let without_status = serde_json::to_value(&HostMessage::HostError {
+            id: "host-1",
+            error: "plugin host call failed",
+            status: None,
+        })
+        .unwrap();
+        assert!(without_status.get("status").is_none());
     }
 }

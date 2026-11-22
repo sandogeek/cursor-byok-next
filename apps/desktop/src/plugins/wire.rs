@@ -1,6 +1,7 @@
 //! Translates between core model types and the plugin SDK wire contract.
 
 use base64::{Engine, engine::general_purpose::STANDARD};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     model::{
@@ -10,6 +11,94 @@ use crate::{
     plugins::{Error, Result},
     provider::{FinishReason, ModelEvent},
 };
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmRequest {
+    pub instructions: String,
+    pub messages: Vec<LlmMessage>,
+    pub tools: Vec<LlmTool>,
+    pub reasoning: LlmReasoning,
+    pub latency: String,
+    pub max_output_tokens: Option<u64>,
+    pub cache_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmReasoning {
+    pub enabled: bool,
+    pub effort: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmTool {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum LlmContentPart {
+    Text {
+        text: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Image {
+        media_type: String,
+        data_base64: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    File {
+        media_type: String,
+        filename: Option<String>,
+        data_base64: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmReplayState {
+    pub provider_kind: String,
+    pub value: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmToolCall {
+    pub index: usize,
+    pub call_id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "role", rename_all = "camelCase")]
+pub enum LlmMessage {
+    System {
+        content: Vec<LlmContentPart>,
+    },
+    User {
+        content: Vec<LlmContentPart>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Assistant {
+        text: String,
+        thinking: String,
+        replay_state: Option<LlmReplayState>,
+        tool_calls: Vec<LlmToolCall>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Tool {
+        call_id: String,
+        name: String,
+        content: String,
+        is_error: bool,
+        parts: Vec<LlmContentPart>,
+    },
+}
 
 pub fn llm_request(invocation: &ModelInvocation) -> Result<serde_json::Value> {
     let request = &invocation.request;
@@ -262,6 +351,8 @@ mod tests {
             },
         };
         let request = llm_request(&invocation).unwrap();
+        let parsed: LlmRequest = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), request);
         assert_eq!(request["instructions"], "be brief");
         assert_eq!(request["latency"], "standard");
         assert_eq!(request["cacheKey"], "conversation");

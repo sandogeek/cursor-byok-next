@@ -360,6 +360,7 @@ impl PluginHost {
                 object.insert("id".into(), serde_json::Value::String(upstream.to_owned()));
             }
             let request = wire::llm_request(&invocation)?;
+            let llm_request = serde_json::from_value(request.clone())?;
             let params = serde_json::json!({
                 "providerId": provider_id,
                 "model": model_snapshot,
@@ -375,6 +376,7 @@ impl PluginHost {
                     cancellation.clone(),
                     recorder.clone(),
                     origins,
+                    Some(llm_request),
                 )
                 .await?;
             yield ModelEvent::Start {
@@ -383,7 +385,7 @@ impl PluginHost {
             while let Some(item) = items.recv().await {
                 match item {
                     WorkerStreamItem::Event(event) => {
-                        yield wire::model_event(&event)?;
+                        yield event;
                     }
                     WorkerStreamItem::Result(result) => {
                         let value = result?;
@@ -1073,6 +1075,20 @@ mod tests {
         Arc<Notify>,
         tokio::task::JoinHandle<()>,
     ) {
+        invocation_gateway_with_status(endpoint, events, 200).await
+    }
+
+    async fn invocation_gateway_with_status(
+        endpoint: &'static str,
+        events: &'static str,
+        status: u16,
+    ) -> (
+        String,
+        Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+        Arc<Notify>,
+        Arc<Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -1105,11 +1121,26 @@ mod tests {
                         serde_json::from_str(&text[body_start..]).unwrap();
                     requests.lock().await.push(body);
                     received.notify_waiters();
+                    let (status_line, extra_headers) = if status == 200 {
+                        ("HTTP/1.1 200 OK", "Content-Type: text/event-stream\r\n")
+                    } else {
+                        (
+                            "HTTP/1.1 401 Unauthorized",
+                            "Content-Type: text/plain\r\nContent-Length: 12\r\n",
+                        )
+                    };
                     socket
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                        .write_all(
+                            format!("{status_line}\r\n{extra_headers}Connection: close\r\n\r\n")
+                                .as_bytes(),
+                        )
                         .await
                         .unwrap();
                     if socket.write_all(events.as_bytes()).await.is_err() {
+                        disconnected.notify_waiters();
+                        continue;
+                    }
+                    if status != 200 {
                         disconnected.notify_waiters();
                         continue;
                     }
@@ -1386,6 +1417,46 @@ mod tests {
         let call = store.llm_call("cancelled-call").await.unwrap().unwrap();
         assert_eq!(call.status, "cancelled");
         messages.4.abort();
+    }
+
+    #[tokio::test]
+    async fn magpie_invocation_marks_resource_invalid_on_http_401() {
+        assert!(
+            find_bun().is_some(),
+            "install Bun on PATH to run the Magpie integration test"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let gateway =
+            invocation_gateway_with_status("/v1/chat/completions", "unauthorized\n", 401).await;
+        let host = configured_invocation_host(temp.path(), gateway.0).await;
+        let mut stream = host.0.stream_model(
+            invocation(host.1, Vec::new()),
+            CancellationToken::new(),
+            None,
+        );
+        let mut error = None;
+        while let Some(event) = stream.next().await {
+            if let Err(failed) = event {
+                error = Some(failed.to_string());
+            }
+        }
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|message| message.contains("HTTP 401")),
+            "{error:?}"
+        );
+        let snapshot = host.0.snapshot().await;
+        match &snapshot.plugins[0].resources[0].resources[0].state {
+            crate::plugins::ResourceState::Invalid { message } => {
+                assert_eq!(
+                    message.as_deref(),
+                    Some("Magpie authorization failed; check the API key")
+                );
+            }
+            other => panic!("expected invalid resource, got {other:?}"),
+        }
+        gateway.4.abort();
     }
 
     #[test]

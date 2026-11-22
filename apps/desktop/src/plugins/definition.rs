@@ -50,7 +50,6 @@ impl PluginDefinitionLoader {
         let workspace = Arc::new(RuntimeDirectory(path));
         let sdk_dir = workspace.0.join("sdk");
         std::fs::create_dir_all(&sdk_dir)?;
-        std::fs::create_dir_all(sdk_dir.join("protocol"))?;
         let bunfig = sdk_dir.join("bunfig.toml");
         let tsconfig = sdk_dir.join("tsconfig.json");
         let collector = sdk_dir.join("collect.ts");
@@ -70,18 +69,6 @@ impl PluginDefinitionLoader {
                 &sdk_dir.join("resource.ts"),
                 include_str!("sdk/resource.ts"),
             ),
-            (
-                &sdk_dir.join("protocol/openai_responses.ts"),
-                include_str!("sdk/protocol/openai_responses.ts"),
-            ),
-            (
-                &sdk_dir.join("protocol/openai_chat.ts"),
-                include_str!("sdk/protocol/openai_chat.ts"),
-            ),
-            (
-                &sdk_dir.join("protocol/anthropic.ts"),
-                include_str!("sdk/protocol/anthropic.ts"),
-            ),
         ];
         for (path, content) in &modules {
             std::fs::write(path, content)?;
@@ -90,10 +77,6 @@ impl PluginDefinitionLoader {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&sdk_dir, std::fs::Permissions::from_mode(0o700))?;
-            std::fs::set_permissions(
-                sdk_dir.join("protocol"),
-                std::fs::Permissions::from_mode(0o700),
-            )?;
             for (path, _) in &modules {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
             }

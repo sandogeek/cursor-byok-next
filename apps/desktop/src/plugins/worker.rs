@@ -25,8 +25,9 @@ use super::{
     definition::{PluginDefinitionLoader, file_url},
     origin,
     protocol::{HostMessage, WorkerMessage},
+    wire::{self, LlmRequest},
 };
-use crate::calls::CallRecorder;
+use crate::{calls::CallRecorder, provider::ModelEvent};
 
 const INVOCATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_NETWORK_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
@@ -34,7 +35,7 @@ const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum WorkerStreamItem {
-    Event(serde_json::Value),
+    Event(ModelEvent),
     Result(Result<serde_json::Value>),
 }
 
@@ -72,6 +73,7 @@ impl Pending {
         let id = uuid::Uuid::new_v4().to_string();
         let (items, receiver) = mpsc::unbounded_channel();
         let (active, _) = watch::channel(());
+        *state.events.lock() = Some(items.clone());
         self.0
             .lock()
             .as_mut()
@@ -153,21 +155,35 @@ impl Drop for WorkerProcess {
     }
 }
 
-struct InvocationState {
+pub(super) struct InvocationState {
     allowed_origins: HashSet<String>,
     magpie_catalog_status: Option<AtomicU16>,
-    cancellation: CancellationToken,
+    pub(super) cancellation: CancellationToken,
     recorder: Option<CallRecorder>,
     recorder_claimed: AtomicBool,
+    llm_request: Option<LlmRequest>,
+    events: parking_lot::Mutex<Option<mpsc::UnboundedSender<WorkerStreamItem>>>,
 }
 
 impl InvocationState {
-    fn claim_recorder(&self) -> Option<CallRecorder> {
+    pub(super) fn claim_recorder(&self) -> Option<CallRecorder> {
         self.recorder.as_ref().and_then(|recorder| {
             self.recorder_claimed
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .ok()
                 .map(|_| recorder.clone())
+        })
+    }
+
+    pub(super) fn emit(&self, event: ModelEvent) {
+        if let Some(events) = self.events.lock().as_ref() {
+            let _ = events.send(WorkerStreamItem::Event(event));
+        }
+    }
+
+    pub(super) fn llm_request(&self) -> Result<&LlmRequest> {
+        self.llm_request.as_ref().ok_or_else(|| {
+            Error::Protocol("protocol.stream requires a registered model request".into())
         })
     }
 
@@ -187,7 +203,7 @@ impl InvocationState {
 }
 
 #[derive(Clone)]
-struct HostContext {
+pub(super) struct HostContext {
     plugin_id: String,
     network_hosts: Arc<HashSet<String>>,
     resource_origin: bool,
@@ -235,6 +251,7 @@ impl PluginWorker {
                 CancellationToken::new(),
                 None,
                 allowed_origins,
+                None,
             )
             .await?;
         match tokio::time::timeout(INVOCATION_TIMEOUT, async {
@@ -265,6 +282,7 @@ impl PluginWorker {
         cancellation: CancellationToken,
         recorder: Option<CallRecorder>,
         allowed_origins: HashSet<String>,
+        llm_request: Option<LlmRequest>,
     ) -> Result<mpsc::UnboundedReceiver<WorkerStreamItem>> {
         let (writer, pending) = self.connection().await?;
         let permit = writer
@@ -280,6 +298,8 @@ impl PluginWorker {
             cancellation: request_cancellation.clone(),
             recorder,
             recorder_claimed: AtomicBool::new(false),
+            llm_request,
+            events: parking_lot::Mutex::new(None),
         })?;
         permit.send(encode_message(&HostMessage::Request {
             id: &request.id,
@@ -418,7 +438,14 @@ async fn read_stdout(
             }
             WorkerMessage::Event { id, event } => {
                 if let Some(sender) = pending.sender(&id) {
-                    let _ = sender.send(WorkerStreamItem::Event(event));
+                    match wire::model_event(&event) {
+                        Ok(event) => {
+                            let _ = sender.send(WorkerStreamItem::Event(event));
+                        }
+                        Err(error) => {
+                            let _ = sender.send(WorkerStreamItem::Result(Err(error)));
+                        }
+                    }
                 }
             }
             WorkerMessage::HostCall {
@@ -439,7 +466,20 @@ async fn read_stdout(
                         _ = async {
                             let response = match host.call(&invocation, &method, params).await {
                                 Ok(result) => encode_message(&HostMessage::HostResult { id: &id, result: &result }),
-                                Err(_) => encode_message(&HostMessage::HostError { id: &id, error: "plugin host call failed" }),
+                                Err(error) => {
+                                    let (message, status) = match error {
+                                        Error::HttpStatus { status, body } => {
+                                            (format!("HTTP {status}: {body}"), Some(status))
+                                        }
+                                        Error::Cancelled => ("run was cancelled".into(), None),
+                                        error => (error.to_string(), None),
+                                    };
+                                    encode_message(&HostMessage::HostError {
+                                        id: &id,
+                                        error: &message,
+                                        status,
+                                    })
+                                }
                             };
                             if let Ok(bytes) = response {
                                 let _ = writer.send(bytes).await;
@@ -488,23 +528,21 @@ impl HostContext {
                     .remove(required_string(&params, "streamId")?);
                 Ok(serde_json::Value::Null)
             }
+            "protocol.stream" => super::adapters::stream(self, invocation, params).await,
             _ => Err(Error::Protocol(format!(
                 "unsupported plugin host method: {method}"
             ))),
         }
     }
 
-    async fn request(
+    pub(super) async fn prepare_request(
         &self,
         invocation: &InvocationState,
-        params: &serde_json::Value,
-    ) -> Result<(
-        reqwest::RequestBuilder,
-        reqwest::Url,
-        reqwest::Method,
-        Option<CallRecorder>,
-    )> {
-        let raw_url = required_string(params, "url")?;
+        raw_url: &str,
+        method: reqwest::Method,
+        headers: &std::collections::HashMap<String, String>,
+        body: Option<&str>,
+    ) -> Result<(reqwest::RequestBuilder, Option<CallRecorder>)> {
         let url = url::Url::parse(raw_url)
             .map_err(|error| Error::Config(format!("invalid plugin network URL: {error}")))?;
         if !url.username().is_empty() || url.password().is_some() {
@@ -530,34 +568,68 @@ impl HostContext {
                 self.plugin_id
             )));
         }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|error| Error::Config(format!("cannot build plugin HTTP client: {error}")))?;
+        let mut request = client.request(method, url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        if let Some(body) = body {
+            request = request.body(body.to_owned());
+        }
+        let recorder = invocation.claim_recorder();
+        if let Some(recorder) = &recorder {
+            let mut recorded_headers = serde_json::Map::new();
+            for (name, value) in headers {
+                if !crate::calls::is_sensitive_header(name) {
+                    recorded_headers.insert(name.clone(), value.clone().into());
+                }
+            }
+            let recorded_body = body
+                .map(|body| serde_json::from_str(body).unwrap_or_else(|_| body.into()))
+                .unwrap_or(serde_json::Value::Null);
+            recorder
+                .request(serde_json::Value::Object(recorded_headers), &recorded_body)
+                .await?;
+        }
+        Ok((request, recorder))
+    }
+
+    async fn request(
+        &self,
+        invocation: &InvocationState,
+        params: &serde_json::Value,
+    ) -> Result<(
+        reqwest::RequestBuilder,
+        reqwest::Url,
+        reqwest::Method,
+        Option<CallRecorder>,
+    )> {
+        let raw_url = required_string(params, "url")?;
+        let url = url::Url::parse(raw_url)
+            .map_err(|error| Error::Config(format!("invalid plugin network URL: {error}")))?;
         let method = params
             .get("method")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("GET")
             .parse::<reqwest::Method>()
             .map_err(|error| Error::Config(format!("invalid plugin HTTP method: {error}")))?;
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|error| Error::Config(format!("cannot build plugin HTTP client: {error}")))?;
-        let mut request = client.request(method.clone(), url.clone());
-        if let Some(headers) = params.get("headers").and_then(serde_json::Value::as_object) {
-            for (name, value) in headers {
+        let mut headers = std::collections::HashMap::new();
+        if let Some(map) = params.get("headers").and_then(serde_json::Value::as_object) {
+            for (name, value) in map {
                 let value = value.as_str().ok_or_else(|| {
                     Error::Config(format!("plugin HTTP header '{name}' must be a string"))
                 })?;
-                request = request.header(name, value);
+                headers.insert(name.clone(), value.to_owned());
             }
         }
-        if let Some(body) = params.get("body").and_then(serde_json::Value::as_str) {
-            request = request.body(body.to_owned());
-        }
-        let recorder = invocation.claim_recorder();
-        if let Some(recorder) = &recorder {
-            let (headers, body) = recorded_network_request(params)?;
-            recorder.request(headers, &body).await?;
-        }
+        let body = params.get("body").and_then(serde_json::Value::as_str);
+        let (request, recorder) = self
+            .prepare_request(invocation, raw_url, method.clone(), &headers, body)
+            .await?;
         Ok((request, url, method, recorder))
     }
 
@@ -777,6 +849,7 @@ fn required_string<'a>(params: &'a serde_json::Value, key: &str) -> Result<&'a s
         .ok_or_else(|| Error::Protocol(format!("plugin host call requires string '{key}'")))
 }
 
+#[cfg(test)]
 fn recorded_network_request(
     params: &serde_json::Value,
 ) -> Result<(serde_json::Value, serde_json::Value)> {
@@ -810,6 +883,8 @@ mod tests {
             cancellation: CancellationToken::new(),
             recorder: None,
             recorder_claimed: AtomicBool::new(false),
+            llm_request: None,
+            events: parking_lot::Mutex::new(None),
         }
     }
 
@@ -838,6 +913,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protocol_stream_rejects_unregistered_requests_and_foreign_hosts() {
+        let host = host();
+        let missing = host
+            .call(
+                &invocation(HashSet::from(["http://127.0.0.1:1".into()])),
+                "protocol.stream",
+                serde_json::json!({
+                    "protocol": "openai-chat",
+                    "url": "http://127.0.0.1:1/v1/chat/completions",
+                    "model": "gpt"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(missing.to_string().contains("registered model request"));
+
+        let mut registered = invocation(HashSet::from(["http://127.0.0.1:1".into()]));
+        registered.llm_request = Some(crate::plugins::wire::LlmRequest {
+            instructions: String::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            reasoning: crate::plugins::wire::LlmReasoning {
+                enabled: false,
+                effort: None,
+            },
+            latency: "standard".into(),
+            max_output_tokens: None,
+            cache_key: None,
+        });
+        let foreign = host
+            .call(
+                &registered,
+                "protocol.stream",
+                serde_json::json!({
+                    "protocol": "openai-chat",
+                    "url": "http://10.0.0.2/v1/chat/completions",
+                    "model": "gpt"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(foreign.to_string().contains("cannot access host"));
+        let credentials = host
+            .call(
+                &registered,
+                "protocol.stream",
+                serde_json::json!({
+                    "protocol": "openai-chat",
+                    "url": "http://user:pass@127.0.0.1:1/v1/chat/completions",
+                    "model": "gpt"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(credentials.to_string().contains("must not contain credentials"));
+    }
+
+    #[tokio::test]
     async fn magpie_catalog_reports_only_the_host_observed_status() {
         use tokio::io::AsyncReadExt;
 
@@ -859,6 +992,8 @@ mod tests {
             cancellation: CancellationToken::new(),
             recorder: None,
             recorder_claimed: AtomicBool::new(false),
+            llm_request: None,
+            events: parking_lot::Mutex::new(None),
         };
         assert!(!invocation.failure().to_string().contains("HTTP"));
         let result = host
@@ -999,6 +1134,8 @@ mod tests {
             cancellation: CancellationToken::new(),
             recorder: Some(recorder),
             recorder_claimed: AtomicBool::new(false),
+            llm_request: None,
+            events: parking_lot::Mutex::new(None),
         }
     }
 

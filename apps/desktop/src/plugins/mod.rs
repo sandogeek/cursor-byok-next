@@ -1,5 +1,6 @@
 //! Owns discovery and Bun workers for trusted built-in plugins.
 
+mod adapters;
 mod builtin;
 mod catalog;
 mod data;
