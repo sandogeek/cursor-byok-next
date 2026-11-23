@@ -29,6 +29,17 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## Agent skills
+
+`.agents/skills/` vendors five skills for coding agents working in this repository:
+
+| Directory | Source | License |
+|---|---|---|
+| `nsh/`, `nsh-design-guides/` | [longbridge/nsh](https://github.com/longbridge/nsh) | Apache-2.0 |
+| `rust-best-practices/`, `rust-port/`, `rust-review/` | [morganlinton/BeautifulRust](https://github.com/morganlinton/BeautifulRust) | MIT |
+
+They are reference material for agents and are not part of the application build.
+
 ## Runtime dependencies
 
 The remaining dependencies are crates from crates.io and NSH (MIT/Apache-2.0); `cargo install cargo-about` can list them with their licenses when a notice is required.
