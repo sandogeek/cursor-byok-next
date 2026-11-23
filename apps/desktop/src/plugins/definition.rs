@@ -39,12 +39,17 @@ impl PluginDefinitionLoader {
         let path = parent
             .canonicalize()?
             .join(format!("cursor-byok-next-plugin-{}", uuid::Uuid::new_v4()));
-        let mut directory = std::fs::DirBuilder::new();
+        // The workspace holds plugin code another user must not read or
+        // replace, so it is created 0o700 where the platform has modes.
         #[cfg(unix)]
-        {
+        let directory = {
             use std::os::unix::fs::DirBuilderExt;
-            directory.mode(0o700);
-        }
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+        };
+        #[cfg(not(unix))]
+        let directory = std::fs::DirBuilder::new();
         // Create a new isolated copy; never reuse code under a discoverable install path.
         directory.create(&path)?;
         let workspace = Arc::new(RuntimeDirectory(path));

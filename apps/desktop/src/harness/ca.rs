@@ -187,6 +187,8 @@ fn parse_issuer(cert: &str, key: &str) -> Result<Issuer<'static, KeyPair>> {
 }
 
 fn write_atomic(path: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = mode;
     let temp = path.with_extension("tmp");
     fs::write(&temp, data)?;
     #[cfg(unix)]

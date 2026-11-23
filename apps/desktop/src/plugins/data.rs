@@ -146,7 +146,14 @@ fn validate_component(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn set_directory_permissions(path: &Path) -> Result<()> {
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "the caller treats a permission failure the same on every platform, but only Unix has a way to fail here"
+    )
+)]
+fn set_directory_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
