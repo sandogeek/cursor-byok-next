@@ -29,6 +29,28 @@ static POOL: LazyLock<DescriptorPool> = LazyLock::new(|| {
     DescriptorPool::decode(CURSOR_DESCRIPTORS).expect("decode Cursor protobuf descriptors")
 });
 
+/// Frame and message lengths travel over the wire as `i32`. Cursor never sends
+/// a frame past `MAX_CONNECT_FRAME_BYTES`, so anything larger is clamped
+/// instead of wrapping into a negative length.
+fn payload_length(len: usize) -> i32 {
+    i32::try_from(len).unwrap_or(i32::MAX)
+}
+
+pub fn frame_count(len: usize) -> i32 {
+    i32::try_from(len).unwrap_or(i32::MAX)
+}
+
+/// A capture limit stored as `i32`, as the `usize` a buffer needs.
+pub fn capture_limit(limit: i32) -> usize {
+    usize::try_from(limit.max(0)).unwrap_or(usize::MAX)
+}
+
+/// One byte past the decompressed-size cap, so `io::copy` can detect an
+/// oversized payload rather than truncating it.
+fn frame_limit_bytes() -> u64 {
+    u64::try_from(MAX_CONNECT_FRAME_BYTES.saturating_add(1)).unwrap_or(u64::MAX)
+}
+
 static CURSOR_DESCRIPTORS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cursor.bin"));
 
 static PROTO_JSON: LazyLock<prost_reflect::SerializeOptions> = LazyLock::new(|| {
@@ -70,12 +92,14 @@ impl ConnectFrameDecoder {
         self.buffer.extend_from_slice(payload);
         while self.buffer.len() >= 5 && self.frame_count < self.max_frames {
             let flags = self.buffer[0];
-            let length =
-                u32::from_be_bytes(self.buffer[1..5].try_into().expect("4 bytes")) as usize;
+            let length = usize::try_from(u32::from_be_bytes(
+                self.buffer[1..5].try_into().expect("4 bytes"),
+            ))
+            .unwrap_or(usize::MAX);
             if length > MAX_CONNECT_FRAME_BYTES {
                 self.emit(FrameView {
                     flags,
-                    length: length as i32,
+                    length: payload_length(length),
                     error: "Connect 帧长度异常".into(),
                     ..empty_frame()
                 });
@@ -95,7 +119,7 @@ impl ConnectFrameDecoder {
     pub fn close(&mut self) {
         if !self.buffer.is_empty() && self.frame_count < self.max_frames {
             self.emit(FrameView {
-                length: self.buffer.len() as i32,
+                length: payload_length(self.buffer.len()),
                 raw_hex: clipped_hex(&self.buffer, 4096),
                 error: "流结束时仍有不完整的 Connect 帧".into(),
                 ..empty_frame()
@@ -113,7 +137,7 @@ impl ConnectFrameDecoder {
     fn decode(&self, flags: u8, payload: &[u8]) -> FrameView {
         let mut frame = FrameView {
             flags,
-            length: payload.len() as i32,
+            length: payload_length(payload.len()),
             compressed: flags & 0x01 != 0,
             end_stream: flags & 0x02 != 0,
             raw_hex: clipped_hex(payload, 4096),
@@ -140,7 +164,7 @@ impl ConnectFrameDecoder {
             None => frame.error = "未知的 protobuf 消息类型".into(),
             Some(Err(err)) => frame.error = format!("protobuf 解码失败：{err}"),
             Some(Ok(message)) => {
-                frame.message_type = self.message_type.clone();
+                frame.message_type.clone_from(&self.message_type);
                 frame.kind = active_oneof_name(&message);
                 if self.message_type == "aiserver.v1.BidiRequestId" {
                     frame.request_id = string_field(&message, "request_id");
@@ -307,132 +331,149 @@ pub fn hydrate_stored_exchange(exchange: &mut Exchange) -> bool {
     if exchange.summary.state != "completed" && exchange.summary.state != "streaming" {
         return false;
     }
-    let mut changed = false;
-    if let Some(message_type) = streaming_request_message_type(&exchange.summary.path)
-        && exchange.request.frames.is_empty()
-        && !exchange.request.raw_hex.is_empty()
-        && !exchange.request.raw_truncated
+    let request_frames = hydrate_stored_request_frames(exchange);
+    let response_frames = hydrate_stored_response_frames(exchange);
+    let request_unary = hydrate_stored_unary_request(exchange);
+    let response_unary = hydrate_stored_unary_response(exchange);
+    let request_text = hydrate_stored_request_text(exchange);
+    let response_text = hydrate_stored_response_text(exchange);
+    request_frames
+        || response_frames
+        || request_unary
+        || response_unary
+        || request_text
+        || response_text
+}
+
+fn hydrate_stored_request_frames(exchange: &mut Exchange) -> bool {
+    let Some(message_type) = streaming_request_message_type(&exchange.summary.path) else {
+        return false;
+    };
+    if !exchange.request.frames.is_empty()
+        || exchange.request.raw_hex.is_empty()
+        || exchange.request.raw_truncated
     {
-        match decode_stored_connect_frames(
-            &exchange.request.raw_hex,
-            &message_type,
-            &exchange.request.content_codec,
-        ) {
-            Ok(frames) if !frames.is_empty() => {
-                for frame in &frames {
-                    if !frame.kind.is_empty() && frame.kind != "end_stream" {
-                        exchange.summary.request_kind = frame.kind.clone();
-                    }
-                    if !frame.request_id.is_empty() {
-                        exchange.summary.request_id = frame.request_id.clone();
-                    }
-                }
-                exchange.request.frames = frames;
-            }
-            Ok(_) => {}
-            Err(err) => exchange.request.decode_error = err,
-        }
-        changed = true;
+        return false;
     }
-    if let Some(message_type) = streaming_response_message_type(&exchange.summary.path)
-        && exchange.response.frames.is_empty()
-        && !exchange.response.raw_hex.is_empty()
-        && !exchange.response.raw_truncated
-    {
-        match decode_stored_connect_frames(
-            &exchange.response.raw_hex,
-            &message_type,
-            &exchange.response.content_codec,
-        ) {
-            Ok(frames) if !frames.is_empty() => {
-                exchange.summary.frame_count = frames.len() as i32;
-                for frame in &frames {
-                    if !frame.kind.is_empty() && frame.kind != "end_stream" {
-                        exchange.summary.response_kind = frame.kind.clone();
-                    }
+    match decode_stored_connect_frames(
+        &exchange.request.raw_hex,
+        &message_type,
+        &exchange.request.content_codec,
+    ) {
+        Ok(frames) if !frames.is_empty() => {
+            for frame in &frames {
+                if !frame.kind.is_empty() && frame.kind != "end_stream" {
+                    exchange.summary.request_kind.clone_from(&frame.kind);
                 }
-                exchange.response.frames = frames;
+                if !frame.request_id.is_empty() {
+                    exchange.summary.request_id.clone_from(&frame.request_id);
+                }
+            }
+            exchange.request.frames = frames;
+        }
+        Ok(_) => {}
+        Err(err) => exchange.request.decode_error = err,
+    }
+    true
+}
+
+fn hydrate_stored_response_frames(exchange: &mut Exchange) -> bool {
+    let Some(message_type) = streaming_response_message_type(&exchange.summary.path) else {
+        return false;
+    };
+    if !exchange.response.frames.is_empty()
+        || exchange.response.raw_hex.is_empty()
+        || exchange.response.raw_truncated
+    {
+        return false;
+    }
+    match decode_stored_connect_frames(
+        &exchange.response.raw_hex,
+        &message_type,
+        &exchange.response.content_codec,
+    ) {
+        Ok(frames) if !frames.is_empty() => {
+            exchange.summary.frame_count = frame_count(frames.len());
+            for frame in &frames {
+                if !frame.kind.is_empty() && frame.kind != "end_stream" {
+                    exchange.summary.response_kind.clone_from(&frame.kind);
+                }
+            }
+            exchange.response.frames = frames;
+        }
+        Ok(_) => {}
+        Err(err) => exchange.response.decode_error = err,
+    }
+    true
+}
+
+fn hydrate_stored_unary_request(exchange: &mut Exchange) -> bool {
+    if !is_unary_proto_content_type(&exchange.request.content_type)
+        || !exchange.request.decoded_json.is_empty()
+        || exchange.request.raw_truncated
+    {
+        return false;
+    }
+    match decode_stored_raw_payload(&exchange.request.raw_hex, &exchange.request.content_codec) {
+        Ok(payload) => {
+            let decoded = decode_unary_request(&exchange.summary.path, &payload);
+            if let Some(err) = decoded.error {
+                exchange.request.decode_error = err;
+            }
+            if decoded.json.is_empty() {
+                return !exchange.request.decode_error.is_empty();
+            }
+            exchange.request.decoded_json = decoded.json;
+            exchange.request.decoded_lang = "json".into();
+            exchange.summary.request_kind = decoded.kind;
+            if !decoded.request_id.is_empty() {
+                exchange.summary.request_id = decoded.request_id;
+            }
+            if !decoded.conversation_id.is_empty() {
+                exchange.summary.conversation_id = decoded.conversation_id;
+            }
+        }
+        Err(err) => exchange.request.decode_error = err,
+    }
+    true
+}
+
+fn hydrate_stored_unary_response(exchange: &mut Exchange) -> bool {
+    if !is_unary_proto_content_type(&exchange.response.content_type)
+        || !exchange.response.decoded_json.is_empty()
+        || exchange.response.raw_truncated
+    {
+        return false;
+    }
+    match decode_stored_raw_payload(&exchange.response.raw_hex, &exchange.response.content_codec) {
+        Ok(payload) => match decode_unary_response(&exchange.summary.path, &payload) {
+            Ok((decoded, kind)) if !decoded.is_empty() => {
+                exchange.response.decoded_json = decoded;
+                exchange.response.decoded_lang = "json".into();
+                exchange.summary.response_kind = kind;
             }
             Ok(_) => {}
             Err(err) => exchange.response.decode_error = err,
-        }
-        changed = true;
+        },
+        Err(err) => exchange.response.decode_error = err,
     }
-    if is_unary_proto_content_type(&exchange.request.content_type)
-        && exchange.request.decoded_json.is_empty()
-        && !exchange.request.raw_truncated
-    {
-        match decode_stored_raw_payload(&exchange.request.raw_hex, &exchange.request.content_codec)
-        {
-            Ok(payload) => {
-                let decoded = decode_unary_request(&exchange.summary.path, &payload);
-                if let Some(err) = decoded.error {
-                    exchange.request.decode_error = err;
-                    changed = true;
-                }
-                if !decoded.json.is_empty() {
-                    exchange.request.decoded_json = decoded.json;
-                    exchange.request.decoded_lang = "json".into();
-                    exchange.summary.request_kind = decoded.kind;
-                    if !decoded.request_id.is_empty() {
-                        exchange.summary.request_id = decoded.request_id;
-                    }
-                    if !decoded.conversation_id.is_empty() {
-                        exchange.summary.conversation_id = decoded.conversation_id;
-                    }
-                    changed = true;
-                }
-            }
-            Err(err) => {
-                exchange.request.decode_error = err;
-                changed = true;
-            }
-        }
-    }
-    if is_unary_proto_content_type(&exchange.response.content_type)
-        && exchange.response.decoded_json.is_empty()
-        && !exchange.response.raw_truncated
-    {
-        match decode_stored_raw_payload(
-            &exchange.response.raw_hex,
-            &exchange.response.content_codec,
-        ) {
-            Ok(payload) => match decode_unary_response(&exchange.summary.path, &payload) {
-                Ok((decoded, kind)) if !decoded.is_empty() => {
-                    exchange.response.decoded_json = decoded;
-                    exchange.response.decoded_lang = "json".into();
-                    exchange.summary.response_kind = kind;
-                    changed = true;
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    exchange.response.decode_error = err;
-                    changed = true;
-                }
-            },
-            Err(err) => {
-                exchange.response.decode_error = err;
-                changed = true;
-            }
-        }
-    }
-    if exchange.request.decoded_json.is_empty()
+    true
+}
+
+fn hydrate_stored_request_text(exchange: &mut Exchange) -> bool {
+    exchange.request.decoded_json.is_empty()
         && !exchange.request.raw_hex.is_empty()
         && !is_proto_content_type(&exchange.request.content_type)
         && streaming_request_message_type(&exchange.summary.path).is_none()
         && hydrate_stored_text_payload(&mut exchange.request)
-    {
-        changed = true;
-    }
-    if exchange.response.decoded_json.is_empty()
+}
+
+fn hydrate_stored_response_text(exchange: &mut Exchange) -> bool {
+    exchange.response.decoded_json.is_empty()
         && !exchange.response.raw_hex.is_empty()
         && !is_proto_content_type(&exchange.response.content_type)
         && streaming_response_message_type(&exchange.summary.path).is_none()
         && hydrate_stored_text_payload(&mut exchange.response)
-    {
-        changed = true;
-    }
-    changed
 }
 
 fn hydrate_stored_text_payload(payload: &mut Payload) -> bool {
@@ -540,6 +581,19 @@ fn json_valid(payload: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(payload).is_ok()
 }
 
+/// Reads a decompressor to the end, refusing anything past the frame cap.
+fn inflate_limited(mut reader: impl Read, label: &str) -> Result<Vec<u8>, String> {
+    let mut result = Vec::new();
+    io::copy(&mut reader.by_ref().take(frame_limit_bytes()), &mut result)
+        .map_err(|err| format!("读取 {label} 内容失败：{err}"))?;
+    if result.len() > MAX_CONNECT_FRAME_BYTES {
+        return Err(format!(
+            "{label} 解压后超过 {MAX_CONNECT_FRAME_BYTES} 字节限制"
+        ));
+    }
+    Ok(result)
+}
+
 pub fn decode_http_content(payload: &[u8], codec: &str) -> Result<Vec<u8>, String> {
     let encodings: Vec<_> = codec
         .split(',')
@@ -551,34 +605,12 @@ pub fn decode_http_content(payload: &[u8], codec: &str) -> Result<Vec<u8>, Strin
             "" | "identity" => {}
             "gzip" | "x-gzip" => decoded = decompress_payload(&decoded, "gzip")?,
             "deflate" => {
-                let decoder = ZlibDecoder::new(decoded.as_slice());
-                let mut result = Vec::new();
-                io::copy(
-                    &mut decoder.take((MAX_CONNECT_FRAME_BYTES + 1) as u64),
-                    &mut result,
-                )
-                .map_err(|err| format!("读取 deflate 内容失败：{err}"))?;
-                if result.len() > MAX_CONNECT_FRAME_BYTES {
-                    return Err(format!(
-                        "deflate 解压后超过 {MAX_CONNECT_FRAME_BYTES} 字节限制"
-                    ));
-                }
-                decoded = result;
+                let inflater = ZlibDecoder::new(decoded.as_slice());
+                decoded = inflate_limited(inflater, "deflate")?;
             }
             "br" => {
-                let decoder = Decompressor::new(decoded.as_slice(), 4096);
-                let mut result = Vec::new();
-                io::copy(
-                    &mut decoder.take((MAX_CONNECT_FRAME_BYTES + 1) as u64),
-                    &mut result,
-                )
-                .map_err(|err| format!("读取 Brotli 内容失败：{err}"))?;
-                if result.len() > MAX_CONNECT_FRAME_BYTES {
-                    return Err(format!(
-                        "Brotli 解压后超过 {MAX_CONNECT_FRAME_BYTES} 字节限制"
-                    ));
-                }
-                decoded = result;
+                let decompressor = Decompressor::new(decoded.as_slice(), 4096);
+                decoded = inflate_limited(decompressor, "Brotli")?;
             }
             other => return Err(format!("暂不支持内容编码 {other:?}")),
         }
@@ -641,14 +673,15 @@ pub fn decode_stored_connect_frames(
     let payload = hex::decode(raw_hex_value.trim())
         .map_err(|err| format!("解析已存储 Connect 正文失败：{err}"))?;
     let frames = Arc::new(Mutex::new(Vec::new()));
-    let collected = frames.clone();
+    let collected = Arc::clone(&frames);
     let mut decoder =
         ConnectFrameDecoder::new(message_type, codec, DEFAULT_MAX_FRAMES, move |frame| {
             collected.lock().expect("frame lock").push(frame);
         });
     decoder.write(&payload);
     decoder.close();
-    Ok(frames.lock().expect("frame lock").clone())
+    let frames = frames.lock().expect("frame lock");
+    Ok(frames.clone())
 }
 
 pub fn is_unary_proto_content_type(content_type: &str) -> bool {
@@ -884,19 +917,7 @@ pub fn decompress_payload(payload: &[u8], codec: &str) -> Result<Vec<u8>, String
     if !codec.is_empty() && !codec.eq_ignore_ascii_case("gzip") {
         return Err(format!("暂不支持压缩算法 {codec:?}"));
     }
-    let decoder = GzDecoder::new(payload);
-    let mut decoded = Vec::new();
-    io::copy(
-        &mut decoder.take((MAX_CONNECT_FRAME_BYTES + 1) as u64),
-        &mut decoded,
-    )
-    .map_err(|err| format!("gzip 解压失败：{err}"))?;
-    if decoded.len() > MAX_CONNECT_FRAME_BYTES {
-        return Err(format!(
-            "gzip 解压后超过 {MAX_CONNECT_FRAME_BYTES} 字节限制"
-        ));
-    }
-    Ok(decoded)
+    inflate_limited(GzDecoder::new(payload), "gzip")
 }
 
 fn empty_frame() -> FrameView {

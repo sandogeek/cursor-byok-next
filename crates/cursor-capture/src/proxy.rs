@@ -17,9 +17,10 @@ use url::Url;
 use crate::capture::CaptureBody;
 use crate::config::{Config, DEBUG_BASE_PATH, browser_address};
 use crate::decode::{
-    ConnectFrameDecoder, decode_captured_content, decode_unary_request, decode_unary_response,
-    decodes_unary_request, decodes_unary_response, decompress_payload, is_unary_proto_content_type,
-    raw_hex, streaming_request_message_type, streaming_response_message_type,
+    ConnectFrameDecoder, capture_limit, decode_captured_content, decode_unary_request,
+    decode_unary_response, decodes_unary_request, decodes_unary_response, decompress_payload,
+    frame_count, is_unary_proto_content_type, raw_hex, streaming_request_message_type,
+    streaming_response_message_type,
 };
 use crate::store::{CaptureId, ExchangeStore, sorted_headers};
 use crate::types::{Error, Exchange, ExchangeSummary, Payload, Result};
@@ -28,6 +29,10 @@ use crate::web;
 type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
 
 #[derive(Clone)]
+#[expect(
+    missing_debug_implementations,
+    reason = "the server owns the capture store, which has no Debug impl"
+)]
 pub struct Server {
     config: Config,
     upstream: Url,
@@ -161,7 +166,7 @@ impl Server {
                         if !frame.request_id.is_empty() {
                             exchange.summary.request_id.clone_from(&frame.request_id);
                         }
-                        if (exchange.request.frames.len() as i32) < max_frames {
+                        if frame_count(exchange.request.frames.len()) < max_frames {
                             exchange.request.frames.push(frame);
                         }
                     });
@@ -176,7 +181,7 @@ impl Server {
         let chunk_decoder = decoder.clone();
         CaptureBody::new(
             body,
-            self.config.max_capture_bytes.max(0) as usize,
+            capture_limit(self.config.max_capture_bytes),
             move |chunk| {
                 if let Some(decoder) = &chunk_decoder {
                     decoder.lock().expect("decoder").write(chunk);
@@ -227,10 +232,10 @@ impl Server {
                         if !frame.error.is_empty() {
                             exchange.response.decode_error.clone_from(&frame.error);
                         }
-                        if (exchange.response.frames.len() as i32) < max_frames {
+                        if frame_count(exchange.response.frames.len()) < max_frames {
                             exchange.response.frames.push(frame);
                         }
-                        exchange.summary.frame_count = exchange.response.frames.len() as i32;
+                        exchange.summary.frame_count = frame_count(exchange.response.frames.len());
                     });
                 },
             )))
@@ -239,7 +244,7 @@ impl Server {
         let chunk_decoder = decoder.clone();
         CaptureBody::new(
             body,
-            self.config.max_capture_bytes.max(0) as usize,
+            capture_limit(self.config.max_capture_bytes),
             move |chunk| {
                 if let Some(decoder) = &chunk_decoder {
                     decoder.lock().expect("decoder").write(chunk);
@@ -315,8 +320,8 @@ async fn proxy(State(server): State<Arc<Server>>, request: Request<Body>) -> Res
                 exchange.summary.state = "streaming".into();
                 exchange.summary.duration_ms = elapsed_ms(exchange.summary.started_at);
                 exchange.response.headers = sorted_headers(&headers);
-                exchange.response.content_type = content_type.clone();
-                exchange.response.content_codec = codec.clone();
+                exchange.response.content_type.clone_from(&content_type);
+                exchange.response.content_codec.clone_from(&codec);
             });
             let captured =
                 server.wrap_response_body(upstream.into_body(), id, path, content_type, codec);
@@ -488,20 +493,23 @@ fn finish_request_body(store: &ExchangeStore, body: CapturedBody) {
         exchange.request.raw_hex = raw_hex(&captured);
         exchange.request.raw_truncated = truncated;
         if !decoded_json.is_empty() {
-            exchange.request.decoded_json = decoded_json.clone();
-            exchange.request.decoded_lang = decoded_lang.clone();
+            exchange.request.decoded_json.clone_from(&decoded_json);
+            exchange.request.decoded_lang.clone_from(&decoded_lang);
         }
         if !kind.is_empty() {
-            exchange.summary.request_kind = kind.clone();
+            exchange.summary.request_kind.clone_from(&kind);
         }
         if !request_id.is_empty() {
-            exchange.summary.request_id = request_id.clone();
+            exchange.summary.request_id.clone_from(&request_id);
         }
         if !conversation_id.is_empty() {
-            exchange.summary.conversation_id = conversation_id.clone();
+            exchange
+                .summary
+                .conversation_id
+                .clone_from(&conversation_id);
         }
         if let Some(err) = &decode_err {
-            exchange.request.decode_error = err.clone();
+            exchange.request.decode_error.clone_from(err);
         }
         if let Some(err) = read_err {
             exchange.summary.error = err;
@@ -558,14 +566,14 @@ fn finish_response_body(store: &ExchangeStore, body: CapturedBody) {
         exchange.response.raw_hex = raw_hex(&captured);
         exchange.response.raw_truncated = truncated;
         if !decoded_json.is_empty() {
-            exchange.response.decoded_json = decoded_json.clone();
-            exchange.response.decoded_lang = decoded_lang.clone();
+            exchange.response.decoded_json.clone_from(&decoded_json);
+            exchange.response.decoded_lang.clone_from(&decoded_lang);
         }
         if !kind.is_empty() {
-            exchange.summary.response_kind = kind.clone();
+            exchange.summary.response_kind.clone_from(&kind);
         }
         if let Some(err) = &decode_err {
-            exchange.response.decode_error = err.clone();
+            exchange.response.decode_error.clone_from(err);
         }
         exchange.summary.duration_ms = elapsed_ms(exchange.summary.started_at);
         exchange.summary.state = "completed".into();

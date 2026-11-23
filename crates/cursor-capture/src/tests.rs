@@ -56,11 +56,17 @@ fn run_sse_uses_hardcoded_stream_types() {
 #[test]
 fn connect_frames_decode_across_chunk_boundaries() {
     let json = br#"{"a":1}"#;
-    let mut payload = vec![0x00, 0x00, 0x00, 0x00, json.len() as u8];
+    let mut payload = vec![
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        u8::try_from(json.len()).expect("short json"),
+    ];
     payload.extend_from_slice(json);
     payload.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x02, b'{', b'}']);
     let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let collected = frames.clone();
+    let collected = std::sync::Arc::clone(&frames);
     let mut decoder = ConnectFrameDecoder::new("unknown.Message", "", 8, move |frame| {
         collected.lock().unwrap().push(frame);
     });
@@ -91,7 +97,8 @@ fn gzip_json_content_is_pretty_printed() {
 #[test]
 fn bidi_append_hex_client_message_extracts_conversation_id() {
     let client = encode_agent_run_request("conv-1");
-    let request = encode_bidi_append(hex::encode(&client), b"");
+    let client_hex = hex::encode(&client);
+    let request = encode_bidi_append(&client_hex, b"");
     let decoded = decode_unary_request("/aiserver.v1.BidiService/BidiAppend", &request);
     assert_eq!(decoded.kind, "run_request");
     assert_eq!(decoded.request_id, "req-9");
@@ -111,7 +118,7 @@ fn encode_agent_run_request(conversation_id: &str) -> Vec<u8> {
     message
 }
 
-fn encode_bidi_append(data: String, data_binary: &[u8]) -> Vec<u8> {
+fn encode_bidi_append(data: &str, data_binary: &[u8]) -> Vec<u8> {
     let mut payload = Vec::new();
     if !data.is_empty() {
         payload.push(0x0a);
@@ -135,12 +142,12 @@ fn encode_bidi_append(data: String, data_binary: &[u8]) -> Vec<u8> {
 
 fn encode_len(len: usize) -> Vec<u8> {
     let mut out = Vec::new();
-    let mut value = len as u64;
+    let mut value = u64::try_from(len).expect("protobuf lengths fit in u64");
     while value >= 0x80 {
-        out.push(((value as u8) & 0x7f) | 0x80);
+        out.push(u8::try_from(value & 0x7f).expect("low 7 bits") | 0x80);
         value >>= 7;
     }
-    out.push(value as u8);
+    out.push(u8::try_from(value).expect("final byte is below 0x80"));
     out
 }
 
@@ -283,7 +290,7 @@ async fn debug_api_serves_original_ui_and_status() {
 async fn stream_completes_and_persists_both_chunks() {
     let dir = TempDir::new().unwrap();
     let gate = Arc::new(tokio::sync::Notify::new());
-    let server = serve_stream_fixture(&dir, gate.clone()).await;
+    let server = serve_stream_fixture(&dir, std::sync::Arc::clone(&gate)).await;
     let body = first_stream_chunk(Arc::clone(&server).router()).await;
     assert_eq!(
         server.store().get("1").unwrap().unwrap().summary.state,
@@ -310,7 +317,7 @@ async fn stream_completes_and_persists_both_chunks() {
 async fn clear_during_stream_does_not_overwrite_reused_id() {
     let dir = TempDir::new().unwrap();
     let gate = Arc::new(tokio::sync::Notify::new());
-    let server = serve_stream_fixture(&dir, gate.clone()).await;
+    let server = serve_stream_fixture(&dir, std::sync::Arc::clone(&gate)).await;
     let app = Arc::clone(&server).router();
     let old_body = first_stream_chunk(app.clone()).await;
     assert_eq!(

@@ -56,13 +56,14 @@ impl<B: Body> CaptureBody<B> {
     }
 
     fn capture_chunk(&mut self, chunk: &[u8]) {
-        self.size += chunk.len() as i64;
+        self.size += i64::try_from(chunk.len()).unwrap_or(i64::MAX);
         let remaining = self.limit.saturating_sub(self.buffer.len());
         if remaining > 0 {
             let captured = remaining.min(chunk.len());
             self.buffer.extend_from_slice(&chunk[..captured]);
         }
-        if self.buffer.len() >= self.limit && self.size > self.buffer.len() as i64 {
+        let buffered = i64::try_from(self.buffer.len()).unwrap_or(i64::MAX);
+        if self.buffer.len() >= self.limit && self.size > buffered {
             self.truncated = true;
         }
         if let Some(on_chunk) = self.on_chunk.as_mut() {
@@ -96,7 +97,13 @@ where
     ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
         // CaptureBody is structurally pinned only through `inner`; other fields
         // are never pinned, so projecting them as `&mut` is sound.
+        //
+        // SAFETY: `self` is pinned for the whole call and `inner` is the only
+        // field read through the projection. The `&mut Self` never escapes this
+        // function, so the pinning guarantee is upheld.
         let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: `this.inner` was pinned in place by `self`; it is not moved or
+        // dropped before this borrow ends, so the pin contract holds.
         let inner = unsafe { Pin::new_unchecked(&mut this.inner) };
         match inner.poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {

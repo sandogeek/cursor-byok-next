@@ -247,9 +247,8 @@ impl Diagnostics {
         }
     }
 
-    pub fn has_failure(&self, validate_err: bool) -> bool {
-        validate_err
-            || self.skipped_field_objects > 0
+    pub fn has_failure(&self) -> bool {
+        self.skipped_field_objects > 0
             || !self.unresolved_type_refs.is_empty()
             || !self.placeholder_hits.is_empty()
             || !self.missing_declarations.is_empty()

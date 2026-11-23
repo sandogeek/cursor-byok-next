@@ -10,7 +10,7 @@ use crate::types::{
 pub type AliasIndex = HashMap<u32, HashMap<String, Vec<String>>>;
 pub type ModuleImports = HashMap<u32, HashMap<String, u32>>;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct TypeResolver {
     by_symbol: HashMap<String, Vec<SymbolDef>>,
     by_alias: HashMap<String, Vec<SymbolDef>>,
@@ -174,14 +174,18 @@ impl TypeResolver {
                 return Some(type_name);
             }
         }
-        let prefer_same = !trimmed.contains('.');
+        let scope = if trimmed.contains('.') {
+            ModuleScope::AnyModule
+        } else {
+            ModuleScope::SameModuleFirst
+        };
         if let Some(name) = self.resolve_by_symbol(
             trimmed,
             context_pos,
             context_module_start,
             preferred_pkg,
             expected_kind,
-            prefer_same,
+            scope,
         ) {
             return Some(name);
         }
@@ -196,7 +200,7 @@ impl TypeResolver {
             context_module_start,
             preferred_pkg,
             expected_kind,
-            prefer_same,
+            scope,
         ) {
             return Some(name);
         }
@@ -224,7 +228,7 @@ impl TypeResolver {
                 context_module_start,
                 preferred_pkg,
                 expected_kind,
-                false,
+                ModuleScope::AnyModule,
             ) {
                 return Some(name);
             }
@@ -234,7 +238,7 @@ impl TypeResolver {
                 context_module_start,
                 preferred_pkg,
                 expected_kind,
-                false,
+                ModuleScope::AnyModule,
             ) {
                 return Some(name);
             }
@@ -244,7 +248,7 @@ impl TypeResolver {
                 context_module_start,
                 preferred_pkg,
                 expected_kind,
-                false,
+                ModuleScope::AnyModule,
             ) {
                 return Some(name);
             }
@@ -256,6 +260,15 @@ impl TypeResolver {
     }
 }
 
+/// Which module's definitions a lookup prefers: the caller's module, or any.
+#[derive(Clone, Copy)]
+enum ModuleScope {
+    /// Prefer a definition from the caller's own module.
+    SameModuleFirst,
+    /// Consider every module equally.
+    AnyModule,
+}
+
 impl TypeResolver {
     fn resolve_by_symbol(
         &self,
@@ -264,13 +277,12 @@ impl TypeResolver {
         context_module_start: u32,
         preferred_pkg: &str,
         expected_kind: &str,
-        prefer_same_module: bool,
+        scope: ModuleScope,
     ) -> Option<String> {
         let candidates = self.by_symbol.get(symbol)?;
-        let module_start = if prefer_same_module {
-            context_module_start
-        } else {
-            0
+        let module_start = match scope {
+            ModuleScope::SameModuleFirst => context_module_start,
+            ModuleScope::AnyModule => 0,
         };
         pick_best_definition(
             candidates,
@@ -308,13 +320,12 @@ impl TypeResolver {
         context_module_start: u32,
         preferred_pkg: &str,
         expected_kind: &str,
-        prefer_same_module: bool,
+        scope: ModuleScope,
     ) -> Option<String> {
         let candidates = self.by_short.get(symbol)?;
-        let module_start = if prefer_same_module {
-            context_module_start
-        } else {
-            0
+        let module_start = match scope {
+            ModuleScope::SameModuleFirst => context_module_start,
+            ModuleScope::AnyModule => 0,
         };
         pick_best_definition(
             candidates,
@@ -431,7 +442,7 @@ fn resolve_root(direct: &HashMap<String, String>, symbol: &str) -> String {
         }
         seen.push(current.clone());
         match direct.get(&current) {
-            Some(next) => current = next.clone(),
+            Some(next) => current.clone_from(next),
             None => return current,
         }
     }

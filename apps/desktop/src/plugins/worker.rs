@@ -1209,12 +1209,12 @@ mod tests {
     }
 
     async fn recorder(
-        detailed: bool,
+        storage: crate::calls::PayloadStorage,
         call_id: &str,
     ) -> (tempfile::TempDir, crate::calls::CallStore, CallRecorder) {
         let directory = tempfile::tempdir().unwrap();
         let store = crate::calls::CallStore::at(directory.path().join("calls.db"));
-        store.set_detailed_logging(detailed).await.unwrap();
+        store.set_detailed_logging(storage).await.unwrap();
         let recorder = CallRecorder::start(
             store.clone(),
             crate::calls::NewLlmCall {
@@ -1278,7 +1278,8 @@ mod tests {
 
     #[tokio::test]
     async fn only_the_first_plugin_network_request_claims_the_recorder() {
-        let (_directory, store, recorder) = recorder(true, "first-request").await;
+        let (_directory, store, recorder) =
+            recorder(crate::calls::PayloadStorage::Detailed, "first-request").await;
         let host = recording_host();
         let invocation = recorded_invocation(recorder.clone());
         let (_, _, _, first) = host.request(&invocation, &network_params()).await.unwrap();
@@ -1322,7 +1323,8 @@ mod tests {
 
     #[tokio::test]
     async fn standard_plugin_network_recording_keeps_metrics_without_payloads() {
-        let (_directory, store, recorder) = recorder(false, "standard-plugin").await;
+        let (_directory, store, recorder) =
+            recorder(crate::calls::PayloadStorage::Metrics, "standard-plugin").await;
         let host = recording_host();
         let invocation = recorded_invocation(recorder.clone());
         let params = network_params();

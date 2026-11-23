@@ -180,7 +180,7 @@ pub fn local_token() -> Result<String> {
         "type": "session",
         "iss": "cursor-client",
         "scope": "openid profile email",
-        "exp": 4070908800_u64
+        "exp": 4_070_908_800_u64
     }))?);
     Ok(format!("{header}.{payload}.{SUBJECT}"))
 }

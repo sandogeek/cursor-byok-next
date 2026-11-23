@@ -46,9 +46,19 @@ pub struct ExtractResult {
     pub diagnostics: Diagnostics,
 }
 
+/// Whether diagnostics fail the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strictness {
+    /// Any diagnostic (skipped fields, unresolved types, placeholders, missing
+    /// declarations, parse or shape errors) fails the run.
+    Strict,
+    /// Diagnostics are returned in the result but never fail the run.
+    Lenient,
+}
+
 pub fn extract_from_sources(
     sources: &[(&str, String)],
-    strict: bool,
+    strictness: Strictness,
 ) -> Result<ExtractResult, ExtractError> {
     let mut all_messages = Vec::new();
     let mut all_enums = Vec::new();
@@ -77,7 +87,8 @@ pub fn extract_from_sources(
     let messages = keep_local_loop_messages(merge_messages_by_type_name(all_messages));
     let enums = keep_local_loop_enums(merge_enums_by_type_name(all_enums));
     let services = keep_local_loop_services(merge_services_by_type_name(all_services));
-    let resolver = TypeResolver::new(&messages, &enums, &Default::default(), &Default::default());
+    let no_aliases = HashMap::default();
+    let resolver = TypeResolver::new(&messages, &enums, &no_aliases, &no_aliases);
 
     record_empty_messages(&mut diag, &messages);
     let (declared_count, extracted_count, missing) =
@@ -87,7 +98,7 @@ pub fn extract_from_sources(
     diag.missing_declarations = compact_strings(missing);
 
     let files = generate_local_loop_protos(&messages, &enums, &services, &resolver, &mut diag);
-    if strict && diag.has_failure(false) {
+    if strictness == Strictness::Strict && diag.has_failure() {
         return Err(ExtractError::Validation(diag.to_string()));
     }
     Ok(ExtractResult {
@@ -102,7 +113,7 @@ pub fn extract_from_sources(
 pub fn extract_from_files(
     input_files: &[impl AsRef<Path>],
     output_dir: impl AsRef<Path>,
-    strict: bool,
+    strictness: Strictness,
 ) -> Result<ExtractResult, ExtractError> {
     let mut sources = Vec::new();
     for path in input_files {
@@ -117,14 +128,14 @@ pub fn extract_from_files(
         .iter()
         .map(|(name, text)| (name.as_str(), text.clone()))
         .collect();
-    let result = extract_from_sources(&named, strict)?;
+    let result = extract_from_sources(&named, strictness)?;
     write_protos(output_dir, &result.files)?;
     Ok(result)
 }
 
 pub fn write_protos(
     output_dir: impl AsRef<Path>,
-    files: &HashMap<String, String>,
+    files: &HashMap<String, String, impl std::hash::BuildHasher>,
 ) -> Result<(), ExtractError> {
     let output_dir = output_dir.as_ref();
     let parent = output_dir.parent().unwrap_or_else(|| Path::new("."));
@@ -161,7 +172,7 @@ fn unique_temp_dir(parent: &Path, output_dir: &Path) -> Result<PathBuf, ExtractE
         let candidate = parent.join(format!(".{stem}.tmp.{nanos}.{attempt}"));
         match fs::create_dir(&candidate) {
             Ok(()) => return Ok(candidate),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(source) => {
                 return Err(ExtractError::Write {
                     path: candidate.display().to_string(),

@@ -9,7 +9,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use cursor_protocol_extractor::extract_from_files;
+use cursor_protocol_extractor::{Strictness, extract_from_files};
 
 fn main() -> ExitCode {
     let mut inputs = Vec::new();
@@ -46,7 +46,12 @@ fn main() -> ExitCode {
         eprintln!("-output is required");
         return ExitCode::from(2);
     };
-    match extract_from_files(&inputs, &output, strict) {
+    let strictness = if strict {
+        Strictness::Strict
+    } else {
+        Strictness::Lenient
+    };
+    match extract_from_files(&inputs, &output, strictness) {
         Ok(result) => {
             eprint!("{}", result.diagnostics);
             eprintln!(

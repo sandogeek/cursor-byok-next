@@ -127,6 +127,7 @@ pub struct StoreEvent {
 }
 
 impl Exchange {
+    #[must_use]
     pub fn clone_exchange(&self) -> Self {
         self.clone()
     }

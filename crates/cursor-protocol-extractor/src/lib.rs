@@ -19,7 +19,7 @@ mod validate;
 
 pub use compact::parse_compact_field;
 pub use extract::{
-    ExtractError, ExtractResult, extract_from_files, extract_from_sources, write_protos,
+    ExtractError, ExtractResult, Strictness, extract_from_files, extract_from_sources, write_protos,
 };
 pub use merge::{
     declaration_coverage, merge_enums_by_type_name, merge_messages_by_type_name,

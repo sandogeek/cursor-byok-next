@@ -159,8 +159,10 @@ fn strip_line_comment(line: &str) -> &str {
 
 fn brace_delta(line: &str) -> i32 {
     let text = strip_line_comment(line);
-    let opens = text.bytes().filter(|byte| *byte == b'{').count() as i32;
-    let closes = text.bytes().filter(|byte| *byte == b'}').count() as i32;
+    let opens =
+        i32::try_from(text.bytes().filter(|byte| *byte == b'{').count()).unwrap_or(i32::MAX);
+    let closes =
+        i32::try_from(text.bytes().filter(|byte| *byte == b'}').count()).unwrap_or(i32::MAX);
     opens - closes
 }
 

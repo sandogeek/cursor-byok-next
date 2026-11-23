@@ -1,6 +1,9 @@
 //! Render extracted declarations as stable proto3 text.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    fmt::Write as _,
+};
 
 use crate::resolver::{TypeResolver, fallback_type_token};
 use crate::types::{
@@ -12,6 +15,12 @@ struct TypeNode {
     message: Option<Message>,
     enum_item: Option<Enum>,
     children: BTreeMap<String, TypeNode>,
+}
+
+/// Formats straight into `out`; writing to a `String` cannot fail.
+fn emit(out: &mut String, args: std::fmt::Arguments<'_>) {
+    out.write_fmt(args)
+        .expect("writing to a String cannot fail");
 }
 
 pub fn generate_proto_file(
@@ -26,20 +35,23 @@ pub fn generate_proto_file(
     let imports = collect_imports(pkg_name, messages, services, resolver);
     let mut out = String::new();
     out.push_str("syntax = \"proto3\";\n\n");
-    out.push_str(&format!("package {pkg_name};\n\n"));
+    emit(&mut out, format_args!("package {pkg_name};\n\n"));
     if !imports.is_empty() {
         let mut sorted: Vec<_> = imports.into_iter().collect();
         sorted.sort();
         for item in sorted {
-            out.push_str(&format!("import \"{item}\";\n"));
+            emit(&mut out, format_args!("import \"{item}\";\n"));
         }
         out.push('\n');
     }
     let go_path = pkg_name.replace('.', "/");
     let go_name = pkg_name.replace('.', "");
-    out.push_str(&format!(
-        "option go_package = \"github.com/leookun/cursor-byok/cursor-proto/gen/{go_path};{go_name}\";\n\n"
-    ));
+    emit(
+        &mut out,
+        format_args!(
+            "option go_package = \"github.com/leookun/cursor-byok/cursor-proto/gen/{go_path};{go_name}\";\n\n"
+        ),
+    );
 
     let mut root = TypeNode::default();
     for message in messages {
@@ -57,11 +69,17 @@ pub fn generate_proto_file(
     let mut services = services.to_vec();
     services.sort_by(|a, b| a.short_name.cmp(&b.short_name));
     for service in services {
-        out.push_str(&format!(
-            "// Source: {} (var: {})\n",
-            service.type_name, service.var_name
-        ));
-        out.push_str(&format!("service {} {{\n", service.short_name));
+        emit(
+            &mut out,
+            format_args!(
+                "// Source: {} (var: {})\n",
+                service.type_name, service.var_name
+            ),
+        );
+        emit(
+            &mut out,
+            format_args!("service {} {{\n", service.short_name),
+        );
         for method in &service.methods {
             let input = resolve_method_type(
                 &method.input_type,
@@ -149,21 +167,30 @@ fn write_type_tree(
         if let Some(item) = &child.enum_item {
             let original = copied.get(&item.short_name).cloned().unwrap_or_default();
             if original.is_empty() || original.starts_with("local:") {
-                out.push_str(&format!(
-                    "{indent_str}// Source: {} (var: {})\n",
-                    item.type_name, item.var_name
-                ));
+                emit(
+                    out,
+                    format_args!(
+                        "{indent_str}// Source: {} (var: {})\n",
+                        item.type_name, item.var_name
+                    ),
+                );
             } else {
-                out.push_str(&format!(
-                    "{indent_str}// Copied from: {original} (var: {})\n",
-                    item.var_name
-                ));
+                emit(
+                    out,
+                    format_args!(
+                        "{indent_str}// Copied from: {original} (var: {})\n",
+                        item.var_name
+                    ),
+                );
             }
-            out.push_str(&format!("{indent_str}enum {name} {{\n"));
+            emit(out, format_args!("{indent_str}enum {name} {{\n"));
             for value in &item.values {
-                out.push_str(&format!("{indent_str}  {} = {};\n", value.name, value.no));
+                emit(
+                    out,
+                    format_args!("{indent_str}  {} = {};\n", value.name, value.no),
+                );
             }
-            out.push_str(&format!("{indent_str}}}\n\n"));
+            emit(out, format_args!("{indent_str}}}\n\n"));
         } else if child.message.is_some() || !child.children.is_empty() {
             if let Some(message) = &child.message {
                 let mut var_info = message.var_name.clone();
@@ -172,22 +199,26 @@ fn write_type_tree(
                 }
                 let original = copied.get(&message.short_name).cloned().unwrap_or_default();
                 if original.is_empty() || original.starts_with("local:") {
-                    out.push_str(&format!(
-                        "{indent_str}// Source: {} (var: {var_info})\n",
-                        message.type_name
-                    ));
+                    emit(
+                        out,
+                        format_args!(
+                            "{indent_str}// Source: {} (var: {var_info})\n",
+                            message.type_name
+                        ),
+                    );
                 } else {
-                    out.push_str(&format!(
-                        "{indent_str}// Copied from: {original} (var: {var_info})\n"
-                    ));
+                    emit(
+                        out,
+                        format_args!("{indent_str}// Copied from: {original} (var: {var_info})\n"),
+                    );
                 }
             }
-            out.push_str(&format!("{indent_str}message {name} {{\n"));
+            emit(out, format_args!("{indent_str}message {name} {{\n"));
             write_type_tree(child, out, resolver, copied, diag, indent + 1);
             if let Some(message) = &child.message {
                 write_message_fields(message, out, resolver, copied, diag, indent + 1);
             }
-            out.push_str(&format!("{indent_str}}}\n\n"));
+            emit(out, format_args!("{indent_str}}}\n\n"));
         }
     }
 }
@@ -230,13 +261,16 @@ fn write_message_fields(
         } else {
             ""
         };
-        out.push_str(&format!(
-            "{indent_str}{prefix}{field_type} {} = {};\n",
-            field.name, field.no
-        ));
+        emit(
+            out,
+            format_args!(
+                "{indent_str}{prefix}{field_type} {} = {};\n",
+                field.name, field.no
+            ),
+        );
     }
     for (oneof_name, fields) in oneofs {
-        out.push_str(&format!("{indent_str}oneof {oneof_name} {{\n"));
+        emit(out, format_args!("{indent_str}oneof {oneof_name} {{\n"));
         for field in fields {
             let field_type = resolve_field_type(
                 field,
@@ -249,12 +283,15 @@ fn write_message_fields(
                 copied,
                 diag,
             );
-            out.push_str(&format!(
-                "{indent_str}  {field_type} {} = {};\n",
-                field.name, field.no
-            ));
+            emit(
+                out,
+                format_args!(
+                    "{indent_str}  {field_type} {} = {};\n",
+                    field.name, field.no
+                ),
+            );
         }
-        out.push_str(&format!("{indent_str}}}\n"));
+        emit(out, format_args!("{indent_str}}}\n"));
     }
 }
 

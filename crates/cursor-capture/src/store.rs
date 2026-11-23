@@ -17,7 +17,25 @@ use crate::types::{
 
 const EVENT_CAPACITY: usize = 256;
 
+/// Whether an update should also be written through to SQLite.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Persistence {
+    /// Persist the exchange after the update (finished state).
+    Write,
+    /// Leave the last persisted row alone (streaming progress).
+    Skip,
+}
+
+/// `inner.max` holds a validated positive count; SQLite wants it as `i64`.
+fn row_limit(max: usize) -> i64 {
+    i64::try_from(max).unwrap_or(i64::MAX)
+}
+
 #[derive(Clone)]
+#[expect(
+    missing_debug_implementations,
+    reason = "the store owns a rusqlite Connection, which has no Debug impl"
+)]
 pub struct ExchangeStore {
     inner: Arc<Mutex<Inner>>,
     events: broadcast::Sender<StoreEvent>,
@@ -47,7 +65,7 @@ impl ExchangeStore {
             inner: Arc::new(Mutex::new(Inner {
                 generation: 0,
                 next_number: 1,
-                max: max.max(1) as usize,
+                max: usize::try_from(max.max(1)).unwrap_or(usize::MAX),
                 order: Vec::new(),
                 exchanges: HashMap::new(),
                 db: None,
@@ -99,16 +117,16 @@ impl ExchangeStore {
                     |row| row.get(0),
                 )
                 .map_err(|err| Error::Database(err.to_string()))?;
-            inner.next_number = maximum.max(0) as u64 + 1;
+            inner.next_number = u64::try_from(maximum.max(0)).unwrap_or(u64::MAX) + 1;
             inner.db = Some(db);
             inner.database_path = path.display().to_string();
-            store.backfill_decoded_exchanges(&mut inner)?;
-            store.load_recent(&mut inner)?;
+            Self::backfill_decoded_exchanges(&mut inner)?;
+            Self::load_recent(&mut inner)?;
         }
         Ok(store)
     }
 
-    fn backfill_decoded_exchanges(&self, inner: &mut Inner) -> Result<()> {
+    fn backfill_decoded_exchanges(inner: &mut Inner) -> Result<()> {
         let Some(db) = inner.db.as_mut() else {
             return Ok(());
         };
@@ -155,7 +173,7 @@ impl ExchangeStore {
         Ok(())
     }
 
-    fn load_recent(&self, inner: &mut Inner) -> Result<()> {
+    fn load_recent(inner: &mut Inner) -> Result<()> {
         let Some(db) = inner.db.as_mut() else {
             return Ok(());
         };
@@ -166,7 +184,7 @@ impl ExchangeStore {
             )
             .map_err(|err| Error::Database(format!("读取 SQLite 抓包记录失败: {err}")))?;
         let rows = stmt
-            .query_map([inner.max as i64], |row| {
+            .query_map([row_limit(inner.max)], |row| {
                 Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|err| Error::Database(err.to_string()))?;
@@ -205,18 +223,18 @@ impl ExchangeStore {
     }
 
     pub(crate) fn update(&self, id: &CaptureId, apply: impl FnOnce(&mut Exchange)) {
-        self.update_with_persistence(id, apply, true);
+        self.apply_update(id, apply, Persistence::Write);
     }
 
     pub(crate) fn update_transient(&self, id: &CaptureId, apply: impl FnOnce(&mut Exchange)) {
-        self.update_with_persistence(id, apply, false);
+        self.apply_update(id, apply, Persistence::Skip);
     }
 
-    fn update_with_persistence(
+    fn apply_update(
         &self,
         id: &CaptureId,
         apply: impl FnOnce(&mut Exchange),
-        persist: bool,
+        persistence: Persistence,
     ) {
         let mut inner = self.inner.lock();
         if id.generation != inner.generation {
@@ -246,7 +264,7 @@ impl ExchangeStore {
             let conversation_id = exchange.summary.conversation_id.clone();
             associate_conversation_locked(&mut inner, id, &request_id, conversation_id);
         }
-        if persist {
+        if persistence == Persistence::Write {
             persist_locked(&mut inner, id);
         }
         self.publish(StoreEvent {
@@ -520,7 +538,7 @@ fn associate_conversation_locked(
             if candidate.summary.request_id == request_id
                 && !candidate.summary.conversation_id.is_empty()
             {
-                conversation_id = candidate.summary.conversation_id.clone();
+                conversation_id.clone_from(&candidate.summary.conversation_id);
                 break;
             }
         }

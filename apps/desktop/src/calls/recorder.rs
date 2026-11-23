@@ -15,9 +15,16 @@ use crate::{
     provider::{FinishReason, ModelEvent, is_valid_response_event},
 };
 
-use super::{CallStore, NewLlmCall, store::BufferedLlmChunk};
+use super::{
+    CallStore, NewLlmCall,
+    store::{BufferedLlmChunk, PayloadStorage},
+};
 
 #[derive(Clone)]
+#[expect(
+    missing_debug_implementations,
+    reason = "the recorder owns a store and task handles that add no useful Debug detail"
+)]
 pub struct CallRecorder {
     inner: Arc<Inner>,
 }
@@ -50,7 +57,7 @@ impl Drop for CancelOnDrop {
 struct Inner {
     store: CallStore,
     call_id: String,
-    detailed: bool,
+    storage: PayloadStorage,
     started: Instant,
     lifecycle: Mutex<Lifecycle>,
     observations: Mutex<Option<mpsc::Sender<Observation>>>,
@@ -77,7 +84,7 @@ const MAX_BUFFER_AGE: std::time::Duration = std::time::Duration::from_millis(50)
 struct ObservationWriter {
     store: CallStore,
     call_id: String,
-    detailed: bool,
+    storage: PayloadStorage,
     started: Instant,
     receiver: mpsc::Receiver<Observation>,
     next_chunk: i64,
@@ -90,14 +97,14 @@ impl ObservationWriter {
     fn new(
         store: CallStore,
         call_id: String,
-        detailed: bool,
+        storage: PayloadStorage,
         started: Instant,
         receiver: mpsc::Receiver<Observation>,
     ) -> Self {
         Self {
             store,
             call_id,
-            detailed,
+            storage,
             started,
             receiver,
             next_chunk: 0,
@@ -127,7 +134,7 @@ impl ObservationWriter {
                 self.flush().await;
                 return;
             };
-            self.chunks.push(if self.detailed {
+            self.chunks.push(if self.storage.keeps_payloads() {
                 BufferedLlmChunk::new(self.next_chunk, observation.elapsed_ms, &observation.data)
             } else {
                 BufferedLlmChunk::metrics(
@@ -155,7 +162,7 @@ impl ObservationWriter {
         let first_event_at_ms = started_at_ms(self.started, chunks[0].elapsed_ms);
         if let Err(error) = self
             .store
-            .record_llm_chunks(&self.call_id, &chunks, self.detailed, first_event_at_ms)
+            .record_llm_chunks(&self.call_id, &chunks, self.storage, first_event_at_ms)
             .await
         {
             self.store.mark_degraded();
@@ -166,11 +173,12 @@ impl ObservationWriter {
 
 impl CallRecorder {
     pub async fn start(store: CallStore, mut call: NewLlmCall) -> Self {
-        call.detailed = store.detailed_logging().await.unwrap_or_else(|error| {
+        let storage = store.payload_storage().await.unwrap_or_else(|error| {
             tracing::warn!(%error, "cannot read LLM detailed logging");
             store.mark_degraded();
-            false
+            PayloadStorage::Metrics
         });
+        call.detailed = storage.keeps_payloads();
         if let Err(error) = store.start_llm_call(&call).await {
             tracing::warn!(call_id = %call.call_id, %error, "cannot start LLM call record");
             store.mark_degraded();
@@ -181,7 +189,7 @@ impl CallRecorder {
             ObservationWriter::new(
                 store.clone(),
                 call.call_id.clone(),
-                call.detailed,
+                storage,
                 started,
                 receiver,
             )
@@ -191,7 +199,7 @@ impl CallRecorder {
             inner: Arc::new(Inner {
                 store,
                 call_id: call.call_id,
-                detailed: call.detailed,
+                storage,
                 started,
                 lifecycle: Mutex::default(),
                 observations: Mutex::new(Some(sender)),
@@ -226,10 +234,11 @@ impl CallRecorder {
         self.observe(
             self.inner
                 .store
-                .record_llm_request(&self.inner.call_id, &headers, body, self.inner.detailed)
+                .record_llm_request(&self.inner.call_id, &headers, body, self.inner.storage)
                 .await,
             "cannot record LLM request",
-        )
+        );
+        Ok(())
     }
 
     pub async fn response_headers(&self, status: u16) -> Result<()> {
@@ -250,7 +259,8 @@ impl CallRecorder {
                 )
                 .await,
             "cannot record LLM response headers",
-        )
+        );
+        Ok(())
     }
 
     pub async fn response_chunk(&self, data: &[u8]) -> Result<()> {
@@ -343,7 +353,8 @@ impl CallRecorder {
                 .record_llm_usage(&self.inner.call_id, usage)
                 .await,
             "cannot record LLM usage",
-        )
+        );
+        Ok(())
     }
 
     pub async fn completed(&self, reason: FinishReason) -> Result<()> {
@@ -406,12 +417,13 @@ impl CallRecorder {
         Ok(())
     }
 
-    fn observe(&self, result: Result<()>, message: &str) -> Result<()> {
+    /// A failed record keeps the call going: the store is degraded, the
+    /// response is unaffected.
+    fn observe(&self, result: Result<()>, message: &str) {
         if let Err(error) = result {
             self.inner.store.mark_degraded();
             tracing::warn!(call_id = %self.inner.call_id, %error, "{message}");
         }
-        Ok(())
     }
 }
 
@@ -419,13 +431,13 @@ fn started_at_ms(started: Instant, offset_ms: i64) -> i64 {
     let epoch_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64;
+        .as_millis();
+    let epoch_ms = i64::try_from(epoch_ms).unwrap_or(i64::MAX);
     epoch_ms.saturating_sub(elapsed_ms(started).saturating_sub(offset_ms))
 }
 
 fn elapsed_ms(started: Instant) -> i64 {
-    started.elapsed().as_millis().min(i64::MAX as u128) as i64
+    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
 fn finish_reason(reason: FinishReason) -> &'static str {

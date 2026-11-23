@@ -34,7 +34,7 @@ use nsh_core::{
 use tokio::sync::watch;
 
 use self::backend::Backend;
-use self::calls::CallStore;
+use self::calls::{CallStore, PayloadStorage};
 use self::harness::{
     CaState as HarnessCa, CursorHarness, Error as HarnessError, HarnessPaths, HarnessStatus,
     IntegrationState as HarnessIntegration,
@@ -146,6 +146,10 @@ pub struct HarnessState {
 ///
 /// Create one and keep it for the app's lifetime: it owns the proxy task.
 #[class]
+#[expect(
+    missing_debug_implementations,
+    reason = "the class owns proxy state and a watch channel; the TSX side never Debug-prints it"
+)]
 pub struct Harness {
     inner: Arc<CursorHarness>,
     backend: watch::Receiver<Option<String>>,
@@ -166,19 +170,23 @@ impl Harness {
     /// The current state. Also heals a takeover whose proxy went away.
     pub async fn status(this: Instance<Self>) -> Result<HarnessState, HarnessError> {
         let (harness, mut backend) =
-            this.with(|harness| (harness.inner.clone(), harness.backend.clone()));
+            this.with(|harness| (Arc::clone(&harness.inner), harness.backend.clone()));
         attach_backend(&harness, &mut backend).await?;
         Ok(harness.status().await.into())
     }
 
     /// Turns takeover on or off. Enabling fails, without touching Cursor, when
     /// the CA is not trusted yet; check `ca` in the status first.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "the switch maps 1:1 to a TSX boolean; an enum would only move the translation to the screen"
+    )]
     pub async fn set_enabled(
         this: Instance<Self>,
         enabled: bool,
     ) -> Result<HarnessState, HarnessError> {
         let (harness, mut backend) =
-            this.with(|harness| (harness.inner.clone(), harness.backend.clone()));
+            this.with(|harness| (Arc::clone(&harness.inner), harness.backend.clone()));
         attach_backend(&harness, &mut backend).await?;
         harness.set_enabled(enabled).await.map(Into::into)
     }
@@ -189,7 +197,7 @@ impl Harness {
         let addr = addr.parse().map_err(|error| {
             HarnessError::Config(format!("invalid local backend address: {error}"))
         })?;
-        this.with(|harness| harness.inner.clone())
+        this.with(|harness| Arc::clone(&harness.inner))
             .set_backend_addr(addr)
             .await
     }
@@ -197,8 +205,8 @@ impl Harness {
     /// Generates the CA when it is missing. Trusting it is the user's step:
     /// copy `caInstallCommand` into a terminal.
     pub async fn initialize_ca(this: Instance<Self>) -> Result<HarnessState, HarnessError> {
-        let harness = this.with(|harness| harness.inner.clone());
-        let worker = harness.clone();
+        let harness = this.with(|harness| Arc::clone(&harness.inner));
+        let worker = Arc::clone(&harness);
         blocking(move || worker.initialize_ca())
             .await
             .map_err(|error| {
@@ -213,7 +221,7 @@ impl Harness {
         this: Instance<Self>,
         port: Option<u16>,
     ) -> Result<HarnessState, HarnessError> {
-        this.with(|harness| harness.inner.clone())
+        this.with(|harness| Arc::clone(&harness.inner))
             .set_preferred_port(port)
             .await
             .map(Into::into)
@@ -222,7 +230,7 @@ impl Harness {
     /// Drops the proxy a crashed run left in Cursor's settings. `true` when it
     /// removed something.
     pub async fn cleanup_stale_settings(this: Instance<Self>) -> Result<bool, HarnessError> {
-        this.with(|harness| harness.inner.clone())
+        this.with(|harness| Arc::clone(&harness.inner))
             .cleanup_stale_settings()
             .await
     }
@@ -386,8 +394,8 @@ impl From<HostResourceView> for PluginResourceView {
 impl From<HostFormSubmit> for PluginFormResult {
     fn from(value: HostFormSubmit) -> Self {
         Self {
-            added: value.added as u32,
-            updated: value.updated as u32,
+            added: u32::try_from(value.added).unwrap_or(u32::MAX),
+            updated: u32::try_from(value.updated).unwrap_or(u32::MAX),
             model_sync_error: value.model_sync_error,
         }
     }
@@ -561,6 +569,10 @@ pub struct PluginFormValue {
 ///
 /// Create one and keep it for the app's lifetime: it owns plugin workers.
 #[class]
+#[expect(
+    missing_debug_implementations,
+    reason = "the class owns plugin workers and their process state"
+)]
 pub struct Plugins {
     inner: Arc<PluginHost>,
 }
@@ -577,7 +589,7 @@ impl Plugins {
 
     /// The current plugin snapshot, including Magpie models when a gateway exists.
     pub async fn snapshot(this: Instance<Self>) -> Result<PluginSnapshot, plugins::Error> {
-        let inner = this.with(|plugins| plugins.inner.clone());
+        let inner = this.with(|plugins| Arc::clone(&plugins.inner));
         start_backend((*inner).clone());
         Ok(inner.snapshot().await.into())
     }
@@ -594,7 +606,7 @@ impl Plugins {
         for value in values {
             object.insert(value.id, serde_json::Value::String(value.value));
         }
-        this.with(|plugins| plugins.inner.clone())
+        this.with(|plugins| Arc::clone(&plugins.inner))
             .form_submit(
                 &plugin_id,
                 &resource_type,
@@ -612,7 +624,7 @@ impl Plugins {
         resource_type: String,
         resource_id: String,
     ) -> Result<PluginSnapshot, plugins::Error> {
-        let host = this.with(|plugins| plugins.inner.clone());
+        let host = this.with(|plugins| Arc::clone(&plugins.inner));
         host.delete_resource(&plugin_id, &resource_type, &resource_id)
             .await?;
         Ok(host.snapshot().await.into())
@@ -624,7 +636,7 @@ impl Plugins {
         plugin_id: String,
         provider_id: String,
     ) -> Result<PluginSnapshot, plugins::Error> {
-        let host = this.with(|plugins| plugins.inner.clone());
+        let host = this.with(|plugins| Arc::clone(&plugins.inner));
         host.refresh_catalog(&plugin_id, &provider_id).await?;
         Ok(host.snapshot().await.into())
     }
@@ -632,6 +644,10 @@ impl Plugins {
 
 /// One recorded Magpie model call.
 #[derive(Debug, Clone, PartialEq, JsObject)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "these are independent SQLite flags mirrored to TSX, not a mode switch"
+)]
 pub struct CallRecord {
     /// Invocation id from Cursor.
     pub call_id: String,
@@ -880,6 +896,10 @@ impl From<calls::LlmCallResponseChunk> for CallChunkRecord {
 /// Create one and keep it for the app's lifetime: it shares the store with the
 /// local loop.
 #[class]
+#[expect(
+    missing_debug_implementations,
+    reason = "the class owns the SQLite-backed call store"
+)]
 pub struct Calls {
     store: CallStore,
 }
@@ -888,9 +908,7 @@ pub struct Calls {
 impl Calls {
     /// Opens the shared call store used by the local loop.
     pub fn new() -> Self {
-        Self {
-            store: shared_call_store(),
-        }
+        Self::default()
     }
 
     /// Newest calls, the detailed-mode setting, and storage counts.
@@ -920,9 +938,18 @@ impl Calls {
     }
 
     /// Turns detailed recording on or off for later calls.
-    pub async fn set_detailed(this: Instance<Self>, enabled: bool) -> Result<CallsSnapshot, Error> {
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "the toggle maps 1:1 to a TSX boolean; `PayloadStorage::from` converts it here"
+    )]
+    pub async fn set_detailed(
+        this: Instance<Self>,
+        detailed: bool,
+    ) -> Result<CallsSnapshot, Error> {
         let store = this.with(|calls| calls.store.clone());
-        store.set_detailed_logging(enabled).await?;
+        store
+            .set_detailed_logging(PayloadStorage::from(detailed))
+            .await?;
         Ok(store.snapshot(200).await.into())
     }
 
@@ -940,6 +967,15 @@ impl Calls {
             .clear_all()
             .await
             .map(Into::into)
+    }
+}
+
+impl Default for Calls {
+    /// The store is process-wide, so `Default` and `new` are the same operation.
+    fn default() -> Self {
+        Self {
+            store: shared_call_store(),
+        }
     }
 }
 
@@ -1020,7 +1056,7 @@ fn backend_addr() -> watch::Receiver<Option<String>> {
 
 fn start_backend(plugins: PluginHost) {
     start_backend_on(
-        backend_watch().clone(),
+        Arc::clone(backend_watch()),
         Backend::start(plugins, shared_call_store()),
     );
 }
@@ -1105,6 +1141,7 @@ fn shared_call_store() -> CallStore {
 }
 
 /// Text helpers.
+#[derive(Debug)]
 #[module]
 pub struct Format;
 
@@ -1123,7 +1160,7 @@ impl Format {
 }
 
 /// A count kept in Rust.
-#[derive(Default)]
+#[derive(Debug, Default)]
 #[class]
 pub struct Counter {
     count: u32,
@@ -1197,8 +1234,8 @@ mod backend_lifecycle_tests {
     fn startup_outside_a_runtime_stays_idle() {
         let watch = isolated_watch();
         let started = Arc::new(AtomicUsize::new(0));
-        let attempts = started.clone();
-        start_backend_on(watch.clone(), async move {
+        let attempts = Arc::clone(&started);
+        start_backend_on(Arc::clone(&watch), async move {
             attempts.fetch_add(1, Ordering::SeqCst);
             std::future::pending::<Result<Backend>>().await
         });
@@ -1212,9 +1249,9 @@ mod backend_lifecycle_tests {
         let release = Arc::new(Notify::new());
         let attempts = Arc::new(AtomicUsize::new(0));
         for _ in 0..2 {
-            let release = release.clone();
-            let attempts = attempts.clone();
-            start_backend_on(watch.clone(), async move {
+            let release = Arc::clone(&release);
+            let attempts = Arc::clone(&attempts);
+            start_backend_on(Arc::clone(&watch), async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 release.notified().await;
                 std::future::pending::<Result<Backend>>().await
@@ -1230,7 +1267,7 @@ mod backend_lifecycle_tests {
     async fn startup_failure_wakes_waiters_and_allows_a_retry() {
         let watch = isolated_watch();
         let mut receiver = watch.sender.subscribe();
-        start_backend_on(watch.clone(), async {
+        start_backend_on(Arc::clone(&watch), async {
             Err(crate::Error::Protocol("injected startup failure".into()))
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), receiver.changed())
@@ -1241,8 +1278,8 @@ mod backend_lifecycle_tests {
         assert_eq!(*backend_state(&watch), BackendState::Idle);
 
         let attempts = Arc::new(AtomicUsize::new(0));
-        let retried = attempts.clone();
-        start_backend_on(watch.clone(), async move {
+        let retried = Arc::clone(&attempts);
+        start_backend_on(Arc::clone(&watch), async move {
             retried.fetch_add(1, Ordering::SeqCst);
             std::future::pending::<Result<Backend>>().await
         });
@@ -1254,11 +1291,14 @@ mod backend_lifecycle_tests {
     #[tokio::test]
     async fn startup_panic_also_allows_a_retry() {
         let watch = isolated_watch();
-        start_backend_on(watch.clone(), async {
+        start_backend_on(Arc::clone(&watch), async {
             panic!("injected startup panic");
         });
         wait_for_state(&watch, BackendState::Idle).await;
-        start_backend_on(watch.clone(), std::future::pending::<Result<Backend>>());
+        start_backend_on(
+            Arc::clone(&watch),
+            std::future::pending::<Result<Backend>>(),
+        );
         wait_for_state(&watch, BackendState::Starting).await;
     }
 
@@ -1266,7 +1306,7 @@ mod backend_lifecycle_tests {
     fn a_poisoned_state_lock_is_recovered() {
         let watch = isolated_watch();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
-            let watch = watch.clone();
+            let watch = Arc::clone(&watch);
             move || {
                 let _state = watch.state.lock().unwrap();
                 panic!("injected state lock poison");

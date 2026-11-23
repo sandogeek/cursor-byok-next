@@ -132,9 +132,11 @@ pub fn split_compact_first_string(body: &str) -> Option<(String, &str)> {
     let body = body.trim();
     let mut chars = body.chars();
     let quote = chars.next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
+    let quote_byte = match quote {
+        '"' => b'"',
+        '\'' => b'\'',
+        _ => return None,
+    };
     let bytes = body.as_bytes();
     let mut escaped = false;
     for i in 1..bytes.len() {
@@ -147,7 +149,7 @@ pub fn split_compact_first_string(body: &str) -> Option<(String, &str)> {
             escaped = true;
             continue;
         }
-        if ch == quote as u8 {
+        if ch == quote_byte {
             let rest = body[i + 1..].trim();
             let rest = rest.strip_prefix(',').unwrap_or(rest).trim();
             return Some((body[1..i].to_string(), rest));
@@ -234,10 +236,10 @@ fn split_compact_type_and_oneof(spec: &str) -> (&str, Option<String>) {
 fn split_compact_flag(spec: &str) -> (&str, Option<char>) {
     let bytes = spec.as_bytes();
     match bytes.last() {
-        Some(b'*' | b'?') => (
-            &spec[..spec.len() - 1],
-            Some(bytes[bytes.len() - 1] as char),
-        ),
+        Some(b'*' | b'?') => {
+            let flag = spec.chars().next_back();
+            (&spec[..spec.len() - 1], flag)
+        }
         _ => (spec, None),
     }
 }

@@ -21,7 +21,15 @@ use crate::{Result, model::Usage};
 
 const MAX_RETAINED_CALLS: i64 = 1000;
 const MAX_STORED_REQUEST_BYTES: usize = 1024 * 1024;
-const MAX_STORED_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Stored response payloads stop at 1 MiB; SQLite stores the total as `i64`.
+const MAX_STORED_RESPONSE_BYTES: i64 = 1024 * 1024;
+
+/// SQLite columns hold byte counts and token counts as `i64`. Values come from
+/// `usize` lengths and provider usage numbers, so clamping keeps the cast total.
+fn as_i64_len(len: usize) -> i64 {
+    i64::try_from(len).unwrap_or(i64::MAX)
+}
 
 const LLM_CALL_COLUMNS: &str = "call_id, run_id, conversation_id, provider_call_index, model_hash,
                 provider_type, provider_url, request_type, request_url, model_id, display_name,
@@ -127,9 +135,40 @@ pub struct CallStorage {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CallSnapshot {
     pub calls: Vec<LlmCallSummary>,
+    /// Whether payload bodies are being stored.
     pub detailed: bool,
     pub storage: CallStorage,
     pub degraded: bool,
+}
+
+/// Whether a call stores payload bodies or only their metrics.
+///
+/// The setting lives in `service_settings`; each call snapshots it, because
+/// turning the setting off must not retroactively change running calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PayloadStorage {
+    /// Timing, byte counts, and token usage only.
+    #[default]
+    Metrics,
+    /// Bodies, headers, and response chunks as well.
+    Detailed,
+}
+
+impl PayloadStorage {
+    pub(crate) fn keeps_payloads(self) -> bool {
+        matches!(self, Self::Detailed)
+    }
+}
+
+/// The TS boundary and the stored setting both express the mode as a bool.
+impl From<bool> for PayloadStorage {
+    fn from(detailed: bool) -> Self {
+        if detailed {
+            Self::Detailed
+        } else {
+            Self::Metrics
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +200,10 @@ impl BufferedLlmChunk {
 }
 
 #[derive(Clone)]
+#[expect(
+    missing_debug_implementations,
+    reason = "the store owns a sqlx pool, whose Debug output is not useful here"
+)]
 pub struct CallStore {
     path: PathBuf,
     connected: Arc<OnceCell<Connected>>,
@@ -222,7 +265,13 @@ impl CallStore {
         serde_json::from_str(&value).map_err(Into::into)
     }
 
-    pub async fn set_detailed_logging(&self, enabled: bool) -> Result<()> {
+    /// The storage mode new calls will snapshot.
+    pub async fn payload_storage(&self) -> Result<PayloadStorage> {
+        self.detailed_logging().await.map(PayloadStorage::from)
+    }
+
+    pub async fn set_detailed_logging(&self, storage: PayloadStorage) -> Result<()> {
+        let enabled = storage.keeps_payloads();
         let connected = self.connected().await?;
         let _write = connected.writes.lock().await;
         sqlx::query(
@@ -263,8 +312,8 @@ impl CallStore {
         .bind(call.fast)
         .bind(now)
         .bind(now)
-        .bind(call.message_count as i64)
-        .bind(call.tool_count as i64)
+        .bind(as_i64_len(call.message_count))
+        .bind(as_i64_len(call.tool_count))
         .bind(call.detailed)
         .execute(&connected.pool)
         .await
@@ -287,8 +336,9 @@ impl CallStore {
         call_id: &str,
         headers: &serde_json::Value,
         body: &serde_json::Value,
-        detailed: bool,
+        storage: PayloadStorage,
     ) -> Result<()> {
+        let detailed = storage.keeps_payloads();
         let body_json = serde_json::to_string(body)?;
         let stored_body = if body_json.len() > MAX_STORED_REQUEST_BYTES {
             serde_json::json!({
@@ -314,14 +364,14 @@ impl CallStore {
                 .bind(call_id)
                 .bind(headers_json)
                 .bind(&stored_body)
-                .bind(body_json.len() as i64)
+                .bind(as_i64_len(body_json.len()))
                 .bind(call_id)
                 .execute(&mut *transaction)
                 .await
                 .map_err(|error| self.fail(error))?;
         }
         sqlx::query("UPDATE llm_calls SET request_bytes = ?, request_truncated = ? WHERE call_id = ? AND status = 'running'")
-            .bind(body_json.len() as i64)
+            .bind(as_i64_len(body_json.len()))
             .bind(body_json.len() > MAX_STORED_REQUEST_BYTES)
             .bind(call_id)
             .execute(&mut *transaction)
@@ -357,17 +407,18 @@ impl CallStore {
         &self,
         call_id: &str,
         chunks: &[BufferedLlmChunk],
-        detailed: bool,
+        storage: PayloadStorage,
         first_event_at_ms: i64,
     ) -> Result<()> {
         if chunks.is_empty() {
             return Ok(());
         }
+        let detailed = storage.keeps_payloads();
         let byte_count = chunks
             .iter()
-            .map(|chunk| chunk.byte_count as i64)
+            .map(|chunk| as_i64_len(chunk.byte_count))
             .sum::<i64>();
-        let chunk_count = chunks.len() as i64;
+        let chunk_count = as_i64_len(chunks.len());
         let connected = self.connected().await?;
         let _write = connected.writes.lock().await;
         let mut transaction = connected
@@ -388,7 +439,8 @@ impl CallStore {
                 let data = chunk.data.as_deref().ok_or_else(|| {
                     crate::Error::Storage("detailed LLM chunk is missing payload data".into())
                 })?;
-                let remaining = (MAX_STORED_RESPONSE_BYTES as i64 - stored_bytes).max(0) as usize;
+                let remaining = usize::try_from((MAX_STORED_RESPONSE_BYTES - stored_bytes).max(0))
+                    .unwrap_or(usize::MAX);
                 if remaining == 0 || data.len() > remaining {
                     truncated = true;
                     continue;
@@ -398,14 +450,14 @@ impl CallStore {
                     .bind(chunk.seq)
                     .bind(chunk.elapsed_ms)
                     .bind(data)
-                    .bind(chunk.byte_count as i64)
+                    .bind(as_i64_len(chunk.byte_count))
                     .bind(call_id)
                     .execute(&mut *transaction)
                     .await
                     .map_err(|error| self.fail(error))?;
-                stored_bytes += chunk.byte_count as i64;
+                stored_bytes += as_i64_len(chunk.byte_count);
             }
-            if truncated || stored_bytes >= MAX_STORED_RESPONSE_BYTES as i64 {
+            if truncated || stored_bytes >= MAX_STORED_RESPONSE_BYTES {
                 sqlx::query("UPDATE llm_calls SET response_truncated = 1 WHERE call_id = ? AND status = 'running'")
                     .bind(call_id)
                     .execute(&mut *transaction)
@@ -511,7 +563,7 @@ impl CallStore {
         .fetch_all(&connected.pool)
         .await
         .map_err(|error| self.fail(error))?;
-        rows.into_iter().map(summary_from_row).collect()
+        rows.iter().map(summary_from_row).collect()
     }
 
     pub async fn llm_call(&self, call_id: &str) -> Result<Option<LlmCallSummary>> {
@@ -523,6 +575,7 @@ impl CallStore {
         .fetch_optional(&connected.pool)
         .await
         .map_err(|error| self.fail(error))?
+        .as_ref()
         .map(summary_from_row)
         .transpose()
     }
@@ -585,7 +638,7 @@ impl CallStore {
 
     pub async fn clear_details(&self) -> Result<CallSnapshot> {
         let connected = self.connected().await?;
-        let _write = connected.writes.lock().await;
+        let write_guard = connected.writes.lock().await;
         let mut transaction = connected
             .pool
             .begin()
@@ -607,13 +660,13 @@ impl CallStore {
             .commit()
             .await
             .map_err(|error| self.fail(error))?;
-        drop(_write);
+        drop(write_guard);
         self.try_snapshot(200).await
     }
 
     pub async fn clear_all(&self) -> Result<CallSnapshot> {
         let connected = self.connected().await?;
-        let _write = connected.writes.lock().await;
+        let write_guard = connected.writes.lock().await;
         let mut transaction = connected
             .pool
             .begin()
@@ -627,7 +680,7 @@ impl CallStore {
             .commit()
             .await
             .map_err(|error| self.fail(error))?;
-        drop(_write);
+        drop(write_guard);
         self.try_snapshot(200).await
     }
 
@@ -677,18 +730,18 @@ async fn apply_schema(pool: &SqlitePool) -> Result<()> {
 }
 
 fn now_ms() -> i64 {
-    std::time::SystemTime::now()
+    let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
 fn as_i64(value: Option<u64>) -> Option<i64> {
-    value.map(|value| value.min(i64::MAX as u64) as i64)
+    value.map(|value| i64::try_from(value).unwrap_or(i64::MAX))
 }
 
-fn summary_from_row(row: SqliteRow) -> Result<LlmCallSummary> {
+fn summary_from_row(row: &SqliteRow) -> Result<LlmCallSummary> {
     let usage = row.try_get::<Option<String>, _>("usage_json")?;
     Ok(LlmCallSummary {
         call_id: row.try_get("call_id")?,
@@ -745,7 +798,7 @@ fn summary_from_row(row: SqliteRow) -> Result<LlmCallSummary> {
 mod tests {
     use super::*;
 
-    fn sample(call_id: &str, model_id: &str, detailed: bool) -> NewLlmCall {
+    fn sample(call_id: &str, model_id: &str, storage: PayloadStorage) -> NewLlmCall {
         NewLlmCall {
             call_id: call_id.into(),
             run_id: format!("run-{call_id}"),
@@ -762,7 +815,7 @@ mod tests {
             fast: false,
             message_count: 1,
             tool_count: 0,
-            detailed,
+            detailed: storage.keeps_payloads(),
         }
     }
 
@@ -771,7 +824,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = CallStore::at(directory.path().join("calls.db"));
         store
-            .start_llm_call(&sample("plugin-call", "gpt-test", false))
+            .start_llm_call(&sample("plugin-call", "gpt-test", PayloadStorage::Metrics))
             .await
             .unwrap();
         store
@@ -792,8 +845,11 @@ mod tests {
     async fn detailed_mode_is_snapshotted_per_call_and_clears_payloads_separately() {
         let directory = tempfile::tempdir().unwrap();
         let store = CallStore::at(directory.path().join("calls.db"));
-        store.set_detailed_logging(true).await.unwrap();
-        let mut call = sample("detailed", "model", true);
+        store
+            .set_detailed_logging(PayloadStorage::Detailed)
+            .await
+            .unwrap();
+        let mut call = sample("detailed", "model", PayloadStorage::Detailed);
         call.detailed = store.detailed_logging().await.unwrap();
         store.start_llm_call(&call).await.unwrap();
         store
@@ -801,7 +857,7 @@ mod tests {
                 "detailed",
                 &serde_json::json!({"content-type": "application/json"}),
                 &serde_json::json!({"model": "test"}),
-                true,
+                PayloadStorage::Detailed,
             )
             .await
             .unwrap();
@@ -809,12 +865,15 @@ mod tests {
             .record_llm_chunks(
                 "detailed",
                 &[BufferedLlmChunk::new(0, 1, b"data: [DONE]\n\n")],
-                true,
+                PayloadStorage::Detailed,
                 now_ms(),
             )
             .await
             .unwrap();
-        store.set_detailed_logging(false).await.unwrap();
+        store
+            .set_detailed_logging(PayloadStorage::Metrics)
+            .await
+            .unwrap();
         assert!(!store.detailed_logging().await.unwrap());
         assert!(store.llm_call("detailed").await.unwrap().unwrap().detailed);
         assert_eq!(store.storage().await.unwrap().request_count, 1);
@@ -833,7 +892,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = CallStore::at(directory.path().join("calls.db"));
         store
-            .start_llm_call(&sample("timing", "model", false))
+            .start_llm_call(&sample("timing", "model", PayloadStorage::Metrics))
             .await
             .unwrap();
         store
@@ -879,11 +938,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = CallStore::at(directory.path().join("calls.db"));
         store
-            .start_llm_call(&sample("a", "a", false))
+            .start_llm_call(&sample("a", "a", PayloadStorage::Metrics))
             .await
             .unwrap();
         store
-            .start_llm_call(&sample("b", "b", false))
+            .start_llm_call(&sample("b", "b", PayloadStorage::Metrics))
             .await
             .unwrap();
         let calls = store.llm_calls(200).await.unwrap();
@@ -898,7 +957,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = CallStore::at(directory.path().join("calls.db"));
         store
-            .start_llm_call(&sample("usage", "model", false))
+            .start_llm_call(&sample("usage", "model", PayloadStorage::Metrics))
             .await
             .unwrap();
         store
@@ -927,7 +986,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = CallStore::at(directory.path().join("calls.db"));
         store
-            .start_llm_call(&sample("finished", "model", true))
+            .start_llm_call(&sample("finished", "model", PayloadStorage::Detailed))
             .await
             .unwrap();
         store
@@ -959,7 +1018,7 @@ mod tests {
             .record_llm_chunks(
                 "finished",
                 &[BufferedLlmChunk::new(0, 99, b"late")],
-                true,
+                PayloadStorage::Detailed,
                 now_ms(),
             )
             .await
@@ -969,7 +1028,7 @@ mod tests {
                 "finished",
                 &serde_json::json!({}),
                 &serde_json::json!({"late": true}),
-                true,
+                PayloadStorage::Detailed,
             )
             .await
             .unwrap();
@@ -984,7 +1043,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = CallStore::at(directory.path().join("calls.db"));
         store
-            .start_llm_call(&sample("bounded", "model", true))
+            .start_llm_call(&sample("bounded", "model", PayloadStorage::Detailed))
             .await
             .unwrap();
         store
@@ -992,7 +1051,7 @@ mod tests {
                 "bounded",
                 &serde_json::json!({"content-type": "application/json"}),
                 &serde_json::json!({"body": "x".repeat(MAX_STORED_REQUEST_BYTES + 1)}),
-                true,
+                PayloadStorage::Detailed,
             )
             .await
             .unwrap();
@@ -1000,10 +1059,10 @@ mod tests {
             .record_llm_chunks(
                 "bounded",
                 &[
-                    BufferedLlmChunk::new(0, 1, &vec![b'a'; MAX_STORED_RESPONSE_BYTES]),
+                    BufferedLlmChunk::new(0, 1, &payload_at_limit()),
                     BufferedLlmChunk::new(1, 2, b"discarded"),
                 ],
-                true,
+                PayloadStorage::Detailed,
                 now_ms(),
             )
             .await
@@ -1013,7 +1072,7 @@ mod tests {
             .record_llm_chunks(
                 "bounded",
                 &[BufferedLlmChunk::new(2, 3, b"after-limit")],
-                true,
+                PayloadStorage::Detailed,
                 now_ms(),
             )
             .await
@@ -1021,15 +1080,19 @@ mod tests {
         let call = store.llm_call("bounded").await.unwrap().unwrap();
         assert!(call.request_truncated);
         assert!(call.response_truncated);
-        assert_eq!(call.response_bytes, MAX_STORED_RESPONSE_BYTES as i64 + 20);
+        assert_eq!(call.response_bytes, MAX_STORED_RESPONSE_BYTES + 20);
         let request = store.llm_call_request("bounded").await.unwrap().unwrap();
         assert_eq!(request.body["truncated"], true);
         let chunks = store.llm_call_chunks("bounded").await.unwrap();
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].byte_count, MAX_STORED_RESPONSE_BYTES as i64);
+        assert_eq!(chunks[0].byte_count, MAX_STORED_RESPONSE_BYTES);
         let cleared = store.clear_details().await.unwrap();
         assert!(!cleared.calls[0].request_truncated);
         assert!(!cleared.calls[0].response_truncated);
+    }
+
+    fn payload_at_limit() -> Vec<u8> {
+        vec![b'a'; usize::try_from(MAX_STORED_RESPONSE_BYTES).expect("cap fits in usize")]
     }
 
     #[tokio::test]
@@ -1038,7 +1101,11 @@ mod tests {
         let store = CallStore::at(directory.path().join("calls.db"));
         for index in 0..=MAX_RETAINED_CALLS {
             store
-                .start_llm_call(&sample(&format!("call-{index}"), "model", false))
+                .start_llm_call(&sample(
+                    &format!("call-{index}"),
+                    "model",
+                    PayloadStorage::Metrics,
+                ))
                 .await
                 .unwrap();
         }

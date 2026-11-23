@@ -46,7 +46,7 @@ pub fn merge_messages_by_type_name(messages: Vec<Message>) -> Vec<Message> {
 }
 
 fn message_completeness(message: &Message) -> i32 {
-    let mut score = message.fields.len() as i32 * 10;
+    let mut score = length_score(message.fields.len()) * 10;
     for field in &message.fields {
         if field.kind == "map" {
             score += 2;
@@ -62,6 +62,12 @@ fn message_completeness(message: &Message) -> i32 {
 
 fn type_ref_completeness(token: Option<&TypeToken>) -> i32 {
     token.map_or(0, TypeToken::completeness)
+}
+
+/// Score for "how much this declaration has", kept in `i32` because the
+/// comparisons only care about magnitude, not the absolute value.
+fn length_score(len: usize) -> i32 {
+    i32::try_from(len).unwrap_or(i32::MAX)
 }
 
 pub fn merge_enums_by_type_name(enums: Vec<Enum>) -> Vec<Enum> {
@@ -81,9 +87,9 @@ pub fn merge_enums_by_type_name(enums: Vec<Enum>) -> Vec<Enum> {
 }
 
 fn enum_completeness(item: &Enum) -> i32 {
-    let mut score = item.values.len() as i32 * 10;
+    let mut score = length_score(item.values.len()) * 10;
     for value in &item.values {
-        score += value.name.len() as i32;
+        score += length_score(value.name.len());
     }
     score
 }
@@ -105,7 +111,7 @@ pub fn merge_services_by_type_name(services: Vec<Service>) -> Vec<Service> {
 }
 
 fn service_completeness(service: &Service) -> i32 {
-    let mut score = service.methods.len() as i32 * 10;
+    let mut score = length_score(service.methods.len()) * 10;
     for method in &service.methods {
         score += type_ref_completeness(Some(&TypeToken::Named(method.input_type.clone())));
         score += type_ref_completeness(Some(&TypeToken::Named(method.output_type.clone())));

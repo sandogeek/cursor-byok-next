@@ -1,14 +1,50 @@
 //! Ports of the upstream Go extractor tests that local loop still needs.
 
+use std::collections::HashMap;
+
 use super::{
-    Enum, Field, Message, Service, TypeToken, declaration_coverage, extract_from_sources,
-    has_placeholder, merge_messages_by_type_name, parse_field_object_source,
+    BundleScan, Enum, Field, Message, Service, Strictness, TypeToken, declaration_coverage,
+    extract_from_sources, has_placeholder, merge_messages_by_type_name, parse_field_object_source,
     reclassify_enum_fields, resolver_from_scan, scan_source, validate_required_agent_shapes,
 };
 
 fn field_by_name<'a>(fields: &'a [Field], name: &str) -> Option<&'a Field> {
     fields.iter().find(|field| field.name == name)
 }
+
+/// A compact-syntax bundle declaring the `RunInference` mode-config shapes.
+const RUN_INFERENCE_BUNDLE: &str = r#"
+D6t="aiserver.v1.";
+class F6t extends Base{static $p(){return D6t}}
+K6t=(0,s.QT)(r.proto3,D6t,"InferenceMessageRole",[[0,"UNSPECIFIED"],[1,"USER"],[2,"ASSISTANT"],[3,"TOOL"],[4,"SYSTEM"]],1);
+class z7t extends F6t{
+  static $(){return["RunInferenceClientMessage|1 run_request #0 message|4 finish_run #1 message",Qp1,lf1]}
+}
+class vf1 extends F6t{
+  static $(){return["RunInferencePromptModelMetadata|1 vendor 9|36 feature_flags 9,#0|46 agent_mode_configs #1*|48 ask_question_config #2?",Tf1,Cf1,wf1]}
+}
+class Cf1 extends F6t{
+  static $(){return["RunInferenceAgentModeConfig|1 mode_id 9|2 enable_ask_question_tool 8|3 switch_mode_tool_config #0?",kf1]}
+}
+class wf1 extends F6t{
+  static $(){return["RunInferenceAskQuestionConfig|1 tool_name 9|2 auto_reject_first 8"]}
+}
+class Tf1 extends F6t{
+  static $(){return["RunInferenceFlagValue|1 bool_value 8 value|2 number_value 1 value|3 string_value 9 value"]}
+}
+class kf1 extends F6t{
+  static $(){return["RunInferenceSwitchModeToolConfig|1 target_modes 9*"]}
+}
+class Lp1 extends F6t{
+  static $(){return["InferenceToolResultPart|1 tool_call_id 9|3 result #0",r.Value]}
+}
+class hf1 extends F6t{
+  static $(){return["RunInferenceRunReady|12 metric_labels 9,9|4 prompt_model_metadata #0",vf1]}
+}
+InferenceReason=enumType(proto3,__protoPackage117,"InferenceReason",[[0,"UNSPECIFIED"],[1,"GEMINI_VIDEO_SUBAGENT"]],1);
+__protoPackage117="aiserver.v1.";
+var Pf1={typeName:"aiserver.v1.InferenceService",methods:{runInference:{name:"RunInference",I:z7t,O:hf1,kind:ye.BiDiStreaming},runInferenceSSE:{name:"RunInferenceSSE",I:j$e,O:hf1,kind:ye.ServerStreaming},recordEmpty:{name:"RecordEmpty",I:z7t,O:r.Empty,kind:ye.Unary}}};
+"#;
 
 fn enum_by_name<'a>(enums: &'a [Enum], type_name: &str) -> Option<&'a Enum> {
     enums.iter().find(|item| item.type_name == type_name)
@@ -87,8 +123,8 @@ fn resolver_prefers_expected_kind_over_current_package() {
             pos: 20,
             module_start: 1,
         }],
-        &Default::default(),
-        &Default::default(),
+        &HashMap::default(),
+        &HashMap::default(),
     );
     let type_name = resolver
         .resolve_type_name("nt", 30, 1, "origin.v1", "message")
@@ -148,7 +184,7 @@ fn modern_factory_syntax_extracts_in_app_ad_service_types() {
 
 #[test]
 fn resolver_maps_dotted_google_well_known_types() {
-    let resolver = super::TypeResolver::new(&[], &[], &Default::default(), &Default::default());
+    let resolver = super::TypeResolver::new(&[], &[], &HashMap::default(), &HashMap::default());
     assert_eq!(
         resolver
             .resolve_type_name("r.Empty", 0, 0, "aiserver.v1", "message")
@@ -375,45 +411,42 @@ fn merge_messages_prefers_more_complete_definition() {
 
 #[test]
 fn compact_factory_extracts_run_inference_mode_config() {
-    const BUNDLE: &str = r#"
-D6t="aiserver.v1.";
-class F6t extends Base{static $p(){return D6t}}
-K6t=(0,s.QT)(r.proto3,D6t,"InferenceMessageRole",[[0,"UNSPECIFIED"],[1,"USER"],[2,"ASSISTANT"],[3,"TOOL"],[4,"SYSTEM"]],1);
-class z7t extends F6t{
-  static $(){return["RunInferenceClientMessage|1 run_request #0 message|4 finish_run #1 message",Qp1,lf1]}
+    let mut scan = scan_run_inference_bundle();
+    let by_type = messages_by_type(&scan);
+    assert_run_inference_metadata(&by_type);
+    assert_run_inference_maps(&by_type);
+    let role = enum_by_name(&scan.enums, "aiserver.v1.InferenceMessageRole").expect("role");
+    assert_eq!(role.values.len(), 5);
+    assert_eq!(role.values[1].name, "INFERENCE_MESSAGE_ROLE_USER");
+    let reason = enum_by_name(&scan.enums, "aiserver.v1.InferenceReason").expect("reason");
+    assert_eq!(
+        reason.values[1].name,
+        "INFERENCE_REASON_GEMINI_VIDEO_SUBAGENT"
+    );
+    assert_eq!(scan.services.len(), 1);
+    assert_eq!(scan.services[0].type_name, "aiserver.v1.InferenceService");
+    let resolver = resolver_from_scan(&scan);
+    super::normalize_type_references(&mut scan.messages, &mut scan.services, &resolver);
+    assert_eq!(
+        scan.services[0].methods[2].output_type,
+        "google.protobuf.Empty"
+    );
 }
-class vf1 extends F6t{
-  static $(){return["RunInferencePromptModelMetadata|1 vendor 9|36 feature_flags 9,#0|46 agent_mode_configs #1*|48 ask_question_config #2?",Tf1,Cf1,wf1]}
-}
-class Cf1 extends F6t{
-  static $(){return["RunInferenceAgentModeConfig|1 mode_id 9|2 enable_ask_question_tool 8|3 switch_mode_tool_config #0?",kf1]}
-}
-class wf1 extends F6t{
-  static $(){return["RunInferenceAskQuestionConfig|1 tool_name 9|2 auto_reject_first 8"]}
-}
-class Tf1 extends F6t{
-  static $(){return["RunInferenceFlagValue|1 bool_value 8 value|2 number_value 1 value|3 string_value 9 value"]}
-}
-class kf1 extends F6t{
-  static $(){return["RunInferenceSwitchModeToolConfig|1 target_modes 9*"]}
-}
-class Lp1 extends F6t{
-  static $(){return["InferenceToolResultPart|1 tool_call_id 9|3 result #0",r.Value]}
-}
-class hf1 extends F6t{
-  static $(){return["RunInferenceRunReady|12 metric_labels 9,9|4 prompt_model_metadata #0",vf1]}
-}
-InferenceReason=enumType(proto3,__protoPackage117,"InferenceReason",[[0,"UNSPECIFIED"],[1,"GEMINI_VIDEO_SUBAGENT"]],1);
-__protoPackage117="aiserver.v1.";
-var Pf1={typeName:"aiserver.v1.InferenceService",methods:{runInference:{name:"RunInference",I:z7t,O:hf1,kind:ye.BiDiStreaming},runInferenceSSE:{name:"RunInferenceSSE",I:j$e,O:hf1,kind:ye.ServerStreaming},recordEmpty:{name:"RecordEmpty",I:z7t,O:r.Empty,kind:ye.Unary}}};
-"#;
-    let mut scan = scan_source(BUNDLE);
+
+fn scan_run_inference_bundle() -> BundleScan {
+    let mut scan = scan_source(RUN_INFERENCE_BUNDLE);
     reclassify_enum_fields(&mut scan.messages, &scan.enums);
-    let by_type: std::collections::HashMap<_, _> = scan
-        .messages
+    scan
+}
+
+fn messages_by_type(scan: &BundleScan) -> HashMap<String, Message> {
+    scan.messages
         .iter()
         .map(|message| (message.type_name.clone(), message.clone()))
-        .collect();
+        .collect()
+}
+
+fn assert_run_inference_metadata(by_type: &HashMap<String, Message>) {
     let meta = by_type
         .get("aiserver.v1.RunInferencePromptModelMetadata")
         .expect("metadata");
@@ -438,58 +471,24 @@ var Pf1={typeName:"aiserver.v1.InferenceService",methods:{runInference:{name:"Ru
         .expect("mode config");
     assert!(field_by_name(&mode.fields, "mode_id").is_some());
     assert!(field_by_name(&mode.fields, "enable_ask_question_tool").is_some());
-    let result = field_by_name(
-        &by_type
-            .get("aiserver.v1.InferenceToolResultPart")
-            .expect("result part")
-            .fields,
-        "result",
-    )
-    .expect("result");
+}
+
+fn assert_run_inference_maps(by_type: &HashMap<String, Message>) {
+    let result_part = by_type
+        .get("aiserver.v1.InferenceToolResultPart")
+        .expect("result part");
+    let result = field_by_name(&result_part.fields, "result").expect("result");
     assert_eq!(
         result.t,
         Some(TypeToken::Named("google.protobuf.Value".into()))
     );
-    let labels = field_by_name(
-        &by_type
-            .get("aiserver.v1.RunInferenceRunReady")
-            .expect("run ready")
-            .fields,
-        "metric_labels",
-    )
-    .expect("metric_labels");
+    let ready = by_type
+        .get("aiserver.v1.RunInferenceRunReady")
+        .expect("run ready");
+    let labels = field_by_name(&ready.fields, "metric_labels").expect("metric_labels");
     assert_eq!(labels.kind, "map");
     assert_eq!(labels.map_key, 9);
     assert_eq!(labels.map_value_kind, "scalar");
-    let role = enum_by_name(&scan.enums, "aiserver.v1.InferenceMessageRole").expect("role");
-    assert_eq!(role.values.len(), 5);
-    assert_eq!(role.values[1].name, "INFERENCE_MESSAGE_ROLE_USER");
-    let reason = enum_by_name(&scan.enums, "aiserver.v1.InferenceReason");
-    assert!(
-        reason.is_some(),
-        "missing InferenceReason, got {:?}",
-        scan.enums
-            .iter()
-            .map(|item| (
-                item.type_name.clone(),
-                item.package.clone(),
-                item.var_name.clone()
-            ))
-            .collect::<Vec<_>>()
-    );
-    let reason = reason.expect("reason");
-    assert_eq!(
-        reason.values[1].name,
-        "INFERENCE_REASON_GEMINI_VIDEO_SUBAGENT"
-    );
-    assert_eq!(scan.services.len(), 1);
-    assert_eq!(scan.services[0].type_name, "aiserver.v1.InferenceService");
-    let resolver = resolver_from_scan(&scan);
-    super::normalize_type_references(&mut scan.messages, &mut scan.services, &resolver);
-    assert_eq!(
-        scan.services[0].methods[2].output_type,
-        "google.protobuf.Empty"
-    );
 }
 
 #[test]
@@ -550,8 +549,8 @@ fn no_strict_extract_keeps_files_when_required_shapes_are_missing() {
 var Keep=n.makeMessageType("aiserver.v1.Keep",()=>[{no:1,name:"id",kind:"scalar",T:9}]);
 var Ads={typeName:"aiserver.v1.InAppAdService",methods:{ping:{name:"Ping",I:Keep,O:Keep,kind:n.MethodKind.Unary}}};
 "#;
-    let result =
-        extract_from_sources(&[("bundle.js", BUNDLE.to_string())], false).expect("extract");
+    let result = extract_from_sources(&[("bundle.js", BUNDLE.to_string())], Strictness::Lenient)
+        .expect("extract");
     assert!(result.files.contains_key("aiserver_v1.proto"));
     assert!(result.diagnostics.shape_errors.is_empty());
 }
@@ -576,8 +575,8 @@ var Keep=n.makeMessageType("agent.v1.Keep",()=>[{no:1,name:"id",kind:"scalar",T:
 var Drop=n.makeMessageType("origin.v1.Drop",()=>[{no:1,name:"id",kind:"scalar",T:9}]);
 var Ads={typeName:"aiserver.v1.InAppAdService",methods:{ping:{name:"Ping",I:Keep,O:Keep,kind:n.MethodKind.Unary}}};
 "#;
-    let result =
-        extract_from_sources(&[("bundle.js", BUNDLE.to_string())], false).expect("extract");
+    let result = extract_from_sources(&[("bundle.js", BUNDLE.to_string())], Strictness::Lenient)
+        .expect("extract");
     assert!(
         result
             .messages

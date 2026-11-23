@@ -1324,7 +1324,10 @@ mod tests {
         );
         let temp = tempfile::tempdir().unwrap();
         let store = crate::calls::CallStore::at(temp.path().join("calls.db"));
-        store.set_detailed_logging(true).await.unwrap();
+        store
+            .set_detailed_logging(crate::calls::PayloadStorage::Detailed)
+            .await
+            .unwrap();
         let responses = invocation_gateway(
             "/v1/responses",
             concat!(

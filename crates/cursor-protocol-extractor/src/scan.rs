@@ -15,9 +15,9 @@ use std::sync::OnceLock;
 
 use crate::ast_util::{
     argument_expr, array_from_expr, assignment_ident, assignment_member, binding_ident,
-    callee_tail, ident_name, is_js_true, last_segment, member_or_ident, number_lit, object_prop,
-    object_prop_shorthand, param_names, property_name, property_numeric_key, returned_expression,
-    string_lit,
+    callee_tail, f64_to_i32, f64_to_u32, ident_name, is_js_true, last_segment, member_or_ident,
+    number_lit, object_prop, object_prop_shorthand, param_names, property_name,
+    property_numeric_key, returned_expression, string_lit,
 };
 use crate::compact::{
     CompactClass, CompactPendingMessage, CompactPrefix, compact_class_name_at,
@@ -29,7 +29,7 @@ use crate::types::{
     is_field_name, is_google_pkg, is_ident, is_local_loop_pkg, parse_type_name,
 };
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct BundleScan {
     pub messages: Vec<Message>,
     pub enums: Vec<Enum>,
@@ -165,17 +165,17 @@ impl Scanner<'_> {
         }
     }
 
-    fn keep_type(&self, type_name: &str) -> bool {
+    fn keep_type(type_name: &str) -> bool {
         let (pkg, _) = parse_type_name(type_name);
         is_local_loop_pkg(&pkg) || is_google_pkg(&pkg)
     }
 
-    fn keep_package(&self, pkg: &str) -> bool {
+    fn keep_package(pkg: &str) -> bool {
         is_local_loop_pkg(pkg)
     }
 
     fn push_message(&mut self, message: Message) {
-        if !self.keep_type(&message.type_name) {
+        if !Self::keep_type(&message.type_name) {
             return;
         }
         if let Some(&index) = self.message_index.get(&message.type_name) {
@@ -195,7 +195,7 @@ impl Scanner<'_> {
     }
 
     fn push_enum(&mut self, item: Enum) {
-        if !item.package.is_empty() && !self.keep_type(&item.type_name) {
+        if !item.package.is_empty() && !Self::keep_type(&item.type_name) {
             return;
         }
         if let Some(&index) = self.enum_index.get(&item.type_name) {
@@ -215,7 +215,7 @@ impl Scanner<'_> {
     }
 
     fn push_service(&mut self, service: Service) {
-        if !self.keep_type(&service.type_name) {
+        if !Self::keep_type(&service.type_name) {
             return;
         }
         if self.service_index.contains_key(&service.type_name) {
@@ -279,8 +279,10 @@ impl Scanner<'_> {
     }
 
     fn source_span(&self, span: Span) -> &str {
-        let start = span.start as usize;
-        let end = (span.end as usize).min(self.source.len());
+        let start = usize::try_from(span.start).unwrap_or(usize::MAX);
+        let end = usize::try_from(span.end)
+            .unwrap_or(usize::MAX)
+            .min(self.source.len());
         if start >= end || start >= self.source.len() {
             ""
         } else {
@@ -288,7 +290,7 @@ impl Scanner<'_> {
         }
     }
 
-    fn parse_enum_values(&self, expr: &Expression<'_>) -> Vec<EnumValue> {
+    fn parse_enum_values(expr: &Expression<'_>) -> Vec<EnumValue> {
         let Some(array) = array_from_expr(expr) else {
             return Vec::new();
         };
@@ -297,14 +299,17 @@ impl Scanner<'_> {
             let Some(item) = element.as_expression() else {
                 continue;
             };
-            let Some(no) = object_prop(item, "no").and_then(number_lit) else {
+            let Some(no) = object_prop(item, "no")
+                .and_then(number_lit)
+                .and_then(f64_to_i32)
+            else {
                 continue;
             };
             let Some(name) = object_prop(item, "name").and_then(string_lit) else {
                 continue;
             };
             values.push(EnumValue {
-                no: no as i32,
+                no,
                 name: name.to_string(),
             });
         }
@@ -427,7 +432,7 @@ impl Scanner<'_> {
                     .arguments
                     .get(1)
                     .and_then(argument_expr)
-                    .map(|expr| self.parse_enum_values(expr))
+                    .map(Self::parse_enum_values)
                     .unwrap_or_default();
                 self.record_enum(type_name, assigned.unwrap_or(""), values, pos);
             }
@@ -450,7 +455,7 @@ impl Scanner<'_> {
                     .arguments
                     .get(2)
                     .and_then(argument_expr)
-                    .map(|expr| self.parse_enum_values(expr))
+                    .map(Self::parse_enum_values)
                     .unwrap_or_default();
                 self.record_enum(type_name, var_name, values, pos);
             }
@@ -467,7 +472,6 @@ impl Scanner<'_> {
                     if let Some(fields_expr) = call.arguments.first().and_then(argument_expr) {
                         let fields = self.extract_fields_from_expr(fields_expr);
                         if let Some(type_name) = self.class_type_name() {
-                            let type_name = type_name;
                             self.record_message(
                                 &type_name,
                                 &var_name,
@@ -489,7 +493,7 @@ impl Scanner<'_> {
         let pending = std::mem::take(&mut self.pending_enum_pkgs);
         for (pos, pkg_expr) in pending {
             let pkg = resolve_compact_package_expr(&pkg_expr, pos, &prefixes);
-            if !self.keep_package(&pkg) {
+            if !Self::keep_package(&pkg) {
                 continue;
             }
             let Some(&index) = self.enum_by_pos.get(&pos) else {
@@ -501,8 +505,8 @@ impl Scanner<'_> {
             } else {
                 crate::ast_util::last_segment(&item.short_name).to_string()
             };
-            item.package = pkg.clone();
-            item.short_name = short.clone();
+            item.package.clone_from(&pkg);
+            item.short_name.clone_from(&short);
             let type_name = format!("{pkg}.{short}");
             if item.type_name != type_name {
                 self.enum_index.remove(&item.type_name);
@@ -564,7 +568,7 @@ impl Scanner<'_> {
             return;
         };
         let pkg = resolve_compact_package_expr(&pkg_expr, call.span.start, &self.compact_prefixes);
-        if !pkg.is_empty() && !self.keep_package(&pkg) {
+        if !pkg.is_empty() && !Self::keep_package(&pkg) {
             return;
         }
         let values = call
@@ -628,7 +632,7 @@ impl Scanner<'_> {
             .first()
             .and_then(argument_expr)
             .and_then(number_lit)
-            .map(|value| value as u32)
+            .and_then(f64_to_u32)
         else {
             return;
         };
@@ -730,7 +734,7 @@ impl Scanner<'_> {
             return;
         }
         let pkg = package_for_compact_pos(pos, &self.compact_classes, &self.compact_prefixes);
-        if !self.keep_package(&pkg) {
+        if !Self::keep_package(&pkg) {
             return;
         }
         let type_name = format!("{pkg}.{short_name}");
@@ -928,7 +932,7 @@ pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, String> {
     };
     let no = object_prop(expr, "no")
         .and_then(number_lit)
-        .map(|value| value as i32)
+        .and_then(f64_to_i32)
         .ok_or_else(|| "missing field no".to_string())?;
     let name = object_prop(expr, "name")
         .and_then(string_lit)
@@ -973,8 +977,11 @@ pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, String> {
         field.opt = true;
     }
     if field.kind == "map" {
-        if let Some(key) = object_prop(expr, "K").and_then(number_lit) {
-            field.map_key = key as i32;
+        if let Some(key) = object_prop(expr, "K")
+            .and_then(number_lit)
+            .and_then(f64_to_i32)
+        {
+            field.map_key = key;
         }
         if let Some(value) = object_prop(expr, "V") {
             if let Some(kind) = object_prop(value, "kind").and_then(string_lit) {
@@ -987,10 +994,10 @@ pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, String> {
 }
 
 fn type_token_from_expr(expr: &Expression<'_>) -> Option<TypeToken> {
-    if let Some(number) = number_lit(expr) {
-        return Some(TypeToken::Scalar(number as i32));
+    match number_lit(expr) {
+        Some(number) => f64_to_i32(number).map(TypeToken::Scalar),
+        None => member_or_ident(expr).map(TypeToken::Named),
     }
-    member_or_ident(expr).map(TypeToken::Named)
 }
 
 fn parse_methods(object: &ObjectExpression<'_>) -> Vec<Method> {

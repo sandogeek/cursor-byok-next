@@ -41,6 +41,39 @@ pub fn number_lit(expr: &Expression<'_>) -> Option<f64> {
     }
 }
 
+/// JS numbers are doubles, so every integer read out of the AST goes through
+/// here: out-of-range values are rejected instead of silently saturating. A
+/// proto field id or enum number that does not fit cannot come from a Cursor
+/// bundle, so dropping it surfaces as a diagnostic instead of a wrong schema.
+pub fn f64_to_i32(value: f64) -> Option<i32> {
+    if value.is_finite() && (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&value) {
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            reason = "the range check above makes the cast exact"
+        )]
+        let converted = value as i32;
+        Some(converted)
+    } else {
+        None
+    }
+}
+
+pub fn f64_to_u32(value: f64) -> Option<u32> {
+    if value.is_finite() && (0.0..=f64::from(u32::MAX)).contains(&value) {
+        #[expect(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the range check above makes the cast exact"
+        )]
+        let converted = value as u32;
+        Some(converted)
+    } else {
+        None
+    }
+}
+
 pub fn is_js_true(expr: &Expression<'_>) -> bool {
     match expr.get_inner_expression() {
         Expression::BooleanLiteral(lit) => lit.value,
@@ -99,7 +132,7 @@ pub fn property_name<'a>(key: &'a PropertyKey<'a>) -> Option<&'a str> {
 
 pub fn property_numeric_key(key: &PropertyKey<'_>) -> Option<u32> {
     match key {
-        PropertyKey::NumericLiteral(lit) => Some(lit.value as u32),
+        PropertyKey::NumericLiteral(lit) => f64_to_u32(lit.value),
         PropertyKey::StringLiteral(lit) => js_str(&lit.value).and_then(|value| value.parse().ok()),
         PropertyKey::StaticIdentifier(id) => id.name.parse().ok(),
         _ => None,
