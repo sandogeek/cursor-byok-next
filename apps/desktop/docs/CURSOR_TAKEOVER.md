@@ -63,6 +63,7 @@ pub use self::proxy::{is_cursor_host, Routing as ProxyRouting, UPSTREAM_URL_HEAD
 | 22 | 停用 / 残留清理 | 完整通用签名 + 任意 loopback 地址即可删除 | 只清理完整匹配本 harness 代理 URL 的 5 个键 | 不删除用户后来改回的代理，也不清理其他本地工具 |
 | 23 | 路由改写失败 | URI 构造失败则静默发往上游 | 返回 502，不向上游旁路 | 命中本地白名单后必须失败关闭 |
 | 24 | `AgentService/Run*` | `RunSSE` 在白名单，且有本地 handler（配 `RunEngine`） | 白名单不含 `Run` / `RunSSE` / `RunPoll`，一律直通官方 | 这三条只服务 backend loop；本仓库不做 engine，而白名单命中后没有 handler 就是 502。local loop 会拒绝一部分 turn（模式、action、harness 覆盖、tool restriction），这些 turn 必须还能打到官方。见 [`docs/protocol/cursor-agent-loop-routing.md`](../../../docs/protocol/cursor-agent-loop-routing.md) |
+| 25 | native 实例所有权 | 服务端拥有长生命周期 harness | `App.tsx` 模块级单例持有 `Harness` / `Plugins` / `Calls`，不在 `mount` 回调内临时构造 | NSH 的 JS 对象被 GC 时会 drop 其 Rust 实例。临时 `new Harness()` 在 `status()` 返回后触发 `ProxyRuntime::drop`，代理被 abort，但 TSX 镜像仍显示已接管，Cursor 对已配置端口反复 `ECONNREFUSED`。应用级所有者必须与 socket 生命周期一致 |
 
 ### 顺带修掉的上游隐患
 
@@ -99,6 +100,12 @@ settings 匹配    Degraded          Enabled    ← 残留设置 / 端口不符
 | Cursor 认为已登录 | `account.rs` | 登录与额度 UI 失效，进不了 Agent 面板 |
 
 `process.rs` 只是加速器：改完设置不重启 Cursor 也会在下次启动生效。
+
+### 2026-11-23：假接管与持续重连排查
+
+真实运行中，`~/.cursor-byok-next/harness.json` 为启用且 CA 已信任，`settings.json` 指向 `127.0.0.1:53922`，但 Cursor 对该端口持续报 `ECONNREFUSED`。临时生命周期探针确认代理已完整执行 `ProxyRuntime::start`，随后 `ProxyRuntime::drop` 又将其取消。入口在 `mount` 回调内构造 `Harness`，NSH 回收对应 JS 对象时也回收 Rust 所有者；TSX 的状态镜像却不会因此失效，所以出现“已接管”的假象。模块级单例修复后，同一端口保持监听，账号、Statsig、模型目录等 Cursor RPC 已进入本地 backend。
+
+验证边界：已验证真实 Cursor 的连接恢复和本地 RPC 路由；完整 BYOK 生成轮次仍需在 Cursor 中发送消息后验收。
 
 ## Cursor 侧文件落点（对照）
 
