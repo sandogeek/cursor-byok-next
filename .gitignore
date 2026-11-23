@@ -1,5 +1,7 @@
 .DS_Store
 target
+# nsh build output (root .nsh/; apps/desktop/.gitignore covers the nested one)
+.nsh/
 protocols/.*.tmp.*
 # Per-machine editor setup: the folder list and settings reference paths
 # that only exist on one machine.

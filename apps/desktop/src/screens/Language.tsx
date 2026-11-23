@@ -1,6 +1,6 @@
-import { locale, Storage, Text, View } from "nsh";
+import { locale, Storage } from "nsh";
 import { availableLocales, setLocale, t } from "nsh/i18n";
-import { Select } from "nsh/base";
+import type { SelectItem } from "nsh/base";
 
 /** Where an explicit language choice lives; absent means follow the system. */
 export const LOCALE_KEY = "cursor-byok-next:locale";
@@ -28,37 +28,16 @@ export async function restoreLocale() {
 
 const nameOf = (tag: string) => NAMES[tag] ?? tag;
 
-/**
- * The app's translations, and "follow the system" for the device's language.
- * The app shows the user's own language until a choice is made here.
- */
-export function LanguagePicker() {
-  const items = () => [
+/** What a language picker offers here: the system, then every bundled language. */
+export function languageItems(): SelectItem[] {
+  return [
     { value: "system", title: t("language.system") },
     ...availableLocales().map((tag) => ({ value: tag, title: nameOf(tag) })),
   ];
-  const chosen = () => {
-    const shown = locale();
-    return availableLocales().some((tag) => tag === shown) ? shown : "system";
-  };
-  const shownName = () => chosen() === "system" ? t("language.system") : nameOf(chosen());
-  return (
-    <View class="gap-1">
-      <Text class="px-0.5 text-xs text-muted-foreground">{t("language.label")}</Text>
-      <Select
-        items={items()}
-        value={chosen()}
-        accessibilityLabel={t("language.label")}
-        onChange={({ value }) => chooseLocale(value === "system" || value === null ? null : value)}
-        trigger={
-          <View class="min-h-8 flex-row items-center justify-between gap-2 rounded-(--radius) border border-sidebar-border bg-card px-2.5 text-sidebar-foreground hover:bg-muted">
-            <Text class="text-xs">{shownName()}</Text>
-            <Text class="text-[10px] text-muted-foreground">▾</Text>
-          </View>
-        }
-        popupClass="rounded-(--radius) border border-border bg-popover p-1 shadow-lg"
-        itemClass="rounded-(--radius) px-2 py-1.5 text-xs text-popover-foreground focus:bg-muted selected:text-primary"
-      />
-    </View>
-  );
+}
+
+/** The chosen tag, or `"system"` while the app follows the device. */
+export function localePreference(): string {
+  const shown = locale();
+  return availableLocales().some((tag) => tag === shown) ? shown : "system";
 }

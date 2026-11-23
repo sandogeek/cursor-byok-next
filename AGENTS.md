@@ -33,14 +33,15 @@ cursor-byok-nsh/
     │   ├── PLUGIN_CATALOG.md      # Magpie 插件目录
     │   ├── PLUGIN_PROTOCOL_ADAPTERS.md # 协议适配器下沉 Rust
     │   ├── LOCAL_LOOP.md          # local loop 服务端接入
-    │   └── MODEL_CALLS.md         # Magpie 调用记录
+    │   ├── MODEL_CALLS.md         # Magpie 调用记录
+    │   └── SYSTEM_SETTINGS.md     # 系统设置：端口 / 调用记录 / 外观 / 语言 / 数据目录
     └── src/
         ├── lib.rs                 # #[native_module("cursor-byok-next/native")]：Harness + Plugins + Calls
         ├── harness/               # 上游 server/src/local_app 的移植
         ├── plugins/               # 插件宿主、Bun worker、Magpie 目录、协议适配器
         ├── calls/                 # 调用记录 SQLite 与生命周期
-        ├── screens/               # Cursor / Plugins / Language / Calls / CallDetails
-        └── ui/                    # 样式控件 + localized()
+        ├── screens/               # Cursor / Plugins / Calls / CallDetails / SystemSettings / Language
+        └── ui/                    # 样式控件（Button / Field / NumberField / Select / ChoiceGroup / SettingRow / Surface …）
 ```
 
 上游参照：`../cursor-byok/server/src/local_app/`（同一工作区里的 `jsProject/cursor-byok`）。
@@ -133,3 +134,4 @@ nsh package --target macos
 - [x] 把 Magpie 模型广告给 Cursor picker
 - [x] 模型调用 / 调用记录（见 `apps/desktop/docs/MODEL_CALLS.md`）
 - [x] 插件协议适配器下沉 Rust（见 `apps/desktop/docs/PLUGIN_PROTOCOL_ADAPTERS.md`）
+- [x] 系统设置页（见 `apps/desktop/docs/SYSTEM_SETTINGS.md`）

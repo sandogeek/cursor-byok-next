@@ -19,13 +19,8 @@ nav:
   cursor: Cursor
   plugins: 插件配置
   systemSettings: 系统设置
-  tutorial: 使用教程
-
-app:
-  tagline: 本地接管 · NSH
 
 language:
-  label: 界面语言
   system: 跟随系统
 
 takeover:
@@ -208,3 +203,51 @@ calls:
       errorMessage: Error Message
       headers: 请求头
       body: 请求体
+
+settings:
+  port:
+    title: 代理端口
+    description: Cursor 连接的本地代理端口。填 0 由系统自动选择；下次开启接管时生效。
+    field: 端口
+    save: 保存端口
+    saved: 端口已保存，下次开启接管时生效。
+    current: "当前：%{port}"
+    unbound: 未占用
+    invalid: 请填写 0–65535 之间的整数
+  calls:
+    title: 调用记录
+    count: "%{calls} 条调用 · %{requests} 条请求 · %{chunks} 个响应块"
+    detailed: 详细记录
+    detailedHint: 保存脱敏请求和原始响应，单份上限 1 MiB，不影响已在途的调用。
+    retention: 只保留最近 1000 次调用。
+    clearDetails: 清空详情
+    clearAll: 清空全部
+  storage:
+    clearedDetails: 详细记录已清理。
+    clearedAll: 全部调用记录已清理。
+  appearance:
+    title: 外观
+    description: 跟随系统，或固定使用亮色 / 暗色。
+    system: 跟随系统
+    light: 亮色
+    dark: 暗色
+  language:
+    title: 界面语言
+    description: 默认跟随操作系统；不支持的系统语言使用英文。
+    field: 语言
+  about:
+    title: 关于
+    dataDir: 应用数据目录
+    version: "版本 %{version}"
+    copy: 复制路径
+    copied: 数据目录已复制
+    body: Cursor-BYOK-Next 只在本机运行，不收集任何使用数据。
+  dialog:
+    details:
+      title: 清空请求和响应详情？
+      body: 会删除已保存的请求和响应内容，调用摘要和用量会保留。
+      confirm: 删除已存详情
+    all:
+      title: 清空全部调用记录？
+      body: 会删除本应用保存的全部 Magpie 调用摘要、请求和响应。Cursor 官方记录不受影响。
+      confirm: 删除全部记录

@@ -19,13 +19,8 @@ nav:
   cursor: Cursor
   plugins: Plugins
   systemSettings: System settings
-  tutorial: Guide
-
-app:
-  tagline: Local takeover · NSH
 
 language:
-  label: Language
   system: Follow system
 
 takeover:
@@ -208,3 +203,51 @@ calls:
       errorMessage: Error message
       headers: Request headers
       body: Request body
+
+settings:
+  port:
+    title: Proxy port
+    description: The local proxy port Cursor connects to. Use 0 to let the system pick; it applies the next time takeover starts.
+    field: Port
+    save: Save port
+    saved: Port saved. It applies the next time takeover starts.
+    current: "Now: %{port}"
+    unbound: not bound
+    invalid: Enter a whole number from 0 to 65535
+  calls:
+    title: Call records
+    count: "%{calls} calls · %{requests} requests · %{chunks} response chunks"
+    detailed: Detailed recording
+    detailedHint: Stores redacted requests and raw responses up to 1 MiB each. In-flight calls keep their original setting.
+    retention: The latest 1000 calls are retained.
+    clearDetails: Clear details
+    clearAll: Clear all
+  storage:
+    clearedDetails: Detailed records cleared.
+    clearedAll: Every call record cleared.
+  appearance:
+    title: Appearance
+    description: Follow the system, or always use light or dark.
+    system: System
+    light: Light
+    dark: Dark
+  language:
+    title: Display language
+    description: Follows the operating system by default; an unsupported system language uses English.
+    field: Language
+  about:
+    title: About
+    dataDir: App data directory
+    version: Version %{version}
+    copy: Copy path
+    copied: Data directory copied
+    body: Cursor-BYOK-Next runs only on this machine and collects no usage data.
+  dialog:
+    details:
+      title: Clear request and response details?
+      body: Deletes stored request and response payloads. Call summaries and token usage stay.
+      confirm: Delete details
+    all:
+      title: Clear every call record?
+      body: Deletes every Magpie call summary, request, and response this app saved. Official Cursor records are not stored here.
+      confirm: Delete all records

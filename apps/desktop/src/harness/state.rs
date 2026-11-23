@@ -18,6 +18,11 @@ pub struct HarnessState {
     pub enabled: bool,
     /// The port the proxy bound last, so a restart can try it again.
     pub proxy_port: u16,
+    /// The port the user chose in system settings; `0` lets the OS pick.
+    /// Kept apart from `proxy_port` so a chosen port survives a run that
+    /// could not bind it.
+    #[serde(default)]
+    pub preferred_port: u16,
 }
 
 #[derive(Debug)]
@@ -76,11 +81,32 @@ mod tests {
         let state = HarnessState {
             enabled: true,
             proxy_port: 41000,
+            preferred_port: 41000,
         };
 
         store.save(state).unwrap();
 
         assert_eq!(store.load(), state);
+    }
+
+    #[test]
+    fn a_state_from_before_preferred_ports_reads_the_bound_port_as_no_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HarnessStateStore::at(dir.path().join("harness.json"));
+        std::fs::write(
+            &store.path,
+            r#"{"enabled": true, "proxyPort": 41000}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.load(),
+            HarnessState {
+                enabled: true,
+                proxy_port: 41000,
+                preferred_port: 0,
+            }
+        );
     }
 
     #[test]

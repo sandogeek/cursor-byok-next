@@ -2,6 +2,7 @@ import { host, mount, setColorScheme } from "nsh";
 import type { CallDetail, CallsSnapshot, HarnessState, PluginFormResult, PluginSnapshot } from "cursor-byok-next/native";
 import { Cursor } from "../src/screens/Cursor";
 import { restoreLocale } from "../src/screens/Language";
+import { restoreAppearance } from "../src/ui/appearance";
 
 if (host.params.colorScheme === "light" || host.params.colorScheme === "dark") {
   setColorScheme(host.params.colorScheme);
@@ -11,6 +12,7 @@ const takeover = {
   status: () => host.call<HarnessState>("cursor.status"),
   initializeCa: () => host.call<HarnessState>("cursor.initializeCa"),
   setEnabled: (enabled: boolean) => host.call<HarnessState>("cursor.setEnabled", { enabled }),
+  setPreferredPort: (port: number) => host.call<HarnessState>("cursor.setPreferredPort", { port }),
 };
 
 const plugins = {
@@ -35,6 +37,6 @@ const calls = {
   clearAll: () => host.call<CallsSnapshot>("calls.clearAll"),
 };
 
-void restoreLocale().then(() => {
+void restoreAppearance().then(() => restoreLocale()).then(() => {
   mount(() => <Cursor takeover={takeover} plugins={plugins} calls={calls} />);
 });

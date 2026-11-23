@@ -6,6 +6,8 @@ const missing: HarnessState = {
   ca: "missing",
   integration: "disabled",
   settingsApplied: false,
+  preferredProxyPort: 0,
+  dataDir: "/Users/test/.cursor-byok-next",
 };
 const untrusted: HarnessState = {
   ...missing,
@@ -145,6 +147,11 @@ function options(initial: HarnessState, calls: string[] = [], plugins: PluginSna
           current = next ? enabled : ready;
           return current;
         },
+        "cursor.setPreferredPort": ({ port }: { port: number }) => {
+          calls.push(`port:${port}`);
+          current = { ...current, preferredProxyPort: port };
+          return current;
+        },
         "plugins.snapshot": () => catalog,
         "plugins.submitForm": () => {
           calls.push("submitForm");
@@ -279,15 +286,15 @@ test("网关数据读取失败时不显示首次配置的空状态", async () =>
 test("界面语言跟随设备，切换后立即翻译并记住选择", async () => {
   const app = await open("./test-fixtures/App.tsx", options(missing));
   expect(app.texts()).toContain("数据概览");
-  await app.press("界面语言");
+  await app.press("系统设置");
+  await app.press("id:settings-language");
   await app.press("English");
-  expect(app.texts()).toContain("Overview");
-  expect(app.texts()).not.toContain("数据概览");
-  expect(app.texts()).toContain("Initialize the local CA first");
+  expect(app.texts()).toContain("System settings");
+  expect(app.texts()).not.toContain("系统设置");
   expect(app.storage()["cursor-byok-next:locale"]).toBe("en-US");
-  await app.press("Language");
+  await app.press("id:settings-language");
   await app.press("中文");
-  expect(app.texts()).toContain("数据概览");
+  expect(app.texts()).toContain("系统设置");
   expect(app.storage()["cursor-byok-next:locale"]).toBe("zh-CN");
 });
 
@@ -327,13 +334,55 @@ test("找不到调用时显示独立空状态", async () => {
   expect(app.texts()).not.toContain("暂时无法读取调用详情");
 });
 
+test("系统设置页保存端口与清理存储都走真实边界", async () => {
+  const calls: string[] = [];
+  const app = await open("./test-fixtures/App.tsx", options(ready, calls, magpieReady, recordedCalls));
+  await app.press("系统设置");
+  expect(app.texts()).toContain("代理端口");
+  expect(app.texts()).toContain("/Users/test/.cursor-byok-next");
+  expect(app.texts()).toContain("1 条调用 · 1 条请求 · 1 个响应块");
+  expect(app.enabled("保存端口")).toBe(false);
+  await app.clear("id:settings-port");
+  await app.type("id:settings-port", "41234");
+  expect(app.enabled("保存端口")).toBe(true);
+  await app.press("保存端口");
+  expect(calls).toEqual(["port:41234"]);
+  expect(app.texts()).toContain("端口已保存，下次开启接管时生效。");
+  await app.press("清空全部");
+  expect(app.texts()).toContain("清空全部调用记录？");
+  await app.press("删除全部记录");
+  expect(calls).toContain("clear-all");
+});
+
+test("系统设置页的外观与语言选择立即生效并记住", async () => {
+  const app = await open("./test-fixtures/App.tsx", options(ready));
+  await app.press("系统设置");
+  await app.press("暗色");
+  expect(app.storage()["cursor-byok-next:appearance"]).toBe("dark");
+  expect(app.texts()).toContain("跟随系统");
+  await app.press("id:settings-language");
+  await app.press("English");
+  expect(app.texts()).toContain("Appearance");
+  expect(app.texts()).not.toContain("外观");
+  expect(app.storage()["cursor-byok-next:locale"]).toBe("en-US");
+});
+
+test("系统设置页在端口越界时给出错误文案", async () => {
+  const app = await open("./test-fixtures/App.tsx", options(ready));
+  await app.press("系统设置");
+  await app.type("id:settings-port", "70000");
+  expect(app.texts()).toContain("请填写 0–65535 之间的整数");
+  expect(app.enabled("保存端口")).toBe(false);
+});
+
 test("调用详细空状态与英文文案", async () => {
   const app = await open("./test-fixtures/App.tsx", options(ready));
   await app.press("调用详细");
   expect(app.texts()).toContain("还没有 Magpie 调用。Cursor 走本地模型后会出现在这里。");
   expect(app.enabled("清空详情")).toBe(false);
   expect(app.enabled("清空全部")).toBe(false);
-  await app.press("界面语言");
+  await app.press("系统设置");
+  await app.press("id:settings-language");
   await app.press("English");
   await app.press("Calls");
   expect(app.texts()).toContain("No Magpie calls yet. They appear here after Cursor uses a local model.");
