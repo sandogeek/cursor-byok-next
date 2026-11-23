@@ -42,7 +42,7 @@ pub struct Backend {
 
 impl Backend {
     pub async fn start(plugins: PluginHost, calls: CallStore) -> Result<Self> {
-        let knowledge = KnowledgeService::managed()?;
+        let knowledge = KnowledgeService::with_root(crate::harness::data_dir()?.join("rules"))?;
         let inference = InferenceService::new(plugins.clone(), knowledge.clone(), calls);
         let proxy = proxy::CursorProxy::default();
         let listener = TcpListener::bind("127.0.0.1:0").await?;

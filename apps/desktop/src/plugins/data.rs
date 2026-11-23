@@ -18,12 +18,7 @@ pub struct PluginDataStore {
 }
 
 impl PluginDataStore {
-    pub fn managed() -> Result<Self> {
-        Self::new(crate::harness::data_dir()?.join("plugins/data"))
-    }
-
-    #[cfg(test)]
-    pub(super) fn for_test(root: PathBuf) -> Result<Self> {
+    pub fn at(root: PathBuf) -> Result<Self> {
         Self::new(root)
     }
 

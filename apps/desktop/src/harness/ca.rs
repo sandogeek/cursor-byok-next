@@ -36,12 +36,6 @@ pub struct CaManager {
 }
 
 impl CaManager {
-    pub fn managed() -> Result<Self> {
-        Ok(Self {
-            dir: super::data_dir()?.join("ca"),
-        })
-    }
-
     pub fn at(dir: PathBuf) -> Self {
         Self { dir }
     }

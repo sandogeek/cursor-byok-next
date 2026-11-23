@@ -308,10 +308,6 @@ struct Inner {
 }
 
 impl KnowledgeService {
-    pub fn managed() -> Result<Self> {
-        Self::with_root(crate::harness::data_dir()?.join("rules"))
-    }
-
     pub fn with_root(root: std::path::PathBuf) -> Result<Self> {
         Ok(Self {
             inner: Arc::new(Inner {

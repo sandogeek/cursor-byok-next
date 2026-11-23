@@ -18,11 +18,11 @@ pub struct HarnessState {
     pub enabled: bool,
     /// The port the proxy bound last, so a restart can try it again.
     pub proxy_port: u16,
-    /// The port the user chose in system settings; `0` lets the OS pick.
-    /// Kept apart from `proxy_port` so a chosen port survives a run that
-    /// could not bind it.
-    #[serde(default)]
-    pub preferred_port: u16,
+    /// The port the user chose in system settings. `Some(0)` asks the OS to
+    /// pick; `None` means no choice was ever saved, so the last bound port is
+    /// reused. Kept apart from `proxy_port` so a chosen port survives a run
+    /// that could not bind it.
+    pub preferred_port: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -31,12 +31,6 @@ pub struct HarnessStateStore {
 }
 
 impl HarnessStateStore {
-    pub fn managed() -> Result<Self> {
-        Ok(Self {
-            path: super::data_dir()?.join("harness.json"),
-        })
-    }
-
     pub fn at(path: PathBuf) -> Self {
         Self { path }
     }
@@ -81,7 +75,7 @@ mod tests {
         let state = HarnessState {
             enabled: true,
             proxy_port: 41000,
-            preferred_port: 41000,
+            preferred_port: Some(41000),
         };
 
         store.save(state).unwrap();
@@ -90,21 +84,37 @@ mod tests {
     }
 
     #[test]
-    fn a_state_from_before_preferred_ports_reads_the_bound_port_as_no_choice() {
+    fn a_state_without_a_choice_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let store = HarnessStateStore::at(dir.path().join("harness.json"));
-        std::fs::write(
-            &store.path,
-            r#"{"enabled": true, "proxyPort": 41000}"#,
-        )
-        .unwrap();
+        let state = HarnessState {
+            enabled: false,
+            proxy_port: 41000,
+            preferred_port: None,
+        };
 
+        store.save(state).unwrap();
+
+        assert_eq!(store.load(), state);
+        let raw = std::fs::read_to_string(&store.path).unwrap();
+        // An explicit null, not an omitted key: the choice is visible in the file.
+        assert!(raw.contains("\"preferredPort\": null"), "{raw}");
+    }
+
+    #[test]
+    fn a_file_without_a_choice_field_reads_as_no_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HarnessStateStore::at(dir.path().join("harness.json"));
+        std::fs::write(&store.path, r#"{"enabled": true, "proxyPort": 41000}"#).unwrap();
+
+        // A missing `Option` field is `None` in serde itself; no migration code
+        // writes it, so this is just the shape of "no choice saved".
         assert_eq!(
             store.load(),
             HarnessState {
                 enabled: true,
                 proxy_port: 41000,
-                preferred_port: 0,
+                preferred_port: None,
             }
         );
     }

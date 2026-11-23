@@ -80,9 +80,10 @@ pub struct PluginSnapshot {
 
 impl PluginHost {
     pub fn managed() -> Result<Self> {
+        let data_dir = crate::harness::data_dir()?;
         Ok(Self::new(
             PluginCatalog::managed()?,
-            PluginDataStore::managed()?,
+            PluginDataStore::at(data_dir.join("plugins/data"))?,
         ))
     }
 
@@ -104,7 +105,7 @@ impl PluginHost {
     pub(crate) fn for_test(root: &Path) -> Result<Self> {
         Ok(Self::new(
             PluginCatalog::for_test(root)?,
-            PluginDataStore::for_test(root.join("data"))?,
+            PluginDataStore::at(root.join("data"))?,
         ))
     }
 
@@ -995,7 +996,7 @@ mod tests {
         let root = temp.path().join("data");
         let host = PluginHost::new(
             PluginCatalog::for_test(temp.path()).unwrap(),
-            PluginDataStore::for_test(root.clone()).unwrap(),
+            PluginDataStore::at(root.clone()).unwrap(),
         );
         let initial = host.snapshot().await;
         assert!(
@@ -1169,7 +1170,7 @@ mod tests {
         std::fs::create_dir_all(root).unwrap();
         let host = PluginHost::new(
             PluginCatalog::for_test(root).unwrap(),
-            PluginDataStore::for_test(root.join("data")).unwrap(),
+            PluginDataStore::at(root.join("data")).unwrap(),
         );
         host.form_submit(
             MAGPIE,
@@ -1228,11 +1229,10 @@ mod tests {
         };
         let mut file_invocation = invocation(responses_host.1, vec![file]);
         file_invocation.request.model.max_output_tokens = Some(8192);
-        let mut stream = responses_host.0.stream_model(
-            file_invocation,
-            CancellationToken::new(),
-            None,
-        );
+        let mut stream =
+            responses_host
+                .0
+                .stream_model(file_invocation, CancellationToken::new(), None);
         while let Some(event) = stream.next().await {
             event.unwrap();
         }
@@ -1508,9 +1508,12 @@ mod tests {
         .await;
         let host = configured_invocation_host(&temp.path().join("frames"), gateway.0).await;
         let mut short = host.0.stream_model(
-            invocation(host.1.clone(), vec![crate::model::ContentPart::Text {
-                text: "hello".into(),
-            }]),
+            invocation(
+                host.1.clone(),
+                vec![crate::model::ContentPart::Text {
+                    text: "hello".into(),
+                }],
+            ),
             CancellationToken::new(),
             None,
         );

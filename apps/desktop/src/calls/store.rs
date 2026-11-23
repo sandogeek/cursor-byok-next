@@ -17,7 +17,7 @@ use sqlx::{
 };
 use tokio::sync::{Mutex, OnceCell};
 
-use crate::{Result, harness, model::Usage};
+use crate::{Result, model::Usage};
 
 const MAX_RETAINED_CALLS: i64 = 1000;
 const MAX_STORED_REQUEST_BYTES: usize = 1024 * 1024;
@@ -173,10 +173,6 @@ struct Connected {
 }
 
 impl CallStore {
-    pub fn managed() -> Result<Self> {
-        Ok(Self::at(harness::data_dir()?.join("calls.db")))
-    }
-
     pub fn at(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),

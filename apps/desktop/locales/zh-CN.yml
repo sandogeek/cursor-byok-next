@@ -207,7 +207,7 @@ calls:
 settings:
   port:
     title: 代理端口
-    description: Cursor 连接的本地代理端口。填 0 由系统自动选择；下次开启接管时生效。
+    description: Cursor 连接的本地代理端口。填 0 由系统自动选择，留空则继续使用上次的端口；下次开启接管时生效。
     field: 端口
     save: 保存端口
     saved: 端口已保存，下次开启接管时生效。

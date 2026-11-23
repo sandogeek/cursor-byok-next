@@ -27,7 +27,7 @@ const initialTracking: HarnessState = {
   ca: "missing",
   integration: "disabled",
   settingsApplied: false,
-  preferredProxyPort: 0,
+  preferredProxyPort: null,
   dataDir: "",
 };
 
@@ -42,13 +42,13 @@ function errorText(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
-/** Ports are 0–65535, and an empty field means "let the OS pick". */
-function parsePort(text: string): number | null {
+/** Ports are 0–65535, an empty field clears the choice, and `0` asks the OS. */
+function parsePort(text: string): number | null | undefined {
   const trimmed = text.trim();
-  if (trimmed === "") return 0;
-  if (!/^\d{1,5}$/.test(trimmed)) return null;
+  if (trimmed === "") return null;
+  if (!/^\d{1,5}$/.test(trimmed)) return undefined;
   const port = Number(trimmed);
-  return port <= 65_535 ? port : null;
+  return port <= 65_535 ? port : undefined;
 }
 
 export function SystemSettings(props: { takeover: CursorTakeover; calls: SettingsCallLog }) {
@@ -68,9 +68,10 @@ export function SystemSettings(props: { takeover: CursorTakeover; calls: Setting
   const current = () => tracking() ?? initialTracking;
   const log = () => calls() ?? emptyCalls;
   /** The edit, or the saved port while the user has not typed. */
-  const portText = () => portDraft() ?? String(current().preferredProxyPort);
-  const portEdited = () => portDraft() !== null && portDraft() !== String(current().preferredProxyPort);
-  const portInvalid = () => portEdited() && parsePort(portText()) === null;
+  const savedPortText = () => current().preferredProxyPort == null ? "" : String(current().preferredProxyPort);
+  const portText = () => portDraft() ?? savedPortText();
+  const portEdited = () => portDraft() !== null && portDraft() !== savedPortText();
+  const portInvalid = () => portEdited() && parsePort(portText()) === undefined;
   const version = () => appInfo().version ?? "";
 
   /** The appearance the app starts with was restored in `App.tsx`; mirror it. */
@@ -92,7 +93,7 @@ export function SystemSettings(props: { takeover: CursorTakeover; calls: Setting
 
   const savePort = () => {
     const port = parsePort(portText());
-    if (port === null) return;
+    if (port === undefined) return;
     void perform(async () => {
       tracking.mutate(await props.takeover.setPreferredPort(port));
       portDraft.set(null);

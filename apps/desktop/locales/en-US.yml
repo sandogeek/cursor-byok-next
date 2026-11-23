@@ -207,7 +207,7 @@ calls:
 settings:
   port:
     title: Proxy port
-    description: The local proxy port Cursor connects to. Use 0 to let the system pick; it applies the next time takeover starts.
+    description: The local proxy port Cursor connects to. Use 0 to let the system pick, or leave it empty to keep reusing the last port; it applies the next time takeover starts.
     field: Port
     save: Save port
     saved: Port saved. It applies the next time takeover starts.

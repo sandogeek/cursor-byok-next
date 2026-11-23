@@ -340,7 +340,7 @@ mod tests {
 
     fn store() -> (tempfile::TempDir, PluginStateStore) {
         let root = tempfile::tempdir().unwrap();
-        let data = PluginDataStore::for_test(root.path().join("data")).unwrap();
+        let data = PluginDataStore::at(root.path().join("data")).unwrap();
         (root, PluginStateStore::new(data))
     }
 

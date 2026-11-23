@@ -15,7 +15,7 @@ export interface CursorTakeover {
   status(): Promise<HarnessState>;
   initializeCa(): Promise<HarnessState>;
   setEnabled(enabled: boolean): Promise<HarnessState>;
-  setPreferredPort(port: number): Promise<HarnessState>;
+  setPreferredPort(port: number | null): Promise<HarnessState>;
 }
 
 const initialState: HarnessState = {
@@ -23,7 +23,7 @@ const initialState: HarnessState = {
   ca: "missing",
   integration: "disabled",
   settingsApplied: false,
-  preferredProxyPort: 0,
+  preferredProxyPort: null,
   dataDir: "",
 };
 

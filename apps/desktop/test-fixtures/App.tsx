@@ -12,7 +12,7 @@ const takeover = {
   status: () => host.call<HarnessState>("cursor.status"),
   initializeCa: () => host.call<HarnessState>("cursor.initializeCa"),
   setEnabled: (enabled: boolean) => host.call<HarnessState>("cursor.setEnabled", { enabled }),
-  setPreferredPort: (port: number) => host.call<HarnessState>("cursor.setPreferredPort", { port }),
+  setPreferredPort: (port: number | null) => host.call<HarnessState>("cursor.setPreferredPort", { port }),
 };
 
 const plugins = {

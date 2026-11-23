@@ -6,7 +6,7 @@ const missing: HarnessState = {
   ca: "missing",
   integration: "disabled",
   settingsApplied: false,
-  preferredProxyPort: 0,
+  preferredProxyPort: null,
   dataDir: "/Users/test/.cursor-byok-next",
 };
 const untrusted: HarnessState = {
@@ -147,7 +147,7 @@ function options(initial: HarnessState, calls: string[] = [], plugins: PluginSna
           current = next ? enabled : ready;
           return current;
         },
-        "cursor.setPreferredPort": ({ port }: { port: number }) => {
+        "cursor.setPreferredPort": ({ port }: { port: number | null }) => {
           calls.push(`port:${port}`);
           current = { ...current, preferredProxyPort: port };
           return current;
@@ -373,6 +373,18 @@ test("系统设置页在端口越界时给出错误文案", async () => {
   await app.type("id:settings-port", "70000");
   expect(app.texts()).toContain("请填写 0–65535 之间的整数");
   expect(app.enabled("保存端口")).toBe(false);
+});
+
+test("清空端口字段表示沿用上次绑定的端口", async () => {
+  const calls: string[] = [];
+  const chosen = { ...ready, preferredProxyPort: 41234 };
+  const app = await open("./test-fixtures/App.tsx", options(chosen, calls));
+  await app.press("系统设置");
+  expect(app.enabled("保存端口")).toBe(false);
+  await app.clear("id:settings-port");
+  expect(app.enabled("保存端口")).toBe(true);
+  await app.press("保存端口");
+  expect(calls).toEqual(["port:null"]);
 });
 
 test("调用详细空状态与英文文案", async () => {

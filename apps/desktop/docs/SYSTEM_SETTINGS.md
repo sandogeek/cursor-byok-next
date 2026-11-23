@@ -9,7 +9,7 @@
 
 ```text
 cursor-byok/apps/desktop/src/features/settings/   apps/desktop/src/
-├── SettingsPage.tsx               319  页面编排   screens/SystemSettings.tsx  276  分区与操作
+├── SettingsPage.tsx               319  页面编排   screens/SystemSettings.tsx  277  分区与操作
 ├── AppLifecycleSettingsCard.tsx   166  开机/静默  ─                          ─
 ├── CommitSettingsCard.tsx         231  commit 模型 ─                          ─
 ├── ExternalApiSettingsCard.tsx     62  外部 API    ─                          ─
@@ -18,7 +18,7 @@ cursor-byok/apps/desktop/src/features/settings/   apps/desktop/src/
 └── TabSettingsCard.tsx             90  TAB 地址    ─                          ─
 
 cursor-byok/server/src/                           apps/desktop/src/
-├── store/settings.rs              714  KV 设置     harness/state.rs  120  JSON 意图 + 端口偏好
+├── store/settings.rs              714  KV 设置     harness/state.rs  130  JSON 意图 + 端口偏好
 ├── control/settings.rs            188  HTTP 读写   lib.rs Harness    native 方法
 └── local_app/settings.rs          111  Cursor 配置 harness/settings.rs  不改（已有）
 
@@ -38,8 +38,8 @@ src/ui/appearance.ts     28  外观持久化（Storage 键）
 系统设置（TSX）
 ├── 代理端口
 │   ├── resource(() => takeover.status())       读 preferredProxyPort / proxyPort / dataDir
-│   ├── 编辑 → signal 草稿（undefined = 未编辑）
-│   └── 保存 → Harness.setPreferredPort(port) → HarnessStatus → signal 镜像
+│   ├── 编辑 → signal 草稿（null = 未编辑，空串 = 清掉选择）
+│   └── 保存 → Harness.setPreferredPort(number | null) → HarnessStatus → signal 镜像
 │                 └── harness.json preferredPort（下次 enable 时优先尝试）
 ├── 调用记录
 │   ├── resource(() => calls.snapshot())        detailed / storage 计数
@@ -55,14 +55,14 @@ src/ui/appearance.ts     28  外观持久化（Storage 键）
 └── NSH Storage                        cursor-byok-next:appearance / :locale
 ```
 
-`preferredPort` 与 `proxyPort` 分开存：前者是用户意图，后者是上次实际绑定的端口。绑定失败（端口被占）时下次仍会先试用户选的端口，而不是被一个临时随机端口顶掉。
+`preferredPort` 与 `proxyPort` 分开存：前者是用户意图（`null` 表示没选过，`0` 表示这次由系统挑），后者是上次实际绑定的端口。传入 `null` 表示清掉选择，下次沿用上次绑定；传入 `0` 则即使上次绑过固定端口，下次也会重新让 OS 挑——两者不会互相顶掉。
 
 ## 差异清单
 
 | # | 主题 | 上游 | nsh 版 | 原因 |
 |---|---|---|---|---|
 | 1 | 设置载体 | SQLite `service_settings` KV + HTTP API | `harness.json`（serde + temp/rename）+ native 方法 | 本仓库没有服务端 control API；`harness.json` 已是端口与意图的唯一所有者，加一份 KV 会造出第二个所有者 |
-| 2 | 端口语义 | `network_ports.proxy_port`/`service_port`，重启生效 | 只有 `preferredPort`，下次开启接管时生效 | 本应用没有独立的服务端口；代理端口在 enable 时绑定，这个时机本来就是现有的重启点 |
+| 2 | 端口语义 | `network_ports.proxy_port`/`service_port`，重启生效 | 只有 `preferredPort`（`null` = 没选过，`0` = 系统挑），下次开启接管时生效 | 本应用没有独立的服务端口；代理端口在 enable 时绑定，这个时机本来就是现有的重启点 |
 | 3 | 实际端口 | 与配置值分开存 DB | `proxyPort` 只存在于 status（运行时），`harness.json` 保留上次绑定值 | 状态只读接口不返回错误（不变量 7）；端口被占用时的回落要能被界面看见 |
 | 4 | 出站代理 | `outbound_proxy` + 所有 reqwest client 重建 | 不做 | 本仓库没有内置 HTTP provider，出站只有 Magpie worker，代理由插件网关自身决定 |
 | 5 | TAB / commit 模型 | 可配置公益服务地址与 commit 模型 | 不做 | `LOCAL_LOOP.md` 刻意不做清单：没有 commit settings / TAB 直连需求 |
@@ -80,8 +80,8 @@ src/ui/appearance.ts     28  外观持久化（Storage 键）
 ## 必须保持的不变量
 
 1. **CA 未 `Ready` 不影响设置页。** 设置页只读 status，不改接管；端口保存在 `harness.json`，写它不需要 CA。
-2. **端口只改意图，不改在途代理。** `setPreferredPort` 不重启、不写 Cursor 文件；界面文案明确「下次开启接管时生效」。
-3. **端口范围 0–65535**，`0` 表示由系统选择；越界不发起调用，只显示行内错误。
+2. **端口只改意图，不改在途代理。** `setPreferredPort` 不重启、不写 Cursor 文件；界面文案明确「下次开启接管时生效」。它与其他意图写入（开关、状态自愈）共用同一个 `update_intent`，且都在 `operation` 锁内，避免读-改-写互相覆盖。
+3. **端口范围 0–65535**；`0` 表示由系统选择，空串表示清掉选择（沿用上次绑定）。越界不发起调用，只显示行内错误。
 4. **调用记录只有一个所有者。** 详细模式与清理都走 `Calls`（`calls.db`），设置页和调用详细页共享同一份实现。
 5. **清理是不可撤销操作**，必须经确认弹窗，文案写明保留什么、删什么。
 6. **外观与语言立即生效**，写入 `Storage` 后重启仍保留；「跟随系统」是删除键值，不是写特殊值。
@@ -89,8 +89,9 @@ src/ui/appearance.ts     28  外观持久化（Storage 键）
 8. **设置页读取失败不抛错给界面**（`resource` 保留最后值），也不写假数据。
 9. **TSX 不拼路径、不猜端口。** `dataDir`、`preferredProxyPort`、`proxyPort` 全部来自 `HarnessState`。
 10. **测试走临时目录替身**，不读 `~/.cursor-byok-next`，不碰真实 Cursor 配置。
-11. **`harness.json` 读失败一律降级为默认值**（含新增的 `preferredPort` 字段，旧文件缺字段按 0 处理）。
-12. **`proxyPort` 与 `preferredPort` 不互相覆盖**：绑定成功只写 `proxyPort`，用户选择只写 `preferredPort`。
+11. **`harness.json` 读失败一律降级为默认值**；字段缺失不做迁移（beta 不写兼容层），`preferredPort` 缺失由 serde 的 `Option` 自然读成"没选过"。
+12. **`proxyPort` 与 `preferredPort` 不互相覆盖**：绑定成功只写 `proxyPort`，用户选择只写 `preferredPort`；两者经同一个 `update_intent` 在 `operation` 锁内写入。
+13. **`data_dir()` 每进程解析一次**（`OnceLock`），所有存储共用同一个目录值。
 
 ## 验证
 
@@ -100,14 +101,15 @@ cd apps/desktop && nsh check && nsh test
 nsh test test-fixtures/Visual.test.tsx --target macos
 ```
 
-Rust 覆盖：`a_state_from_before_preferred_ports_reads_the_bound_port_as_no_choice`（旧 `harness.json` 兼容读）、`a_chosen_port_is_remembered_for_the_next_run`（只写意图、不动 `proxyPort`），以及原有的 harness 状态机测试（`harness::tests` 6 项）。
+Rust 覆盖：`a_file_without_a_choice_field_reads_as_no_choice`、`a_state_without_a_choice_round_trips`（无选择在文件里是显式 `null`）、`a_chosen_port_is_remembered_for_the_next_run`、`a_saved_zero_asks_for_a_fresh_os_pick_even_after_a_bind`、`the_port_to_bind_prefers_the_choice_over_the_last_bind`（纯函数，覆盖"用户选择 / 沿用上次绑定 / 平台默认"三条分支），以及原有的 harness 状态机测试。
 
 TSX 覆盖：
 - `系统设置页保存端口与清理存储都走真实边界`（默认禁用保存 → 输入后启用 → 只调用一次 `setPreferredPort` → 清理确认）
 - `系统设置页的外观与语言选择立即生效并记住`（Storage 键两条 + 英文文案切换）
 - `系统设置页在端口越界时给出错误文案`（越界不禁用保存但仍显示错误）
+- `清空端口字段表示沿用上次绑定的端口`（清空后保存发送 `null`，而不是 `0`）
 
-`nsh test` 当前 165 项：164 通过，1 项显式跳过（`Visual.test.tsx` 需 `--target macos`）。
+`nsh test` 当前 169 项：167 通过，1 项显式跳过（`Visual.test.tsx` 需 `--target macos`）。
 
 ### 设计完成清单
 

@@ -43,10 +43,6 @@ use self::plugins::{
     PluginSnapshot as HostSnapshot, ResourceState as HostResourceState,
 };
 
-/// The proxy port Cursor is pointed at when this app has never bound one.
-/// `0` lets the OS pick, and the chosen port is remembered from then on.
-const DEFAULT_PROXY_PORT: u16 = 0;
-
 /// The crate's UI set (`nsh.json` `"rust"`).
 #[native_module("cursor-byok-next/native")]
 fn native(registry: &mut Registry) {
@@ -133,8 +129,9 @@ pub struct HarnessState {
     pub proxy_url: Option<String>,
     /// The port the proxy bound.
     pub proxy_port: Option<u16>,
-    /// The port the user chose in system settings; `0` lets the OS pick.
-    pub preferred_proxy_port: u16,
+    /// The port the user chose in system settings. `0` asks the OS to pick;
+    /// `null` means no choice was saved, so the last bound port is reused.
+    pub preferred_proxy_port: Option<u16>,
     /// Where this app keeps its own files (`harness.json`, `ca/`, plugins).
     pub data_dir: String,
     /// The command that trusts the CA; the app cannot run it (it needs sudo).
@@ -156,7 +153,7 @@ pub struct Harness {
 impl Harness {
     /// Restores the proxy port and the on/off intent of the previous run.
     pub fn new() -> Result<Self, HarnessError> {
-        let paths = HarnessPaths::managed(DEFAULT_PROXY_PORT)?;
+        let paths = HarnessPaths::managed()?;
         Ok(Self {
             inner: Arc::new(CursorHarness::new(paths)),
             backend: backend_addr(),
@@ -207,17 +204,16 @@ impl Harness {
         Ok(harness.status().await.into())
     }
 
-    /// Remembers the port takeover should bind; `0` lets the OS pick. Takes
-    /// effect the next time takeover starts.
+    /// Remembers the port takeover should bind; `0` lets the OS pick and `null`
+    /// clears the choice. Takes effect the next time takeover starts.
     pub async fn set_preferred_port(
         this: Instance<Self>,
-        port: u16,
+        port: Option<u16>,
     ) -> Result<HarnessState, HarnessError> {
-        let (harness, mut backend) =
-            this.with(|harness| (harness.inner.clone(), harness.backend.clone()));
-        attach_backend(&harness, &mut backend).await?;
-        harness.set_preferred_port(port)?;
-        Ok(harness.status().await.into())
+        this.with(|harness| harness.inner.clone())
+            .set_preferred_port(port)
+            .await
+            .map(Into::into)
     }
 
     /// Drops the proxy a crashed run left in Cursor's settings. `true` when it
@@ -1095,10 +1091,14 @@ fn shared_call_store() -> CallStore {
     if let Some(store) = CALL_STORE.get() {
         return store.clone();
     }
-    let store = CallStore::managed().unwrap_or_else(|error| {
-        tracing::error!(%error, "cannot open LLM call records");
-        CallStore::at(std::env::temp_dir().join("cursor-byok-next-calls.db"))
-    });
+    let store = CallStore::at(
+        crate::harness::data_dir()
+            .map(|dir| dir.join("calls.db"))
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "cannot open LLM call records");
+                std::env::temp_dir().join("cursor-byok-next-calls.db")
+            }),
+    );
     CALL_STORE.get_or_init(|| store.clone()).clone()
 }
 
