@@ -242,6 +242,21 @@ settings:
     copy: Copy path
     copied: Data directory copied
     body: Cursor-BYOK-Next runs only on this machine and collects no usage data.
+  updates:
+    title: Updates
+    description: Release archives and the signed update manifest come from this project's GitHub releases.
+    check: Check for updates
+    checking: Checking…
+    upToDate: You're on the latest version.
+    available: "Version %{version} is available."
+    notes: What changed
+    install: Download and install on quit
+    downloading: "Downloading… %{received} / %{total}"
+    ready: The update installs when you quit.
+    unavailable: This copy cannot replace itself. Download it from the release page.
+    open: Open release page
+    failed: "Update check failed: %{message}"
+    shell: This brings a newer runtime and app shell; your code is current.
   dialog:
     details:
       title: Clear request and response details?

@@ -1,0 +1,53 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      # The workflows pin actions by SHA; one group keeps the bumps in one
+      # review, since every workflow must move together.
+      actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    open-pull-requests-limit: 3
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      # Code generation and runtime crates must be reviewed together.
+      protobuf:
+        patterns: ["prost", "prost-*", "protoc-bin-vendored*", "protox"]
+      # The desktop app's Rust UI crate and the toolchain that builds it are
+      # one version: `.github/scripts/check-release.mjs` refuses a split.
+      nsh:
+        patterns: ["nsh", "nsh-*"]
+      patches:
+        patterns: ["*"]
+        update-types: [patch]
+        # Keep family groups disjoint from the general patch group.
+        exclude-patterns:
+          - prost
+          - "prost-*"
+          - "protoc-bin-vendored*"
+          - protox
+          - nsh
+          - "nsh-*"
+          - "sqlx*"
+          - hudsucker
+          - rcgen
+    open-pull-requests-limit: 5
+  # GitHub Actions is the only npm surface here: the app has no package.json
+  # (NSH supplies the TypeScript compiler), and `.github/scripts` uses Node's
+  # standard library only.

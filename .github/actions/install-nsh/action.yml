@@ -1,0 +1,69 @@
+# Installs the `nsh` CLI the app is built with, from its own GitHub release,
+# checking the archive's SHA-256 first.
+#
+# `version` is the one source for CI: the `nsh-*` Cargo dependencies
+# (apps/desktop/Cargo.toml) and this default are checked against each other
+# by `.github/scripts/check-release.mjs`. `nsh` rewrites the `.nsh/rust`
+# workspace's crates to the CLI's version, so a mismatch would silently
+# retarget the app; bump both together.
+name: Install nsh
+description: Download, verify and install the nsh CLI of a pinned version
+
+inputs:
+  version:
+    description: nsh release version, without the leading `v`
+    required: false
+    default: 0.6.0
+
+runs:
+  using: composite
+  steps:
+    - name: Install nsh
+      shell: bash
+      env:
+        NSH_VERSION: ${{ inputs.version }}
+        RUNNER_OS_NAME: ${{ runner.os }}
+        RUNNER_ARCH_NAME: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+
+        case "${RUNNER_OS_NAME}-${RUNNER_ARCH_NAME}" in
+          macOS-ARM64) asset=nsh-macos-arm64.tar.gz ;;
+          macOS-X64) asset=nsh-macos-x86_64.tar.gz ;;
+          Linux-X64) asset=nsh-linux-x86_64.tar.gz ;;
+          Linux-ARM64) asset=nsh-linux-arm64.tar.gz ;;
+          Windows-X64) asset=nsh-windows-x86_64.zip ;;
+          Windows-ARM64) asset=nsh-windows-arm64.zip ;;
+          *)
+            echo "No nsh release for ${RUNNER_OS_NAME}/${RUNNER_ARCH_NAME}" >&2
+            exit 1
+            ;;
+        esac
+
+        base="https://github.com/longbridge/nsh/releases/download/v${NSH_VERSION}"
+        download="$RUNNER_TEMP/nsh-download"
+        extract="$RUNNER_TEMP/nsh"
+        mkdir -p "$download" "$extract"
+        curl -fsSL --retry 3 -o "$download/$asset" "$base/$asset"
+        curl -fsSL --retry 3 -o "$download/$asset.sha256" "$base/$asset.sha256"
+
+        # `<hex>  <name>` or `<hex> *<name>` (sha256sum's binary marker).
+        expected="$(cut -d' ' -f1 "$download/$asset.sha256")"
+        if command -v sha256sum >/dev/null 2>&1; then
+          actual="$(sha256sum "$download/$asset" | cut -d' ' -f1)"
+        else
+          actual="$(shasum -a 256 "$download/$asset" | cut -d' ' -f1)"
+        fi
+        if [[ "$expected" != "$actual" ]]; then
+          echo "$asset: SHA-256 ${actual}, the release says ${expected}" >&2
+          exit 1
+        fi
+
+        # The archive holds `nsh/bin` and `nsh/runtime`; `bsdtar` on the
+        # Windows runners reads the .zip the same way.
+        tar -xf "$download/$asset" -C "$extract"
+        bin="$(cd "$extract/nsh/bin" && pwd)"
+        # Later steps find `nsh` through this; `nsh` itself finds its
+        # runtimes next to the executable, so either path form works.
+        echo "$bin" >> "$GITHUB_PATH"
+        "$bin/nsh" --version

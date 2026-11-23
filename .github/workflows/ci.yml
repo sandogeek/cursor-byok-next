@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to validate for a release
+        required: false
+        type: string
+        default: ""
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # CI builds each crate once: no incremental state and no debug info.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  # One pin for CI: Cargo.toml's `nsh-*` versions, `.nsh/rust`'s crates
+  # and the app's `.nsh/types` all come from this CLI, and check-release.mjs
+  # refuses a mismatch with the Cargo dependencies.
+  NSH_VERSION: "0.6.0"
+
+jobs:
+  repository:
+    name: Repository checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Verify release configuration
+        run: node .github/scripts/check-release.mjs
+      - name: Test release scripts
+        run: node --test .github/scripts/*.test.mjs
+
+  rust:
+    name: Rust (${{ matrix.os }})
+    needs: repository
+    strategy:
+      fail-fast: false
+      matrix:
+        # The desktop crate is `std` + tokio, with code under `cfg(windows)`
+        # and `cfg(unix)` that only compiles on its own platform; the CLI
+        # crates are portable. Clippy runs on all three, tests on Linux.
+        include:
+          - os: ubuntu-24.04
+            tests: true
+          - os: macos-15
+            tests: false
+          - os: windows-latest
+            tests: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      # The vendored protoc binary and aws-lc-rs build C; Linux also needs
+      # a linker and `pkg-config` for the openssl-free stack.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          workspaces: ". -> target"
+
+      # `nsh test` runs `cargo test` of the app's crate *and* its TSX tests;
+      # it builds the crate in `.nsh/rust`, so install the CLI first.
+      - uses: ./.github/actions/install-nsh
+        with:
+          version: ${{ env.NSH_VERSION }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run workspace tests
+        if: matrix.tests
+        run: cargo test --locked --workspace --all-targets
+
+      # The app's own checks on their own platform: `cargo check` of the crate
+      # with its platform code, then `tsc` against the declarations `nsh`
+      # generates from it. The generated `.nsh/` is not committed.
+      - name: Check the app
+        working-directory: apps/desktop
+        run: nsh check
+
+      - name: Build the app
+        working-directory: apps/desktop
+        run: nsh build
+
+      - name: Test the app
+        if: matrix.tests
+        working-directory: apps/desktop
+        run: nsh test
+
+  # One packaging build per platform, the same three the release makes: a
+  # target packages only on itself, and the workflow must keep packaging
+  # after a change in `nsh.json` or the app's entry.
+  package:
+    name: Package (${{ matrix.target }})
+    needs: repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos
+            os: macos-15
+          - target: linux
+            os: ubuntu-24.04
+          - target: windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      # NSH's Linux desktop packages link GTK 4 (and WebKitGTK for web views).
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libgtk-4-dev libwebkitgtk-6.0-dev
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          workspaces: ". -> target"
+          # A separate cache per target: the release runners reuse them.
+          key: package-${{ matrix.target }}
+
+      - uses: ./.github/actions/install-nsh
+        with:
+          version: ${{ env.NSH_VERSION }}
+
+      - name: Package the app
+        working-directory: apps/desktop
+        run: nsh package --target ${{ matrix.target }} -o "$RUNNER_TEMP/out"
+
+      - name: Keep the package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-${{ matrix.target }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: error

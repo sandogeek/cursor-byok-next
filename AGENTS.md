@@ -148,3 +148,4 @@ nsh package --target macos
 - [x] 模型调用 / 调用记录（见 `apps/desktop/docs/MODEL_CALLS.md`）
 - [x] 插件协议适配器下沉 Rust（见 `apps/desktop/docs/PLUGIN_PROTOCOL_ADAPTERS.md`）
 - [x] 系统设置页（见 `apps/desktop/docs/SYSTEM_SETTINGS.md`）
+- [x] GitHub 配置与发布线：`.github/`（CI / 发布 / 脚本 / 模板 / dependabot）+ 应用内更新检查（见 `apps/desktop/docs/GITHUB_CI.md`）

@@ -1,0 +1,329 @@
+name: Release desktop app
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing unpublished release tag to build
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+
+env:
+  NSH_VERSION: "0.6.0"
+  # `macos` and `linux` package both architectures and write one archive per
+  # architecture, so one job per OS covers every platform the manifest lists.
+  # The key is `nsh_updater::platform()`'s at run time (`macos-aarch64`, …):
+  # one list here drives the archives, the manifest check and the notes.
+  RELEASE_PLATFORMS: "macos-aarch64,macos-x86_64,linux-x86_64,linux-aarch64,windows-x86_64"
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      should_publish: ${{ steps.release.outputs.should_publish }}
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Verify release author
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          if [[ "${GITHUB_ACTOR}" != "${REPOSITORY_OWNER}" || "${GITHUB_TRIGGERING_ACTOR}" != "${REPOSITORY_OWNER}" ]]; then
+            echo "Only ${REPOSITORY_OWNER} may publish a release" >&2
+            exit 1
+          fi
+
+      # Without the key, `nsh update-manifest` writes an unsigned manifest,
+      # and the app's `publicKey` would refuse it on every machine.
+      - name: Verify updater signing key
+        env:
+          NSH_UPDATE_KEY: ${{ secrets.NSH_UPDATE_KEY }}
+        shell: bash
+        run: |
+          key="$(printf '%s' "${NSH_UPDATE_KEY:-}" | tr -d '[:space:]')"
+          if [[ -z "$key" ]]; then
+            echo "NSH_UPDATE_KEY is not configured" >&2
+            exit 1
+          fi
+          # `nsh keygen`'s `.secret` is the base64 of a 32-byte Ed25519 key.
+          if [[ ! "$key" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+            echo "NSH_UPDATE_KEY is not an nsh keygen .secret (44 base64 characters)" >&2
+            exit 1
+          fi
+
+      - name: Read and verify the app version
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          node .github/scripts/check-release.mjs --tag "${RELEASE_TAG}"
+          version=$(node -p 'require("./apps/desktop/nsh.json").version')
+          commit=$(git rev-parse HEAD)
+          test "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")" = "${commit}"
+          git fetch origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${commit}" origin/main; then
+            echo "Release tag must point to a commit contained in origin/main" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check whether this version is already published
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          state=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.tag_name == env.RELEASE_TAG) | if .draft then "draft" else "published" end')
+          if [[ "${state}" = "published" ]]; then
+            echo "Version ${VERSION} is already published; use a new version." >&2
+            exit 1
+          fi
+          echo "should_publish=true" >> "${GITHUB_OUTPUT}"
+
+  checks:
+    name: Release checks
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.prepare.outputs.commit }}
+
+  # `nsh package` pairs each target with its archive, so the build is one
+  # job per OS (a target packages only on itself), not per architecture.
+  publish:
+    name: Publish (${{ matrix.target }})
+    needs: [prepare, checks]
+    permissions:
+      contents: write
+    timeout-minutes: 90
+    if: needs.prepare.outputs.should_publish == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos
+            os: macos-15
+          - target: linux
+            os: ubuntu-24.04
+          - target: windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+
+      # NSH's Linux desktop packages link GTK 4 (and WebKitGTK for web views).
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libgtk-4-dev libwebkitgtk-6.0-dev
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          # `--target macos` writes an archive per architecture by building
+          # the runner twice: this Mac's, and Intel's.
+          targets: ${{ matrix.target == 'macos' && 'x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          workspaces: ". -> target"
+          key: release-${{ matrix.target }}
+
+      - uses: ./.github/actions/install-nsh
+        with:
+          version: ${{ env.NSH_VERSION }}
+
+      # `nsh.json` has `"updater"`, so this writes the app *and* the update
+      # archives `nsh update-manifest` reads:
+      # `<name>-<version>-<platform>.<ext>`, one per architecture of the OS.
+      - name: Package the app
+        working-directory: apps/desktop
+        run: nsh package --target ${{ matrix.target }} -o "$RUNNER_TEMP/out"
+
+      # The manifest needs every platform's archive at once; the assets are
+      # uploaded from one job, so each packaging job hands them over.
+      - name: Keep the package and its archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: error
+
+  finalize:
+    name: Publish GitHub Release
+    needs: [prepare, publish]
+    if: needs.prepare.outputs.should_publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - uses: ./.github/actions/install-nsh
+        with:
+          version: ${{ env.NSH_VERSION }}
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Show the release's files
+        run: ls -la dist
+
+      # The tag is the release's; the tag's commit is what `publish` built.
+      # Drafting first keeps `releases/latest` pointing at the published
+      # version while this one is incomplete.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes=".github/release-notes/${VERSION}.md"
+          test -f "${notes}"
+          existing=$(gh release view "v${VERSION}" --json isDraft --jq '.isDraft' 2>/dev/null || echo missing)
+          if [[ "${existing}" = "true" ]]; then
+            gh release edit "v${VERSION}" --draft
+          elif [[ "${existing}" = "missing" ]]; then
+            gh release create "v${VERSION}" --draft --title "Cursor-BYOK-Next v${VERSION}" --notes-file "${notes}"
+          else
+            echo "Release v${VERSION} is already published" >&2
+            exit 1
+          fi
+
+      - name: Upload the archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PLATFORMS: ${{ env.RELEASE_PLATFORMS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for platform in ${PLATFORMS//,/ }; do
+            case "${platform}" in
+              macos-*|linux-*) ext=tar.gz ;;
+              windows-*) ext=zip ;;
+            esac
+            matches=(dist/Cursor-BYOK-Next-"${VERSION}"-"${platform}".${ext})
+            if [[ "${#matches[@]}" -ne 1 ]]; then
+              echo "Expected exactly one archive for ${platform}; found ${#matches[@]}" >&2
+              exit 1
+            fi
+            gh release upload "v${VERSION}" "${matches[0]}" --clobber
+          done
+
+      # Signed with the key whose public half is `nsh.json`'s
+      # `updater.publicKey`: a manifest from anywhere else is refused.
+      - name: Write and sign the updater manifest
+        env:
+          NSH_UPDATE_KEY: ${{ secrets.NSH_UPDATE_KEY }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PLATFORMS: ${{ env.RELEASE_PLATFORMS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/update.secret"
+          printf '%s' "${NSH_UPDATE_KEY}" > "${key}"
+          chmod 600 "${key}"
+          shopt -s nullglob
+          nsh update-manifest dist/*.tar.gz dist/*.zip \
+            --entry apps/desktop \
+            --notes ".github/release-notes/${VERSION}.md" \
+            --key "${key}" \
+            -o dist
+          rm -f "${key}"
+          node .github/scripts/check-updater-manifest.mjs \
+            --app apps/desktop/nsh.json \
+            --manifest dist/latest.json \
+            --platforms "${PLATFORMS}"
+
+      # `latest.json.sig` before `latest.json`, archives before both: an app
+      # reads `releases/latest/download/latest.json`, and a manifest that
+      # names an asset the release does not have yet would be refused.
+      - name: Upload the manifest last
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "v${VERSION}" dist/latest.json.sig dist/latest.json --clobber
+
+      - name: Write release notes and download guide
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          cat ".github/release-notes/${VERSION}.md" > RELEASE_NOTES.md
+          app="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
+          cat >> RELEASE_NOTES.md <<EOF
+
+          ## Download / 下载安装
+
+          | Platform | Package |
+          | --- | --- |
+          | macOS Apple Silicon (arm64) | [Download](${app}/Cursor-BYOK-Next-${VERSION}-macos-aarch64.tar.gz) |
+          | macOS Intel (x86_64) | [Download](${app}/Cursor-BYOK-Next-${VERSION}-macos-x86_64.tar.gz) |
+          | Windows x64 | [Download](${app}/Cursor-BYOK-Next-${VERSION}-windows-x86_64.zip) |
+          | Linux x86_64 | [Download](${app}/Cursor-BYOK-Next-${VERSION}-linux-x86_64.tar.gz) |
+          | Linux arm64 | [Download](${app}/Cursor-BYOK-Next-${VERSION}-linux-aarch64.tar.gz) |
+
+          Each archive holds the whole app. Unpack it and run it; macOS apps are ad hoc signed, so Gatekeeper may ask for confirmation.
+
+          The other files in Assets, including \`latest.json\` and \`latest.json.sig\`, are used by automatic updates.
+
+          **Changes:** https://github.com/${GITHUB_REPOSITORY}/commits/v${VERSION}
+
+          This is an unofficial project and is not affiliated with Cursor.
+          EOF
+
+      - name: Update the draft release description
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: gh release edit "v${VERSION}" --notes-file RELEASE_NOTES.md
+
+      - name: Publish the completed release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: gh release edit "v${VERSION}" --draft=false --latest

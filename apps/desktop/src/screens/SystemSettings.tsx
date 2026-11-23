@@ -1,5 +1,6 @@
-import { appInfo, Clipboard, Scroll, createMotion, resource, signal, Text, View } from "nsh";
+import { appInfo, Clipboard, openUrl, Scroll, createMotion, resource, signal, Text, View } from "nsh";
 import { t } from "nsh/i18n";
+import { shellInfo } from "nsh/updater";
 import type { CallsSnapshot, HarnessState } from "cursor-byok-next/native";
 import type { CursorTakeover } from "./Cursor";
 import { chooseAppearance, readAppearance, type Appearance } from "../ui/appearance";
@@ -13,6 +14,7 @@ import { StatusBadge, Surface } from "../ui/Surface";
 import { Switch } from "../ui/Switch";
 import { motion } from "../ui/motion";
 import { chooseLocale, languageItems, localePreference } from "./Language";
+import { checkForUpdates, installUpdate, installedVersion, updateState } from "./updates";
 
 /** What the settings page needs of the call log: counts, mode and clearing. */
 export interface SettingsCallLog {
@@ -72,7 +74,7 @@ export function SystemSettings(props: { takeover: CursorTakeover; calls: Setting
   const portText = () => portDraft() ?? savedPortText();
   const portEdited = () => portDraft() !== null && portDraft() !== savedPortText();
   const portInvalid = () => portEdited() && parsePort(portText()) === undefined;
-  const version = () => appInfo().version ?? "";
+  const version = () => shownVersion();
 
   /** The appearance the app starts with was restored in `App.tsx`; mirror it. */
   void readAppearance().then(appearance.set);
@@ -123,6 +125,20 @@ export function SystemSettings(props: { takeover: CursorTakeover; calls: Setting
       error.set(errorText(cause));
     }
   };
+
+  const openReleasePage = async () => {
+    const update = updateState().update;
+    if (!update) return;
+    try {
+      await openUrl(update.url);
+    } catch (cause) {
+      error.set(errorText(cause));
+    }
+  };
+
+  /** The offered version, or the installed one when nothing newer is known. */
+  const shownVersion = () => shellInfo().version ?? appInfo().version ?? "";
+  const updateBusy = () => updateState().status === "checking" || updateState().status === "downloading";
 
   const appearanceOptions = () => [
     { value: "system", title: t("settings.appearance.system") },
@@ -229,6 +245,80 @@ export function SystemSettings(props: { takeover: CursorTakeover; calls: Setting
               />
             </View>
           </SettingRow>
+        </Surface>
+
+        <Surface class="gap-3 p-4">
+          <View class="flex-row items-center justify-between gap-3">
+            <Text role="header" class="text-sm font-semibold text-foreground">{t("settings.updates.title")}</Text>
+            <StatusBadge
+              label={updateState().update ? updateState().update!.version : t("settings.updates.check")}
+              tone={updateState().status === "failed" ? "warning" : updateState().status === "available" ? "success" : "neutral"}
+            />
+          </View>
+          <SettingRow title={t("settings.about.version", { version: version() })} description={t("settings.updates.description")}>
+            <Button
+              label={updateBusy() ? t("settings.updates.checking") : t("settings.updates.check")}
+              testID="settings-check-update"
+              loading={updateBusy()}
+              disabled={updateBusy()}
+              onPress={() => void checkForUpdates()}
+            />
+          </SettingRow>
+          <If when={updateState().status === "idle"}>
+            <Text class="text-xs text-muted-foreground">{t("settings.updates.upToDate")}</Text>
+          </If>
+          <If when={updateState().update !== null && (updateState().status === "available" || updateState().status === "downloading" || updateState().status === "ready")}>
+            <View class="gap-2 rounded-(--radius) border border-border bg-muted px-3 py-2">
+              <Text class="text-sm text-foreground">
+                {t("settings.updates.available", { version: updateState().update?.version ?? "" })}
+              </Text>
+              <If when={updateState().update?.shell}>
+                <Text class="text-xs text-muted-foreground">{t("settings.updates.shell")}</Text>
+              </If>
+              <If when={updateState().update?.notes}>
+                <View class="gap-1">
+                  <Text class="text-xs text-muted-foreground">{t("settings.updates.notes")}</Text>
+                  <Text class="select-text text-xs text-foreground">{updateState().update?.notes ?? ""}</Text>
+                </View>
+              </If>
+              <If when={updateState().status === "downloading"}>
+                <Text class="text-xs text-muted-foreground">
+                  {t("settings.updates.downloading", {
+                    received: String(updateState().received),
+                    total: updateState().total == null ? "?" : String(updateState().total),
+                  })}
+                </Text>
+              </If>
+              <If when={updateState().status === "ready"}>
+                <Text class="text-xs text-success">{t("settings.updates.ready")}</Text>
+              </If>
+              <View class="flex-row items-center gap-2 pt-1">
+                <Button
+                  label={t("settings.updates.install")}
+                  variant="primary"
+                  size="sm"
+                  testID="settings-install-update"
+                  disabled={!updateState().update?.canInstall || updateBusy() || updateState().status === "ready"}
+                  onPress={() => void installUpdate()}
+                />
+                <If when={!updateState().update?.canInstall}>
+                  <Button
+                    label={t("settings.updates.open")}
+                    size="sm"
+                    onPress={() => void openReleasePage()}
+                  />
+                </If>
+              </View>
+              <If when={!updateState().update?.canInstall}>
+                <Text class="text-xs text-muted-foreground">{t("settings.updates.unavailable")}</Text>
+              </If>
+            </View>
+          </If>
+          <If when={updateState().status === "failed"}>
+            <Text role="alert" class="text-xs text-destructive">
+              {t("settings.updates.failed", { message: updateState().error })}
+            </Text>
+          </If>
         </Surface>
 
         <Surface class="gap-3 p-4">

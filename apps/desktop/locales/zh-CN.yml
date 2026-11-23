@@ -242,6 +242,21 @@ settings:
     copy: 复制路径
     copied: 数据目录已复制
     body: Cursor-BYOK-Next 只在本机运行，不收集任何使用数据。
+  updates:
+    title: 更新
+    description: 安装包与签名的更新清单都来自本项目的 GitHub Release。
+    check: 检查更新
+    checking: 正在检查…
+    upToDate: 已是最新版本。
+    available: 有新版本 %{version}。
+    notes: 更新内容
+    install: 下载，退出时安装
+    downloading: "正在下载… %{received} / %{total}"
+    ready: 退出应用时安装更新。
+    unavailable: 当前这份应用无法自我替换，请到 Release 页面下载。
+    open: 打开发布页面
+    failed: "检查更新失败：%{message}"
+    shell: 这次带来的是更新的运行时和应用外壳，你的代码已是最新。
   dialog:
     details:
       title: 清空请求和响应详情？

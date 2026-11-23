@@ -1,8 +1,12 @@
 {
   "name": "Cursor-BYOK-Next",
   "id": "dev.cursorbyoknext.app",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "build": 1,
+  "updater": {
+    "github": "sandogeek/cursor-byok-nsh",
+    "publicKey": "QIQBChER4HbtiTvXMN2HyEqTWaT3iUIj7McZ1Dg4WGQ="
+  },
   "icon": "assets/icon.png",
   "rust": ".",
   "locales": ["zh-CN", "en-US"],
