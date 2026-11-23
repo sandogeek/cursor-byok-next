@@ -281,6 +281,13 @@ impl Server {
 }
 
 fn https_client() -> HttpsClient {
+    // The workspace build links both `ring` and `aws-lc-rs`, so rustls can no
+    // longer pick a process-wide provider on its own. This crate only enables
+    // `ring` (through hyper-rustls), so make that the explicit choice.
+    static PROVIDER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    PROVIDER.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
     let mut http = HttpConnector::new();
     http.enforce_http(false);
     http.set_nodelay(true);

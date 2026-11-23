@@ -33,9 +33,22 @@ use super::{
 
 const LIVE_CATALOG_TTL: Duration = Duration::from_secs(15);
 
+/// Whether a catalog read may reuse the TTL cache or must re-ask the plugin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatalogRefresh {
+    Cached,
+    Forced,
+}
+
 #[derive(Clone)]
 pub struct PluginHost {
     inner: Arc<HostInner>,
+}
+
+impl std::fmt::Debug for PluginHost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("PluginHost").finish_non_exhaustive()
+    }
 }
 
 struct HostInner {
@@ -50,9 +63,9 @@ struct HostInner {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct LiveCatalogKey {
-    plugin_id: String,
-    provider_id: String,
-    resource_id: String,
+    plugin: String,
+    provider: String,
+    resource: String,
 }
 
 #[derive(Clone, Debug)]
@@ -261,7 +274,7 @@ impl PluginHost {
         let executable = self.executable().await?;
         let entry = self.find_entry(&executable, plugin_id).await?;
         let provider = find_provider(&entry, provider_id)?;
-        self.provider_models(&entry, &executable, provider, true, None)
+        self.provider_models(&entry, &executable, provider, CatalogRefresh::Forced, None)
             .await;
         Ok(())
     }
@@ -277,7 +290,7 @@ impl PluginHost {
                     continue;
                 }
                 let (stored, _) = self
-                    .provider_models(&entry, &executable, provider, false, None)
+                    .provider_models(&entry, &executable, provider, CatalogRefresh::Cached, None)
                     .await;
                 models.extend(stored.into_iter().map(|model| {
                     PluginModelDescriptor::new(
@@ -303,7 +316,7 @@ impl PluginHost {
             return Ok(None);
         }
         let (stored, _) = self
-            .provider_models(&entry, &executable, provider, false, None)
+            .provider_models(&entry, &executable, provider, CatalogRefresh::Cached, None)
             .await;
         Ok(stored
             .into_iter()
@@ -329,29 +342,15 @@ impl PluginHost {
             let entry = host.find_entry(&executable, &plugin_id).await?;
             let provider = find_provider(&entry, &provider_id)?.clone();
             let (stored, _) = host
-                .provider_models(&entry, &executable, &provider, false, None)
+                .provider_models(&entry, &executable, &provider, CatalogRefresh::Cached, None)
                 .await;
             let stored = stored
                 .into_iter()
                 .find(|model| model.id == upstream_id)
                 .ok_or_else(|| Error::NotFound(format!("plugin model {model_id}")))?;
-            let resource = match &provider.resource_type {
-                Some(resource_type) if provider.catalog == LIVE_CATALOG => {
-                    let resource_id = live_resource_id(&upstream_id).ok_or_else(|| {
-                        Error::Provider(format!("invalid live plugin model ID: {model_id}"))
-                    })?;
-                    Some((
-                        resource_type.clone(),
-                        host.find_record(&plugin_id, resource_type, resource_id)
-                            .await?,
-                    ))
-                }
-                Some(resource_type) => Some((
-                    resource_type.clone(),
-                    host.select_resource(&plugin_id, resource_type).await?,
-                )),
-                None => None,
-            };
+            let resource = host
+                .invocation_resource(&plugin_id, &provider, &upstream_id)
+                .await?;
             let mut model_snapshot = stored.snapshot();
             if provider.catalog == LIVE_CATALOG
                 && let Some(upstream) = live_upstream_id(&upstream_id)
@@ -365,7 +364,7 @@ impl PluginHost {
                 "resource": resource.as_ref().map(|(resource_type, record)| record.snapshot(resource_type)),
             });
             let worker = host.worker(&entry, &executable).await;
-            let origins = host.resource_origins(&entry, resource.as_ref().map(|(_, record)| record));
+            let origins = Self::resource_origins(&entry, resource.as_ref().map(|(_, record)| record));
             let mut invocation = invocation;
             if invocation.request.model.max_output_tokens.is_none() {
                 invocation.request.model.max_output_tokens = stored.max_output_tokens;
@@ -378,7 +377,7 @@ impl PluginHost {
                     cancellation.clone(),
                     recorder.clone(),
                     origins,
-                    Some(invocation.clone()),
+                    Some(Arc::clone(&invocation)),
                 )
                 .await?;
             yield ModelEvent::Start {
@@ -386,52 +385,14 @@ impl PluginHost {
             };
             while let Some(item) = items.recv().await {
                 match item {
-                    WorkerStreamItem::Event(event) => {
-                        yield event;
-                    }
+                    WorkerStreamItem::Event(event) => yield event,
                     WorkerStreamItem::Result(result) => {
                         let value = result?;
-                        let status = value
-                            .get("status")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default();
-                        let patch = value
-                            .get("patch")
-                            .filter(|patch| !patch.is_null())
-                            .map(|patch| serde_json::from_value::<ResourcePatch>(patch.clone()))
-                            .transpose()?;
-                        if let (Some(patch), Some((resource_type, record))) =
-                            (patch, resource.as_ref())
+                        if host
+                            .apply_invocation_result(&plugin_id, resource.as_ref(), &value)
+                            .await?
                         {
-                            if let Err(error) = host
-                                .inner
-                                .state
-                                .apply_patch(&plugin_id, resource_type, &record.id, patch)
-                                .await
-                            {
-                                tracing::warn!(plugin = %plugin_id, %error, "failed to apply plugin resource patch");
-                            } else {
-                                host.invalidate_live_catalogs(
-                                    &plugin_id,
-                                    &HashSet::from([record.id.clone()]),
-                                )
-                                .await;
-                            }
-                        }
-                        match status {
-                            "completed" => return,
-                            "resource-error" | "request-error" => {
-                                let message = value
-                                    .get("message")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("plugin provider call failed");
-                                Err(Error::Provider(message.to_owned()))?;
-                            }
-                            status => {
-                                Err(Error::Protocol(format!(
-                                    "unknown plugin provider result: {status}"
-                                )))?;
-                            }
+                            return;
                         }
                     }
                 }
@@ -440,6 +401,75 @@ impl PluginHost {
                 "plugin '{plugin_id}' worker stopped mid-stream"
             )))?;
         })
+    }
+
+    /// Resolves which stored resource the invocation binds to, if the provider
+    /// advertises one.
+    async fn invocation_resource(
+        &self,
+        plugin_id: &str,
+        provider: &ProviderDefinition,
+        upstream_id: &str,
+    ) -> Result<Option<(String, ResourceRecord)>> {
+        let Some(resource_type) = &provider.resource_type else {
+            return Ok(None);
+        };
+        if provider.catalog != LIVE_CATALOG {
+            let record = self.select_resource(plugin_id, resource_type).await?;
+            return Ok(Some((resource_type.clone(), record)));
+        }
+        let resource_id = live_resource_id(upstream_id).ok_or_else(|| {
+            Error::Provider(format!("invalid live plugin model ID: {upstream_id}"))
+        })?;
+        let record = self
+            .find_record(plugin_id, resource_type, resource_id)
+            .await?;
+        Ok(Some((resource_type.clone(), record)))
+    }
+
+    /// Applies the plugin's terminal result. Returns `Ok(true)` when the call
+    /// reported `completed`, and an error for the two error statuses.
+    async fn apply_invocation_result(
+        &self,
+        plugin_id: &str,
+        resource: Option<&(String, ResourceRecord)>,
+        value: &serde_json::Value,
+    ) -> Result<bool> {
+        let status = value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let patch = value
+            .get("patch")
+            .filter(|patch| !patch.is_null())
+            .map(|patch| serde_json::from_value::<ResourcePatch>(patch.clone()))
+            .transpose()?;
+        if let (Some(patch), Some((resource_type, record))) = (patch, resource) {
+            if let Err(error) = self
+                .inner
+                .state
+                .apply_patch(plugin_id, resource_type, &record.id, patch)
+                .await
+            {
+                tracing::warn!(plugin = %plugin_id, %error, "failed to apply plugin resource patch");
+            } else {
+                self.invalidate_live_catalogs(plugin_id, &HashSet::from([record.id.clone()]))
+                    .await;
+            }
+        }
+        match status {
+            "completed" => Ok(true),
+            "resource-error" | "request-error" => Err(Error::Provider(
+                value
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("plugin provider call failed")
+                    .to_owned(),
+            )),
+            status => Err(Error::Protocol(format!(
+                "unknown plugin provider result: {status}"
+            ))),
+        }
     }
 
     fn manifest_plugins(&self) -> Vec<PluginDescriptor> {
@@ -466,7 +496,7 @@ impl PluginHost {
         let mut providers = Vec::new();
         for provider in &entry.definition.providers {
             let (stored, catalog_error) = self
-                .provider_models(entry, executable, provider, false, None)
+                .provider_models(entry, executable, provider, CatalogRefresh::Cached, None)
                 .await;
             let configured = self.provider_configured(entry, provider).await;
             providers.push(PluginProviderDescriptor {
@@ -542,7 +572,7 @@ impl PluginHost {
             .collect::<Vec<_>>();
         let origins = records
             .iter()
-            .flat_map(|record| self.resource_origins(entry, Some(record)))
+            .flat_map(|record| Self::resource_origins(entry, Some(record)))
             .collect();
         let presented = self
             .worker(entry, executable)
@@ -611,7 +641,13 @@ impl PluginHost {
                 continue;
             }
             let (_, error) = self
-                .provider_models(entry, executable, provider, true, Some(changed))
+                .provider_models(
+                    entry,
+                    executable,
+                    provider,
+                    CatalogRefresh::Forced,
+                    Some(changed),
+                )
                 .await;
             errors.extend(error);
         }
@@ -623,7 +659,7 @@ impl PluginHost {
         entry: &PluginEntry,
         executable: &Path,
         provider: &ProviderDefinition,
-        force: bool,
+        refresh: CatalogRefresh,
         only: Option<&HashSet<String>>,
     ) -> (Vec<StoredModel>, Option<String>) {
         if !provider.has_models || provider.catalog != LIVE_CATALOG {
@@ -637,9 +673,8 @@ impl PluginHost {
             .state
             .resources(&entry.manifest.id, resource_type)
             .await;
-        let records = match records {
-            Ok(records) => records,
-            Err(_) => return (Vec::new(), None), // Reported on the resource descriptor.
+        let Ok(records) = records else {
+            return (Vec::new(), None); // Reported on the resource descriptor.
         };
         let mut models = Vec::new();
         let mut errors = Vec::new();
@@ -648,7 +683,7 @@ impl PluginHost {
                 continue;
             }
             let catalog = self
-                .live_models_for_resource(entry, executable, provider, &record, force)
+                .live_models_for_resource(entry, executable, provider, &record, refresh)
                 .await;
             models.extend(catalog.models);
             if let Some(error) = catalog.error {
@@ -664,14 +699,14 @@ impl PluginHost {
         executable: &Path,
         provider: &ProviderDefinition,
         record: &ResourceRecord,
-        force: bool,
+        refresh: CatalogRefresh,
     ) -> LiveCatalogEntry {
         let key = LiveCatalogKey {
-            plugin_id: entry.manifest.id.clone(),
-            provider_id: provider.id.clone(),
-            resource_id: record.id.clone(),
+            plugin: entry.manifest.id.clone(),
+            provider: provider.id.clone(),
+            resource: record.id.clone(),
         };
-        if !force {
+        if refresh == CatalogRefresh::Cached {
             let catalogs = self.inner.live_catalogs.lock().await;
             if let Some(cached) = catalogs.get(&key)
                 && cached.last_attempt.elapsed() < LIVE_CATALOG_TTL
@@ -717,7 +752,7 @@ impl PluginHost {
             .invoke(
                 "models.list",
                 serde_json::json!({ "providerId": provider.id, "resource": snapshot }),
-                self.resource_origins(entry, resource),
+                Self::resource_origins(entry, resource),
             )
             .await?;
         let definitions = value
@@ -734,11 +769,7 @@ impl PluginHost {
         Ok(models)
     }
 
-    fn resource_origins(
-        &self,
-        entry: &PluginEntry,
-        record: Option<&ResourceRecord>,
-    ) -> HashSet<String> {
+    fn resource_origins(entry: &PluginEntry, record: Option<&ResourceRecord>) -> HashSet<String> {
         if !entry.manifest.permissions.resource_origin {
             return HashSet::new();
         }
@@ -749,9 +780,11 @@ impl PluginHost {
     }
 
     async fn invalidate_live_catalogs(&self, plugin_id: &str, resource_ids: &HashSet<String>) {
-        self.inner.live_catalogs.lock().await.retain(|key, _| {
-            key.plugin_id != plugin_id || !resource_ids.contains(&key.resource_id)
-        });
+        self.inner
+            .live_catalogs
+            .lock()
+            .await
+            .retain(|key, _| key.plugin != plugin_id || !resource_ids.contains(&key.resource));
     }
 
     async fn executable(&self) -> Result<std::path::PathBuf> {
@@ -784,16 +817,13 @@ impl PluginHost {
 
     async fn worker(&self, entry: &PluginEntry, executable: &Path) -> Arc<PluginWorker> {
         let mut workers = self.inner.workers.lock().await;
-        workers
-            .entry(entry.manifest.id.clone())
-            .or_insert_with(|| {
-                Arc::new(PluginWorker::new(
-                    entry,
-                    executable.to_path_buf(),
-                    self.inner.catalog.loader().clone(),
-                ))
-            })
-            .clone()
+        Arc::clone(workers.entry(entry.manifest.id.clone()).or_insert_with(|| {
+            Arc::new(PluginWorker::new(
+                entry,
+                executable.to_path_buf(),
+                self.inner.catalog.loader().clone(),
+            ))
+        }))
     }
 
     #[cfg(test)]
@@ -947,8 +977,8 @@ mod tests {
         let offline = Arc::new(AtomicBool::new(false));
         let calls = Arc::new(AtomicUsize::new(0));
         let task = tokio::spawn({
-            let offline = offline.clone();
-            let calls = calls.clone();
+            let offline = Arc::clone(&offline);
+            let calls = Arc::clone(&calls);
             async move {
                 loop {
                     let (socket, _) = listener.accept().await.unwrap();
@@ -1107,9 +1137,9 @@ mod tests {
         let received = Arc::new(Notify::new());
         let disconnected = Arc::new(Notify::new());
         let task = tokio::spawn({
-            let requests = requests.clone();
-            let received = received.clone();
-            let disconnected = disconnected.clone();
+            let requests = Arc::clone(&requests);
+            let received = Arc::clone(&received);
+            let disconnected = Arc::clone(&disconnected);
             async move {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
@@ -1204,8 +1234,23 @@ mod tests {
         }
     }
 
+    fn pdf_part() -> crate::model::ContentPart {
+        crate::model::ContentPart::File {
+            mime_type: "application/pdf".into(),
+            filename: Some("report.pdf".into()),
+            data: b"%PDF-1".to_vec(),
+        }
+    }
+
+    /// Drains a provider stream so every event and the terminal result is produced.
+    async fn drain(mut stream: crate::provider::ProviderStream) {
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    }
+
     #[tokio::test]
-    async fn magpie_invocation_serializes_files_and_propagates_cancellation() {
+    async fn magpie_invocation_serializes_files_per_protocol() {
         assert!(
             find_bun().is_some(),
             "install Bun on PATH to run the Magpie integration test"
@@ -1221,20 +1266,14 @@ mod tests {
         .await;
         let responses_host =
             configured_invocation_host(&temp.path().join("responses"), responses.0).await;
-        let file = crate::model::ContentPart::File {
-            mime_type: "application/pdf".into(),
-            filename: Some("report.pdf".into()),
-            data: b"%PDF-1".to_vec(),
-        };
-        let mut file_invocation = invocation(responses_host.1, vec![file]);
+        let mut file_invocation = invocation(responses_host.1, vec![pdf_part()]);
         file_invocation.request.model.max_output_tokens = Some(8192);
-        let mut stream =
+        drain(
             responses_host
                 .0
-                .stream_model(file_invocation, CancellationToken::new(), None);
-        while let Some(event) = stream.next().await {
-            event.unwrap();
-        }
+                .stream_model(file_invocation, CancellationToken::new(), None),
+        )
+        .await;
         let requests = responses.1.lock().await;
         assert_eq!(requests[0]["max_output_tokens"], 8192);
         assert_eq!(requests[0]["input"][0]["content"][0]["type"], "input_file");
@@ -1251,19 +1290,12 @@ mod tests {
 
         let chat = invocation_gateway("/v1/chat/completions", "data: [DONE]\n\n").await;
         let chat_host = configured_invocation_host(&temp.path().join("chat"), chat.0).await;
-        let file = crate::model::ContentPart::File {
-            mime_type: "application/pdf".into(),
-            filename: Some("report.pdf".into()),
-            data: b"%PDF-1".to_vec(),
-        };
-        let mut stream = chat_host.0.stream_model(
-            invocation(chat_host.1, vec![file]),
+        drain(chat_host.0.stream_model(
+            invocation(chat_host.1, vec![pdf_part()]),
             CancellationToken::new(),
             None,
-        );
-        while let Some(event) = stream.next().await {
-            event.unwrap();
-        }
+        ))
+        .await;
         let requests = chat.1.lock().await;
         assert_eq!(requests[0]["messages"][0]["content"][0]["type"], "file");
         assert_eq!(
@@ -1272,7 +1304,15 @@ mod tests {
         );
         drop(requests);
         chat.4.abort();
+    }
 
+    #[tokio::test]
+    async fn magpie_invocation_propagates_cancellation() {
+        assert!(
+            find_bun().is_some(),
+            "install Bun on PATH to run the Magpie integration test"
+        );
+        let temp = tempfile::tempdir().unwrap();
         let messages = invocation_gateway("/v1/messages", "").await;
         let messages_host =
             configured_invocation_host(&temp.path().join("messages"), messages.0).await;
@@ -1377,9 +1417,10 @@ mod tests {
         assert_eq!(call.http_status, Some(200));
         assert!(call.response_bytes > 0);
         let request = store.llm_call_request("call").await.unwrap().unwrap();
-        let recorded = request.headers.to_string() + &request.body.to_string();
-        assert!(!recorded.contains(FAKE_KEY));
-        assert!(!recorded.contains("Bearer"));
+        let mut transcript = request.headers.to_string();
+        transcript.push_str(&request.body.to_string());
+        assert!(!transcript.contains(FAKE_KEY));
+        assert!(!transcript.contains("Bearer"));
         responses.4.abort();
     }
 

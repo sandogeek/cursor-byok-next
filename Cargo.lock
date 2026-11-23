@@ -757,6 +757,7 @@ dependencies = [
  "protox",
  "rusqlite",
  "rust-embed",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",

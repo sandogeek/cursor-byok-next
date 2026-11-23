@@ -214,7 +214,7 @@ async fn read_sse(
         let chunk = chunk.map_err(|error| {
             Error::Provider(format!("cannot read plugin network stream: {error}"))
         })?;
-        total += chunk.len() as u64;
+        total = total.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
         if total > MAX_STREAM_BYTES {
             return Err(Error::Provider(
                 "plugin network stream is larger than allowed".into(),
@@ -297,7 +297,7 @@ impl SseFrame {
             return None;
         }
         if let Some(rest) = line.strip_prefix("event:") {
-            self.event = sse_field(rest).to_owned();
+            sse_field(rest).clone_into(&mut self.event);
             return None;
         }
         if let Some(rest) = line.strip_prefix("data:") {
@@ -330,6 +330,39 @@ fn object(value: &Value) -> Option<&serde_json::Map<String, Value>> {
     value.as_object()
 }
 
+/// Provider request bodies are JSON objects; every adapter builds one, so a
+/// miss is a bug in the adapter rather than bad external input.
+fn object_mut(value: &mut Value) -> Result<&mut serde_json::Map<String, Value>> {
+    value
+        .as_object_mut()
+        .ok_or_else(|| Error::Provider("provider request body must be an object".into()))
+}
+
+/// Whether a stream reported at least one tool call. A `bool` here would read
+/// as `map_finish(reason, true)` at the call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SawTool {
+    Absent,
+    Present,
+}
+
+impl SawTool {
+    pub(super) fn from_count(count: usize) -> Self {
+        if count == 0 {
+            Self::Absent
+        } else {
+            Self::Present
+        }
+    }
+}
+
+/// Whether a protocol's terminal event closes the tool call it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ToolFinish {
+    Open,
+    Done,
+}
+
 fn text(value: &Value) -> Option<&str> {
     value.as_str()
 }
@@ -339,15 +372,14 @@ fn count_u64(value: &Value) -> Option<u64> {
         Value::Number(number) => number.as_u64().or_else(|| {
             number
                 .as_f64()
-                .filter(|value| value.is_finite() && *value >= 0.0)
-                .map(|value| value as u64)
+                .and_then(crate::protocol::json::integral_u64)
         }),
         _ => None,
     }
 }
 
 fn count_usize(value: &Value) -> Option<usize> {
-    count_u64(value).map(|value| value as usize)
+    count_u64(value).and_then(|value| usize::try_from(value).ok())
 }
 
 fn parse_object(payload: &str, label: &str) -> Result<Value> {
@@ -953,10 +985,17 @@ mod tests {
         assert!(frame.push_line("").is_none());
     }
 
+    /// Whether the test origin leaves the response body open after the payload.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StalledBody {
+        Closes,
+        Hangs,
+    }
+
     async fn stalled_error_response(
         body: &'static [u8],
         content_length: usize,
-        stall: bool,
+        behavior: StalledBody,
     ) -> reqwest::Response {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -971,7 +1010,7 @@ mod tests {
             );
             socket.write_all(header.as_bytes()).await.unwrap();
             socket.write_all(body).await.unwrap();
-            if stall {
+            if behavior == StalledBody::Hangs {
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
         });
@@ -989,7 +1028,7 @@ mod tests {
     async fn error_body_read_keeps_the_status_and_never_waits_for_eof() {
         // The gateway announced more bytes than it sent and keeps the body open:
         // without a deadline this would hang until the run timed out.
-        let mut stalled = stalled_error_response(b"unauthorized", 4096, true).await;
+        let mut stalled = stalled_error_response(b"unauthorized", 4096, StalledBody::Hangs).await;
         let started = tokio::time::Instant::now();
         let body = super::read_error_body(
             &mut stalled,
@@ -1004,7 +1043,8 @@ mod tests {
 
         let oversized =
             Box::leak(vec![b'x'; super::MAX_ERROR_BODY_BYTES + 1024].into_boxed_slice());
-        let mut capped = stalled_error_response(oversized, oversized.len(), false).await;
+        let mut capped =
+            stalled_error_response(oversized, oversized.len(), StalledBody::Closes).await;
         let body = super::read_error_body(
             &mut capped,
             &CancellationToken::new(),

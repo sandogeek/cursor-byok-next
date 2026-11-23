@@ -61,6 +61,10 @@ pub struct NewLlmCall {
     pub detailed: bool,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four independent persisted flags read straight from the calls table; folding them into enums would change the recorded schema for no gain"
+)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct LlmCallSummary {
     pub call_id: String,

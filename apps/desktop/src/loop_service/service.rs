@@ -200,7 +200,7 @@ impl InferenceService {
             let output = Arc::new(OutputHub::default());
             let run = Arc::new(Run {
                 input: sender,
-                output: output.clone(),
+                output: Arc::clone(&output),
                 next_seqno: AsyncMutex::new(0),
                 subscriptions: Mutex::default(),
                 cancellation: CancellationToken::new(),
@@ -223,7 +223,7 @@ impl InferenceService {
                 receiver,
                 run.cancellation.clone(),
             ));
-            InferenceRoute::Local(run)
+            InferenceRoute::Local(Arc::clone(&run))
         } else {
             tracing::info!(
                 request_id,
@@ -256,7 +256,7 @@ impl InferenceService {
             Subscription {
                 service: self.clone(),
                 request_id,
-                run: run.clone(),
+                run: Arc::clone(run),
             },
         )
     }
@@ -321,145 +321,210 @@ async fn serve(
         model,
         knowledge,
     } = context;
-    let invocations = Arc::new(Mutex::new(HashMap::<String, CancellationToken>::new()));
-    let mut tasks = JoinSet::new();
-    let mut finished = false;
-    let mut disconnected = false;
-    let mut provider_call_index = 0;
-    let configured_context_window = model.as_ref().and_then(|model| model.context_window_tokens);
-    let mut run_context_window = configured_context_window;
     let models = plugins.configured_models().await;
-    loop {
-        let message = tokio::select! {
-            () = cancellation.cancelled() => {
-                disconnected = true;
-                break;
-            }
-            message = input.recv() => message,
-        };
-        let Some(message) = message else {
-            break;
-        };
+    let mut loop_state = LoopState {
+        output: Arc::clone(&output),
+        cancellation,
+        invocations: Arc::new(Mutex::new(HashMap::new())),
+        tasks: JoinSet::new(),
+        finished: false,
+        disconnected: false,
+        provider_call_index: 0,
+        configured_context_window: model.as_ref().and_then(|model| model.context_window_tokens),
+        run_context_window: model.as_ref().and_then(|model| model.context_window_tokens),
+    };
+    {
         use pb::run_inference_client_message::Message;
-        match message.message {
-            Some(Message::RunRequest(request)) => {
-                let requested_window =
-                    project::requested_context_window(request.requested_model.as_ref())
-                        .ok()
-                        .flatten();
-                run_context_window = requested_window.or(configured_context_window);
-                if run_context_window.is_none() {
-                    tracing::info!(
-                        request_id = %run_id,
-                        model_id,
-                        "inference_context_window_unknown"
-                    );
+        loop {
+            let message = tokio::select! {
+                () = loop_state.cancellation.cancelled() => {
+                    loop_state.disconnected = true;
+                    break;
                 }
-                let ready = run_ready(
-                    &request,
-                    model.as_ref(),
-                    &models,
-                    &model_id,
-                    run_context_window,
-                    knowledge.local_cursor_rules(),
-                );
-                emit(
-                    &output,
-                    pb::run_inference_server_message::Message::RunReady(ready),
-                );
-            }
-            Some(Message::InvokeModel(invoke)) => {
-                let id = invoke.invocation_id.clone();
-                let Some(request) = invoke.request else {
-                    invocation_error(&output, id, "RunInference model request is missing");
-                    continue;
-                };
-                if invoke.delta_base.is_some() || invoke.compressed_request.is_some() {
-                    invocation_error(
-                        &output,
-                        id,
-                        "RunInference delta or compressed requests are not supported",
-                    );
-                    continue;
-                }
-                let request =
-                    match project::project(&request, &model_id, run_context_window, &models) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            invocation_error(&output, id, &error.to_string());
-                            continue;
-                        }
-                    };
-                let context_window_tokens = request.model.context_window_tokens;
-                let cancellation = cancellation.child_token();
-                invocations.lock().insert(id.clone(), cancellation.clone());
-                let recorder = start_recorder(
-                    &calls,
-                    &id,
-                    &run_id,
-                    &conversation_id,
-                    provider_call_index,
-                    &request,
-                    model.as_ref(),
-                )
-                .await;
-                tasks.spawn(serve_invocation(
-                    plugins.clone(),
-                    output.clone(),
-                    invocations.clone(),
-                    cancellation,
-                    recorder,
-                    ModelInvocation {
-                        call_id: id,
-                        run_id: run_id.clone(),
-                        conversation_id: conversation_id.clone(),
-                        provider_call_index,
-                        request,
-                    },
-                    context_window_tokens,
-                ));
-                provider_call_index += 1;
-            }
-            Some(Message::CancelInvocation(cancel)) => {
-                if let Some(token) = invocations.lock().remove(&cancel.invocation_id) {
-                    token.cancel();
-                }
-            }
-            Some(Message::FinishRun(finish)) => {
-                finished = true;
-                if finish.aborted {
-                    for (_, token) in invocations.lock().drain() {
-                        token.cancel();
-                    }
-                }
+                message = input.recv() => message,
+            };
+            let Some(message) = message else {
                 break;
+            };
+            match message.message {
+                Some(Message::RunRequest(request)) => {
+                    let ready = loop_state.run_ready_message(
+                        &request,
+                        model.as_ref(),
+                        &models,
+                        &model_id,
+                        knowledge.local_cursor_rules(),
+                    );
+                    emit(&output, ready);
+                }
+                Some(Message::InvokeModel(invoke)) => {
+                    loop_state
+                        .start_invocation(
+                            &plugins,
+                            &calls,
+                            &models,
+                            (&run_id, &conversation_id, &model_id),
+                            model.as_ref(),
+                            invoke,
+                        )
+                        .await;
+                }
+                Some(Message::CancelInvocation(cancel)) => {
+                    loop_state.cancel_invocation(&cancel.invocation_id);
+                }
+                Some(Message::FinishRun(finish)) => {
+                    loop_state.finished = true;
+                    if finish.aborted {
+                        loop_state.cancel_all();
+                    }
+                    break;
+                }
+                Some(Message::ResolveSubagentModels(resolve)) => {
+                    emit(
+                        &output,
+                        pb::run_inference_server_message::Message::SubagentModelsResolved(
+                            resolve_subagent_models(resolve, &models),
+                        ),
+                    );
+                }
+                Some(
+                    Message::ClientHeartbeat(_)
+                    | Message::AgentEvent(_)
+                    | Message::RunRequestLog(_)
+                    | Message::ClientFirstCallTimings(_),
+                )
+                | None => {}
             }
-            Some(Message::ResolveSubagentModels(resolve)) => {
-                let resolved = resolve_subagent_models(resolve, &models);
-                emit(
-                    &output,
-                    pb::run_inference_server_message::Message::SubagentModelsResolved(resolved),
-                );
-            }
-            Some(
-                Message::ClientHeartbeat(_)
-                | Message::AgentEvent(_)
-                | Message::RunRequestLog(_)
-                | Message::ClientFirstCallTimings(_),
-            )
-            | None => {}
         }
     }
-    if !finished {
-        for (_, token) in invocations.lock().drain() {
+    if !loop_state.finished {
+        loop_state.cancel_all();
+    }
+    loop_state.finish().await;
+    output.close();
+}
+
+/// Per-stream state owned by [`serve`]: the output hub, live invocations,
+/// spawned tasks, and the context window the client asked for.
+struct LoopState {
+    output: Arc<OutputHub>,
+    cancellation: CancellationToken,
+    invocations: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    tasks: JoinSet<()>,
+    finished: bool,
+    disconnected: bool,
+    provider_call_index: u64,
+    configured_context_window: Option<u64>,
+    run_context_window: Option<u64>,
+}
+
+impl LoopState {
+    fn run_ready_message(
+        &mut self,
+        request: &pb::RunInferenceRunRequest,
+        model: Option<&LocalModel>,
+        models: &[PluginModelDescriptor],
+        model_id: &str,
+        rules: Vec<agent::CursorRule>,
+    ) -> pb::run_inference_server_message::Message {
+        let requested_window = project::requested_context_window(request.requested_model.as_ref())
+            .ok()
+            .flatten();
+        self.run_context_window = requested_window.or(self.configured_context_window);
+        if self.run_context_window.is_none() {
+            tracing::info!(model_id, "inference_context_window_unknown");
+        }
+        pb::run_inference_server_message::Message::RunReady(run_ready(
+            request,
+            model,
+            models,
+            model_id,
+            self.run_context_window,
+            rules,
+        ))
+    }
+
+    async fn start_invocation(
+        &mut self,
+        plugins: &PluginHost,
+        calls: &CallStore,
+        models: &[PluginModelDescriptor],
+        ids: (&str, &str, &str),
+        model: Option<&LocalModel>,
+        invoke: pb::RunInferenceInvokeModel,
+    ) {
+        let (run_id, conversation_id, model_id) = ids;
+        let id = invoke.invocation_id.clone();
+        let Some(request) = invoke.request else {
+            invocation_error(&self.output, id, "RunInference model request is missing");
+            return;
+        };
+        if invoke.delta_base.is_some() || invoke.compressed_request.is_some() {
+            invocation_error(
+                &self.output,
+                id,
+                "RunInference delta or compressed requests are not supported",
+            );
+            return;
+        }
+        let request = match project::project(&request, model_id, self.run_context_window, models) {
+            Ok(request) => request,
+            Err(error) => {
+                invocation_error(&self.output, id, &error.to_string());
+                return;
+            }
+        };
+        let context_window_tokens = request.model.context_window_tokens;
+        let cancellation = self.cancellation.child_token();
+        self.invocations
+            .lock()
+            .insert(id.clone(), cancellation.clone());
+        let recorder = start_recorder(
+            calls,
+            &id,
+            run_id,
+            conversation_id,
+            self.provider_call_index,
+            &request,
+            model,
+        )
+        .await;
+        self.tasks.spawn(serve_invocation(
+            plugins.clone(),
+            Arc::clone(&self.output),
+            Arc::clone(&self.invocations),
+            cancellation,
+            recorder,
+            ModelInvocation {
+                call_id: id,
+                run_id: run_id.to_owned(),
+                conversation_id: conversation_id.to_owned(),
+                provider_call_index: self.provider_call_index,
+                request,
+            },
+            context_window_tokens,
+        ));
+        self.provider_call_index += 1;
+    }
+
+    fn cancel_invocation(&self, id: &str) {
+        if let Some(token) = self.invocations.lock().remove(id) {
             token.cancel();
         }
     }
-    while tasks.join_next().await.is_some() {}
-    if !disconnected {
-        output.emit(connect::encode_end_stream());
+
+    fn cancel_all(&self) {
+        for (_, token) in self.invocations.lock().drain() {
+            token.cancel();
+        }
     }
-    output.close();
+
+    async fn finish(mut self) {
+        while self.tasks.join_next().await.is_some() {}
+        if !self.disconnected {
+            self.output.emit(connect::encode_end_stream());
+        }
+    }
 }
 
 fn run_ready(
@@ -483,7 +548,7 @@ fn run_ready(
     pb::RunInferenceRunReady {
         resolved_model: request.requested_model.clone(),
         supports_self_summary: true,
-        summarization: summarization_config(request, context_window_tokens),
+        summarization: Some(summarization_config(request, context_window_tokens)),
         routed_model_display_name: (!display_name.is_empty()).then_some(display_name),
         prompt_model_metadata: Some(pb::RunInferencePromptModelMetadata {
             vendor: if anthropic { "anthropic" } else { "openai" }.into(),
@@ -513,8 +578,8 @@ fn run_ready(
 fn summarization_config(
     request: &pb::RunInferenceRunRequest,
     context_window_tokens: Option<u64>,
-) -> Option<pb::RunInferenceSummarizationConfig> {
-    Some(pb::RunInferenceSummarizationConfig {
+) -> pb::RunInferenceSummarizationConfig {
+    pb::RunInferenceSummarizationConfig {
         model: request.requested_model.clone(),
         is_fallback_to_main_model: true,
         max_prompt_chars: summary_prompt_chars(context_window_tokens),
@@ -523,18 +588,20 @@ fn summarization_config(
             unused_percent_tokens_threshold_to_persist: Some(SUMMARY_UNUSED_WINDOW_PERCENT),
             ..Default::default()
         }),
-    })
+    }
 }
 
 fn summary_prompt_chars(context_window_tokens: Option<u64>) -> i32 {
-    match context_window_tokens {
-        Some(window) if window > 0 && window < SUMMARY_PROMPT_SCALE_WINDOW => i32::try_from(
-            (DEFAULT_SUMMARY_PROMPT_CHARS as u64).saturating_mul(window)
-                / SUMMARY_PROMPT_SCALE_WINDOW,
-        )
-        .unwrap_or(DEFAULT_SUMMARY_PROMPT_CHARS),
-        _ => DEFAULT_SUMMARY_PROMPT_CHARS,
-    }
+    let Some(window) =
+        context_window_tokens.filter(|window| *window > 0 && *window < SUMMARY_PROMPT_SCALE_WINDOW)
+    else {
+        return DEFAULT_SUMMARY_PROMPT_CHARS;
+    };
+    let scaled = u64::try_from(DEFAULT_SUMMARY_PROMPT_CHARS)
+        .unwrap_or_default()
+        .saturating_mul(window)
+        / SUMMARY_PROMPT_SCALE_WINDOW;
+    i32::try_from(scaled).unwrap_or(DEFAULT_SUMMARY_PROMPT_CHARS)
 }
 
 fn overflow_response(message: &str) -> Option<pb::InferenceStreamResponse> {
@@ -894,7 +961,7 @@ fn count(value: Option<u64>) -> i32 {
 }
 
 fn count_value(value: u64) -> i32 {
-    value.min(i32::MAX as u64) as i32
+    i32::try_from(value).unwrap_or(i32::MAX)
 }
 
 fn invocation_error(output: &OutputHub, id: String, message: &str) {
@@ -947,7 +1014,7 @@ async fn start_recorder(
             call_id: call_id.into(),
             run_id: run_id.into(),
             conversation_id: conversation_id.into(),
-            provider_call_index: provider_call_index.min(i64::MAX as u64) as i64,
+            provider_call_index: i64::try_from(provider_call_index).unwrap_or(i64::MAX),
             model_hash: request.model.model_id.clone(),
             provider_type: provider_type.clone(),
             provider_url: request_url.clone(),
@@ -997,7 +1064,7 @@ mod tests {
         service
             .state
             .lock()
-            .insert("run".into(), InferenceRoute::Local(run.clone()));
+            .insert("run".into(), InferenceRoute::Local(Arc::clone(&run)));
         let (_receiver, subscription) = service.subscribe("run".into(), &run);
         drop(subscription);
         tokio::task::yield_now().await;

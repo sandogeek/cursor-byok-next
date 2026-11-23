@@ -28,6 +28,13 @@ pub struct LoadedCa {
     pub issuer: Issuer<'static, KeyPair>,
 }
 
+impl std::fmt::Debug for LoadedCa {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The issuer holds a private key; never render it.
+        formatter.debug_struct("LoadedCa").finish_non_exhaustive()
+    }
+}
+
 /// Owns the CA files: generating them once, loading them, and telling whether
 /// the system trusts them.
 #[derive(Debug)]

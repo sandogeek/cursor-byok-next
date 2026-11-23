@@ -21,10 +21,10 @@ impl OutputHub {
         if state.closed {
             return false;
         }
-        state.history.push(frame.clone());
         state
             .subscribers
             .retain(|subscriber| subscriber.send(frame.clone()).is_ok());
+        state.history.push(frame);
         true
     }
 

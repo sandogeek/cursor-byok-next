@@ -154,6 +154,15 @@ pub struct CursorHarness {
     intent: RwLock<HarnessState>,
 }
 
+impl std::fmt::Debug for CursorHarness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CursorHarness")
+            .field("paths", &self.paths)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The port takeover falls back to on platforms where it has never bound one.
 /// `0` lets the OS pick; the bound port is remembered from then on.
 #[cfg(target_os = "windows")]
@@ -242,6 +251,13 @@ impl CursorHarness {
 
     /// Turns takeover on or off. Enabling fails before touching Cursor when the
     /// CA is not trusted. The persisted intent is committed before files change.
+    ///
+    /// The flag stays a `bool` because it is the `#[class]` boundary the TSX
+    /// takeover switch calls; an enum would change the generated binding.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "the bool is the TSX takeover switch's argument at the native boundary"
+    )]
     pub async fn set_enabled(&self, enabled: bool) -> Result<HarnessStatus> {
         let _operation = self.operation.lock().await;
         self.update_intent(|intent| intent.enabled = enabled)?;

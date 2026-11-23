@@ -260,7 +260,7 @@ pub async fn usage_limit_status(
         Ok(proto(GetUsageLimitStatusAndActiveGrantsResponse {
             usage_limit_policy_status: Some(UsageLimitPolicyStatus {
                 is_in_slow_pool: false,
-                features: Default::default(),
+                features: std::collections::HashMap::default(),
                 can_configure_spend_limit: true,
                 has_pending_request: false,
                 allowed_model_ids: Vec::new(),
@@ -284,7 +284,7 @@ pub async fn stripe_profile(
 }
 
 fn local_stripe_profile(origin: Option<HeaderValue>) -> Result<Response<Body>> {
-    let mut response = json(ultra_profile())?;
+    let mut response = json(&ultra_profile())?;
     if let Some(origin) = origin {
         response
             .headers_mut()
@@ -304,7 +304,7 @@ fn proto(message: impl Message) -> Response<Body> {
     super::proto_response(message)
 }
 
-fn json(value: Value) -> Result<Response<Body>> {
+fn json(value: &Value) -> Result<Response<Body>> {
     let body = serde_json::to_vec(&value)?;
     let length = body.len();
     let mut response = Response::new(Body::from(body));

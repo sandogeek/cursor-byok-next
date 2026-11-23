@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 
 use super::{
-    CoreMessage, ProtocolParser, ToolNames, core_message, count_usize, data_url, object,
+    CoreMessage, ProtocolParser, SawTool, ToolNames, core_message, count_usize, data_url, object,
     parse_object, text, usage_event,
 };
 use crate::{
@@ -63,8 +63,8 @@ impl ProtocolParser for Parser {
         if let Some(error) = event_error(&value) {
             return Err(Error::Provider(format!("OpenAI Chat error: {error}")));
         }
-        if !value.get("usage").is_none_or(Value::is_null) {
-            self.final_usage = Some(chat_usage(value.get("usage").unwrap()));
+        if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
+            self.final_usage = Some(chat_usage(usage));
         }
         let Some(choice) = value
             .get("choices")
@@ -128,7 +128,7 @@ impl ProtocolParser for Parser {
             }
         }
         if let Some(reason) = choice.get("finish_reason").and_then(text) {
-            self.finish = Some(map_finish(reason, !self.tools.is_empty()));
+            self.finish = Some(map_finish(reason, SawTool::from_count(self.tools.len())));
         }
         Ok(false)
     }
@@ -177,11 +177,11 @@ impl ProtocolParser for Parser {
                 },
             ));
         }
+        let observed = SawTool::from_count(self.tools.len());
         let reason = self.finish.or_else(|| {
-            self.saw_done_marker.then_some(if self.tools.is_empty() {
-                FinishReason::Stop
-            } else {
-                FinishReason::ToolUse
+            self.saw_done_marker.then_some(match observed {
+                SawTool::Absent => FinishReason::Stop,
+                SawTool::Present => FinishReason::ToolUse,
             })
         });
         let Some(reason) = reason else {
@@ -211,47 +211,9 @@ pub(super) fn build_body(
                 replay_state,
                 tool_calls,
             } => {
-                let reasoning = replay_state.and_then(|state| {
-                    (state.provider_kind == REPLAY_KIND)
-                        .then(|| {
-                            object(&state.value).and_then(|value| {
-                                super::text(value.get("reasoning_content").unwrap_or(&Value::Null))
-                            })
-                        })
-                        .flatten()
-                });
-                if text.is_empty() && tool_calls.is_empty() && reasoning.is_none() {
-                    continue;
+                if let Some(value) = assistant_message(text, replay_state, tool_calls, tool_names) {
+                    messages.push(value);
                 }
-                let mut value = json!({
-                    "role": "assistant",
-                    "content": if text.is_empty() { Value::Null } else { Value::String(text.into_owned()) },
-                });
-                if let Some(reasoning) = reasoning {
-                    value
-                        .as_object_mut()
-                        .unwrap()
-                        .insert("reasoning_content".into(), reasoning.into());
-                }
-                if !tool_calls.is_empty() {
-                    value.as_object_mut().unwrap().insert(
-                        "tool_calls".into(),
-                        tool_calls
-                            .iter()
-                            .map(|tool_call| {
-                                json!({
-                                    "id": super::truncated_call_id(&tool_call.call_id),
-                                    "type": "function",
-                                    "function": {
-                                        "name": tool_names.alias(&tool_call.name),
-                                        "arguments": serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".into()),
-                                    },
-                                })
-                            })
-                            .collect::<Value>(),
-                    );
-                }
-                messages.push(value);
             }
             CoreMessage::Tool(result) => {
                 messages.push(json!({
@@ -284,42 +246,88 @@ pub(super) fn build_body(
         "stream": true,
         "stream_options": { "include_usage": true },
     });
-    {
-        let object = body.as_object_mut().unwrap();
-        if !request.prompt.tools.is_empty() {
-            object.insert(
-                "tools".into(),
-                request
-                    .prompt
-                    .tools
-                    .iter()
-                    .map(|tool| {
-                        json!({
-                            "type": "function",
-                            "function": {
-                                "name": tool_names.alias(&tool.name),
-                                "description": tool.description,
-                                "parameters": tool.parameters,
-                            },
-                        })
+    let object = super::object_mut(&mut body)?;
+    if !request.prompt.tools.is_empty() {
+        object.insert(
+            "tools".into(),
+            request
+                .prompt
+                .tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool_names.alias(&tool.name),
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                        },
                     })
-                    .collect::<Value>(),
-            );
-        }
-        if let Some(tokens) = request.model.max_output_tokens {
-            object.insert("max_completion_tokens".into(), tokens.into());
-        }
-        if let Some(effort) = &request.model.reasoning.effort {
-            object.insert("reasoning_effort".into(), effort.clone().into());
-        }
-        if request.model.latency == ModelLatency::Fast {
-            object.insert("service_tier".into(), "fast".into());
-        }
+                })
+                .collect::<Value>(),
+        );
+    }
+    if let Some(tokens) = request.model.max_output_tokens {
+        object.insert("max_completion_tokens".into(), tokens.into());
+    }
+    if let Some(effort) = &request.model.reasoning.effort {
+        object.insert("reasoning_effort".into(), effort.clone().into());
+    }
+    if request.model.latency == ModelLatency::Fast {
+        object.insert("service_tier".into(), "fast".into());
     }
     super::apply_openai_prompt_cache_key(&mut body, model, &invocation.conversation_id);
     super::merge_extra_params(&mut body, &request.model.extra_params)?;
     super::apply_stop_sequences(&mut body, "stop", &request.model.stop_sequences)?;
     Ok(body)
+}
+
+/// Renders one assistant turn, or `None` when the turn carries nothing to replay.
+fn assistant_message(
+    text: std::borrow::Cow<'_, str>,
+    replay_state: Option<&crate::model::ProviderReplayState>,
+    tool_calls: &[crate::model::ToolCallContent],
+    tool_names: &ToolNames,
+) -> Option<Value> {
+    let reasoning = replay_state.and_then(|state| {
+        (state.provider_kind == REPLAY_KIND)
+            .then(|| {
+                object(&state.value).and_then(|value| super::text(value.get("reasoning_content")?))
+            })
+            .flatten()
+    });
+    if text.is_empty() && tool_calls.is_empty() && reasoning.is_none() {
+        return None;
+    }
+    let mut value = json!({
+        "role": "assistant",
+        "content": if text.is_empty() { Value::Null } else { Value::String(text.into_owned()) },
+    });
+    let object = value
+        .as_object_mut()
+        .expect("the assistant message was built from an object literal");
+    if let Some(reasoning) = reasoning {
+        object.insert("reasoning_content".into(), reasoning.into());
+    }
+    if !tool_calls.is_empty() {
+        object.insert(
+            "tool_calls".into(),
+            tool_calls
+                .iter()
+                .map(|tool_call| {
+                    json!({
+                        "id": super::truncated_call_id(&tool_call.call_id),
+                        "type": "function",
+                        "function": {
+                            "name": tool_names.alias(&tool_call.name),
+                            "arguments": serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".into()),
+                        },
+                    })
+                })
+                .collect::<Value>(),
+        );
+    }
+    Some(value)
 }
 
 fn chat_content(parts: &[ContentPart]) -> Result<Value> {
@@ -453,12 +461,12 @@ fn count_u64_value(value: &Value) -> Option<u64> {
     super::count_u64(value)
 }
 
-fn map_finish(reason: &str, has_tools: bool) -> FinishReason {
+fn map_finish(reason: &str, has_tools: SawTool) -> FinishReason {
     match reason {
         "tool_calls" | "function_call" => FinishReason::ToolUse,
         "length" => FinishReason::Length,
         "content_filter" => FinishReason::Stop,
-        _ if has_tools => FinishReason::ToolUse,
+        _ if has_tools == SawTool::Present => FinishReason::ToolUse,
         _ => FinishReason::Stop,
     }
 }
@@ -696,10 +704,13 @@ mod tests {
 
     #[test]
     fn observed_tool_calls_outrank_ordinary_stop_reasons() {
-        assert_eq!(map_finish("stop", true), FinishReason::ToolUse);
-        assert_eq!(map_finish("", true), FinishReason::ToolUse);
-        assert_eq!(map_finish("content_filter", true), FinishReason::Stop);
-        assert_eq!(map_finish("length", true), FinishReason::Length);
+        assert_eq!(map_finish("stop", SawTool::Present), FinishReason::ToolUse);
+        assert_eq!(map_finish("", SawTool::Present), FinishReason::ToolUse);
+        assert_eq!(
+            map_finish("content_filter", SawTool::Present),
+            FinishReason::Stop
+        );
+        assert_eq!(map_finish("length", SawTool::Present), FinishReason::Length);
     }
 
     #[test]

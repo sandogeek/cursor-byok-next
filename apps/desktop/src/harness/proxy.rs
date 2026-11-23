@@ -153,6 +153,10 @@ struct CursorRelay {
 }
 
 impl HttpHandler for CursorRelay {
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "hudsucker's HttpHandler trait declares every hook async"
+    )]
     async fn handle_request(
         &mut self,
         _ctx: &HttpContext,
@@ -180,6 +184,10 @@ impl HttpHandler for CursorRelay {
 
     /// Only Cursor's own hosts are decrypted; every other connection is
     /// tunneled byte for byte.
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "hudsucker's HttpHandler trait declares every hook async"
+    )]
     async fn should_intercept_connect(
         &mut self,
         _ctx: &HttpContext,
@@ -191,6 +199,10 @@ impl HttpHandler for CursorRelay {
             .is_some_and(|authority| is_cursor_host(authority.host()))
     }
 
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "hudsucker's HttpHandler trait declares every hook async"
+    )]
     async fn should_intercept_tls(
         &mut self,
         _ctx: &HttpContext,

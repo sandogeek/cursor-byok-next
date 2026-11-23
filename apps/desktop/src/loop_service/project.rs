@@ -17,18 +17,43 @@ use crate::{
     },
 };
 
+/// `InferenceCoreMessage.role` values, as Cursor sends them.
+const ROLE_USER: i32 = 1;
+const ROLE_ASSISTANT: i32 = 2;
+const ROLE_TOOL: i32 = 3;
+const ROLE_SYSTEM_MESSAGE: i32 = 4;
+
 pub(crate) fn project(
     input: &pb::InferenceStreamRequest,
     model_id: &str,
     configured_context_window_tokens: Option<u64>,
     models: &[PluginModelDescriptor],
 ) -> Result<ModelRequest> {
+    let model = project_model(input, model_id, configured_context_window_tokens)?;
+    let (instructions, prefix_len) = project_instructions(&input.messages)?;
+    Ok(ModelRequest {
+        prompt: PromptSpec {
+            instructions,
+            tools: project_tools(input, models),
+        },
+        model,
+        history: project_history(&input.messages[prefix_len..], prefix_len)?,
+    })
+}
+
+/// Builds the model spec: context window, output limit, sampling params and
+/// reasoning effort, all taken from the client's requested model.
+fn project_model(
+    input: &pb::InferenceStreamRequest,
+    model_id: &str,
+    configured_context_window_tokens: Option<u64>,
+) -> Result<ModelSpec> {
     let mut model = ModelSpec::new(model_id);
     if let Some(config) = &input.model_config {
         model.max_output_tokens = config
             .max_tokens
             .and_then(|value| u64::try_from(value).ok());
-        model.stop_sequences = config.stop_sequences.clone();
+        model.stop_sequences.clone_from(&config.stop_sequences);
         let mut extra = Map::new();
         if let Some(value) = config.temperature {
             extra.insert("temperature".into(), Value::from(value));
@@ -56,8 +81,14 @@ pub(crate) fn project(
     if model.context_window_tokens.is_none() {
         model.context_window_tokens = configured_context_window_tokens;
     }
+    Ok(model)
+}
 
-    let tools = input
+fn project_tools(
+    input: &pb::InferenceStreamRequest,
+    models: &[PluginModelDescriptor],
+) -> Vec<ToolDefinition> {
+    input
         .tools
         .iter()
         .map(|tool| {
@@ -75,106 +106,43 @@ pub(crate) fn project(
                 parameters: parameters.get("jsonSchema").cloned().unwrap_or(parameters),
             }
         })
-        .collect();
+        .collect()
+}
 
+/// Concatenates the leading system messages into the prompt instructions and
+/// reports how many messages they consumed.
+fn project_instructions(messages: &[pb::InferenceCoreMessage]) -> Result<(String, usize)> {
     let mut instructions = Vec::new();
-    let mut history = Vec::new();
-    let mut system_prefix = true;
-    for (index, message) in input.messages.iter().enumerate() {
-        let role = match message.role {
-            1 => Role::User,
-            2 => Role::Assistant,
-            3 => Role::Tool,
-            4 => Role::System,
-            value => {
-                return Err(Error::Protocol(format!(
-                    "RunInference message {index} has unsupported role {value}"
-                )));
-            }
-        };
-        let parts = parts(message.content.as_ref())?;
-        if role == Role::System && system_prefix {
-            instructions.push(text_parts(&parts));
-            continue;
+    let mut consumed = 0;
+    for message in messages {
+        if message.role != ROLE_SYSTEM_MESSAGE {
+            break;
         }
-        system_prefix = false;
+        instructions.push(text_parts(&parts(message.content.as_ref())?));
+        consumed += 1;
+    }
+    Ok((instructions.join("\n\n"), consumed))
+}
 
+/// Projects the conversation after `prefix_len` system messages. `index` keeps
+/// message ids stable against the client's original array.
+fn project_history(
+    messages: &[pb::InferenceCoreMessage],
+    prefix_len: usize,
+) -> Result<Vec<ProjectedMessage>> {
+    let mut history = Vec::new();
+    for (offset, message) in messages.iter().enumerate() {
+        let index = prefix_len + offset;
+        let role = message_role(message.role, index)?;
         if let Some(pb::inference_core_message::Content::ToolContent(content)) =
             message.content.as_ref()
         {
-            for (part_index, part) in content.parts.iter().enumerate() {
-                let provider_parts = parts_from_wire(&part.experimental_content)?;
-                let content = part.result.as_ref().map_or(Value::Null, prost_json);
-                history.push(ProjectedMessage {
-                    message_id: format!("cursor:{index}:tool:{part_index}"),
-                    role: Role::Tool,
-                    content: ProjectedContent::ToolResult(ToolResultContent {
-                        call_id: part.tool_call_id.clone(),
-                        name: part.tool_name.clone(),
-                        content: match &content {
-                            Value::String(text) => text.clone(),
-                            value => value.to_string(),
-                        },
-                        is_error: part.is_error,
-                        image: None,
-                        provider_parts,
-                    }),
-                });
-            }
+            history.extend(tool_results(index, &content.parts)?);
             continue;
         }
-
+        let parts = parts(message.content.as_ref())?;
         let content = if role == Role::Assistant {
-            let calls = message
-                .tool_calls
-                .iter()
-                .enumerate()
-                .map(|(index, call)| {
-                    let arguments = match &call.raw_tool_call_args {
-                        Some(raw) => serde_json::from_str(raw)?,
-                        None => call
-                            .args
-                            .as_ref()
-                            .map_or_else(|| serde_json::json!({}), prost_struct),
-                    };
-                    Ok(ToolCallContent {
-                        index,
-                        call_id: call.tool_call_id.clone(),
-                        name: call.tool_name.clone(),
-                        arguments,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let thinking = message
-                .reasoning_parts
-                .iter()
-                .map(|part| part.text.as_str())
-                .collect::<String>();
-            let blocks = message
-                .reasoning_parts
-                .iter()
-                .filter_map(|part| {
-                    if let Some(signature) = &part.signature {
-                        Some(serde_json::json!({
-                            "type": "thinking", "thinking": part.text, "signature": signature
-                        }))
-                    } else {
-                        part.redacted_data.as_ref().map(
-                            |data| serde_json::json!({"type": "redacted_thinking", "data": data}),
-                        )
-                    }
-                })
-                .collect::<Vec<_>>();
-            let replay_state = (!blocks.is_empty()).then(|| ProviderReplayState {
-                provider_kind: "anthropic".into(),
-                value: serde_json::json!({"blocks": blocks}),
-            });
-            ProjectedContent::Assistant {
-                text: text_parts(&parts),
-                thinking,
-                replay_state,
-                calls,
-            }
+            assistant_content(message, &parts)?
         } else {
             ProjectedContent::Parts(parts)
         };
@@ -184,13 +152,101 @@ pub(crate) fn project(
             content,
         });
     }
-    Ok(ModelRequest {
-        prompt: PromptSpec {
-            instructions: instructions.join("\n\n"),
-            tools,
-        },
-        model,
-        history,
+    Ok(history)
+}
+
+fn message_role(role: i32, index: usize) -> Result<Role> {
+    match role {
+        ROLE_USER => Ok(Role::User),
+        ROLE_ASSISTANT => Ok(Role::Assistant),
+        ROLE_TOOL => Ok(Role::Tool),
+        ROLE_SYSTEM_MESSAGE => Ok(Role::System),
+        value => Err(Error::Protocol(format!(
+            "RunInference message {index} has unsupported role {value}"
+        ))),
+    }
+}
+
+fn tool_results(
+    index: usize,
+    parts: &[pb::InferenceToolResultPart],
+) -> Result<Vec<ProjectedMessage>> {
+    let mut results = Vec::with_capacity(parts.len());
+    for (part_index, part) in parts.iter().enumerate() {
+        let provider_parts = parts_from_wire(&part.experimental_content)?;
+        let content = part.result.as_ref().map_or(Value::Null, prost_json);
+        results.push(ProjectedMessage {
+            message_id: format!("cursor:{index}:tool:{part_index}"),
+            role: Role::Tool,
+            content: ProjectedContent::ToolResult(ToolResultContent {
+                call_id: part.tool_call_id.clone(),
+                name: part.tool_name.clone(),
+                content: match &content {
+                    Value::String(text) => text.clone(),
+                    value => value.to_string(),
+                },
+                is_error: part.is_error,
+                image: None,
+                provider_parts,
+            }),
+        });
+    }
+    Ok(results)
+}
+
+fn assistant_content(
+    message: &pb::InferenceCoreMessage,
+    parts: &[ContentPart],
+) -> Result<ProjectedContent> {
+    let calls = message
+        .tool_calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let arguments = match &call.raw_tool_call_args {
+                Some(raw) => serde_json::from_str(raw)?,
+                None => call
+                    .args
+                    .as_ref()
+                    .map_or_else(|| serde_json::json!({}), prost_struct),
+            };
+            Ok(ToolCallContent {
+                index,
+                call_id: call.tool_call_id.clone(),
+                name: call.tool_name.clone(),
+                arguments,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let thinking = message
+        .reasoning_parts
+        .iter()
+        .map(|part| part.text.as_str())
+        .collect::<String>();
+    let blocks = message
+        .reasoning_parts
+        .iter()
+        .filter_map(|part| {
+            if let Some(signature) = &part.signature {
+                Some(serde_json::json!({
+                    "type": "thinking", "thinking": part.text, "signature": signature
+                }))
+            } else {
+                part.redacted_data
+                    .as_ref()
+                    .map(|data| serde_json::json!({"type": "redacted_thinking", "data": data}))
+            }
+        })
+        .collect::<Vec<_>>();
+    let replay_state = (!blocks.is_empty()).then(|| ProviderReplayState {
+        provider_kind: "anthropic".into(),
+        value: serde_json::json!({"blocks": blocks}),
+    });
+    Ok(ProjectedContent::Assistant {
+        text: text_parts(parts),
+        thinking,
+        replay_state,
+        calls,
     })
 }
 
@@ -216,11 +272,12 @@ fn subagent_models_task_description(
          the server resolves both to the same model.\n",
     );
     for model in models {
-        description.push_str(&format!(
-            "\n- {}: model=\"{}\"",
-            serde_json::json!(model.display_name),
-            model.id,
-        ));
+        let display_name = serde_json::json!(model.display_name);
+        description.push_str("\n- ");
+        description.push_str(&display_name.to_string());
+        description.push_str(": model=\"");
+        description.push_str(&model.id);
+        description.push('"');
     }
     description
 }

@@ -6,7 +6,6 @@ use axum::{
     http::{HeaderValue, Request, Response, StatusCode, header},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use bytes::{BufMut, BytesMut};
 use prost::Message;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -16,6 +15,23 @@ use crate::{Error, Result, backend::proxy};
 pub const BOOTSTRAP_STATSIG_PATH: &str = "/aiserver.v1.AnalyticsService/BootstrapStatsig";
 const AGENT_GATES: [(&str, bool); 2] =
     [("nal_agent_retries", true), ("agent_host_local_loop", true)];
+
+/// Whether a Statsig feature gate is on for the local user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Enabled {
+    Enabled,
+    Disabled,
+}
+
+impl From<bool> for Enabled {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Message)]
 struct BootstrapStatsigResponse {
@@ -49,16 +65,16 @@ pub async fn bootstrap_statsig(
 }
 
 fn patch_upstream(response: proxy::BufferedResponse) -> Result<Response<Body>> {
-    let (framed, payload) = unary_payload(&response.body)?;
+    let (framing, payload) = unary_payload(&response.body)?;
     let mut message = BootstrapStatsigResponse::decode(payload)?;
     let mut config = serde_json::from_str::<Value>(&message.config)?;
     configure_agent_gates(&mut config)?;
     message.config = serde_json::to_string(&config)?;
-    Ok(response.with_body(encode_unary(&message, framed)))
+    Ok(response.with_body(super::encode_unary(message.encode_to_vec(), framing)?))
 }
 
 fn local_response() -> Result<Response<Body>> {
-    let generated_at_ms = chrono::Utc::now().timestamp_millis() as u64;
+    let generated_at_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
     let mut config = json!({
         "feature_gates": {},
         "dynamic_configs": {},
@@ -109,7 +125,7 @@ fn configure_agent_gates(config: &mut Value) -> Result<()> {
         .as_object_mut()
         .ok_or_else(|| Error::Protocol("Statsig feature_gates must be an object".into()))?;
     for (key, enabled) in overrides {
-        gates.insert(key.clone(), feature_gate(&key, enabled));
+        gates.insert(key.clone(), feature_gate(&key, Enabled::from(enabled)));
     }
     Ok(())
 }
@@ -131,12 +147,12 @@ fn djb2(value: &str) -> String {
         .to_string()
 }
 
-fn feature_gate(name: &str, enabled: bool) -> Value {
-    let rule = if enabled {
-        "local_enabled"
-    } else {
-        "local_disabled"
+fn feature_gate(name: &str, enabled: Enabled) -> Value {
+    let rule = match enabled {
+        Enabled::Enabled => "local_enabled",
+        Enabled::Disabled => "local_disabled",
     };
+    let enabled = enabled == Enabled::Enabled;
     json!({
         "name": name,
         "value": enabled,
@@ -155,33 +171,8 @@ fn feature_gate(name: &str, enabled: bool) -> Value {
     })
 }
 
-fn unary_payload(body: &Bytes) -> Result<(bool, &[u8])> {
-    if body.len() < 5 {
-        return Ok((false, body));
-    }
-    let flags = body[0];
-    let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
-    if length != body.len() - 5 {
-        return Ok((false, body));
-    }
-    if flags != 0 {
-        return Err(Error::Protocol(format!(
-            "cannot patch compressed or terminal Statsig frame: flags={flags}"
-        )));
-    }
-    Ok((true, &body[5..]))
-}
-
-fn encode_unary(message: &impl Message, framed: bool) -> Bytes {
-    let payload = message.encode_to_vec();
-    if !framed {
-        return Bytes::from(payload);
-    }
-    let mut output = BytesMut::with_capacity(5 + payload.len());
-    output.put_u8(0);
-    output.put_u32(payload.len() as u32);
-    output.extend_from_slice(&payload);
-    output.freeze()
+fn unary_payload(body: &Bytes) -> Result<(super::Framing, &[u8])> {
+    super::unary_payload(body, "Statsig")
 }
 
 #[cfg(test)]

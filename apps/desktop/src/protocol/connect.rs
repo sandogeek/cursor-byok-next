@@ -7,11 +7,19 @@ use crate::{Error, Result};
 
 pub const END_STREAM_FLAG: u8 = 0x02;
 
+/// Reads the payload length out of a Connect envelope's 5-byte header.
+fn envelope_payload_len(body: &[u8]) -> Result<usize> {
+    let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]);
+    usize::try_from(length).map_err(|_| Error::Protocol("Connect payload exceeds usize".into()))
+}
+
 pub fn encode_message<M: Message>(message: &M) -> Result<Bytes> {
     let len = message.encoded_len();
+    let len_u32 =
+        u32::try_from(len).map_err(|_| Error::Protocol("Connect payload exceeds 4 GiB".into()))?;
     let mut output = BytesMut::with_capacity(5 + len);
     output.put_u8(0);
-    output.put_u32(len as u32);
+    output.put_u32(len_u32);
     message.encode(&mut output)?;
     Ok(output.freeze())
 }
@@ -20,7 +28,7 @@ pub fn encode_end_stream() -> Bytes {
     let payload = b"{}";
     let mut output = BytesMut::with_capacity(5 + payload.len());
     output.put_u8(END_STREAM_FLAG);
-    output.put_u32(payload.len() as u32);
+    output.put_u32(2);
     output.extend_from_slice(payload);
     output.freeze()
 }
@@ -28,7 +36,7 @@ pub fn encode_end_stream() -> Bytes {
 pub fn decode_unary<M: Message + Default>(body: &[u8]) -> Result<M> {
     if body.len() >= 5 {
         let flags = body[0];
-        let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+        let length = envelope_payload_len(body)?;
         if flags & END_STREAM_FLAG == 0 && length == body.len() - 5 {
             return Ok(M::decode(&body[5..])?);
         }
@@ -43,7 +51,7 @@ pub fn decode_frames(mut body: &[u8]) -> Result<Vec<(u8, Bytes)>> {
             return Err(Error::Protocol("truncated Connect envelope".into()));
         }
         let flags = body[0];
-        let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+        let length = envelope_payload_len(body)?;
         body = &body[5..];
         if body.len() < length {
             return Err(Error::Protocol("truncated Connect payload".into()));

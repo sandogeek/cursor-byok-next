@@ -96,11 +96,12 @@ impl PluginDataStore {
     }
 
     fn lock(&self, plugin_id: &str) -> Arc<AsyncMutex<()>> {
-        self.locks
-            .lock()
-            .entry(plugin_id.to_owned())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
+        let mut locks = self.locks.lock();
+        Arc::clone(
+            locks
+                .entry(plugin_id.to_owned())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
     }
 }
 

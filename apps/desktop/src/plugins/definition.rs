@@ -166,7 +166,7 @@ async fn read_limited(reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u
         .take(MAX_OUTPUT_BYTES + 1)
         .read_to_end(&mut bytes)
         .await?;
-    if bytes.len() as u64 > MAX_OUTPUT_BYTES {
+    if bytes.len() > usize::try_from(MAX_OUTPUT_BYTES).unwrap_or(usize::MAX) {
         return Err(Error::Config(
             "plugin definition output is larger than allowed".into(),
         ));

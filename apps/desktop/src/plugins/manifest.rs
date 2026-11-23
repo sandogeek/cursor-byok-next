@@ -85,6 +85,10 @@ pub(super) fn version_at_least(actual: &str, minimum: &str) -> bool {
 
 pub(super) fn validate_id(value: &str, label: &str) -> Result<()> {
     static ID: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the pattern is a literal that always compiles"
+    )]
     let expression = ID.get_or_init(|| Regex::new(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$").unwrap());
     if expression.is_match(value) {
         Ok(())

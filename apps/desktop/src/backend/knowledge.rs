@@ -300,6 +300,14 @@ pub struct KnowledgeService {
     inner: Arc<Inner>,
 }
 
+impl std::fmt::Debug for KnowledgeService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KnowledgeService")
+            .finish_non_exhaustive()
+    }
+}
+
 struct Inner {
     store: RuleStore,
     lock: tokio::sync::Mutex<()>,
@@ -328,7 +336,7 @@ impl KnowledgeService {
             .filter(|record| !record.knowledge.trim().is_empty())
             .map(|record| pb::CursorRule {
                 content: record.knowledge,
-                source: pb::CursorRuleSource::User as i32,
+                source: i32::from(pb::CursorRuleSource::User),
                 ..Default::default()
             })
             .collect()
@@ -351,7 +359,7 @@ pub async fn add(
         is_generated: false,
         git_origin: message.git_origin,
     })?;
-    proto(KnowledgeBaseAddResponse { success: true, id })
+    Ok(proto(KnowledgeBaseAddResponse { success: true, id }))
 }
 
 pub async fn list(
@@ -366,12 +374,10 @@ pub async fn list(
     if !git_origin.is_empty() {
         records.retain(|record| record.git_origin == git_origin);
     }
-    if let Some(limit) = message.limit
-        && limit >= 0
-    {
-        records.truncate(limit as usize);
+    if let Some(limit) = message.limit.filter(|limit| *limit >= 0) {
+        records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     }
-    proto(KnowledgeBaseListResponse {
+    Ok(proto(KnowledgeBaseListResponse {
         success: true,
         all_results: records
             .into_iter()
@@ -383,7 +389,7 @@ pub async fn list(
                 is_generated: record.is_generated,
             })
             .collect(),
-    })
+    }))
 }
 
 pub async fn update(
@@ -394,12 +400,12 @@ pub async fn update(
     let message: KnowledgeBaseUpdateRequest = connect::decode_unary(&body)?;
     let _guard = service.inner.lock.lock().await;
     let Some(mut record) = service.inner.store.get(&message.id)? else {
-        return proto(KnowledgeBaseUpdateResponse { success: false });
+        return Ok(proto(KnowledgeBaseUpdateResponse { success: false }));
     };
     record.knowledge = message.knowledge;
     record.title = message.title;
     service.inner.store.upsert(&record)?;
-    proto(KnowledgeBaseUpdateResponse { success: true })
+    Ok(proto(KnowledgeBaseUpdateResponse { success: true }))
 }
 
 pub async fn remove(
@@ -410,7 +416,7 @@ pub async fn remove(
     let message: KnowledgeBaseRemoveRequest = connect::decode_unary(&body)?;
     let _guard = service.inner.lock.lock().await;
     service.inner.store.remove(&message.id)?;
-    proto(KnowledgeBaseRemoveResponse { success: true })
+    Ok(proto(KnowledgeBaseRemoveResponse { success: true }))
 }
 
 async fn buffered(request: Request<Body>) -> Result<(axum::http::request::Parts, Bytes)> {
@@ -425,8 +431,8 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-fn proto(message: impl Message) -> Result<Response<Body>> {
-    Ok(super::proto_response(message))
+fn proto(message: impl Message) -> Response<Body> {
+    super::proto_response(message)
 }
 
 #[cfg(test)]

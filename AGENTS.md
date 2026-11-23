@@ -127,8 +127,8 @@ nsh package --target macos
 
 仓库根 `Cargo.toml` 的 `[workspace.lints]` 与 `clippy.toml` 是 BeautifulRust 的 lint 表，每个成员用 `[lints] workspace = true` 继承。
 
-- 目标形态：`cargo clippy --workspace --all-targets --all-features -- -D warnings`。现在还没到：移植过来的代码仍有一批待清的历史告警（`as_conversions`、`cast_*`、`clone_on_ref_ptr`、`fn_params_excessive_bools`、`missing_debug_implementations`、`unwrap_used` 等，约 730 条），所以暂时只跑不带 `-D` 的版本；每个文件动到时顺手清掉自己那段。
-- 关掉一条要写原因：`#[expect(clippy::unwrap_used, reason = "…")]`；`#[allow]` 会被 `allow_attributes` 拦下。
+- 目标形态已经达成：`cargo clippy --workspace --all-targets --all-features -- -D warnings` 全绿，改动后必须保持全绿。
+- 关掉一条要写原因：`#[expect(clippy::unwrap_used, reason = "…")]`；`#[allow]` 会被 `allow_attributes` 拦下。`#[expect]` 只在真正还会触发时写，多余的 expectation 本身也是一条告警。
 - 生成代码（prost 输出）在 `src/protocol/proto.rs` 的 `include!` 外层统一豁免，不在 crate 根放宽。
 - 三个成员都是应用（桌面 app + 两个 CLI），所以 BeautifulRust 标注 `[lib]` 的 lint（`missing_docs`、`missing_errors_doc`、`missing_panics_doc`、`unreachable_pub`、`exhaustive_enums`）已按表内说明去掉；哪天真出库 crate 再加回来。
 - CLI 入口用 `#![expect(clippy::print_stdout, clippy::print_stderr, reason = …)]` 显式豁免打印。

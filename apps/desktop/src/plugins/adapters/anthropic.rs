@@ -3,8 +3,8 @@
 use serde_json::{Value, json};
 
 use super::{
-    CoreMessage, ProtocolParser, ToolNames, core_message, count_usize, encode_base64, object,
-    parse_object, text,
+    CoreMessage, ProtocolParser, SawTool, ToolNames, core_message, count_usize, encode_base64,
+    object, object_mut, parse_object, text,
 };
 use crate::{
     model::{ContentPart, ModelInvocation},
@@ -15,13 +15,21 @@ use crate::{
 const REPLAY_KIND: &str = "anthropic";
 const DEFAULT_MAX_TOKENS: u64 = 65_000;
 
+/// Anthropic rejects images and documents outside user turns, where `OpenAI`
+/// accepts them anywhere. A `bool` here would read as `anthropic_parts(.., true)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Attachments {
+    Allowed,
+    Forbidden,
+}
+
 struct UsageState {
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    total_tokens: Option<u64>,
-    cache_read_tokens: Option<u64>,
-    cache_write_tokens: Option<u64>,
-    reasoning_tokens: Option<u64>,
+    input: Option<u64>,
+    output: Option<u64>,
+    total: Option<u64>,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
+    reasoning: Option<u64>,
 }
 
 pub(super) struct Parser {
@@ -32,7 +40,7 @@ pub(super) struct Parser {
     thinking_blocks: Vec<Value>,
     usage: UsageState,
     saw_usage: bool,
-    saw_tool: bool,
+    saw_tool: SawTool,
     finish: Option<FinishReason>,
     terminal: bool,
 }
@@ -47,7 +55,7 @@ impl Parser {
             thinking_blocks: Vec::new(),
             usage: empty_usage(),
             saw_usage: false,
-            saw_tool: false,
+            saw_tool: SawTool::Absent,
             finish: None,
             terminal: false,
         }
@@ -86,6 +94,165 @@ impl Parser {
         }
     }
 
+    fn message_start(&mut self, value: &Value) {
+        if let Some(message_usage) = value
+            .get("message")
+            .and_then(object)
+            .and_then(|message| message.get("usage"))
+        {
+            self.saw_usage = true;
+            merge_usage(&mut self.usage, &anthropic_usage(message_usage));
+        }
+    }
+
+    fn content_block_start(
+        &mut self,
+        value: &Value,
+        emit: &mut dyn FnMut(ModelEvent),
+    ) -> Result<()> {
+        let index = required_index(value)?;
+        let block = value
+            .get("content_block")
+            .and_then(object)
+            .cloned()
+            .unwrap_or_default();
+        let kind = required_type(&block)?;
+        self.block_types.insert(index, kind.clone());
+        match kind.as_str() {
+            "text" => emit(ModelEvent::TextStart),
+            "thinking" => {
+                self.thinking_text.insert(index, String::new());
+                self.thinking_signatures.insert(index, String::new());
+                emit(ModelEvent::ThinkingStart);
+            }
+            "redacted_thinking" => {
+                let data = text(block.get("data").unwrap_or(&Value::Null))
+                    .ok_or_else(|| Error::Provider("Anthropic event is missing data".into()))?;
+                self.thinking_blocks
+                    .push(json!({ "type": "redacted_thinking", "data": data }));
+                emit(ModelEvent::RedactedThinking(data.to_owned()));
+            }
+            "tool_use" => {
+                let call_id = text(block.get("id").unwrap_or(&Value::Null));
+                let name = text(block.get("name").unwrap_or(&Value::Null));
+                let (Some(call_id), Some(name)) = (call_id, name) else {
+                    return Err(Error::Provider(
+                        "Anthropic event is missing id or name".into(),
+                    ));
+                };
+                self.saw_tool = SawTool::Present;
+                emit(ModelEvent::ToolCallStart {
+                    index,
+                    call_id: super::truncated_call_id(call_id).to_owned(),
+                    name: self.tool_names.restore(name),
+                });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn content_block_delta(
+        &mut self,
+        value: &Value,
+        emit: &mut dyn FnMut(ModelEvent),
+    ) -> Result<()> {
+        let index = required_index(value)?;
+        let delta = value
+            .get("delta")
+            .and_then(object)
+            .cloned()
+            .unwrap_or_default();
+        let delta_kind = required_type(&delta)?;
+        self.open_implicit_block(&delta_kind, index, emit);
+        match delta_kind.as_str() {
+            "text_delta" => {
+                if let Some(delta_text) = text(delta.get("text").unwrap_or(&Value::Null)) {
+                    emit(ModelEvent::TextDelta(delta_text.to_owned()));
+                }
+            }
+            "thinking_delta" => {
+                if let Some(delta_text) = text(delta.get("thinking").unwrap_or(&Value::Null)) {
+                    self.thinking_text
+                        .entry(index)
+                        .or_default()
+                        .push_str(delta_text);
+                    emit(ModelEvent::ThinkingDelta(delta_text.to_owned()));
+                }
+            }
+            "signature_delta" => {
+                if let Some(signature) = text(delta.get("signature").unwrap_or(&Value::Null)) {
+                    self.thinking_signatures
+                        .entry(index)
+                        .or_default()
+                        .push_str(signature);
+                }
+            }
+            "input_json_delta" => {
+                if let Some(partial) = text(delta.get("partial_json").unwrap_or(&Value::Null)) {
+                    self.saw_tool = SawTool::Present;
+                    emit(ModelEvent::ToolCallArgumentsDelta {
+                        index,
+                        delta: partial.to_owned(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Some gateways skip `content_block_start` and open straight into a delta.
+    fn open_implicit_block(
+        &mut self,
+        delta_kind: &str,
+        index: usize,
+        emit: &mut dyn FnMut(ModelEvent),
+    ) {
+        let kind = match delta_kind {
+            "text_delta" => "text",
+            "thinking_delta" | "signature_delta" => "thinking",
+            _ => return,
+        };
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.block_types.entry(index) {
+            entry.insert(kind.into());
+            if kind == "text" {
+                emit(ModelEvent::TextStart);
+            } else {
+                self.thinking_text.insert(index, String::new());
+                self.thinking_signatures.insert(index, String::new());
+                emit(ModelEvent::ThinkingStart);
+            }
+        }
+    }
+
+    fn content_block_stop(
+        &mut self,
+        value: &Value,
+        emit: &mut dyn FnMut(ModelEvent),
+    ) -> Result<()> {
+        let index = required_index(value)?;
+        if let Some(kind) = self.block_types.remove(&index) {
+            self.close_block(index, &kind, emit);
+        }
+        Ok(())
+    }
+
+    fn message_delta(&mut self, value: &Value) {
+        if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
+            self.saw_usage = true;
+            let update = anthropic_usage(usage);
+            merge_usage(&mut self.usage, &update);
+        }
+        if let Some(reason) = value
+            .get("delta")
+            .and_then(object)
+            .and_then(|delta| text(delta.get("stop_reason").unwrap_or(&Value::Null)))
+        {
+            self.finish = Some(map_stop(reason, self.saw_tool));
+        }
+    }
+
     fn finish_stream(&mut self, emit: &mut dyn FnMut(ModelEvent)) {
         self.close_remaining(emit);
         if !self.thinking_blocks.is_empty() {
@@ -98,23 +265,23 @@ impl Parser {
             self.thinking_blocks.clear();
         }
         if self.saw_usage {
-            let context_input_tokens = self.usage.input_tokens.map(|input| {
+            let context_input_tokens = self.usage.input.map(|input| {
                 input
-                    .saturating_add(self.usage.cache_read_tokens.unwrap_or_default())
-                    .saturating_add(self.usage.cache_write_tokens.unwrap_or_default())
+                    .saturating_add(self.usage.cache_read.unwrap_or_default())
+                    .saturating_add(self.usage.cache_write.unwrap_or_default())
             });
             emit(ModelEvent::Usage(crate::model::Usage {
-                input_tokens: self.usage.input_tokens,
+                input_tokens: self.usage.input,
                 context_input_tokens,
-                output_tokens: self.usage.output_tokens,
-                total_tokens: self.usage.total_tokens.or_else(|| {
+                output_tokens: self.usage.output,
+                total_tokens: self.usage.total.or_else(|| {
                     context_input_tokens
-                        .zip(self.usage.output_tokens)
+                        .zip(self.usage.output)
                         .map(|(input, output)| input.saturating_add(output))
                 }),
-                cache_read_tokens: self.usage.cache_read_tokens,
-                cache_write_tokens: self.usage.cache_write_tokens,
-                reasoning_tokens: self.usage.reasoning_tokens,
+                cache_read_tokens: self.usage.cache_read,
+                cache_write_tokens: self.usage.cache_write,
+                reasoning_tokens: self.usage.reasoning,
             }));
         }
         emit(ModelEvent::Done(final_reason(self.finish, self.saw_tool)));
@@ -140,142 +307,11 @@ impl ProtocolParser for Parser {
             kind => kind,
         };
         match kind {
-            "message_start" => {
-                if let Some(message_usage) = value
-                    .get("message")
-                    .and_then(object)
-                    .and_then(|message| message.get("usage"))
-                {
-                    self.saw_usage = true;
-                    merge_usage(&mut self.usage, anthropic_usage(message_usage));
-                }
-            }
-            "content_block_start" => {
-                let index = required_index(&value)?;
-                let block = value
-                    .get("content_block")
-                    .and_then(object)
-                    .cloned()
-                    .unwrap_or_default();
-                let kind = required_type(&block)?;
-                self.block_types.insert(index, kind.clone());
-                match kind.as_str() {
-                    "text" => emit(ModelEvent::TextStart),
-                    "thinking" => {
-                        self.thinking_text.insert(index, String::new());
-                        self.thinking_signatures.insert(index, String::new());
-                        emit(ModelEvent::ThinkingStart);
-                    }
-                    "redacted_thinking" => {
-                        let data =
-                            text(block.get("data").unwrap_or(&Value::Null)).ok_or_else(|| {
-                                Error::Provider("Anthropic event is missing data".into())
-                            })?;
-                        self.thinking_blocks
-                            .push(json!({ "type": "redacted_thinking", "data": data }));
-                        emit(ModelEvent::RedactedThinking(data.to_owned()));
-                    }
-                    "tool_use" => {
-                        let call_id = text(block.get("id").unwrap_or(&Value::Null));
-                        let name = text(block.get("name").unwrap_or(&Value::Null));
-                        let (Some(call_id), Some(name)) = (call_id, name) else {
-                            return Err(Error::Provider(
-                                "Anthropic event is missing id or name".into(),
-                            ));
-                        };
-                        self.saw_tool = true;
-                        emit(ModelEvent::ToolCallStart {
-                            index,
-                            call_id: super::truncated_call_id(call_id).to_owned(),
-                            name: self.tool_names.restore(name),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            "content_block_delta" => {
-                let index = required_index(&value)?;
-                let delta = value
-                    .get("delta")
-                    .and_then(object)
-                    .cloned()
-                    .unwrap_or_default();
-                let delta_kind = required_type(&delta)?;
-                if let std::collections::btree_map::Entry::Vacant(e) = self.block_types.entry(index)
-                {
-                    if delta_kind == "text_delta" {
-                        e.insert("text".into());
-                        emit(ModelEvent::TextStart);
-                    } else if delta_kind == "thinking_delta" || delta_kind == "signature_delta" {
-                        e.insert("thinking".into());
-                        self.thinking_text.insert(index, String::new());
-                        self.thinking_signatures.insert(index, String::new());
-                        emit(ModelEvent::ThinkingStart);
-                    }
-                }
-                match delta_kind.as_str() {
-                    "text_delta" => {
-                        if let Some(delta_text) = text(delta.get("text").unwrap_or(&Value::Null)) {
-                            emit(ModelEvent::TextDelta(delta_text.to_owned()));
-                        }
-                    }
-                    "thinking_delta" => {
-                        if let Some(delta_text) =
-                            text(delta.get("thinking").unwrap_or(&Value::Null))
-                        {
-                            self.thinking_text
-                                .entry(index)
-                                .or_default()
-                                .push_str(delta_text);
-                            emit(ModelEvent::ThinkingDelta(delta_text.to_owned()));
-                        }
-                    }
-                    "signature_delta" => {
-                        if let Some(signature) =
-                            text(delta.get("signature").unwrap_or(&Value::Null))
-                        {
-                            self.thinking_signatures
-                                .entry(index)
-                                .or_default()
-                                .push_str(signature);
-                        }
-                    }
-                    "input_json_delta" => {
-                        if let Some(partial) =
-                            text(delta.get("partial_json").unwrap_or(&Value::Null))
-                        {
-                            self.saw_tool = true;
-                            emit(ModelEvent::ToolCallArgumentsDelta {
-                                index,
-                                delta: partial.to_owned(),
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            "content_block_stop" => {
-                let index = required_index(&value)?;
-                if let Some(kind) = self.block_types.remove(&index) {
-                    self.close_block(index, &kind, emit);
-                }
-            }
-            "message_delta" => {
-                if !value.get("usage").is_none_or(Value::is_null) {
-                    self.saw_usage = true;
-                    merge_usage(
-                        &mut self.usage,
-                        anthropic_usage(value.get("usage").unwrap()),
-                    );
-                }
-                if let Some(reason) = value
-                    .get("delta")
-                    .and_then(object)
-                    .and_then(|delta| text(delta.get("stop_reason").unwrap_or(&Value::Null)))
-                {
-                    self.finish = Some(map_stop(reason, self.saw_tool));
-                }
-            }
+            "message_start" => self.message_start(&value),
+            "content_block_start" => self.content_block_start(&value, emit)?,
+            "content_block_delta" => self.content_block_delta(&value, emit)?,
+            "content_block_stop" => self.content_block_stop(&value, emit)?,
+            "message_delta" => self.message_delta(&value),
             "message_stop" => {
                 self.terminal = true;
                 self.finish_stream(emit);
@@ -324,49 +360,46 @@ pub(super) fn build_body(
         "max_tokens": request.model.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         "stream": true,
     });
-    {
-        let object = body.as_object_mut().unwrap();
-        if !request.prompt.tools.is_empty() {
-            object.insert(
-                "tools".into(),
-                request
-                    .prompt
-                    .tools
-                    .iter()
-                    .enumerate()
-                    .map(|(index, tool)| {
-                        let mut value = json!({
-                            "name": tool_names.alias(&tool.name),
-                            "description": tool.description,
-                            "input_schema": tool.parameters,
-                        });
-                        if index + 1 == request.prompt.tools.len() {
-                            value
-                                .as_object_mut()
-                                .unwrap()
-                                .insert("cache_control".into(), json!({ "type": "ephemeral" }));
-                        }
-                        value
-                    })
-                    .collect::<Value>(),
-            );
-        }
-        if request.model.reasoning.enabled {
-            object.insert(
-                "thinking".into(),
-                json!({ "type": "adaptive", "display": "summarized" }),
-            );
-        }
-        if let Some(effort) = &request.model.reasoning.effort {
-            object.insert("output_config".into(), json!({ "effort": effort }));
-        }
+    let object = object_mut(&mut body)?;
+    if !request.prompt.tools.is_empty() {
+        object.insert(
+            "tools".into(),
+            request
+                .prompt
+                .tools
+                .iter()
+                .enumerate()
+                .map(|(index, tool)| {
+                    let mut value = json!({
+                        "name": tool_names.alias(&tool.name),
+                        "description": tool.description,
+                        "input_schema": tool.parameters,
+                    });
+                    if index + 1 == request.prompt.tools.len()
+                        && let Some(object) = value.as_object_mut()
+                    {
+                        object.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+                    }
+                    value
+                })
+                .collect::<Value>(),
+        );
+    }
+    if request.model.reasoning.enabled {
+        object.insert(
+            "thinking".into(),
+            json!({ "type": "adaptive", "display": "summarized" }),
+        );
+    }
+    if let Some(effort) = &request.model.reasoning.effort {
+        object.insert("output_config".into(), json!({ "effort": effort }));
     }
     super::merge_extra_params(&mut body, &request.model.extra_params)?;
     super::apply_stop_sequences(&mut body, "stop_sequences", &request.model.stop_sequences)?;
     Ok(body)
 }
 
-fn anthropic_parts(parts: &[ContentPart], allow_attachments: bool) -> Result<Vec<Value>> {
+fn anthropic_parts(parts: &[ContentPart], allow_attachments: Attachments) -> Result<Vec<Value>> {
     let mut content = Vec::new();
     for part in parts {
         match part {
@@ -375,12 +408,14 @@ fn anthropic_parts(parts: &[ContentPart], allow_attachments: bool) -> Result<Vec
                     content.push(json!({ "type": "text", "text": text }));
                 }
             }
+            ContentPart::Image { .. } | ContentPart::File { .. }
+                if allow_attachments == Attachments::Forbidden =>
+            {
+                return Err(Error::Provider(
+                    "Anthropic only accepts attachments in user messages".into(),
+                ));
+            }
             ContentPart::Image { mime_type, data } => {
-                if !allow_attachments {
-                    return Err(Error::Provider(
-                        "Anthropic only accepts attachments in user messages".into(),
-                    ));
-                }
                 content.push(json!({
                     "type": "image",
                     "source": {
@@ -395,11 +430,6 @@ fn anthropic_parts(parts: &[ContentPart], allow_attachments: bool) -> Result<Vec
                 filename,
                 data,
             } => {
-                if !allow_attachments {
-                    return Err(Error::Provider(
-                        "Anthropic only accepts attachments in user messages".into(),
-                    ));
-                }
                 if mime_type == "application/pdf" {
                     content.push(json!({
                         "type": "document",
@@ -426,10 +456,7 @@ fn anthropic_parts(parts: &[ContentPart], allow_attachments: bool) -> Result<Vec
                     },
                 });
                 if let Some(filename) = filename {
-                    document
-                        .as_object_mut()
-                        .unwrap()
-                        .insert("title".into(), filename.clone().into());
+                    object_mut(&mut document)?.insert("title".into(), filename.clone().into());
                 }
                 content.push(document);
             }
@@ -504,19 +531,19 @@ fn anthropic_messages(
                         "content": if result.provider_parts.is_empty() {
                             Value::String(result.content.clone())
                         } else {
-                            anthropic_parts(&result.provider_parts, true)?.into()
+                            anthropic_parts(&result.provider_parts, Attachments::Allowed)?.into()
                         },
                     })],
                 );
             }
             CoreMessage::System(content) => {
-                let parts = anthropic_parts(content, false)?;
+                let parts = anthropic_parts(content, Attachments::Forbidden)?;
                 if !parts.is_empty() {
                     push_anthropic(&mut output, "user", parts);
                 }
             }
             CoreMessage::User(content) => {
-                let parts = anthropic_parts(content, true)?;
+                let parts = anthropic_parts(content, Attachments::Allowed)?;
                 if !parts.is_empty() {
                     push_anthropic(&mut output, "user", parts);
                 }
@@ -575,28 +602,28 @@ fn event_error(value: &Value) -> Option<String> {
 
 fn empty_usage() -> UsageState {
     UsageState {
-        input_tokens: None,
-        output_tokens: None,
-        total_tokens: None,
-        cache_read_tokens: None,
-        cache_write_tokens: None,
-        reasoning_tokens: None,
+        input: None,
+        output: None,
+        total: None,
+        cache_read: None,
+        cache_write: None,
+        reasoning: None,
     }
 }
 
 fn anthropic_usage(value: &Value) -> UsageState {
     let usage = object(value).cloned().unwrap_or_default();
     UsageState {
-        input_tokens: usage.get("input_tokens").and_then(super::count_u64),
-        output_tokens: usage.get("output_tokens").and_then(super::count_u64),
-        total_tokens: usage.get("total_tokens").and_then(super::count_u64),
-        cache_read_tokens: usage
+        input: usage.get("input_tokens").and_then(super::count_u64),
+        output: usage.get("output_tokens").and_then(super::count_u64),
+        total: usage.get("total_tokens").and_then(super::count_u64),
+        cache_read: usage
             .get("cache_read_input_tokens")
             .and_then(super::count_u64),
-        cache_write_tokens: usage
+        cache_write: usage
             .get("cache_creation_input_tokens")
             .and_then(super::count_u64),
-        reasoning_tokens: None,
+        reasoning: None,
     }
 }
 
@@ -607,42 +634,35 @@ fn merge_usage_field(total: Option<u64>, update: Option<u64>) -> Option<u64> {
     }
 }
 
-fn merge_usage(total: &mut UsageState, update: UsageState) {
-    total.input_tokens = merge_usage_field(total.input_tokens, update.input_tokens);
-    total.output_tokens = merge_usage_field(total.output_tokens, update.output_tokens);
-    total.total_tokens = merge_usage_field(total.total_tokens, update.total_tokens);
-    total.cache_read_tokens = merge_usage_field(total.cache_read_tokens, update.cache_read_tokens);
-    total.cache_write_tokens =
-        merge_usage_field(total.cache_write_tokens, update.cache_write_tokens);
-    let context = total.input_tokens.map(|input| {
-        input.saturating_add(total.cache_read_tokens.unwrap_or(0))
-            + total.cache_write_tokens.unwrap_or(0)
+fn merge_usage(total: &mut UsageState, update: &UsageState) {
+    total.input = merge_usage_field(total.input, update.input);
+    total.output = merge_usage_field(total.output, update.output);
+    total.total = merge_usage_field(total.total, update.total);
+    total.cache_read = merge_usage_field(total.cache_read, update.cache_read);
+    total.cache_write = merge_usage_field(total.cache_write, update.cache_write);
+    let context = total.input.map(|input| {
+        input.saturating_add(total.cache_read.unwrap_or(0)) + total.cache_write.unwrap_or(0)
     });
-    if let (Some(context), Some(output)) = (context, total.output_tokens) {
-        total.total_tokens = Some(context.saturating_add(output));
+    if let (Some(context), Some(output)) = (context, total.output) {
+        total.total = Some(context.saturating_add(output));
     }
 }
 
-fn map_stop(reason: &str, saw_tool: bool) -> FinishReason {
+fn map_stop(reason: &str, saw_tool: SawTool) -> FinishReason {
     match reason {
         "tool_use" => FinishReason::ToolUse,
         "max_tokens" | "model_context_window_exceeded" => FinishReason::Length,
         "end_turn" | "stop_sequence" | "pause_turn" | "refusal" => FinishReason::Stop,
-        _ => {
-            if saw_tool {
-                FinishReason::ToolUse
-            } else {
-                FinishReason::Stop
-            }
-        }
+        _ if saw_tool == SawTool::Present => FinishReason::ToolUse,
+        _ => FinishReason::Stop,
     }
 }
 
-fn final_reason(finish: Option<FinishReason>, saw_tool: bool) -> FinishReason {
+fn final_reason(finish: Option<FinishReason>, saw_tool: SawTool) -> FinishReason {
     if finish == Some(FinishReason::Length) {
         return FinishReason::Length;
     }
-    if saw_tool {
+    if saw_tool == SawTool::Present {
         FinishReason::ToolUse
     } else {
         finish.unwrap_or(FinishReason::Stop)

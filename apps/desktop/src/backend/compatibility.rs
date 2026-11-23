@@ -71,7 +71,7 @@ mod tests {
     #[tokio::test]
     async fn local_response_consumes_request_body_before_replying() {
         let polled = Arc::new(AtomicBool::new(false));
-        let observed = polled.clone();
+        let observed = Arc::clone(&polled);
         let body = Body::from_stream(stream::once(async move {
             observed.store(true, Ordering::SeqCst);
             Ok::<_, std::convert::Infallible>(Bytes::from_static(b"request"))

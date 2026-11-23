@@ -3,8 +3,8 @@
 use serde_json::{Value, json};
 
 use super::{
-    CoreMessage, ProtocolParser, ToolNames, core_message, count_usize, data_url, object,
-    parse_object, text, usage_event,
+    CoreMessage, ProtocolParser, SawTool, ToolFinish, ToolNames, core_message, count_usize,
+    data_url, object, object_mut, parse_object, text, usage_event,
 };
 use crate::{
     model::{ContentPart, ModelInvocation, ModelLatency},
@@ -36,9 +36,26 @@ pub(super) struct Parser {
     tools: std::collections::BTreeMap<usize, ToolState>,
     tool_names: ToolNames,
     reasoning_items: Vec<Value>,
-    saw_tool: bool,
-    saw_completed_item: bool,
-    terminal: bool,
+    saw_tool: SawTool,
+    completion: Completion,
+}
+
+/// How far the terminal handshake has advanced. Two separate `bool`s would let
+/// `terminal` be true while `saw_completed_item` stayed false.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Completion {
+    /// No complete output item yet, and no terminal event.
+    Pending,
+    /// At least one complete output item arrived.
+    ItemsCompleted,
+    /// `response.completed` or `response.incomplete` arrived.
+    Terminal,
+}
+
+impl Completion {
+    fn is_terminal(self) -> bool {
+        self == Self::Terminal
+    }
 }
 
 impl Parser {
@@ -50,9 +67,8 @@ impl Parser {
             tools: std::collections::BTreeMap::new(),
             tool_names,
             reasoning_items: Vec::new(),
-            saw_tool: false,
-            saw_completed_item: false,
-            terminal: false,
+            saw_tool: SawTool::Absent,
+            completion: Completion::Pending,
         }
     }
 
@@ -81,7 +97,7 @@ impl Parser {
             emit(ModelEvent::TextDelta(
                 final_text[self.streamed_text.len()..].to_owned(),
             ));
-            self.streamed_text = final_text.to_owned();
+            final_text.clone_into(&mut self.streamed_text);
         }
     }
 
@@ -104,6 +120,119 @@ impl Parser {
             ));
             self.reasoning_items.clear();
         }
+    }
+
+    fn output_item_added(&mut self, value: &Value, emit: &mut dyn FnMut(ModelEvent)) -> Result<()> {
+        let item = value.get("item").and_then(object);
+        if item.and_then(|item| text(item.get("type").unwrap_or(&Value::Null)))
+            != Some("function_call")
+        {
+            return Ok(());
+        }
+        self.saw_tool = SawTool::Present;
+        for event in update_tool(
+            required_index(value)?,
+            item,
+            ToolArguments::None,
+            ToolFinish::Open,
+            &mut self.tools,
+            &self.tool_names,
+        )? {
+            emit(event);
+        }
+        Ok(())
+    }
+
+    fn output_item_done(&mut self, value: &Value, emit: &mut dyn FnMut(ModelEvent)) -> Result<()> {
+        let item = value.get("item").and_then(object);
+        match item.and_then(|item| text(item.get("type").unwrap_or(&Value::Null))) {
+            Some("reasoning") => {
+                self.close_thinking(emit);
+                self.reasoning_items
+                    .push(value.get("item").cloned().unwrap_or(Value::Null));
+            }
+            Some("message") => {
+                self.completion = Completion::ItemsCompleted;
+                if let Some(item) = item
+                    && let Some(final_text) = item_text(item)
+                {
+                    self.reconcile_text(&final_text, emit);
+                }
+                self.close_text(emit);
+            }
+            Some("function_call") => {
+                self.completion = Completion::ItemsCompleted;
+                self.saw_tool = SawTool::Present;
+                let snapshot =
+                    item.and_then(|item| text(item.get("arguments").unwrap_or(&Value::Null)));
+                let args = match snapshot {
+                    None => ToolArguments::None,
+                    Some(snapshot) => ToolArguments::Snapshot(snapshot.to_owned()),
+                };
+                for event in update_tool(
+                    required_index(value)?,
+                    item,
+                    args,
+                    ToolFinish::Done,
+                    &mut self.tools,
+                    &self.tool_names,
+                )? {
+                    emit(event);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn function_call_arguments_delta(
+        &mut self,
+        value: &Value,
+        emit: &mut dyn FnMut(ModelEvent),
+    ) -> Result<()> {
+        let Some(delta) = text(value.get("delta").unwrap_or(&Value::Null)) else {
+            return Ok(());
+        };
+        self.saw_tool = SawTool::Present;
+        for event in update_tool(
+            required_index(value)?,
+            None,
+            ToolArguments::Delta(delta.to_owned()),
+            ToolFinish::Open,
+            &mut self.tools,
+            &self.tool_names,
+        )? {
+            emit(event);
+        }
+        Ok(())
+    }
+
+    fn function_call_arguments_done(
+        &mut self,
+        value: &Value,
+        emit: &mut dyn FnMut(ModelEvent),
+    ) -> Result<()> {
+        let snapshot = text(value.get("arguments").unwrap_or(&Value::Null));
+        let args = match snapshot {
+            None | Some("") => ToolArguments::None,
+            Some(snapshot) => ToolArguments::Snapshot(snapshot.to_owned()),
+        };
+        let finish = if snapshot.is_some_and(|snapshot| !snapshot.is_empty()) {
+            ToolFinish::Done
+        } else {
+            ToolFinish::Open
+        };
+        for event in update_tool(
+            required_index(value)?,
+            None,
+            args,
+            finish,
+            &mut self.tools,
+            &self.tool_names,
+        )? {
+            emit(event);
+        }
+        Ok(())
     }
 }
 
@@ -148,98 +277,13 @@ impl ProtocolParser for Parser {
             Some("response.reasoning_summary_text.done" | "response.reasoning_text.done") => {
                 self.close_thinking(emit);
             }
-            Some("response.output_item.added") => {
-                let item = value.get("item").and_then(object);
-                if item.and_then(|item| text(item.get("type").unwrap_or(&Value::Null)))
-                    != Some("function_call")
-                {
-                    return Ok(false);
-                }
-                self.saw_tool = true;
-                for event in update_tool(
-                    required_index(&value)?,
-                    item,
-                    ToolArguments::None,
-                    false,
-                    &mut self.tools,
-                    &self.tool_names,
-                )? {
-                    emit(event);
-                }
-            }
-            Some("response.output_item.done") => {
-                let item = value.get("item").and_then(object);
-                match item.and_then(|item| text(item.get("type").unwrap_or(&Value::Null))) {
-                    Some("reasoning") => {
-                        self.close_thinking(emit);
-                        self.reasoning_items
-                            .push(value.get("item").cloned().unwrap_or(Value::Null));
-                    }
-                    Some("message") => {
-                        self.saw_completed_item = true;
-                        if let Some(item) = item
-                            && let Some(final_text) = item_text(item)
-                        {
-                            self.reconcile_text(&final_text, emit);
-                        }
-                        self.close_text(emit);
-                    }
-                    Some("function_call") => {
-                        self.saw_completed_item = true;
-                        self.saw_tool = true;
-                        let snapshot = item
-                            .and_then(|item| text(item.get("arguments").unwrap_or(&Value::Null)));
-                        let args = match snapshot {
-                            None => ToolArguments::None,
-                            Some(snapshot) => ToolArguments::Snapshot(snapshot.to_owned()),
-                        };
-                        for event in update_tool(
-                            required_index(&value)?,
-                            item,
-                            args,
-                            true,
-                            &mut self.tools,
-                            &self.tool_names,
-                        )? {
-                            emit(event);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            Some("response.output_item.added") => self.output_item_added(&value, emit)?,
+            Some("response.output_item.done") => self.output_item_done(&value, emit)?,
             Some("response.function_call_arguments.delta") => {
-                let Some(delta) = text(value.get("delta").unwrap_or(&Value::Null)) else {
-                    return Ok(false);
-                };
-                self.saw_tool = true;
-                for event in update_tool(
-                    required_index(&value)?,
-                    None,
-                    ToolArguments::Delta(delta.to_owned()),
-                    false,
-                    &mut self.tools,
-                    &self.tool_names,
-                )? {
-                    emit(event);
-                }
+                self.function_call_arguments_delta(&value, emit)?;
             }
             Some("response.function_call_arguments.done") => {
-                let snapshot = text(value.get("arguments").unwrap_or(&Value::Null));
-                let args = match snapshot {
-                    None | Some("") => ToolArguments::None,
-                    Some(snapshot) => ToolArguments::Snapshot(snapshot.to_owned()),
-                };
-                let done = snapshot.is_some_and(|snapshot| !snapshot.is_empty());
-                for event in update_tool(
-                    required_index(&value)?,
-                    None,
-                    args,
-                    done,
-                    &mut self.tools,
-                    &self.tool_names,
-                )? {
-                    emit(event);
-                }
+                self.function_call_arguments_done(&value, emit)?;
             }
             Some("response.completed") => {
                 if let Some(usage) = value
@@ -257,20 +301,16 @@ impl ProtocolParser for Parser {
                         "OpenAI Responses completed with incomplete tool metadata".into(),
                     ));
                 }
-                self.terminal = true;
+                self.completion = Completion::Terminal;
                 self.emit_replay_state(emit);
-                emit(ModelEvent::Done(if self.saw_tool {
-                    FinishReason::ToolUse
-                } else {
-                    FinishReason::Stop
-                }));
+                emit(ModelEvent::Done(finish_reason(self.saw_tool)));
                 return Ok(true);
             }
             Some("response.incomplete") => {
                 self.close_thinking(emit);
                 self.close_text(emit);
                 self.end_started_tools(emit);
-                self.terminal = true;
+                self.completion = Completion::Terminal;
                 emit(ModelEvent::Done(FinishReason::Length));
                 return Ok(true);
             }
@@ -290,7 +330,7 @@ impl ProtocolParser for Parser {
     }
 
     fn finish(&mut self, emit: &mut dyn FnMut(ModelEvent)) -> Result<()> {
-        if !self.terminal && self.saw_completed_item {
+        if self.completion == Completion::ItemsCompleted {
             self.close_thinking(emit);
             self.close_text(emit);
             if self.tools.values().any(|tool| !tool.ended) {
@@ -298,15 +338,11 @@ impl ProtocolParser for Parser {
                     "OpenAI Responses stream ended with an incomplete tool call".into(),
                 ));
             }
-            self.terminal = true;
+            self.completion = Completion::Terminal;
             self.emit_replay_state(emit);
-            emit(ModelEvent::Done(if self.saw_tool {
-                FinishReason::ToolUse
-            } else {
-                FinishReason::Stop
-            }));
+            emit(ModelEvent::Done(finish_reason(self.saw_tool)));
         }
-        if !self.terminal {
+        if !self.completion.is_terminal() {
             return Err(Error::Provider(
                 "OpenAI Responses stream ended without response.completed or response.incomplete"
                     .into(),
@@ -322,8 +358,29 @@ pub(super) fn build_body(
     tool_names: &ToolNames,
 ) -> Result<Value> {
     let request = &invocation.request;
+    let input = responses_input(&request.history, tool_names)?;
+    let mut body = json!({
+        "model": model,
+        "input": input,
+        "stream": true,
+        "instructions": request.prompt.instructions,
+        "include": ["reasoning.encrypted_content"],
+    });
+    apply_responses_options(&mut body, request, tool_names)?;
+    super::apply_openai_prompt_cache_key(&mut body, model, &invocation.conversation_id);
+    // OpenAI Responses has no stop-sequence field; a `stop` key would be rejected
+    // by strict gateways, so Cursor's stop sequences are dropped for this protocol.
+    super::merge_extra_params(&mut body, &request.model.extra_params)?;
+    Ok(body)
+}
+
+/// Projects the conversation into Responses `input` items.
+fn responses_input(
+    history: &[crate::model::ProjectedMessage],
+    tool_names: &ToolNames,
+) -> Result<Vec<Value>> {
     let mut input = Vec::new();
-    for message in &request.history {
+    for message in history {
         match core_message(message)? {
             CoreMessage::Assistant {
                 text,
@@ -384,56 +441,58 @@ pub(super) fn build_body(
             }
         }
     }
-    let mut body = json!({
-        "model": model,
-        "input": input,
-        "stream": true,
-        "instructions": request.prompt.instructions,
-        "include": ["reasoning.encrypted_content"],
-    });
-    {
-        let object = body.as_object_mut().unwrap();
-        if !request.prompt.tools.is_empty() {
-            object.insert(
-                "tools".into(),
-                request
-                    .prompt
-                    .tools
-                    .iter()
-                    .map(|tool| {
-                        json!({
-                            "type": "function",
-                            "name": tool_names.alias(&tool.name),
-                            "description": tool.description,
-                            "parameters": tool.parameters,
-                            "strict": false,
-                        })
+    Ok(input)
+}
+
+fn apply_responses_options(
+    body: &mut Value,
+    request: &crate::model::ModelRequest,
+    tool_names: &ToolNames,
+) -> Result<()> {
+    let object = object_mut(body)?;
+    if !request.prompt.tools.is_empty() {
+        object.insert(
+            "tools".into(),
+            request
+                .prompt
+                .tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "type": "function",
+                        "name": tool_names.alias(&tool.name),
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                        "strict": false,
                     })
-                    .collect::<Value>(),
-            );
-        }
-        if let Some(tokens) = request.model.max_output_tokens {
-            object.insert("max_output_tokens".into(), tokens.into());
-        }
-        if request.model.reasoning.enabled || request.model.reasoning.effort.is_some() {
-            let mut reasoning = json!({ "summary": "auto" });
-            if let Some(effort) = &request.model.reasoning.effort {
-                reasoning
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("effort".into(), effort.clone().into());
-            }
-            object.insert("reasoning".into(), reasoning);
-        }
-        if request.model.latency == ModelLatency::Fast {
-            object.insert("service_tier".into(), "priority".into());
-        }
+                })
+                .collect::<Value>(),
+        );
     }
-    super::apply_openai_prompt_cache_key(&mut body, model, &invocation.conversation_id);
-    // OpenAI Responses has no stop-sequence field; a `stop` key would be rejected
-    // by strict gateways, so Cursor's stop sequences are dropped for this protocol.
-    super::merge_extra_params(&mut body, &request.model.extra_params)?;
-    Ok(body)
+    if let Some(tokens) = request.model.max_output_tokens {
+        object.insert("max_output_tokens".into(), tokens.into());
+    }
+    if request.model.reasoning.enabled || request.model.reasoning.effort.is_some() {
+        let mut reasoning = json!({ "summary": "auto" });
+        if let Some(effort) = &request.model.reasoning.effort
+            && let Some(reasoning) = reasoning.as_object_mut()
+        {
+            reasoning.insert("effort".into(), effort.clone().into());
+        }
+        object.insert("reasoning".into(), reasoning);
+    }
+    if request.model.latency == ModelLatency::Fast {
+        object.insert("service_tier".into(), "priority".into());
+    }
+    Ok(())
+}
+
+/// The finish reason for a completed Responses stream.
+fn finish_reason(saw_tool: SawTool) -> FinishReason {
+    match saw_tool {
+        SawTool::Present => FinishReason::ToolUse,
+        SawTool::Absent => FinishReason::Stop,
+    }
 }
 
 fn content_parts(parts: &[ContentPart], text_type: &str) -> Result<Vec<Value>> {
@@ -491,11 +550,10 @@ fn replay_items(value: &Value) -> Result<Vec<Value>> {
             }
             let mut projected = json!({ "type": "reasoning" });
             for field in ["id", "summary", "content", "encrypted_content"] {
-                if let Some(value) = source.get(field) {
-                    projected
-                        .as_object_mut()
-                        .unwrap()
-                        .insert(field.into(), value.clone());
+                if let Some(value) = source.get(field)
+                    && let Some(projected) = projected.as_object_mut()
+                {
+                    projected.insert(field.into(), value.clone());
                 }
             }
             Ok(projected)
@@ -507,7 +565,7 @@ fn update_tool(
     index: usize,
     item: Option<&serde_json::Map<String, Value>>,
     args: ToolArguments,
-    done: bool,
+    finish: ToolFinish,
     tools: &mut std::collections::BTreeMap<usize, ToolState>,
     tool_names: &ToolNames,
 ) -> Result<Vec<ModelEvent>> {
@@ -530,7 +588,6 @@ fn update_tool(
             .map(str::to_owned);
     }
     match args {
-        ToolArguments::None => {}
         ToolArguments::Delta(delta) => tool.arguments.push_str(&delta),
         ToolArguments::Snapshot(snapshot) if snapshot != tool.arguments => {
             if !snapshot.starts_with(&tool.arguments) {
@@ -540,15 +597,17 @@ fn update_tool(
             }
             tool.arguments.push_str(&snapshot[tool.arguments.len()..]);
         }
-        ToolArguments::Snapshot(_) => {}
+        ToolArguments::None | ToolArguments::Snapshot(_) => {}
     }
     let mut events = Vec::new();
     if !tool.started && tool.call_id.is_some() && tool.name.is_some() {
         tool.started = true;
+        let call_id = tool.call_id.as_deref().expect("checked is_some just above");
+        let name = tool.name.as_deref().expect("checked is_some just above");
         events.push(ModelEvent::ToolCallStart {
             index,
-            call_id: super::truncated_call_id(tool.call_id.as_deref().unwrap()).to_owned(),
-            name: tool_names.restore(tool.name.as_deref().unwrap()),
+            call_id: super::truncated_call_id(call_id).to_owned(),
+            name: tool_names.restore(name),
         });
     }
     if tool.started && tool.emitted < tool.arguments.len() {
@@ -558,7 +617,7 @@ fn update_tool(
         });
         tool.emitted = tool.arguments.len();
     }
-    if done && !tool.ended {
+    if finish == ToolFinish::Done && !tool.ended {
         if !tool.started {
             return Err(Error::Provider(
                 "OpenAI Responses function call is missing call_id or name".into(),

@@ -31,7 +31,7 @@ pub fn llm_request(invocation: &ModelInvocation) -> Result<serde_json::Value> {
         },
         "latency": match request.model.latency {
             ModelLatency::Fast => "fast",
-            _ => "standard",
+            ModelLatency::Standard => "standard",
         },
         "maxOutputTokens": request.model.max_output_tokens,
         "cacheKey": invocation.conversation_id,
@@ -195,7 +195,7 @@ fn required_index(value: &serde_json::Value) -> Result<usize> {
     value
         .get("index")
         .and_then(serde_json::Value::as_u64)
-        .map(|index| index as usize)
+        .map(|index| usize::try_from(index).unwrap_or(usize::MAX))
         .ok_or_else(|| Error::Protocol("plugin model event requires index".into()))
 }
 

@@ -346,11 +346,14 @@ fn merge_response(upstream: proxy::BufferedResponse, extra: Vec<u8>) -> Result<R
         tracing::warn!(status = %upstream.status, "Cursor model catalog upstream rejected request; using local catalog");
         return Ok(local_response(extra));
     }
-    let (framed, payload) = unary_payload(&upstream.body)?;
-    let body = if framed {
-        let mut merged = BytesMut::with_capacity(5 + payload.len() + extra.len());
+    let (framing, payload) = unary_payload(&upstream.body)?;
+    let body = if framing.is_enveloped() {
+        let total = payload.len() + extra.len();
+        let length = u32::try_from(total)
+            .map_err(|_| Error::Protocol("model catalog frame exceeds 4 GiB".into()))?;
+        let mut merged = BytesMut::with_capacity(5 + total);
         merged.put_u8(0);
-        merged.put_u32((payload.len() + extra.len()) as u32);
+        merged.put_u32(length);
         merged.extend_from_slice(payload);
         merged.extend_from_slice(&extra);
         merged.freeze()
@@ -373,21 +376,15 @@ fn local_response(body: Vec<u8>) -> Response<Body> {
     response
 }
 
-fn unary_payload(body: &Bytes) -> Result<(bool, &[u8])> {
-    if body.len() < 5 {
-        return Ok((false, body));
-    }
-    let flags = body[0];
-    let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
-    if length != body.len() - 5 {
-        return Ok((false, body));
-    }
-    if flags != 0 {
-        return Err(Error::Protocol(format!(
-            "cannot merge compressed or terminal model catalog frame: flags={flags}"
-        )));
-    }
-    Ok((true, &body[5..]))
+fn unary_payload(body: &Bytes) -> Result<(super::Framing, &[u8])> {
+    super::unary_payload(body, "model catalog")
+}
+
+/// Whether a variant turns on the "Fast" cost tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FastMode {
+    Off,
+    On,
 }
 
 fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
@@ -395,7 +392,7 @@ fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
         markdown_content: model.description.clone(),
     };
     let contexts = context_options(None);
-    let variants = model_variants(&model.id, &model.display_name, &tooltip, &contexts, true);
+    let variants = model_variants(&model.id, &model.display_name, &tooltip, &contexts);
     let legacy_slugs = variants
         .iter()
         .filter_map(|variant| variant.legacy_slug.clone())
@@ -418,7 +415,7 @@ fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
         inputbox_short_model_name: Some(model.display_name.clone()),
         supports_sandboxing: Some(true),
         supports_cmd_k: Some(false),
-        parameter_definitions: model_parameters(&contexts, true),
+        parameter_definitions: model_parameters(&contexts),
         variants,
         legacy_slugs,
         named_model_section_index: Some(1),
@@ -435,10 +432,7 @@ fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
     }
 }
 
-fn model_parameters(
-    contexts: &[(String, String)],
-    thinking: bool,
-) -> Vec<ModelParameterDefinition> {
+fn model_parameters(contexts: &[(String, String)]) -> Vec<ModelParameterDefinition> {
     let mut parameters = vec![ModelParameterDefinition {
         id: "context".into(),
         name: "Context".into(),
@@ -457,26 +451,25 @@ fn model_parameters(
         }),
         is_cycleable_by_hotkey: Some(false),
     }];
-    if thinking {
-        parameters.push(ModelParameterDefinition {
-            id: "reasoning".into(),
-            name: "Effort".into(),
-            markdown_tooltip: Some("Effort the model uses to generate its response.".into()),
-            parameter_type: Some(ModelParameterType {
-                boolean_parameter: None,
-                enum_parameter: Some(EnumParameter {
-                    values: EFFORTS
-                        .into_iter()
-                        .map(|(value, display_name)| EnumParameterValue {
-                            value: value.into(),
-                            display_name: Some(display_name.into()),
-                        })
-                        .collect(),
-                }),
+    // Reasoning effort is advertised for every plugin model.
+    parameters.push(ModelParameterDefinition {
+        id: "reasoning".into(),
+        name: "Effort".into(),
+        markdown_tooltip: Some("Effort the model uses to generate its response.".into()),
+        parameter_type: Some(ModelParameterType {
+            boolean_parameter: None,
+            enum_parameter: Some(EnumParameter {
+                values: EFFORTS
+                    .into_iter()
+                    .map(|(value, display_name)| EnumParameterValue {
+                        value: value.into(),
+                        display_name: Some(display_name.into()),
+                    })
+                    .collect(),
             }),
-            is_cycleable_by_hotkey: Some(true),
-        });
-    }
+        }),
+        is_cycleable_by_hotkey: Some(true),
+    });
     parameters.push(ModelParameterDefinition {
         id: "fast".into(),
         name: "Fast".into(),
@@ -508,23 +501,18 @@ fn model_variants(
     display_name: &str,
     tooltip: &TooltipData,
     contexts: &[(String, String)],
-    thinking: bool,
 ) -> Vec<ModelVariant> {
-    let efforts: &[Option<(&str, &str)>] = if thinking {
-        &[
-            Some(EFFORTS[0]),
-            Some(EFFORTS[1]),
-            Some(EFFORTS[2]),
-            Some(EFFORTS[3]),
-            Some(EFFORTS[4]),
-        ]
-    } else {
-        &[None]
-    };
+    let efforts: &[Option<(&str, &str)>] = &[
+        Some(EFFORTS[0]),
+        Some(EFFORTS[1]),
+        Some(EFFORTS[2]),
+        Some(EFFORTS[3]),
+        Some(EFFORTS[4]),
+    ];
     let mut variants = Vec::with_capacity(contexts.len() * efforts.len() * 2);
     for (context, context_name) in contexts {
         for effort in efforts {
-            for fast in [false, true] {
+            for fast in [FastMode::Off, FastMode::On] {
                 variants.push(model_variant(
                     name,
                     display_name,
@@ -547,8 +535,9 @@ fn model_variant(
     context: &str,
     context_name: &str,
     effort: Option<(&str, &str)>,
-    fast: bool,
+    fast_mode: FastMode,
 ) -> ModelVariant {
+    let fast = fast_mode == FastMode::On;
     let mut suffix = Vec::with_capacity(3);
     if context != DEFAULT_CONTEXT {
         suffix.push(context_name);

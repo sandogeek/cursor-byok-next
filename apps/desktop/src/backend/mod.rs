@@ -17,12 +17,13 @@ use axum::{
     http::{HeaderValue, Request, Response, StatusCode, header},
     routing::{get, post},
 };
+use bytes::{BufMut, BytesMut};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::{
-    Result,
+    Error, Result,
     calls::CallStore,
     harness,
     loop_service::{InferenceRoute, InferenceService, decode_append},
@@ -38,6 +39,15 @@ pub use knowledge::KnowledgeService;
 pub struct Backend {
     addr: SocketAddr,
     _task: JoinHandle<()>,
+}
+
+impl std::fmt::Debug for Backend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Backend")
+            .field("addr", &self.addr)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Backend {
@@ -67,36 +77,61 @@ fn router(
     proxy: proxy::CursorProxy,
     knowledge: KnowledgeService,
 ) -> Router {
-    Router::new()
+    inference_routes(Router::new())
+        .merge(account_routes())
+        .merge(catalog_routes())
+        .merge(knowledge_routes())
+        .merge(misc_routes())
+        .layer(axum::extract::DefaultBodyLimit::disable())
+        .layer(RequestDecompressionLayer::new())
+        .layer(Extension(proxy))
+        .layer(Extension(knowledge))
+        .layer(Extension(inference))
+        .layer(Extension(plugins))
+}
+
+fn inference_routes(router: Router) -> Router {
+    router
         .route(
             "/aiserver.v1.InferenceService/RunInferenceSSE",
             post(run_inference_sse),
         )
         .route("/aiserver.v1.BidiService/BidiAppend", post(bidi_append))
+}
+
+fn account_routes() -> Router {
+    Router::new()
         .route(
-            "/aiserver.v1.AiService/AvailableDocs",
-            post(compatibility::available_docs),
+            "/aiserver.v1.AuthService/GetEmail",
+            post(account::get_email),
         )
         .route(
-            "/aiserver.v1.DashboardService/GetEffectiveUserPlugins",
-            post(compatibility::effective_user_plugins),
+            "/aiserver.v1.AuthService/GetUserMeta",
+            post(account::get_user_meta),
+        )
+        .route("/aiserver.v1.DashboardService/GetMe", post(account::get_me))
+        .route(
+            "/aiserver.v1.DashboardService/GetTeams",
+            post(account::get_teams),
         )
         .route(
-            "/aiserver.v1.DashboardService/GetUserPrivacyMode",
-            post(compatibility::user_privacy_mode),
+            "/aiserver.v1.DashboardService/GetUserProfile",
+            post(account::get_user_profile),
         )
         .route(
-            "/agent.v1.AgentService/UpdateConversationMetadata",
-            post(compatibility::update_conversation_metadata),
+            "/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+            post(account::current_period_usage),
         )
         .route(
-            "/aiserver.v1.AiService/GetServerConfig",
-            post(server_config::get),
+            "/aiserver.v1.DashboardService/GetUsageLimitStatusAndActiveGrants",
+            post(account::usage_limit_status),
         )
-        .route(
-            "/aiserver.v1.ServerConfigService/GetServerConfig",
-            post(server_config::get),
-        )
+        .route("/auth/full_stripe_profile", get(account::stripe_profile))
+        .route("/auth/stripe_profile", get(account::stripe_profile))
+}
+
+fn catalog_routes() -> Router {
+    Router::new()
         .route(
             "/aiserver.v1.AiService/AvailableModels",
             post(catalog::available_models),
@@ -125,31 +160,10 @@ fn router(
             "/aiserver.v1.AiService/GetDefaultModelNudgeData",
             post(catalog::default_model_nudge),
         )
-        .route(
-            "/aiserver.v1.AuthService/GetEmail",
-            post(account::get_email),
-        )
-        .route(
-            "/aiserver.v1.AuthService/GetUserMeta",
-            post(account::get_user_meta),
-        )
-        .route("/aiserver.v1.DashboardService/GetMe", post(account::get_me))
-        .route(
-            "/aiserver.v1.DashboardService/GetTeams",
-            post(account::get_teams),
-        )
-        .route(
-            "/aiserver.v1.DashboardService/GetUserProfile",
-            post(account::get_user_profile),
-        )
-        .route(
-            "/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
-            post(account::current_period_usage),
-        )
-        .route(
-            "/aiserver.v1.DashboardService/GetUsageLimitStatusAndActiveGrants",
-            post(account::usage_limit_status),
-        )
+}
+
+fn knowledge_routes() -> Router {
+    Router::new()
         .route(
             "/aiserver.v1.AiService/KnowledgeBaseAdd",
             post(knowledge::add),
@@ -166,6 +180,34 @@ fn router(
             "/aiserver.v1.AiService/KnowledgeBaseRemove",
             post(knowledge::remove),
         )
+}
+
+fn misc_routes() -> Router {
+    Router::new()
+        .route(
+            "/aiserver.v1.AiService/AvailableDocs",
+            post(compatibility::available_docs),
+        )
+        .route(
+            "/aiserver.v1.DashboardService/GetEffectiveUserPlugins",
+            post(compatibility::effective_user_plugins),
+        )
+        .route(
+            "/aiserver.v1.DashboardService/GetUserPrivacyMode",
+            post(compatibility::user_privacy_mode),
+        )
+        .route(
+            "/agent.v1.AgentService/UpdateConversationMetadata",
+            post(compatibility::update_conversation_metadata),
+        )
+        .route(
+            "/aiserver.v1.AiService/GetServerConfig",
+            post(server_config::get),
+        )
+        .route(
+            "/aiserver.v1.ServerConfigService/GetServerConfig",
+            post(server_config::get),
+        )
         .route(
             "/aiserver.v1.AiService/WriteGitCommitMessage",
             post(forward_commit_message),
@@ -178,14 +220,6 @@ fn router(
             analytics::BOOTSTRAP_STATSIG_PATH,
             post(analytics::bootstrap_statsig),
         )
-        .route("/auth/full_stripe_profile", get(account::stripe_profile))
-        .route("/auth/stripe_profile", get(account::stripe_profile))
-        .layer(axum::extract::DefaultBodyLimit::disable())
-        .layer(RequestDecompressionLayer::new())
-        .layer(Extension(proxy))
-        .layer(Extension(knowledge))
-        .layer(Extension(inference))
-        .layer(Extension(plugins))
 }
 
 async fn is_connected() -> Result<Response<Body>> {
@@ -330,6 +364,10 @@ async fn buffered(request: Request<Body>) -> Result<(axum::http::request::Parts,
     Ok((parts, body))
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "every call site builds the response inline, and prost's encode_to_vec takes &self"
+)]
 pub(crate) fn proto_response(message: impl prost::Message) -> Response<Body> {
     let body = message.encode_to_vec();
     let length = body.len();
@@ -343,6 +381,52 @@ pub(crate) fn proto_response(message: impl prost::Message) -> Response<Body> {
         HeaderValue::from_str(&length.to_string()).expect("body length is valid"),
     );
     response
+}
+
+/// Whether an upstream Connect unary body carries the 5-byte envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Framing {
+    Enveloped,
+    Bare,
+}
+
+impl Framing {
+    pub(crate) fn is_enveloped(self) -> bool {
+        self == Self::Enveloped
+    }
+}
+
+/// Splits an optional Connect unary envelope off `body`.
+pub(crate) fn unary_payload<'a>(body: &'a [u8], label: &str) -> Result<(Framing, &'a [u8])> {
+    if body.len() < 5 {
+        return Ok((Framing::Bare, body));
+    }
+    let flags = body[0];
+    let length = usize::try_from(u32::from_be_bytes([body[1], body[2], body[3], body[4]]))
+        .unwrap_or(usize::MAX);
+    if length != body.len() - 5 {
+        return Ok((Framing::Bare, body));
+    }
+    if flags != 0 {
+        return Err(Error::Protocol(format!(
+            "cannot patch compressed or terminal {label} frame: flags={flags}"
+        )));
+    }
+    Ok((Framing::Enveloped, &body[5..]))
+}
+
+/// Wraps an encoded unary payload in a Connect envelope when `framing` asks for it.
+pub(crate) fn encode_unary(payload: Vec<u8>, framing: Framing) -> Result<Bytes> {
+    if !framing.is_enveloped() {
+        return Ok(Bytes::from(payload));
+    }
+    let length = u32::try_from(payload.len())
+        .map_err(|_| Error::Protocol("Connect payload exceeds 4 GiB".into()))?;
+    let mut output = BytesMut::with_capacity(5 + payload.len());
+    output.put_u8(0);
+    output.put_u32(length);
+    output.extend_from_slice(&payload);
+    Ok(output.freeze())
 }
 
 async fn consume_body(request: Request<Body>) -> Result<()> {
