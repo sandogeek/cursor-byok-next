@@ -178,7 +178,7 @@ fn assignment_alias_resolves_standard_protobuf_type() {
         .resolve_type_name(
             "ua",
             u32::MAX,
-            scan.messages.last().map(|m| m.module_start).unwrap_or(0),
+            scan.messages.last().map_or(0, |m| m.module_start),
             "aiserver.v1",
             "message",
         )
@@ -494,7 +494,7 @@ var Pf1={typeName:"aiserver.v1.InferenceService",methods:{runInference:{name:"Ru
 
 #[test]
 fn validate_required_agent_shapes_accepts_run_inference_mode_config() {
-    const BODY: &str = r#"
+    const BODY: &str = r"
 message RunInferenceAgentModeConfig {
   string mode_id = 1;
   bool enable_ask_question_tool = 2;
@@ -508,13 +508,13 @@ service InferenceService {
   rpc RunInference(stream RunInferenceClientMessage) returns (stream RunInferenceServerMessage) {}
   rpc RunInferenceSSE(BidiRequestId) returns (stream RunInferenceServerMessage) {}
 }
-"#;
+";
     validate_required_agent_shapes("aiserver_v1.proto", BODY).expect("valid shapes");
 }
 
 #[test]
 fn validate_required_agent_shapes_stays_inside_message_block() {
-    const BODY: &str = r#"
+    const BODY: &str = r"
 message RunInferencePromptModelMetadata {
   string vendor = 1;
 }
@@ -522,7 +522,7 @@ message Other {
   repeated RunInferenceAgentModeConfig agent_mode_configs = 46;
   optional RunInferenceAskQuestionConfig ask_question_config = 48;
 }
-"#;
+";
     let err =
         validate_required_agent_shapes("aiserver_v1.proto", BODY).expect_err("cross-message leak");
     assert!(err.contains("agent_mode_configs"));

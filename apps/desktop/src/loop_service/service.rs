@@ -331,7 +331,7 @@ async fn serve(
     let models = plugins.configured_models().await;
     loop {
         let message = tokio::select! {
-            _ = cancellation.cancelled() => {
+            () = cancellation.cancelled() => {
                 disconnected = true;
                 break;
             }
@@ -470,9 +470,10 @@ fn run_ready(
     context_window_tokens: Option<u64>,
     non_file_rules: Vec<agent::CursorRule>,
 ) -> pb::RunInferenceRunReady {
-    let (display_name, vendor) = model
-        .map(|model| (model.display_name.clone(), model.vendor.clone()))
-        .unwrap_or_else(|| (String::new(), "openai".into()));
+    let (display_name, vendor) = model.map_or_else(
+        || (String::new(), "openai".into()),
+        |model| (model.display_name.clone(), model.vendor.clone()),
+    );
     let anthropic = vendor.eq_ignore_ascii_case("anthropic")
         || vendor.eq_ignore_ascii_case("messages")
         || display_name.to_ascii_lowercase().contains("claude");
@@ -483,7 +484,7 @@ fn run_ready(
         resolved_model: request.requested_model.clone(),
         supports_self_summary: true,
         summarization: summarization_config(request, context_window_tokens),
-        routed_model_display_name: (!display_name.is_empty()).then_some(display_name.clone()),
+        routed_model_display_name: (!display_name.is_empty()).then_some(display_name),
         prompt_model_metadata: Some(pb::RunInferencePromptModelMetadata {
             vendor: if anthropic { "anthropic" } else { "openai" }.into(),
             prompt_version: "latest".into(),
@@ -665,7 +666,7 @@ async fn serve_invocation(
     let mut tool_calls = HashMap::<usize, (String, String, String)>::new();
     let mut error = None;
     while let Some(next) = tokio::select! {
-        _ = cancellation.cancelled() => None,
+        () = cancellation.cancelled() => None,
         next = stream.next() => next,
     } {
         match next {

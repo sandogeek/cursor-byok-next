@@ -1,5 +1,10 @@
 //! CLI for extracting agent.v1 / aiserver.v1 protobuf schemas from Cursor JS bundles.
 
+#![expect(
+    clippy::print_stderr,
+    reason = "a CLI reports its progress and errors on the terminal"
+)]
+
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;

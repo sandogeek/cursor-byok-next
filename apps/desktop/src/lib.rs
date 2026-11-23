@@ -21,7 +21,10 @@ pub use error::{Error, Result};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use nsh_base::theme;
-#[allow(unused_imports)]
+#[expect(
+    unused_imports,
+    reason = "re-exported to the TSX boundary and macro output"
+)]
 use nsh_core::{
     JsonValue,
     element::{JsHost, JsIn, JsOwned, JsValue, PropError, TsTypes},
@@ -1091,14 +1094,13 @@ fn shared_call_store() -> CallStore {
     if let Some(store) = CALL_STORE.get() {
         return store.clone();
     }
-    let store = CallStore::at(
-        crate::harness::data_dir()
-            .map(|dir| dir.join("calls.db"))
-            .unwrap_or_else(|error| {
-                tracing::error!(%error, "cannot open LLM call records");
-                std::env::temp_dir().join("cursor-byok-next-calls.db")
-            }),
-    );
+    let store = CallStore::at(crate::harness::data_dir().map_or_else(
+        |error| {
+            tracing::error!(%error, "cannot open LLM call records");
+            std::env::temp_dir().join("cursor-byok-next-calls.db")
+        },
+        |dir| dir.join("calls.db"),
+    ));
     CALL_STORE.get_or_init(|| store.clone()).clone()
 }
 

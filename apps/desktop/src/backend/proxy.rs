@@ -199,7 +199,7 @@ fn remove_hop_by_hop_headers(headers: &mut axum::http::HeaderMap) {
 
 #[cfg(test)]
 impl CursorProxy {
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "test-only constructor")]
     pub fn with_upstream(upstream: String) -> Self {
         Self {
             client: reqwest::Client::new(),

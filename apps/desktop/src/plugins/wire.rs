@@ -4,8 +4,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 
 use crate::{
     model::{
-        ContentPart, ModelInvocation, ModelLatency, ProjectedContent, ProjectedMessage, Role,
-        Usage,
+        ContentPart, ModelInvocation, ModelLatency, ProjectedContent, ProjectedMessage, Role, Usage,
     },
     plugins::{Error, Result},
     provider::{FinishReason, ModelEvent},
@@ -233,7 +232,7 @@ mod tests {
                         message_id: "m2".into(),
                         role: Role::Assistant,
                         content: ProjectedContent::Assistant {
-                            text: "".into(),
+                            text: String::new(),
                             thinking: "t".into(),
                             replay_state: Some(crate::model::ProviderReplayState {
                                 provider_kind: "openai_responses".into(),

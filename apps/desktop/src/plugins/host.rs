@@ -803,8 +803,7 @@ impl PluginHost {
             .lock()
             .await
             .get(plugin_id)
-            .map(|worker| worker.sdk_projection_count())
-            .unwrap_or(0)
+            .map_or(0, |worker| worker.sdk_projection_count())
     }
 
     async fn select_resource(

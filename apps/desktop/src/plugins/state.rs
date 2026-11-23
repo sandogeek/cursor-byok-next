@@ -239,27 +239,24 @@ impl PluginStateStore {
             let state = draft
                 .state
                 .map_or(ResourceState::Ready, ResourceState::from);
-            match records.iter_mut().find(|record| record.key == draft.key) {
-                Some(existing) => {
-                    existing.private_data = draft.private_data;
-                    existing.state = state;
-                    existing.updated_at_ms = now;
-                    outcome.changed_ids.push(existing.id.clone());
-                    outcome.updated += 1;
-                }
-                None => {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    outcome.changed_ids.push(id.clone());
-                    records.push(ResourceRecord {
-                        id,
-                        key: draft.key,
-                        private_data: draft.private_data,
-                        state,
-                        created_at_ms: now,
-                        updated_at_ms: now,
-                    });
-                    outcome.added += 1;
-                }
+            if let Some(existing) = records.iter_mut().find(|record| record.key == draft.key) {
+                existing.private_data = draft.private_data;
+                existing.state = state;
+                existing.updated_at_ms = now;
+                outcome.changed_ids.push(existing.id.clone());
+                outcome.updated += 1;
+            } else {
+                let id = uuid::Uuid::new_v4().to_string();
+                outcome.changed_ids.push(id.clone());
+                records.push(ResourceRecord {
+                    id,
+                    key: draft.key,
+                    private_data: draft.private_data,
+                    state,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                });
+                outcome.added += 1;
             }
         }
         self.save_resources(plugin_id, resource_type, &records)

@@ -1,4 +1,4 @@
-//! Compiles agent.v1 / aiserver.v1 into a FileDescriptorSet for dynamic decoding.
+//! Compiles agent.v1 / aiserver.v1 into a `FileDescriptorSet` for dynamic decoding.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -45,9 +45,10 @@ fn main() {
                 };
                 let next_agent = replace_ident(&agent, &name, "bytes");
                 let next_aiserver = replace_ident(&aiserver, &name, "bytes");
-                if next_agent == agent && next_aiserver == aiserver {
-                    panic!("could not patch undefined type {name}: {message}");
-                }
+                assert!(
+                    next_agent != agent || next_aiserver != aiserver,
+                    "could not patch undefined type {name}: {message}"
+                );
                 agent = next_agent;
                 aiserver = next_aiserver;
             }

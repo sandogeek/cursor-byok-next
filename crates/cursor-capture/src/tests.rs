@@ -62,7 +62,7 @@ fn connect_frames_decode_across_chunk_boundaries() {
     let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let collected = frames.clone();
     let mut decoder = ConnectFrameDecoder::new("unknown.Message", "", 8, move |frame| {
-        collected.lock().unwrap().push(frame)
+        collected.lock().unwrap().push(frame);
     });
     decoder.write(&payload[..3]);
     decoder.write(&payload[3..8]);

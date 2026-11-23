@@ -2,8 +2,12 @@
 name = "cursor-protocol-extractor"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 publish = false
 description = "Extract Cursor local-loop protobuf schemas from installed JS bundles"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "cursor-protocol-extractor"

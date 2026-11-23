@@ -341,7 +341,7 @@ impl PluginWorker {
         let request_id = request.id.clone();
         tokio::spawn(async move {
             tokio::select! {
-                _ = cancellation.cancelled() => {
+                () = cancellation.cancelled() => {
                     request_cancellation.cancel();
                     if let Ok(bytes) = encode_message(&HostMessage::Cancel { id: &request_id }) {
                         let _ = writer.send(bytes).await;
@@ -356,7 +356,7 @@ impl PluginWorker {
                         let _ = items.send(WorkerStreamItem::Result(Err(Error::Cancelled)));
                     }
                 }
-                _ = items.closed() => {
+                () = items.closed() => {
                     request_cancellation.cancel();
                 }
                 _ = active.changed() => {}
@@ -366,7 +366,10 @@ impl PluginWorker {
         Ok(receiver)
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "shutdown is only exercised by the worker tests")
+    )]
     pub async fn stop(&self) {
         self.inner.process.lock().await.take();
     }
@@ -430,7 +433,7 @@ impl PluginWorker {
             let host = self.inner.host.clone();
             async move {
                 tokio::select! {
-                    _ = read_stdout(stdout, &writer, &pending, &host) => {},
+                    () = read_stdout(stdout, &writer, &pending, &host) => {},
                     _ = write_stdin(stdin, messages) => {},
                     _ = child.wait() => {},
                 }
@@ -453,12 +456,11 @@ async fn read_stdout(
 ) {
     let mut lines = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        let message = match serde_json::from_str::<WorkerMessage>(&line) {
-            Ok(message) => message,
-            Err(_) => {
-                tracing::warn!(plugin = %host.plugin_id, "plugin worker wrote an invalid message");
-                continue;
-            }
+        let message = if let Ok(message) = serde_json::from_str::<WorkerMessage>(&line) {
+            message
+        } else {
+            tracing::warn!(plugin = %host.plugin_id, "plugin worker wrote an invalid message");
+            continue;
         };
         match message {
             WorkerMessage::Result { id, result, error } => {
@@ -519,7 +521,7 @@ async fn read_stdout(
                                 let _ = writer.send(bytes).await;
                             }
                         }
-                        _ = async {
+                        () = async {
                             let response = match host.call(&invocation, &method, params).await {
                                 Ok(result) => encode_message(&HostMessage::HostResult { id: &id, result: &result }),
                                 Err(error) => {
@@ -652,9 +654,9 @@ impl HostContext {
                     recorded_headers.insert(name.clone(), value.clone().into());
                 }
             }
-            let recorded_body = body
-                .map(|body| serde_json::from_str(body).unwrap_or_else(|_| body.into()))
-                .unwrap_or(serde_json::Value::Null);
+            let recorded_body = body.map_or(serde_json::Value::Null, |body| {
+                serde_json::from_str(body).unwrap_or_else(|_| body.into())
+            });
             recorder
                 .request(serde_json::Value::Object(recorded_headers), &recorded_body)
                 .await?;
@@ -724,7 +726,7 @@ impl HostContext {
         });
         let request = request.timeout(Duration::from_secs(60));
         let mut response = tokio::select! {
-            _ = invocation.cancellation.cancelled() => return Err(Error::Cancelled),
+            () = invocation.cancellation.cancelled() => return Err(Error::Cancelled),
             response = request.send() => {
                 response.map_err(|_| Error::Provider("plugin network request failed".into()))?
             }
@@ -751,7 +753,7 @@ impl HostContext {
         let mut body = Vec::new();
         loop {
             let chunk = tokio::select! {
-                _ = invocation.cancellation.cancelled() => return Err(Error::Cancelled),
+                () = invocation.cancellation.cancelled() => return Err(Error::Cancelled),
                 chunk = response.chunk() => {
                     chunk.map_err(|_| Error::Provider("cannot read plugin network response".into()))?
                 }
@@ -782,7 +784,7 @@ impl HostContext {
         let (request, _, _, recorder) = self.request(invocation, &params).await?;
         let cancellation = invocation.cancellation.clone();
         let response = tokio::select! {
-            _ = cancellation.cancelled() => return Err(Error::Cancelled),
+            () = cancellation.cancelled() => return Err(Error::Cancelled),
             response = request.send() => {
                 response.map_err(|_| Error::Provider("plugin network request failed".into()))?
             }
@@ -800,23 +802,22 @@ impl HostContext {
             let mut total = 0_u64;
             loop {
                 let chunk = tokio::select! {
-                    _ = cancellation.cancelled() => {
+                    () = cancellation.cancelled() => {
                         let _ = sender.send(Err(Error::Cancelled)).await;
                         return;
                     }
                     chunk = body.next() => chunk,
                 };
                 let Some(chunk) = chunk else { break };
-                let chunk = match chunk {
-                    Ok(chunk) => chunk,
-                    Err(_) => {
-                        let _ = sender
-                            .send(Err(Error::Provider(
-                                "cannot read plugin network stream".into(),
-                            )))
-                            .await;
-                        return;
-                    }
+                let chunk = if let Ok(chunk) = chunk {
+                    chunk
+                } else {
+                    let _ = sender
+                        .send(Err(Error::Provider(
+                            "cannot read plugin network stream".into(),
+                        )))
+                        .await;
+                    return;
                 };
                 total += chunk.len() as u64;
                 if total > MAX_STREAM_BYTES {
@@ -827,11 +828,11 @@ impl HostContext {
                         .await;
                     return;
                 }
-                if let Some(recorder) = &recorder {
-                    if let Err(error) = recorder.response_chunk(&chunk).await {
-                        let _ = sender.send(Err(error.into())).await;
-                        return;
-                    }
+                if let Some(recorder) = &recorder
+                    && let Err(error) = recorder.response_chunk(&chunk).await
+                {
+                    let _ = sender.send(Err(error.into())).await;
+                    return;
                 }
                 buffered.extend_from_slice(&chunk);
                 while let Some(position) = buffered.iter().position(|byte| *byte == b'\n') {
@@ -944,8 +945,9 @@ fn recorded_network_request(
     let body = params
         .get("body")
         .and_then(serde_json::Value::as_str)
-        .map(|body| serde_json::from_str(body).unwrap_or_else(|_| body.into()))
-        .unwrap_or(serde_json::Value::Null);
+        .map_or(serde_json::Value::Null, |body| {
+            serde_json::from_str(body).unwrap_or_else(|_| body.into())
+        });
     Ok((serde_json::Value::Object(recorded_headers), body))
 }
 
@@ -1048,7 +1050,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(credentials.to_string().contains("must not contain credentials"));
+        assert!(
+            credentials
+                .to_string()
+                .contains("must not contain credentials")
+        );
 
         let projected = host
             .call(&registered, "provider.readRequest", serde_json::Value::Null)
@@ -1362,7 +1368,10 @@ mod tests {
     async fn echo_worker(
         root: &std::path::Path,
         source: &str,
-    ) -> (super::super::definition::PluginDefinitionLoader, PluginWorker) {
+    ) -> (
+        super::super::definition::PluginDefinitionLoader,
+        PluginWorker,
+    ) {
         let executable = find_bun().expect("install Bun on PATH to run plugin worker tests");
         let plugin_dir = root.join("echo");
         std::fs::create_dir_all(plugin_dir.join("assets")).unwrap();
@@ -1385,18 +1394,23 @@ mod tests {
         )
         .unwrap();
         std::fs::write(plugin_dir.join("main.ts"), source).unwrap();
-        let loader = super::super::definition::PluginDefinitionLoader::in_temporary_workspace(root)
-            .unwrap();
+        let loader =
+            super::super::definition::PluginDefinitionLoader::in_temporary_workspace(root).unwrap();
         let entry = plugin_dir.join("main.ts").canonicalize().unwrap();
         let definition = loader.load(&executable, &entry).await.unwrap();
         let plugin = super::super::catalog::PluginEntry {
             entry,
-            manifest: serde_json::from_slice(&std::fs::read(plugin_dir.join("plugin.json")).unwrap())
-                .unwrap(),
+            manifest: serde_json::from_slice(
+                &std::fs::read(plugin_dir.join("plugin.json")).unwrap(),
+            )
+            .unwrap(),
             definition,
             icon: String::new(),
         };
-        (loader.clone(), PluginWorker::new(&plugin, executable, loader))
+        (
+            loader.clone(),
+            PluginWorker::new(&plugin, executable, loader),
+        )
     }
 
     fn echo_invocation(text: &str) -> Arc<crate::model::ModelInvocation> {
@@ -1415,9 +1429,7 @@ mod tests {
                     message_id: "m1".into(),
                     role: crate::model::Role::User,
                     content: crate::model::ProjectedContent::Parts(vec![
-                        crate::model::ContentPart::Text {
-                            text: text.into(),
-                        },
+                        crate::model::ContentPart::Text { text: text.into() },
                     ]),
                 }],
             },
@@ -1495,12 +1507,7 @@ export default defineProviderPlugin({ providers: [provider] });
         );
         let temp = tempfile::tempdir().unwrap();
         let (_loader, worker) = echo_worker(temp.path(), ECHO_PLUGIN).await;
-        let events = invoke_echo(
-            &worker,
-            echo_invocation("hello"),
-            CancellationToken::new(),
-        )
-        .await;
+        let events = invoke_echo(&worker, echo_invocation("hello"), CancellationToken::new()).await;
         let text = events.iter().find_map(|event| match event {
             crate::provider::ModelEvent::TextDelta(text) => Some(text.as_str()),
             _ => None,
@@ -1522,16 +1529,8 @@ export default defineProviderPlugin({ providers: [provider] });
         );
         let temp = tempfile::tempdir().unwrap();
         let (_loader, worker) = echo_worker(temp.path(), ECHO_PLUGIN).await;
-        let first = invoke_echo(
-            &worker,
-            echo_invocation("alpha"),
-            CancellationToken::new(),
-        );
-        let second = invoke_echo(
-            &worker,
-            echo_invocation("beta"),
-            CancellationToken::new(),
-        );
+        let first = invoke_echo(&worker, echo_invocation("alpha"), CancellationToken::new());
+        let second = invoke_echo(&worker, echo_invocation("beta"), CancellationToken::new());
         let (first, second) = tokio::join!(first, second);
         let texts = |events: &[crate::provider::ModelEvent]| {
             events
@@ -1613,11 +1612,12 @@ export default defineProviderPlugin({ providers: [provider] });
     #[test]
     fn invoke_handles_are_taken_before_the_request_is_sent() {
         let pending = Arc::new(Pending::open());
-        let (guard, mut receiver, items, active) = pending
-            .register(invocation(HashSet::new()))
-            .unwrap();
+        let (guard, mut receiver, items, active) =
+            pending.register(invocation(HashSet::new())).unwrap();
         pending.remove(&guard.id);
-        let _ = items.send(WorkerStreamItem::Result(Ok(serde_json::json!({"ok": true}))));
+        let _ = items.send(WorkerStreamItem::Result(Ok(
+            serde_json::json!({"ok": true}),
+        )));
         drop(active);
         let Some(WorkerStreamItem::Result(Ok(value))) = receiver.try_recv().ok() else {
             panic!("pre-send handles must still receive the worker result");

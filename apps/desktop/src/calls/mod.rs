@@ -17,21 +17,22 @@ pub fn is_sensitive_header(name: &str) -> bool {
 }
 
 pub fn plugin_request_url(model_id: &str) -> (String, String, String) {
-    crate::plugins::parse_model_id(model_id)
-        .map(|(plugin_id, provider_id, stored_id)| {
-            (
-                stored_id.to_owned(),
-                "plugin".into(),
-                format!("plugin://{plugin_id}/{provider_id}"),
-            )
-        })
-        .unwrap_or_else(|| {
+    crate::plugins::parse_model_id(model_id).map_or_else(
+        || {
             (
                 model_id.to_owned(),
                 "plugin".into(),
                 format!("plugin://{model_id}"),
             )
-        })
+        },
+        |(plugin_id, provider_id, stored_id)| {
+            (
+                stored_id.to_owned(),
+                "plugin".into(),
+                format!("plugin://{plugin_id}/{provider_id}"),
+            )
+        },
+    )
 }
 
 #[cfg(test)]

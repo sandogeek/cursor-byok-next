@@ -44,9 +44,7 @@ fn json_number(value: f64) -> Value {
             }
         }
     }
-    serde_json::Number::from_f64(value)
-        .map(Value::Number)
-        .unwrap_or(Value::Null)
+    serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)
 }
 
 #[cfg(test)]

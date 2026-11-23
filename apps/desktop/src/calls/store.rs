@@ -241,12 +241,12 @@ impl CallStore {
         let _write = connected.writes.lock().await;
         let now = now_ms();
         sqlx::query(
-            r#"INSERT INTO llm_calls(
+            r"INSERT INTO llm_calls(
                 call_id, run_id, conversation_id, provider_call_index, model_hash,
                 provider_type, provider_url, request_type, request_url, model_id, display_name,
                 reasoning_effort, fast, status,
                 created_at_ms, request_started_at_ms, queue_ms, message_count, tool_count, detailed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, 0, ?, ?, ?)"#,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, 0, ?, ?, ?)",
         )
         .bind(&call.call_id)
         .bind(&call.run_id)
@@ -345,7 +345,7 @@ impl CallStore {
         sqlx::query("UPDATE llm_calls SET response_headers_at_ms = COALESCE(response_headers_at_ms, ?), response_headers_ms = COALESCE(response_headers_ms, ?), http_status = ? WHERE call_id = ? AND status = 'running'")
             .bind(now_ms())
             .bind(elapsed_ms)
-            .bind(http_status as i64)
+            .bind(i64::from(http_status))
             .bind(call_id)
             .execute(&connected.pool)
             .await
@@ -815,7 +815,7 @@ mod tests {
             .await
             .unwrap();
         store.set_detailed_logging(false).await.unwrap();
-        assert!(store.detailed_logging().await.unwrap() == false);
+        assert!(!store.detailed_logging().await.unwrap());
         assert!(store.llm_call("detailed").await.unwrap().unwrap().detailed);
         assert_eq!(store.storage().await.unwrap().request_count, 1);
         let snapshot = store.clear_details().await.unwrap();

@@ -61,7 +61,7 @@ fn message_completeness(message: &Message) -> i32 {
 }
 
 fn type_ref_completeness(token: Option<&TypeToken>) -> i32 {
-    token.map(TypeToken::completeness).unwrap_or(0)
+    token.map_or(0, TypeToken::completeness)
 }
 
 pub fn merge_enums_by_type_name(enums: Vec<Enum>) -> Vec<Enum> {

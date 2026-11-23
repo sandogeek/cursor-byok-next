@@ -1,4 +1,4 @@
-//! OpenAI Responses request body and SSE → ModelEvent.
+//! `OpenAI` Responses request body and SSE → `ModelEvent`.
 
 use serde_json::{Value, json};
 
@@ -71,7 +71,8 @@ impl Parser {
     }
 
     fn reconcile_text(&mut self, final_text: &str, emit: &mut dyn FnMut(ModelEvent)) {
-        if final_text.starts_with(&self.streamed_text) && final_text.len() > self.streamed_text.len()
+        if final_text.starts_with(&self.streamed_text)
+            && final_text.len() > self.streamed_text.len()
         {
             if !self.text_open {
                 self.text_open = true;
@@ -186,9 +187,8 @@ impl ProtocolParser for Parser {
                     Some("function_call") => {
                         self.saw_completed_item = true;
                         self.saw_tool = true;
-                        let snapshot = item.and_then(|item| {
-                            text(item.get("arguments").unwrap_or(&Value::Null))
-                        });
+                        let snapshot = item
+                            .and_then(|item| text(item.get("arguments").unwrap_or(&Value::Null)));
                         let args = match snapshot {
                             None => ToolArguments::None,
                             Some(snapshot) => ToolArguments::Snapshot(snapshot.to_owned()),
@@ -480,7 +480,9 @@ fn replay_items(value: &Value) -> Result<Vec<Value>> {
         .iter()
         .map(|item| {
             let source = object(item).ok_or_else(|| {
-                Error::Provider("OpenAI Responses replay state contains a non-reasoning item".into())
+                Error::Provider(
+                    "OpenAI Responses replay state contains a non-reasoning item".into(),
+                )
             })?;
             if text(source.get("type").unwrap_or(&Value::Null)) != Some("reasoning") {
                 return Err(Error::Provider(
@@ -518,7 +520,8 @@ fn update_tool(
         ended: false,
     });
     if tool.call_id.is_none() {
-        tool.call_id = item.and_then(|item| text(item.get("call_id").unwrap_or(&Value::Null)))
+        tool.call_id = item
+            .and_then(|item| text(item.get("call_id").unwrap_or(&Value::Null)))
             .map(str::to_owned);
     }
     if tool.name.is_none() {
@@ -535,8 +538,7 @@ fn update_tool(
                     "OpenAI Responses final tool arguments do not match streamed arguments".into(),
                 ));
             }
-            tool.arguments
-                .push_str(&snapshot[tool.arguments.len()..]);
+            tool.arguments.push_str(&snapshot[tool.arguments.len()..]);
         }
         ToolArguments::Snapshot(_) => {}
     }

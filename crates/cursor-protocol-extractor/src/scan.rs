@@ -135,7 +135,7 @@ struct CurrentClass {
     start: u32,
 }
 
-impl<'a> Scanner<'a> {
+impl Scanner<'_> {
     fn finish(mut self) -> BundleScan {
         self.qualify_late_prefixes();
         let compact_enums = self.scan.enums.clone();
@@ -467,7 +467,7 @@ impl<'a> Scanner<'a> {
                     if let Some(fields_expr) = call.arguments.first().and_then(argument_expr) {
                         let fields = self.extract_fields_from_expr(fields_expr);
                         if let Some(type_name) = self.class_type_name() {
-                            let type_name = type_name.to_string();
+                            let type_name = type_name;
                             self.record_message(
                                 &type_name,
                                 &var_name,
@@ -640,8 +640,7 @@ impl<'a> Scanner<'a> {
             .module_starts
             .iter()
             .find(|(_, id)| *id == module_id)
-            .map(|(start, _)| *start)
-            .unwrap_or(module_id);
+            .map_or(module_id, |(start, _)| *start);
         self.scan
             .module_imports
             .push((current, alias.to_string(), target_start));
@@ -671,7 +670,7 @@ impl<'a> Scanner<'a> {
             extends: last_segment(&extends).to_string(),
             start: class.span.start,
             end: class.span.end,
-            package_ref: package_ref.clone(),
+            package_ref,
         };
         self.compact_classes.push(compact);
 
@@ -813,7 +812,7 @@ impl<'a> Visit<'a> for Scanner<'a> {
             self.maybe_package_prefix(name, &expr.right, expr.span.start);
             match expr.right.get_inner_expression() {
                 Expression::Identifier(id) => {
-                    self.add_alias(expr.span.start, name, id.name.as_str())
+                    self.add_alias(expr.span.start, name, id.name.as_str());
                 }
                 Expression::ClassExpression(class) => self.collect_class(class, Some(name)),
                 Expression::CallExpression(call) => {
@@ -1011,8 +1010,7 @@ fn parse_methods(object: &ObjectExpression<'_>) -> Vec<Method> {
         };
         let kind = object_prop(&prop.value, "kind")
             .and_then(member_or_ident)
-            .map(|value| last_segment(&value).to_string())
-            .unwrap_or_else(|| "Unary".into());
+            .map_or_else(|| "Unary".into(), |value| last_segment(&value).to_string());
         methods.push(Method {
             name: name.to_string(),
             input_type: input,

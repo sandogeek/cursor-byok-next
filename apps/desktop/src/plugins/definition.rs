@@ -152,7 +152,7 @@ impl PluginDefinitionLoader {
 }
 
 pub(super) fn file_url(path: &Path) -> Result<url::Url> {
-    url::Url::from_file_path(path).map_err(|_| {
+    url::Url::from_file_path(path).map_err(|()| {
         Error::Config(format!(
             "plugin entry path is not a valid file URL: {}",
             path.display()

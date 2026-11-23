@@ -276,10 +276,10 @@ impl CallRecorder {
     }
 
     pub async fn event(&self, event: &ModelEvent) -> Result<()> {
-        if matches!(event, ModelEvent::Done(_)) {
-            if let ModelEvent::Done(reason) = event {
-                return self.completed(*reason).await;
-            }
+        if matches!(event, ModelEvent::Done(_))
+            && let ModelEvent::Done(reason) = event
+        {
+            return self.completed(*reason).await;
         }
         if self.is_finished() {
             return Ok(());
@@ -305,19 +305,20 @@ impl CallRecorder {
                 }
             }
         }
-        if let ModelEvent::TextDelta(delta) = event {
-            if !delta.trim().is_empty() && !lifecycle.first_text_recorded {
-                match self
-                    .inner
-                    .store
-                    .record_llm_first_text(&self.inner.call_id, elapsed_ms(self.inner.started))
-                    .await
-                {
-                    Ok(()) => lifecycle.first_text_recorded = true,
-                    Err(error) => {
-                        self.inner.store.mark_degraded();
-                        tracing::warn!(call_id = %self.inner.call_id, %error, "cannot record first LLM text");
-                    }
+        if let ModelEvent::TextDelta(delta) = event
+            && !delta.trim().is_empty()
+            && !lifecycle.first_text_recorded
+        {
+            match self
+                .inner
+                .store
+                .record_llm_first_text(&self.inner.call_id, elapsed_ms(self.inner.started))
+                .await
+            {
+                Ok(()) => lifecycle.first_text_recorded = true,
+                Err(error) => {
+                    self.inner.store.mark_degraded();
+                    tracing::warn!(call_id = %self.inner.call_id, %error, "cannot record first LLM text");
                 }
             }
         }
@@ -379,11 +380,11 @@ impl CallRecorder {
             return Ok(());
         }
         self.inner.observations.lock().await.take();
-        if let Some(writer) = self.inner.writer.lock().await.take() {
-            if let Err(error) = writer.await {
-                self.inner.store.mark_degraded();
-                tracing::warn!(call_id = %self.inner.call_id, %error, "LLM response recorder stopped unexpectedly");
-            }
+        if let Some(writer) = self.inner.writer.lock().await.take()
+            && let Err(error) = writer.await
+        {
+            self.inner.store.mark_degraded();
+            tracing::warn!(call_id = %self.inner.call_id, %error, "LLM response recorder stopped unexpectedly");
         }
         if let Err(error) = self
             .inner

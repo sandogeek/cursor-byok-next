@@ -356,7 +356,7 @@ impl CursorHarness {
                 Ok(true) => tracing::info!("quit Cursor so the proxy setting applies"),
                 Ok(false) => {}
                 Err(error) => {
-                    tracing::warn!(%error, "could not quit Cursor before applying proxy settings")
+                    tracing::warn!(%error, "could not quit Cursor before applying proxy settings");
                 }
             }
         }

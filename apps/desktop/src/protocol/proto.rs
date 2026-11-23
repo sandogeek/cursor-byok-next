@@ -1,14 +1,27 @@
 //! Includes generated Cursor protobuf types.
+//!
+//! prost output is not hand-written, so the style lints that only make sense for
+//! authored code are exempted here rather than in the crate root.
 
 pub mod agent {
-    #[allow(clippy::large_enum_variant)]
+    #[expect(
+        clippy::doc_markdown,
+        clippy::large_enum_variant,
+        clippy::struct_excessive_bools,
+        reason = "prost-generated bindings"
+    )]
     pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/agent.v1.rs"));
     }
 }
 
 pub mod inference {
-    #[allow(clippy::large_enum_variant)]
+    #[expect(
+        clippy::doc_markdown,
+        clippy::large_enum_variant,
+        clippy::struct_excessive_bools,
+        reason = "prost-generated bindings"
+    )]
     pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/aiserver.v1.rs"));
     }

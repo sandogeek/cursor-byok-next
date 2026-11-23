@@ -170,9 +170,7 @@ fn rule_meta(record: &RuleRecord) -> RuleMeta {
 }
 
 fn timestamp(created_at: &str) -> i64 {
-    chrono::DateTime::parse_from_rfc3339(created_at)
-        .map(|time| time.timestamp_millis())
-        .unwrap_or(0)
+    chrono::DateTime::parse_from_rfc3339(created_at).map_or(0, |time| time.timestamp_millis())
 }
 
 fn file_modified_at(path: &Path) -> String {

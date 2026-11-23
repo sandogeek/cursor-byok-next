@@ -64,8 +64,7 @@ pub(crate) fn project(
             let parameters = tool
                 .parameters
                 .as_ref()
-                .map(prost_struct)
-                .unwrap_or_else(|| serde_json::json!({}));
+                .map_or_else(|| serde_json::json!({}), prost_struct);
             ToolDefinition {
                 name: tool.name.clone(),
                 description: subagent_models_task_description(
@@ -105,7 +104,7 @@ pub(crate) fn project(
         {
             for (part_index, part) in content.parts.iter().enumerate() {
                 let provider_parts = parts_from_wire(&part.experimental_content)?;
-                let content = part.result.as_ref().map(prost_json).unwrap_or(Value::Null);
+                let content = part.result.as_ref().map_or(Value::Null, prost_json);
                 history.push(ProjectedMessage {
                     message_id: format!("cursor:{index}:tool:{part_index}"),
                     role: Role::Tool,
@@ -136,8 +135,7 @@ pub(crate) fn project(
                         None => call
                             .args
                             .as_ref()
-                            .map(prost_struct)
-                            .unwrap_or_else(|| serde_json::json!({})),
+                            .map_or_else(|| serde_json::json!({}), prost_struct),
                     };
                     Ok(ToolCallContent {
                         index,
@@ -287,7 +285,7 @@ fn parts_from_wire(parts: &[pb::InferenceContentPart]) -> Result<Vec<ContentPart
 fn image_data(value: &str, fallback_mime: Option<&str>) -> Result<(String, Vec<u8>)> {
     let (mime_type, encoded) = if let Some((metadata, data)) = value
         .strip_prefix("data:")
-        .and_then(|value| value.split_once(","))
+        .and_then(|value| value.split_once(','))
     {
         (metadata.trim_end_matches(";base64"), data)
     } else {
@@ -302,7 +300,7 @@ fn image_data(value: &str, fallback_mime: Option<&str>) -> Result<(String, Vec<u
 fn file_data(value: &str, fallback_mime: &str) -> Result<(String, Vec<u8>)> {
     let (mime_type, encoded) = if let Some((metadata, data)) = value
         .strip_prefix("data:")
-        .and_then(|value| value.split_once(","))
+        .and_then(|value| value.split_once(','))
     {
         (metadata.trim_end_matches(";base64"), data)
     } else {

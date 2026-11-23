@@ -63,9 +63,10 @@ impl Config {
 }
 
 pub fn default_database_path() -> PathBuf {
-    dirs::home_dir()
-        .map(|home| home.join(".cursor-byok-next").join(DEFAULT_DATABASE_NAME))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_DATABASE_NAME))
+    dirs::home_dir().map_or_else(
+        || PathBuf::from(DEFAULT_DATABASE_NAME),
+        |home| home.join(".cursor-byok-next").join(DEFAULT_DATABASE_NAME),
+    )
 }
 
 pub fn browser_address(address: &str) -> String {
@@ -82,7 +83,7 @@ pub fn browser_address(address: &str) -> String {
 
 pub fn validate_loopback_address(address: &str) -> Result<(), Error> {
     let (host, _) = split_host_port(address)
-        .map_err(|_| Error::Config(format!("调试服务监听地址无效：{address}")))?;
+        .map_err(|()| Error::Config(format!("调试服务监听地址无效：{address}")))?;
     if host.eq_ignore_ascii_case("localhost") {
         return Ok(());
     }

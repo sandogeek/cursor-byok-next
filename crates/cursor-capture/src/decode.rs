@@ -588,17 +588,17 @@ pub fn decode_http_content(payload: &[u8], codec: &str) -> Result<Vec<u8>, Strin
 
 pub fn normalized_media_type(content_type: &str) -> String {
     let trimmed = content_type.trim();
-    trimmed
-        .parse::<mime::Mime>()
-        .map(|mime| mime.essence_str().to_ascii_lowercase())
-        .unwrap_or_else(|_| {
+    trimmed.parse::<mime::Mime>().map_or_else(
+        |_| {
             trimmed
                 .split(';')
                 .next()
                 .unwrap_or_default()
                 .trim()
                 .to_ascii_lowercase()
-        })
+        },
+        |mime| mime.essence_str().to_ascii_lowercase(),
+    )
 }
 
 pub fn is_proto_content_type(content_type: &str) -> bool {

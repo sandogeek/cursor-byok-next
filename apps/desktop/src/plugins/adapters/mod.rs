@@ -26,8 +26,8 @@ use crate::{
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const REQUEST_TIMEOUT: Duration = Duration::from_hours(1);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,9 +70,8 @@ pub(super) async fn stream(
     invocation: &InvocationState,
     params: Value,
 ) -> Result<Value> {
-    let input: ProtocolStreamInput = serde_json::from_value(params).map_err(|error| {
-        Error::Protocol(format!("invalid protocol.stream params: {error}"))
-    })?;
+    let input: ProtocolStreamInput = serde_json::from_value(params)
+        .map_err(|error| Error::Protocol(format!("invalid protocol.stream params: {error}")))?;
     let protocol = ProtocolKind::parse(&input.protocol)?;
     let model = invocation.model()?;
     let tool_names = ToolNames::new(model);
@@ -149,7 +148,7 @@ async fn send_cancellable(
     cancellation: &CancellationToken,
 ) -> Result<reqwest::Response> {
     tokio::select! {
-        _ = cancellation.cancelled() => Err(Error::Cancelled),
+        () = cancellation.cancelled() => Err(Error::Cancelled),
         () = tokio::time::sleep(REQUEST_TIMEOUT) => Err(Error::Provider(format!(
             "plugin network request timed out after {} seconds",
             REQUEST_TIMEOUT.as_secs()
@@ -172,8 +171,8 @@ async fn read_error_body(
     let mut body = Vec::new();
     while body.len() < MAX_ERROR_BODY_BYTES {
         let chunk = tokio::select! {
-            _ = cancellation.cancelled() => return Err(Error::Cancelled),
-            _ = tokio::time::sleep_until(deadline) => break,
+            () = cancellation.cancelled() => return Err(Error::Cancelled),
+            () = tokio::time::sleep_until(deadline) => break,
             chunk = response.chunk() => match chunk {
                 Ok(chunk) => chunk,
                 Err(_) => break,
@@ -202,7 +201,7 @@ async fn read_sse(
     let mut total = 0_u64;
     loop {
         let chunk = tokio::select! {
-            _ = cancellation.cancelled() => return Err(Error::Cancelled),
+            () = cancellation.cancelled() => return Err(Error::Cancelled),
             () = tokio::time::sleep(STREAM_IDLE_TIMEOUT) => {
                 return Err(Error::Provider(format!(
                     "plugin network stream idle timeout: no events received for {} seconds",
@@ -355,7 +354,9 @@ fn parse_object(payload: &str, label: &str) -> Result<Value> {
     match serde_json::from_str::<Value>(payload) {
         Ok(Value::Object(map)) => Ok(Value::Object(map)),
         Ok(_) => Ok(Value::Object(serde_json::Map::new())),
-        Err(_) => Err(Error::Provider(format!("{label} SSE returned invalid JSON"))),
+        Err(_) => Err(Error::Provider(format!(
+            "{label} SSE returned invalid JSON"
+        ))),
     }
 }
 
@@ -443,7 +444,7 @@ fn truncated_call_id(call_id: &str) -> &str {
     }
 }
 
-/// OpenAI accepts `^[a-zA-Z0-9_-]{1,64}$`; Anthropic accepts a longer but
+/// `OpenAI` accepts `^[a-zA-Z0-9_-]{1,64}$`; Anthropic accepts a longer but
 /// equally character-restricted pattern. 64 satisfies both.
 const MAX_TOOL_NAME_CHARS: usize = 64;
 const TOOL_NAME_HASH_CHARS: usize = 7;
@@ -561,9 +562,9 @@ fn merge_extra_params(body: &mut Value, extra: &Value) -> Result<()> {
     if extra.is_empty() {
         return Ok(());
     }
-    let body = body.as_object_mut().ok_or_else(|| {
-        Error::Provider("provider request body must be an object".into())
-    })?;
+    let body = body
+        .as_object_mut()
+        .ok_or_else(|| Error::Provider("provider request body must be an object".into()))?;
     for (name, value) in extra {
         if matches!(
             name.as_str(),
@@ -592,18 +593,12 @@ fn apply_openai_prompt_cache_key(body: &mut Value, model_id: &str, conversation_
         return;
     }
     if let Some(object) = body.as_object_mut() {
-        object.insert(
-            "prompt_cache_key".into(),
-            conversation_id.to_owned().into(),
-        );
+        object.insert("prompt_cache_key".into(), conversation_id.to_owned().into());
     }
 }
 
 #[cfg(test)]
-fn collect_events(
-    parser: &mut dyn ProtocolParser,
-    payloads: &[&str],
-) -> Result<Vec<ModelEvent>> {
+fn collect_events(parser: &mut dyn ProtocolParser, payloads: &[&str]) -> Result<Vec<ModelEvent>> {
     let mut events = Vec::new();
     for payload in payloads {
         if parser.push_data(payload, "", &mut |event| events.push(event))? {
@@ -720,7 +715,9 @@ mod tests {
         invocation.request.history = vec![ProjectedMessage {
             message_id: "m1".into(),
             role: Role::Tool,
-            content: ProjectedContent::Parts(vec![ContentPart::Text { text: "oops".into() }]),
+            content: ProjectedContent::Parts(vec![ContentPart::Text {
+                text: "oops".into(),
+            }]),
         }];
         invocation
     }
@@ -934,7 +931,10 @@ mod tests {
         assert_eq!(chat["top_p"], 0.9);
         invocation.request.model.extra_params = serde_json::json!({ "messages": [] });
         let error = super::chat::build_body("gpt-4.1", &invocation, &names()).unwrap_err();
-        assert_eq!(error.to_string(), "model extra params cannot replace messages");
+        assert_eq!(
+            error.to_string(),
+            "model extra params cannot replace messages"
+        );
         invocation.request.model.extra_params = serde_json::json!({ "stop": [] });
         let error = super::chat::build_body("gpt-4.1", &invocation, &names()).unwrap_err();
         assert_eq!(error.to_string(), "model extra params cannot replace stop");

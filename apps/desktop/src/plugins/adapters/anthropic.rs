@@ -1,4 +1,4 @@
-//! Anthropic Messages request body and SSE → ModelEvent.
+//! Anthropic Messages request body and SSE → `ModelEvent`.
 
 use serde_json::{Value, json};
 
@@ -167,9 +167,10 @@ impl ProtocolParser for Parser {
                         emit(ModelEvent::ThinkingStart);
                     }
                     "redacted_thinking" => {
-                        let data = text(block.get("data").unwrap_or(&Value::Null)).ok_or_else(
-                            || Error::Provider("Anthropic event is missing data".into()),
-                        )?;
+                        let data =
+                            text(block.get("data").unwrap_or(&Value::Null)).ok_or_else(|| {
+                                Error::Provider("Anthropic event is missing data".into())
+                            })?;
                         self.thinking_blocks
                             .push(json!({ "type": "redacted_thinking", "data": data }));
                         emit(ModelEvent::RedactedThinking(data.to_owned()));
@@ -200,12 +201,13 @@ impl ProtocolParser for Parser {
                     .cloned()
                     .unwrap_or_default();
                 let delta_kind = required_type(&delta)?;
-                if !self.block_types.contains_key(&index) {
+                if let std::collections::btree_map::Entry::Vacant(e) = self.block_types.entry(index)
+                {
                     if delta_kind == "text_delta" {
-                        self.block_types.insert(index, "text".into());
+                        e.insert("text".into());
                         emit(ModelEvent::TextStart);
                     } else if delta_kind == "thinking_delta" || delta_kind == "signature_delta" {
-                        self.block_types.insert(index, "thinking".into());
+                        e.insert("thinking".into());
                         self.thinking_text.insert(index, String::new());
                         self.thinking_signatures.insert(index, String::new());
                         emit(ModelEvent::ThinkingStart);
@@ -339,10 +341,10 @@ pub(super) fn build_body(
                             "input_schema": tool.parameters,
                         });
                         if index + 1 == request.prompt.tools.len() {
-                            value.as_object_mut().unwrap().insert(
-                                "cache_control".into(),
-                                json!({ "type": "ephemeral" }),
-                            );
+                            value
+                                .as_object_mut()
+                                .unwrap()
+                                .insert("cache_control".into(), json!({ "type": "ephemeral" }));
                         }
                         value
                     })
@@ -446,7 +448,8 @@ fn replay_blocks(value: &Value) -> Vec<Value> {
 
 fn push_anthropic(output: &mut Vec<Value>, role: &str, content: Vec<Value>) {
     if let Some(last) = output.last_mut()
-        && object(last).is_some_and(|last| text(last.get("role").unwrap_or(&Value::Null)) == Some(role))
+        && object(last)
+            .is_some_and(|last| text(last.get("role").unwrap_or(&Value::Null)) == Some(role))
         && let Some(existing) = last
             .as_object_mut()
             .and_then(|last| last.get_mut("content"))
@@ -538,12 +541,11 @@ fn mark_cache_breakpoint(messages: &mut [Value]) {
             let Some(block) = block.as_object_mut() else {
                 continue;
             };
-            match text(block.get("type").unwrap_or(&Value::Null)) {
-                Some("text" | "image" | "document" | "tool_result") => {
-                    block.insert("cache_control".into(), json!({ "type": "ephemeral" }));
-                    return;
-                }
-                _ => {}
+            if let Some("text" | "image" | "document" | "tool_result") =
+                text(block.get("type").unwrap_or(&Value::Null))
+            {
+                block.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+                return;
             }
         }
     }
@@ -610,7 +612,8 @@ fn merge_usage(total: &mut UsageState, update: UsageState) {
     total.output_tokens = merge_usage_field(total.output_tokens, update.output_tokens);
     total.total_tokens = merge_usage_field(total.total_tokens, update.total_tokens);
     total.cache_read_tokens = merge_usage_field(total.cache_read_tokens, update.cache_read_tokens);
-    total.cache_write_tokens = merge_usage_field(total.cache_write_tokens, update.cache_write_tokens);
+    total.cache_write_tokens =
+        merge_usage_field(total.cache_write_tokens, update.cache_write_tokens);
     let context = total.input_tokens.map(|input| {
         input.saturating_add(total.cache_read_tokens.unwrap_or(0))
             + total.cache_write_tokens.unwrap_or(0)

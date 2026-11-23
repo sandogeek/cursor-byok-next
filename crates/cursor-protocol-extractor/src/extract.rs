@@ -156,8 +156,7 @@ fn unique_temp_dir(parent: &Path, output_dir: &Path) -> Result<PathBuf, ExtractE
         .unwrap_or("protos");
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_nanos());
     for attempt in 0..32 {
         let candidate = parent.join(format!(".{stem}.tmp.{nanos}.{attempt}"));
         match fs::create_dir(&candidate) {

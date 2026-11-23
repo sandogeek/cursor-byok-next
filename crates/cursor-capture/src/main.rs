@@ -1,5 +1,11 @@
 //! Process entry for the Cursor API protocol debugger.
 
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a CLI reports its address and errors on the terminal"
+)]
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 

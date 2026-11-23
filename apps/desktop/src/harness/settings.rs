@@ -32,12 +32,10 @@ impl SettingsStore {
         let path = match std::env::consts::OS {
             "macos" => home.join("Library/Application Support/Cursor/User/settings.json"),
             "windows" => std::env::var_os("APPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join("AppData/Roaming"))
+                .map_or_else(|| home.join("AppData/Roaming"), PathBuf::from)
                 .join("Cursor/User/settings.json"),
             "linux" => std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".config"))
+                .map_or_else(|| home.join(".config"), PathBuf::from)
                 .join("Cursor/User/settings.json"),
             platform => {
                 return Err(Error::Config(format!(

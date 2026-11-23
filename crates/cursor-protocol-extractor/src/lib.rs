@@ -1,6 +1,11 @@
 //! Extract Cursor local-loop protobuf schemas from installed JS bundles.
 
-#![allow(clippy::collapsible_if, clippy::get_first, clippy::too_many_arguments)]
+#![expect(
+    clippy::collapsible_if,
+    clippy::get_first,
+    clippy::too_many_arguments,
+    reason = "the extractor mirrors the shape of the Cursor bundle it parses"
+)]
 
 mod ast_util;
 mod compact;

@@ -412,7 +412,7 @@ fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
         client_display_name: Some(model.display_name.clone()),
         server_model_name: Some(model.id.clone()),
         supports_non_max_mode: Some(true),
-        tooltip_data_for_max_mode: Some(tooltip.clone()),
+        tooltip_data_for_max_mode: Some(tooltip),
         is_recommended_for_background_composer: Some(false),
         supports_plan_mode: Some(true),
         inputbox_short_model_name: Some(model.display_name.clone()),

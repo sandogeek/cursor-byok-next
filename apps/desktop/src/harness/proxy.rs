@@ -168,8 +168,7 @@ impl HttpHandler for CursorRelay {
             };
             let path = original
                 .path_and_query()
-                .map(|value| value.as_str())
-                .unwrap_or("/");
+                .map_or("/", axum::http::uri::PathAndQuery::as_str);
             let Ok(uri) = format!("http://{backend}{path}").parse::<Uri>() else {
                 return bad_gateway("could not build the local Cursor backend URL");
             };

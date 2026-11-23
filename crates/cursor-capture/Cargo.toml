@@ -2,8 +2,12 @@
 name = "cursor-capture"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 publish = false
 description = "Capture and inspect Cursor API traffic with the original debug UI"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "cursor-capture"

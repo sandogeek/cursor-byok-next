@@ -42,10 +42,16 @@ pub struct ResourceDefinition {
     #[serde(default)]
     pub add: Vec<AddMethodDefinition>,
     #[serde(default)]
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "kept in the wire schema; import flow is not ported yet"
+    )]
     pub import: Option<ImportDefinition>,
     #[serde(default)]
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "kept in the wire schema; action flow is not ported yet"
+    )]
     pub actions: Vec<ResourceActionDefinition>,
     pub can_refresh: bool,
     pub can_remove: bool,

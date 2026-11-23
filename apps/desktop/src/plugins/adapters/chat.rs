@@ -1,4 +1,4 @@
-//! OpenAI Chat Completions request body and SSE → ModelEvent.
+//! `OpenAI` Chat Completions request body and SSE → `ModelEvent`.
 
 use serde_json::{Value, json};
 
@@ -87,7 +87,8 @@ impl ProtocolParser for Parser {
             self.reasoning.push_str(reasoning_delta);
             emit(ModelEvent::ThinkingDelta(reasoning_delta.to_owned()));
         }
-        if let Some(content) = delta.and_then(|delta| text(delta.get("content").unwrap_or(&Value::Null)))
+        if let Some(content) =
+            delta.and_then(|delta| text(delta.get("content").unwrap_or(&Value::Null)))
         {
             if self.thinking_open {
                 self.thinking_open = false;
@@ -99,7 +100,8 @@ impl ProtocolParser for Parser {
             }
             emit(ModelEvent::TextDelta(content.to_owned()));
         }
-        if let Some(tool_calls) = delta.and_then(|delta| delta.get("tool_calls").and_then(Value::as_array))
+        if let Some(tool_calls) =
+            delta.and_then(|delta| delta.get("tool_calls").and_then(Value::as_array))
         {
             for (position, raw_tool) in tool_calls.iter().enumerate() {
                 let Some(tool_delta) = object(raw_tool) else {
@@ -113,9 +115,11 @@ impl ProtocolParser for Parser {
                 for event in update_tool(
                     index,
                     tool_delta.get("id").and_then(text),
-                    function.and_then(|function| text(function.get("name").unwrap_or(&Value::Null))),
                     function
-                        .and_then(|function| text(function.get("arguments").unwrap_or(&Value::Null))),
+                        .and_then(|function| text(function.get("name").unwrap_or(&Value::Null))),
+                    function.and_then(|function| {
+                        text(function.get("arguments").unwrap_or(&Value::Null))
+                    }),
                     &mut self.tools,
                     &self.tool_names,
                 ) {
@@ -319,7 +323,10 @@ pub(super) fn build_body(
 }
 
 fn chat_content(parts: &[ContentPart]) -> Result<Value> {
-    if parts.iter().all(|part| matches!(part, ContentPart::Text { .. })) {
+    if parts
+        .iter()
+        .all(|part| matches!(part, ContentPart::Text { .. }))
+    {
         return Ok(Value::String(
             parts
                 .iter()
@@ -425,7 +432,7 @@ fn event_error(value: &Value) -> Option<String> {
     object(error.unwrap_or(&Value::Null))
         .and_then(|error| text(error.get("message").unwrap_or(&Value::Null)).map(str::to_owned))
         .or_else(|| text(value.get("message").unwrap_or(&Value::Null)).map(str::to_owned))
-        .or_else(|| error.map(|error| error.to_string()))
+        .or_else(|| error.map(std::string::ToString::to_string))
 }
 
 fn chat_usage(value: &Value) -> ModelEvent {

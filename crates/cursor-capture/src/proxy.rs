@@ -311,7 +311,7 @@ async fn proxy(State(server): State<Arc<Server>>, request: Request<Body>) -> Res
             let content_type = header_value(&headers, "content-type");
             let codec = response_content_codec(&path, &headers);
             server.store.update(&id, |exchange| {
-                exchange.summary.status = status.as_u16() as i32;
+                exchange.summary.status = i32::from(status.as_u16());
                 exchange.summary.state = "streaming".into();
                 exchange.summary.duration_ms = elapsed_ms(exchange.summary.started_at);
                 exchange.response.headers = sorted_headers(&headers);
@@ -337,8 +337,7 @@ fn rewrite_upstream(upstream: &Url, request: Request<Body>) -> Result<Request<Bo
     let path_and_query = parts
         .uri
         .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or("/");
+        .map_or("/", http::uri::PathAndQuery::as_str);
     parts.uri = outgoing_uri(upstream, path_and_query)?;
     strip_hop_by_hop(&mut parts.headers);
     parts.headers.remove("x-forwarded-for");
