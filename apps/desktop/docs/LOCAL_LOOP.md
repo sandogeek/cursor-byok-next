@@ -56,7 +56,7 @@ Local serve()
 └── ResolveSubagentModels → 已配置 Magpie hash
 ```
 
-`Plugins::new` / `Harness::new` 共用一个 `PluginHost`。backend 绑 `127.0.0.1:0` 后 `set_backend_addr`。App.test.tsx 走 mock host，不启真实 backend。
+`Plugins::new` / `Harness::new` 共用一个 `PluginHost`。同步构造运行在引擎线程，没有 Tokio 上下文，不启动异步任务；首次 `snapshot()` / `status()` / `set_enabled()` 启动 backend。backend 绑 `127.0.0.1:0` 后 `set_backend_addr`。App.test.tsx 走 mock host，不启真实 backend。
 
 ## 差异清单
 
@@ -75,6 +75,7 @@ Local serve()
 | 11 | 断流生命周期 | 只移除路由 | 最后读流断开保留 300s 重连；超时取消所有子 invocation、关闭输出并释放重放历史 | 客户端异常断开后不能继续消耗模型额度；短暂断线仍可恢复同一 Run |
 | 12 | 文件附件 | 拒绝 `InferenceFilePart` | 保留 bytes / media type / filename；Responses 发 `input_file`，Chat 仅 PDF，Messages 仅 PDF 或 `text/*` | 按 provider 协议支持范围透传，不把未知二进制伪装成图片或文本；不支持的类型明确报错 |
 | 13 | 标准协议请求 | invoke 时构造 SDK `LlmRequest` JSON 并塞进 Bun | 标准路径不构造 SDK JSON；适配器直接读 `ModelInvocation`；自定义插件显式 `readRequest()` | 见 `LOCAL_LOOP_REQUEST_PRD.md`：长历史和附件不再为了选端点而序列化进 Bun |
+| 14 | 后端启动 | Tokio 应用启动阶段创建 | 同步构造只建共享状态；异步成员用当前 runtime 启动，`Idle → Starting → Running`；失败或 panic 回 `Idle` | nsh 引擎线程不在 Tokio 上下文中；直接 `spawn` 会 panic 并毒化锁，失败必须能被后续状态刷新重试 |
 
 ## 必须保持的不变量
 
@@ -91,6 +92,7 @@ Local serve()
 11. `NetworkService/IsConnected` 必须空 proto 成功，否则 Cursor 会当断网并取消在途生成。
 12. 多个读流订阅并存时不能互相取消；只有最后一个订阅断开且超过重连宽限期，才允许取消整个 Run。
 13. Run 正常结束仍保留末帧供迟到的读流重放；超时断开则关闭输出并释放历史，不能留下可重连的空 Run。
+14. backend 只在 Tokio 上下文内启动，并发调用只能有一个启动任务；启动失败或任务 panic 必须回到 `Idle` 并唤醒地址等待者，不能永久卡住后续重试。
 
 ## 刻意不做
 

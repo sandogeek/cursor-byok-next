@@ -151,9 +151,6 @@ impl Harness {
     /// Restores the proxy port and the on/off intent of the previous run.
     pub fn new() -> Result<Self, HarnessError> {
         let paths = HarnessPaths::managed(DEFAULT_PROXY_PORT)?;
-        if let Ok(host) = shared_plugin_host() {
-            start_backend(host);
-        }
         Ok(Self {
             inner: Arc::new(CursorHarness::new(paths)),
             backend: backend_addr(),
@@ -555,7 +552,6 @@ impl Plugins {
     /// Restores installed plugins and looks for Bun on PATH.
     pub fn new() -> Result<Self, plugins::Error> {
         let inner = shared_plugin_host()?;
-        start_backend(inner.clone());
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -563,11 +559,9 @@ impl Plugins {
 
     /// The current plugin snapshot, including Magpie models when a gateway exists.
     pub async fn snapshot(this: Instance<Self>) -> Result<PluginSnapshot, plugins::Error> {
-        Ok(this
-            .with(|plugins| plugins.inner.clone())
-            .snapshot()
-            .await
-            .into())
+        let inner = this.with(|plugins| plugins.inner.clone());
+        start_backend((*inner).clone());
+        Ok(inner.snapshot().await.into())
     }
 
     /// Submits a plugin form. Magpie uses this to save a gateway.
@@ -970,17 +964,36 @@ fn shared_plugin_host() -> std::result::Result<PluginHost, plugins::Error> {
 
 struct BackendWatch {
     sender: watch::Sender<Option<String>>,
-    started: Mutex<bool>,
+    state: Mutex<BackendState>,
 }
 
-fn backend_watch() -> &'static BackendWatch {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackendState {
+    Idle,
+    Starting,
+    Running,
+}
+
+fn backend_watch() -> &'static Arc<BackendWatch> {
     BACKEND.get_or_init(|| {
         let (sender, _) = watch::channel(None);
-        BackendWatch {
+        Arc::new(BackendWatch {
             sender,
-            started: Mutex::new(false),
-        }
+            state: Mutex::new(BackendState::Idle),
+        })
     })
+}
+
+fn backend_state(watch: &BackendWatch) -> std::sync::MutexGuard<'_, BackendState> {
+    match watch.state.lock() {
+        Ok(state) => state,
+        Err(poisoned) => {
+            let state = poisoned.into_inner();
+            watch.state.clear_poison();
+            tracing::warn!("recovered a poisoned local loop backend state lock");
+            state
+        }
+    }
 }
 
 fn backend_addr() -> watch::Receiver<Option<String>> {
@@ -988,23 +1001,46 @@ fn backend_addr() -> watch::Receiver<Option<String>> {
 }
 
 fn start_backend(plugins: PluginHost) {
-    let watch = backend_watch();
-    let mut started = watch.started.lock().expect("backend start lock");
-    if *started {
+    start_backend_on(
+        backend_watch().clone(),
+        Backend::start(plugins, shared_call_store()),
+    );
+}
+
+fn start_backend_on(
+    watch: Arc<BackendWatch>,
+    start: impl std::future::Future<Output = Result<Backend>> + Send + 'static,
+) {
+    // Synchronous members run on the engine thread; an async member retries later.
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!("the local loop backend waits for a runtime");
         return;
+    };
+    {
+        let mut state = backend_state(&watch);
+        if *state != BackendState::Idle {
+            return;
+        }
+        *state = BackendState::Starting;
     }
-    *started = true;
-    let sender = watch.sender.clone();
-    let calls = shared_call_store();
-    tokio::spawn(async move {
-        match Backend::start(plugins, calls).await {
-            Ok(backend) => {
+    let starting = runtime.spawn(start);
+    runtime.spawn(async move {
+        match starting.await {
+            Ok(Ok(backend)) => {
                 let addr = backend.addr().to_string();
-                let _ = sender.send(Some(addr));
+                *backend_state(&watch) = BackendState::Running;
+                watch.sender.send_replace(Some(addr));
                 std::mem::forget(backend);
             }
-            Err(error) => {
+            Ok(Err(error)) => {
+                *backend_state(&watch) = BackendState::Idle;
+                watch.sender.send_replace(None);
                 tracing::error!(%error, "cannot start the local loop backend");
+            }
+            Err(error) => {
+                *backend_state(&watch) = BackendState::Idle;
+                watch.sender.send_replace(None);
+                tracing::error!(%error, "local loop backend startup task failed");
             }
         }
     });
@@ -1014,6 +1050,11 @@ async fn attach_backend(
     harness: &CursorHarness,
     backend: &mut watch::Receiver<Option<String>>,
 ) -> std::result::Result<(), HarnessError> {
+    if backend.borrow().is_none()
+        && let Ok(host) = shared_plugin_host()
+    {
+        start_backend(host);
+    }
     if backend.borrow().is_none() {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), backend.changed()).await;
     }
@@ -1029,7 +1070,7 @@ async fn attach_backend(
 
 static PLUGIN_HOST: OnceLock<PluginHost> = OnceLock::new();
 static CALL_STORE: OnceLock<CallStore> = OnceLock::new();
-static BACKEND: OnceLock<BackendWatch> = OnceLock::new();
+static BACKEND: OnceLock<Arc<BackendWatch>> = OnceLock::new();
 
 fn shared_call_store() -> CallStore {
     if let Some(store) = CALL_STORE.get() {
@@ -1085,5 +1126,133 @@ impl Counter {
     #[getter]
     pub fn count(&self) -> u32 {
         self.count
+    }
+}
+
+#[cfg(test)]
+mod backend_lifecycle_tests {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use tokio::sync::{Notify, watch};
+
+    use super::{BackendState, backend_state, start_backend_on};
+    use crate::{Result, backend::Backend};
+
+    fn isolated_watch() -> Arc<super::BackendWatch> {
+        let (sender, _) = watch::channel(None);
+        Arc::new(super::BackendWatch {
+            sender,
+            state: Mutex::new(BackendState::Idle),
+        })
+    }
+
+    async fn wait_for_state(watch: &super::BackendWatch, expected: BackendState) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if *backend_state(watch) == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("backend did not reach {expected:?}"));
+    }
+
+    async fn wait_for_attempts(attempts: &AtomicUsize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while attempts.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("backend startup future was not polled");
+    }
+
+    #[test]
+    fn startup_outside_a_runtime_stays_idle() {
+        let watch = isolated_watch();
+        let started = Arc::new(AtomicUsize::new(0));
+        let attempts = started.clone();
+        start_backend_on(watch.clone(), async move {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<Backend>>().await
+        });
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+        assert_eq!(*backend_state(&watch), BackendState::Idle);
+    }
+
+    #[tokio::test]
+    async fn concurrent_calls_start_only_once() {
+        let watch = isolated_watch();
+        let release = Arc::new(Notify::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let release = release.clone();
+            let attempts = attempts.clone();
+            start_backend_on(watch.clone(), async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
+                std::future::pending::<Result<Backend>>().await
+            });
+        }
+        wait_for_state(&watch, BackendState::Starting).await;
+        wait_for_attempts(&attempts).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(*watch.sender.borrow(), None);
+    }
+
+    #[tokio::test]
+    async fn startup_failure_wakes_waiters_and_allows_a_retry() {
+        let watch = isolated_watch();
+        let mut receiver = watch.sender.subscribe();
+        start_backend_on(watch.clone(), async {
+            Err(crate::Error::Protocol("injected startup failure".into()))
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), receiver.changed())
+            .await
+            .expect("startup failure must wake the status waiter")
+            .unwrap();
+        assert_eq!(*receiver.borrow(), None);
+        assert_eq!(*backend_state(&watch), BackendState::Idle);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let retried = attempts.clone();
+        start_backend_on(watch.clone(), async move {
+            retried.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<Backend>>().await
+        });
+        wait_for_state(&watch, BackendState::Starting).await;
+        wait_for_attempts(&attempts).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_panic_also_allows_a_retry() {
+        let watch = isolated_watch();
+        start_backend_on(watch.clone(), async {
+            panic!("injected startup panic");
+        });
+        wait_for_state(&watch, BackendState::Idle).await;
+        start_backend_on(watch.clone(), std::future::pending::<Result<Backend>>());
+        wait_for_state(&watch, BackendState::Starting).await;
+    }
+
+    #[test]
+    fn a_poisoned_state_lock_is_recovered() {
+        let watch = isolated_watch();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let watch = watch.clone();
+            move || {
+                let _state = watch.state.lock().unwrap();
+                panic!("injected state lock poison");
+            }
+        }));
+        assert!(watch.state.is_poisoned());
+        assert_eq!(*backend_state(&watch), BackendState::Idle);
+        assert!(!watch.state.is_poisoned());
     }
 }
