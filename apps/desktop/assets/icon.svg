@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1024" height="1024" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="tile" x2="0.75" y2="1">
+      <stop stop-color="#223B69"/><stop offset="1" stop-color="#10182F"/>
+    </linearGradient>
+    <linearGradient id="silk" x1="0" y1="0" x2="0.85" y2="1">
+      <stop stop-color="#CAFBF5"/><stop offset=".48" stop-color="#68DBF5"/><stop offset="1" stop-color="#4983F1"/>
+    </linearGradient>
+    <linearGradient id="tail" x2="0.3" y2="1">
+      <stop stop-color="#758DFC"/><stop offset="1" stop-color="#BBA7FA"/>
+    </linearGradient>
+    <g id="wing">
+      <path d="M125 137C113 109 87 78 55 62Q48 59 49 70L55 109Q59 129 76 135Q94 141 125 137Z" fill="url(#silk)"/>
+      <path d="M55 76Q84 93 118 132Q83 109 62 103Z" fill="#E0FFFC" opacity=".42"/>
+      <path d="M123 143Q103 146 83 142Q66 153 74 171Q79 181 88 181Q89 190 84 201Q98 196 104 182Q120 173 123 143Z" fill="url(#tail)"/>
+    </g>
+  </defs>
+  <rect x="19" y="19" width="218" height="218" rx="51" fill="url(#tile)"/>
+  <g transform="rotate(-8 128 128)">
+    <use xlink:href="#wing"/>
+    <use xlink:href="#wing" transform="translate(256 0) scale(-1 1)"/>
+  </g>
+</svg>

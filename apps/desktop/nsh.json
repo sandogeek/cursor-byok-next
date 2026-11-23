@@ -3,6 +3,7 @@
   "id": "dev.cursorbyoknext.app",
   "version": "1.0.0",
   "build": 1,
+  "icon": "assets/icon.png",
   "rust": ".",
   "locales": ["zh-CN", "en-US"],
   "capabilities": {
