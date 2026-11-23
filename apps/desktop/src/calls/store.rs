@@ -1131,6 +1131,6 @@ mod tests {
         std::fs::write(&path, b"not a database").unwrap();
         let snapshot = store.snapshot(20).await;
         assert!(snapshot.degraded);
-        assert!(snapshot.calls.is_empty());
+        assert_eq!(snapshot.calls, Vec::<LlmCallSummary>::new());
     }
 }

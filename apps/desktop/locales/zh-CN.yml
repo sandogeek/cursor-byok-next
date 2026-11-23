@@ -98,8 +98,8 @@ plugins:
     title: 模型目录
     count: "%{count} 个模型 · %{note}"
     stale: 部分目录可能不是最新
-    local: 仅本页可见
-    empty: 连接网关并刷新后，Magpie 模型会出现在这里。Cursor 选择器暂不接入。
+    local: 已加入 Cursor 模型选择器
+    empty: 连接网关并刷新后，Magpie 模型会出现在这里，并加入 Cursor 的模型选择器。
   form:
     required: 请填写%{field}
   dialog:

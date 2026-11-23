@@ -1115,7 +1115,7 @@ mod tests {
             .unwrap();
         assert!(matches!(route, InferenceRoute::Upstream));
         let snapshot = store.snapshot(200).await;
-        assert!(snapshot.calls.is_empty());
+        assert_eq!(snapshot.calls, Vec::<crate::calls::LlmCallSummary>::new());
         assert_eq!(snapshot.storage.call_count, 0);
     }
 

@@ -98,8 +98,8 @@ plugins:
     title: Model catalog
     count: "%{count} models · %{note}"
     stale: some entries may be outdated
-    local: shown on this page only
-    empty: Models appear here once a gateway is connected and refreshed. Cursor's picker does not use them yet.
+    local: also in Cursor's model picker
+    empty: Models appear here once a gateway is connected and refreshed, and Cursor's picker adds them too.
   form:
     required: "%{field} is required"
   dialog:

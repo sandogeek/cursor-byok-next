@@ -530,7 +530,7 @@ message Other {
 #[test]
 fn scan_records_oxc_parse_errors() {
     let scan = scan_source("var x = {;");
-    assert!(!scan.diagnostics.parse_errors.is_empty());
+    assert_ne!(scan.diagnostics.parse_errors, Vec::<String>::new());
 }
 
 #[test]
@@ -552,7 +552,7 @@ var Ads={typeName:"aiserver.v1.InAppAdService",methods:{ping:{name:"Ping",I:Keep
     let result = extract_from_sources(&[("bundle.js", BUNDLE.to_string())], Strictness::Lenient)
         .expect("extract");
     assert!(result.files.contains_key("aiserver_v1.proto"));
-    assert!(result.diagnostics.shape_errors.is_empty());
+    assert_eq!(result.diagnostics.shape_errors, Vec::<String>::new());
 }
 
 #[test]

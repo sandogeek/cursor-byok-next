@@ -59,6 +59,8 @@ push / PR
     │   │   └── protocols/cursor/{agent_v1,aiserver_v1}.proto 非空
     │   └── node --test .github/scripts/*.test.mjs
     ├── rust（ubuntu-24.04 / macos-15 / windows-latest，45 min）
+    │   ├── Rust 1.100.0 + rustfmt（三个 job 同一版本）
+    │   ├── Linux 装 cmake（aws-lc-rs / protoc 构建）
     │   ├── cargo fmt --all -- --check
     │   ├── cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
     │   ├── cargo test --locked --workspace --all-targets        （仅 Linux）
@@ -77,8 +79,8 @@ tag v<version> / workflow_dispatch(tag)
     │   ├── tag 指向的 commit 在 origin/main 上
     │   └── 该 tag 尚未 published（draft 允许复用）
     ├── checks → ci.yml（workflow_call，ref = tag 的 commit）
-    ├── publish（3 个 OS，各 90 min）
-    │   ├── linux/macos: 装 GTK4 + WebKitGTK；macos 额外装 x86_64-apple-darwin
+├── publish（3 个 OS，各 90 min）
+│   ├── linux/macos: 装 GTK4 + WebKitGTK + GStreamer 开发包；macos 额外装 x86_64-apple-darwin
     │   ├── nsh package --target <os>   （nsh.json 有 updater ⇒ 同时写 <name>-<version>-<platform>.<ext>）
     │   └── upload-artifact release-<os>
     └── finalize（ubuntu，15 min）
@@ -98,6 +100,7 @@ tag v<version> / workflow_dispatch(tag)
 |---|---|---|---|
 | `ci.yml` 的 frontend job | `npm ci` + `npm audit` + `npm run check` | 删除，改为 `nsh check` / `nsh build` | 本仓库没有 `package.json`：TSX 的编译器由 nsh 提供，`nsh check` 是唯一的类型检查（`nsh build` 才能看到 View 文本、capabilities 拼写、缺资源）。 |
 | `ci.yml` 的 rust job | Linux 只跑 `cargo clippy/test` | 三平台 clippy + Linux 测试，并加 `nsh check/build/test` | 桌面 crate 有 `cfg(windows)` / `cfg(unix)` 分支，只在自身平台编译；`nsh test` 同时跑 crate 的 `cargo test` 与 `*.test.tsx`。 |
+| Rust 工具链 | 跟随 `stable` | 三个 job 都钉 `1.100.0` | 首次公开跑时 CI 的 stable 已到 1.100，新增 `clippy::assert_is_empty` 让 `-D warnings` 失败，而本机 1.98 看不到。工具链不钉就等于让 CI 结论随上游发版漂移；`rust-version` 仍是最低支持版本，钉住的是检查用的那一个。 |
 | `ci.yml` 新增 package job | 无 | 三平台 `nsh package` 各一次 | 上游由 release 一次性验证；这里 PR 阶段就证明 `nsh.json` + 入口仍能打包，失败在合并前暴露。 |
 | `ci.yml` 的 release 依赖 | release 调 `ci.yml` | 同 | 保留：发布必须跑同一套检查。 |
 | nsh 版本 | Tauri 版本由 `Cargo.toml` 决定 | `NSH_VERSION` 一处 + `install-nsh` action | nsh 会按 CLI 版本重写 `.nsh/rust` 的 `nsh-*` 依赖；CLI 与 Cargo 不一致时行为在同一 runner 上静默改变，所以 `check-release.mjs` 三方对齐。 |

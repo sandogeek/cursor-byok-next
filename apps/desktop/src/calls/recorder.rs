@@ -571,7 +571,10 @@ mod tests {
         recorder.response_chunk(b"data: [DONE]\n\n").await.unwrap();
         recorder.completed(FinishReason::Stop).await.unwrap();
         assert!(store.llm_call_request("metrics").await.unwrap().is_none());
-        assert!(store.llm_call_chunks("metrics").await.unwrap().is_empty());
+        assert_eq!(
+            store.llm_call_chunks("metrics").await.unwrap(),
+            Vec::<crate::calls::LlmCallResponseChunk>::new()
+        );
         let call = store.llm_call("metrics").await.unwrap().unwrap();
         assert_eq!(call.http_status, Some(200));
         assert_eq!(call.response_bytes, 14);

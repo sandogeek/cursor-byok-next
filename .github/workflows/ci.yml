@@ -77,6 +77,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          # One Rust version for every job: a new stable can add a clippy lint
+          # (assert_is_empty arrived in 1.100), so CI must not move on its own.
+          # Bump together with the fixes it needs.
+          toolchain: "1.100.0"
           components: rustfmt
 
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
@@ -138,12 +142,15 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
-      # NSH's Linux desktop packages link GTK 4 (and WebKitGTK for web views).
+      # NSH's Linux desktop runtime links GTK 4, WebKitGTK and GStreamer.
+      # The release runner is built here, so it needs the development
+      # packages, not only the runtime ones.
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake libgtk-4-dev libwebkitgtk-6.0-dev
+          sudo apt-get install -y build-essential cmake libgtk-4-dev libwebkitgtk-6.0-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 

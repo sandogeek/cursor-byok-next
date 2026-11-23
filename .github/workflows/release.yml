@@ -139,15 +139,19 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.commit }}
 
-      # NSH's Linux desktop packages link GTK 4 (and WebKitGTK for web views).
+      # NSH's Linux desktop runtime links GTK 4, WebKitGTK and GStreamer;
+      # building the release runner needs their development packages.
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake libgtk-4-dev libwebkitgtk-6.0-dev
+          sudo apt-get install -y build-essential cmake libgtk-4-dev libwebkitgtk-6.0-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          # The same pin as ci.yml: a release must run the checks it passed.
+          toolchain: "1.100.0"
           # `--target macos` writes an archive per architecture by building
           # the runner twice: this Mac's, and Intel's.
           targets: ${{ matrix.target == 'macos' && 'x86_64-apple-darwin' || '' }}

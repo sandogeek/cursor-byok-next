@@ -324,7 +324,7 @@ mod tests {
         let (magpie, icon) = &manifests[0];
         assert_eq!(magpie.id, "dev.cursorbyoknext.plugins.magpie");
         assert!(magpie.permissions.resource_origin);
-        assert!(magpie.permissions.network.is_empty());
+        assert_eq!(magpie.permissions.network, Vec::<String>::new());
         assert!(icon.starts_with("data:image/svg+xml;base64,"));
         assert_ne!(catalog.directory, impostor);
         assert_eq!(

@@ -1379,12 +1379,9 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            store
-                .llm_call_chunks("standard-plugin")
-                .await
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            store.llm_call_chunks("standard-plugin").await.unwrap(),
+            Vec::<crate::calls::LlmCallResponseChunk>::new()
         );
         let summary = store.llm_call("standard-plugin").await.unwrap().unwrap();
         assert_eq!(summary.http_status, Some(204));

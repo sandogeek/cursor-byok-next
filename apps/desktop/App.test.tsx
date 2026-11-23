@@ -249,7 +249,7 @@ test("插件页显示 Magpie 目录且不含密钥", async () => {
   expect(app.texts()).toContain("Magpie");
   expect(app.texts()).toContain("GPT-5");
   expect(app.texts()).toContain("plugin:dev.cursorbyoknext.plugins.magpie/magpie/resource-1/openai/gpt-5");
-  expect(app.texts()).toContain("1 个模型 · 仅本页可见");
+  expect(app.texts()).toContain("1 个模型 · 已加入 Cursor 模型选择器");
   expect(app.texts().join("\n")).not.toContain("sk-");
   expect(app.texts().join("\n")).not.toContain("privateData");
   await app.press("刷新目录");
