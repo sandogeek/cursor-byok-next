@@ -4,6 +4,7 @@
 //! reported as `false` and takeover continues, because Cursor reads the
 //! setting again the next time it starts.
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Output;
 
 use super::Result;

@@ -13,10 +13,10 @@ cursor-byok/server/src/local_app/          apps/desktop/src/harness/
 ├── proxy.rs           223 行  代理与路由      ├── proxy.rs            405 行
 ├── settings.rs        111 行  settings.json  ├── settings.rs         253 行
 ├── account.rs         175 行  state.vscdb    ├── account.rs          305 行
-├── process.rs          91 行  结束 Cursor    ├── process.rs           97 行
+├── process.rs          91 行  结束 Cursor    ├── process.rs           99 行
 └── ca/
-    ├── mod.rs         239 行  CA 生成与信任   ├── ca.rs               285 行（目录收成单文件）
-    └── windows.rs      75 行  Win32 ROOT 枚举 └── windows.rs           71 行
+    ├── mod.rs         239 行  CA 生成与信任   ├── ca.rs               286 行（目录收成单文件）
+    └── windows.rs      75 行  Win32 ROOT 枚举 └── windows.rs           79 行
                                                └── state.rs            94 行（新增：意图与端口持久化）
 ```
 
