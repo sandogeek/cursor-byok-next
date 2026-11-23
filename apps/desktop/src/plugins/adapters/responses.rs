@@ -2,38 +2,24 @@
 
 use serde_json::{Value, json};
 
+use super::tools::{ToolCalls, ToolState};
 use super::{
-    CoreMessage, ProtocolParser, SawTool, ToolFinish, ToolNames, core_message, count_usize,
-    data_url, object, object_mut, parse_object, text, usage_event,
+    CoreMessage, ProtocolParser, SawTool, ToolNames, core_message, count_usize, data_url, object,
+    object_mut, parse_object, text,
 };
 use crate::{
-    model::{ContentPart, ModelInvocation, ModelLatency},
+    model::{ContentPart, ModelInvocation, ModelLatency, Usage},
     plugins::{Error, Result},
     provider::{FinishReason, ModelEvent},
 };
 
 const REPLAY_KIND: &str = "openai_responses";
 
-struct ToolState {
-    call_id: Option<String>,
-    name: Option<String>,
-    arguments: String,
-    emitted: usize,
-    started: bool,
-    ended: bool,
-}
-
-enum ToolArguments {
-    None,
-    Delta(String),
-    Snapshot(String),
-}
-
 pub(super) struct Parser {
     text_open: bool,
     streamed_text: String,
     thinking_open: bool,
-    tools: std::collections::BTreeMap<usize, ToolState>,
+    tools: ToolCalls,
     tool_names: ToolNames,
     reasoning_items: Vec<Value>,
     saw_tool: SawTool,
@@ -64,7 +50,7 @@ impl Parser {
             text_open: false,
             streamed_text: String::new(),
             thinking_open: false,
-            tools: std::collections::BTreeMap::new(),
+            tools: ToolCalls::new(),
             tool_names,
             reasoning_items: Vec::new(),
             saw_tool: SawTool::Absent,
@@ -103,9 +89,10 @@ impl Parser {
 
     fn end_started_tools(&mut self, emit: &mut dyn FnMut(ModelEvent)) {
         for (index, tool) in &mut self.tools {
-            if tool.started && !tool.ended {
-                tool.ended = true;
-                emit(ModelEvent::ToolCallEnd { index: *index });
+            if tool.is_started()
+                && let Some(event) = tool.take_end(*index)
+            {
+                emit(event);
             }
         }
     }
@@ -130,16 +117,10 @@ impl Parser {
             return Ok(());
         }
         self.saw_tool = SawTool::Present;
-        for event in update_tool(
-            required_index(value)?,
-            item,
-            ToolArguments::None,
-            ToolFinish::Open,
-            &mut self.tools,
-            &self.tool_names,
-        )? {
-            emit(event);
-        }
+        let index = required_index(value)?;
+        let identity = item_identity(item);
+        self.tool(index).fill_identity(identity.0, identity.1);
+        self.emit_pending_tool(index, emit);
         Ok(())
     }
 
@@ -163,20 +144,17 @@ impl Parser {
             Some("function_call") => {
                 self.completion = Completion::ItemsCompleted;
                 self.saw_tool = SawTool::Present;
-                let snapshot =
-                    item.and_then(|item| text(item.get("arguments").unwrap_or(&Value::Null)));
-                let args = match snapshot {
-                    None => ToolArguments::None,
-                    Some(snapshot) => ToolArguments::Snapshot(snapshot.to_owned()),
-                };
-                for event in update_tool(
-                    required_index(value)?,
-                    item,
-                    args,
-                    ToolFinish::Done,
-                    &mut self.tools,
-                    &self.tool_names,
-                )? {
+                let index = required_index(value)?;
+                let tool = self.tool(index);
+                let identity = item_identity(item);
+                tool.fill_identity(identity.0, identity.1);
+                if let Some(snapshot) =
+                    item.and_then(|item| text(item.get("arguments").unwrap_or(&Value::Null)))
+                {
+                    tool.extend_to_snapshot(snapshot)?;
+                }
+                self.emit_pending_tool(index, emit);
+                if let Some(event) = self.tool(index).take_end(index) {
                     emit(event);
                 }
             }
@@ -194,16 +172,9 @@ impl Parser {
             return Ok(());
         };
         self.saw_tool = SawTool::Present;
-        for event in update_tool(
-            required_index(value)?,
-            None,
-            ToolArguments::Delta(delta.to_owned()),
-            ToolFinish::Open,
-            &mut self.tools,
-            &self.tool_names,
-        )? {
-            emit(event);
-        }
+        let index = required_index(value)?;
+        self.tool(index).push_arguments(delta);
+        self.emit_pending_tool(index, emit);
         Ok(())
     }
 
@@ -213,26 +184,31 @@ impl Parser {
         emit: &mut dyn FnMut(ModelEvent),
     ) -> Result<()> {
         let snapshot = text(value.get("arguments").unwrap_or(&Value::Null));
-        let args = match snapshot {
-            None | Some("") => ToolArguments::None,
-            Some(snapshot) => ToolArguments::Snapshot(snapshot.to_owned()),
-        };
-        let finish = if snapshot.is_some_and(|snapshot| !snapshot.is_empty()) {
-            ToolFinish::Done
-        } else {
-            ToolFinish::Open
-        };
-        for event in update_tool(
-            required_index(value)?,
-            None,
-            args,
-            finish,
-            &mut self.tools,
-            &self.tool_names,
-        )? {
+        let index = required_index(value)?;
+        if let Some(snapshot) = snapshot.filter(|snapshot| !snapshot.is_empty()) {
+            self.tool(index).extend_to_snapshot(snapshot)?;
+        }
+        self.emit_pending_tool(index, emit);
+        if snapshot.is_some_and(|snapshot| !snapshot.is_empty())
+            && let Some(event) = self.tool(index).take_end(index)
+        {
             emit(event);
         }
         Ok(())
+    }
+
+    fn tool(&mut self, index: usize) -> &mut ToolState {
+        self.tools.entry(index).or_default()
+    }
+
+    /// Sends what this call still owes: its start, then its argument delta.
+    fn emit_pending_tool(&mut self, index: usize, emit: &mut dyn FnMut(ModelEvent)) {
+        let tool = self.tools.entry(index).or_default();
+        let start = tool.take_start(index, &self.tool_names);
+        let delta = tool.take_arguments_delta(index);
+        for event in [start, delta].into_iter().flatten() {
+            emit(event);
+        }
     }
 }
 
@@ -296,7 +272,7 @@ impl ProtocolParser for Parser {
                 self.close_thinking(emit);
                 self.close_text(emit);
                 self.end_started_tools(emit);
-                if self.tools.values().any(|tool| !tool.started) {
+                if self.tools.values().any(|tool| !tool.is_started()) {
                     return Err(Error::Provider(
                         "OpenAI Responses completed with incomplete tool metadata".into(),
                     ));
@@ -333,7 +309,7 @@ impl ProtocolParser for Parser {
         if self.completion == Completion::ItemsCompleted {
             self.close_thinking(emit);
             self.close_text(emit);
-            if self.tools.values().any(|tool| !tool.ended) {
+            if self.tools.values().any(|tool| !tool.is_ended()) {
                 return Err(Error::Provider(
                     "OpenAI Responses stream ended with an incomplete tool call".into(),
                 ));
@@ -472,12 +448,12 @@ fn apply_responses_options(
     if let Some(tokens) = request.model.max_output_tokens {
         object.insert("max_output_tokens".into(), tokens.into());
     }
-    if request.model.reasoning.enabled || request.model.reasoning.effort.is_some() {
+    if request.model.reasoning.is_enabled() {
         let mut reasoning = json!({ "summary": "auto" });
-        if let Some(effort) = &request.model.reasoning.effort
+        if let Some(effort) = request.model.reasoning.effort()
             && let Some(reasoning) = reasoning.as_object_mut()
         {
-            reasoning.insert("effort".into(), effort.clone().into());
+            reasoning.insert("effort".into(), effort.into());
         }
         object.insert("reasoning".into(), reasoning);
     }
@@ -561,72 +537,15 @@ fn replay_items(value: &Value) -> Result<Vec<Value>> {
         .collect()
 }
 
-fn update_tool(
-    index: usize,
-    item: Option<&serde_json::Map<String, Value>>,
-    args: ToolArguments,
-    finish: ToolFinish,
-    tools: &mut std::collections::BTreeMap<usize, ToolState>,
-    tool_names: &ToolNames,
-) -> Result<Vec<ModelEvent>> {
-    let tool = tools.entry(index).or_insert_with(|| ToolState {
-        call_id: None,
-        name: None,
-        arguments: String::new(),
-        emitted: 0,
-        started: false,
-        ended: false,
-    });
-    if tool.call_id.is_none() {
-        tool.call_id = item
-            .and_then(|item| text(item.get("call_id").unwrap_or(&Value::Null)))
-            .map(str::to_owned);
-    }
-    if tool.name.is_none() {
-        tool.name = item
-            .and_then(|item| text(item.get("name").unwrap_or(&Value::Null)))
-            .map(str::to_owned);
-    }
-    match args {
-        ToolArguments::Delta(delta) => tool.arguments.push_str(&delta),
-        ToolArguments::Snapshot(snapshot) if snapshot != tool.arguments => {
-            if !snapshot.starts_with(&tool.arguments) {
-                return Err(Error::Provider(
-                    "OpenAI Responses final tool arguments do not match streamed arguments".into(),
-                ));
-            }
-            tool.arguments.push_str(&snapshot[tool.arguments.len()..]);
-        }
-        ToolArguments::None | ToolArguments::Snapshot(_) => {}
-    }
-    let mut events = Vec::new();
-    if !tool.started
-        && let (Some(call_id), Some(name)) = (tool.call_id.as_deref(), tool.name.as_deref())
-    {
-        tool.started = true;
-        events.push(ModelEvent::ToolCallStart {
-            index,
-            call_id: super::truncated_call_id(call_id).to_owned(),
-            name: tool_names.restore(name),
-        });
-    }
-    if tool.started && tool.emitted < tool.arguments.len() {
-        events.push(ModelEvent::ToolCallArgumentsDelta {
-            index,
-            delta: tool.arguments[tool.emitted..].to_owned(),
-        });
-        tool.emitted = tool.arguments.len();
-    }
-    if finish == ToolFinish::Done && !tool.ended {
-        if !tool.started {
-            return Err(Error::Provider(
-                "OpenAI Responses function call is missing call_id or name".into(),
-            ));
-        }
-        tool.ended = true;
-        events.push(ModelEvent::ToolCallEnd { index });
-    }
-    Ok(events)
+/// The `call_id` and `name` a Responses output item carries.
+fn item_identity(item: Option<&serde_json::Map<String, Value>>) -> (Option<&str>, Option<&str>) {
+    let Some(item) = item else {
+        return (None, None);
+    };
+    (
+        text(item.get("call_id").unwrap_or(&Value::Null)),
+        text(item.get("name").unwrap_or(&Value::Null)),
+    )
 }
 
 fn item_text(item: &serde_json::Map<String, Value>) -> Option<String> {
@@ -652,14 +571,20 @@ fn responses_usage(value: &Value) -> ModelEvent {
     let usage = object(value).cloned().unwrap_or_default();
     let input_details = usage.get("input_tokens_details").and_then(object);
     let output_details = usage.get("output_tokens_details").and_then(object);
-    usage_event(
-        usage.get("input_tokens").and_then(super::count_u64),
-        usage.get("output_tokens").and_then(super::count_u64),
-        usage.get("total_tokens").and_then(super::count_u64),
-        input_details.and_then(|details| details.get("cached_tokens").and_then(super::count_u64)),
-        None,
-        output_details
-            .and_then(|details| details.get("reasoning_tokens").and_then(super::count_u64)),
+    ModelEvent::Usage(
+        Usage::new(
+            usage.get("input_tokens").and_then(super::count_u64),
+            usage.get("output_tokens").and_then(super::count_u64),
+            usage.get("total_tokens").and_then(super::count_u64),
+        )
+        .with_cache_read(
+            input_details
+                .and_then(|details| details.get("cached_tokens").and_then(super::count_u64)),
+        )
+        .with_reasoning(
+            output_details
+                .and_then(|details| details.get("reasoning_tokens").and_then(super::count_u64)),
+        ),
     )
 }
 
@@ -669,7 +594,7 @@ mod tests {
     use crate::{
         model::{
             ContentPart, ModelLatency, ProjectedContent, ProjectedMessage, ProviderReplayState,
-            Role, ToolCallContent, ToolDefinition,
+            Reasoning, Role, ToolCallContent, ToolDefinition,
         },
         plugins::adapters::{ToolNames, collect_events, tests::invocation},
     };
@@ -682,8 +607,7 @@ mod tests {
     fn builds_responses_body_with_priority_tier() {
         let mut invocation = invocation();
         invocation.request.model.latency = ModelLatency::Fast;
-        invocation.request.model.reasoning.enabled = true;
-        invocation.request.model.reasoning.effort = Some("high".into());
+        invocation.request.model.reasoning = Reasoning::Effort("high".into());
         invocation.request.prompt.tools = vec![ToolDefinition {
             name: "lookup".into(),
             description: "Look up".into(),

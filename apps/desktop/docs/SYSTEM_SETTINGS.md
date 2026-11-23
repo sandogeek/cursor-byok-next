@@ -76,6 +76,8 @@ src/ui/appearance.ts     28  外观持久化（Storage 键）
 | 13 | 数据目录 | 无此信息 | 「关于」显示 `dataDir` 并可复制 | 用户排查接管 / 插件问题需要知道 `~/.cursor-byok-next` 在哪；该值由 Rust 提供，TSX 不拼路径 |
 | 14 | 页面标题 | `PageContent` 内部滚动 | 应用壳统一标题栏 + 唯一滚动区 | `CURSOR_UI.md`：内容区是唯一滚动所有者 |
 | 15 | 保存反馈 | toast | 卡片内行内 notice（成功）/ 页尾 alert（失败） | 本仓库没有 toast 组件；设置项的反馈贴近控件更明确 |
+| 16 | 端口意图的存储形态 | 上游把端口配置当普通数字，缺省即默认端口 | `PortChoice { Unset, OsAssigned, Fixed(u16) }`；JSON 与 TSX 边界仍是 `null / 0 / number` | “没选过”和“这次让 OS 挑”是两种意图，只用一个数字表示会让重启后行为分叉；自定义 `Serialize`/`Deserialize` 保持线上格式 |
+| 17 | 原子写 | 每处各写一遍 temp + rename（`harness.json`、`settings.json`、CA 文件、规则库） | 统一到 `src/atomic.rs` 的 `write` / `write_with_mode`：同目录临时文件、随机后缀、Windows 先删再 rename、失败时清理临时文件 | 四份实现里只有一份处理了 Windows 的 rename 覆盖和临时文件清理；写 Cursor 文件与 CA 的原子性是不变量 5，不能各写各的 |
 
 ## 必须保持的不变量
 

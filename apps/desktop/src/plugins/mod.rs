@@ -33,9 +33,13 @@ pub(crate) fn text(key: &str) -> String {
     nsh_core::t!(key)
 }
 
+/// `CREATE_NO_WINDOW`: a spawned Bun worker must not flash a console window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 #[cfg(windows)]
 fn detach_console(command: &mut tokio::process::Command) {
-    command.creation_flags(0x0800_0000);
+    command.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(not(windows))]

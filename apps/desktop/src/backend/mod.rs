@@ -10,6 +10,11 @@ mod server_config;
 
 use std::net::SocketAddr;
 
+/// Most a buffered Cursor RPC may carry. Cursor's own `BidiAppend` and
+/// knowledge-base bodies are tens of kilobytes; anything near this is either a
+/// bug or an attempt to exhaust memory before the local loop sees the frames.
+pub(crate) const MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
+
 use axum::{
     Router,
     body::{Body, Bytes, to_bytes},
@@ -17,20 +22,19 @@ use axum::{
     http::{HeaderValue, Request, Response, StatusCode, header},
     routing::{get, post},
 };
-use bytes::{BufMut, BytesMut};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::{
-    Error, Result,
+    Result,
     calls::CallStore,
     harness,
     loop_service::{InferenceRoute, InferenceService, decode_append},
     plugins::PluginHost,
     protocol::{
         connect,
-        proto::{agent::v1 as agent, aiserver::v1 as ai, inference},
+        proto::{agent::v1 as agent, aiserver::v1 as ai, inference::v1 as inference},
     },
 };
 
@@ -254,7 +258,8 @@ async fn run_inference_sse(
             let stream = async_stream::stream! {
                 let _subscription = subscription;
                 while let Some(frame) = receiver.recv().await {
-                    let complete = frame.first().is_some_and(|flag| flag & connect::END_STREAM_FLAG != 0);
+                    let complete = connect::decode_frames(&frame)
+                        .is_ok_and(|frames| frames.last().is_some_and(connect::Frame::is_end_stream));
                     yield Ok::<Bytes, std::convert::Infallible>(frame);
                     if complete {
                         return;
@@ -283,20 +288,22 @@ async fn bidi_append(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     let (parts, body) = buffered(request).await?;
-    let request: ai::BidiAppendRequest = connect::decode_unary(&body)?;
+    let mut request: ai::BidiAppendRequest = connect::decode_unary(&body)?;
+    // Owned, so the payload can be moved out of the request below without a
+    // copy and without holding a borrow of `request`.
     let request_id = request
         .request_id
-        .as_ref()
-        .map(|id| id.request_id.as_str())
+        .take()
+        .map(|id| id.request_id)
         .filter(|id| !id.is_empty())
         .ok_or_else(|| crate::Error::Protocol("BidiAppend request_id is required".into()))?;
     let payload = if request.data_binary.is_empty() {
         hex::decode(&request.data)
             .map_err(|error| crate::Error::Protocol(format!("invalid BidiAppend hex: {error}")))?
     } else {
-        request.data_binary.clone()
+        std::mem::take(&mut request.data_binary)
     };
-    let current_route = inference_service.route(request_id);
+    let current_route = inference_service.route(&request_id);
     let candidate = decode_append(&payload).ok();
     let starts_inference = candidate.as_ref().is_some_and(|message| {
         matches!(
@@ -311,7 +318,7 @@ async fn bidi_append(
             .ok_or_else(|| crate::Error::Protocol("invalid RunInference client message".into()))?;
         let route = match current_route {
             Some(route) => route,
-            None => inference_service.begin(request_id, &message).await?,
+            None => inference_service.begin(&request_id, &message).await?,
         };
         match route {
             InferenceRoute::Local(run) => {
@@ -336,7 +343,7 @@ async fn bidi_append(
                 )
                 .await;
                 if finished {
-                    inference_service.finish(request_id);
+                    inference_service.finish(&request_id);
                 }
                 return response;
             }
@@ -351,7 +358,7 @@ async fn bidi_append(
 
 async fn buffered(request: Request<Body>) -> Result<(axum::http::request::Parts, Bytes)> {
     let (parts, body) = request.into_parts();
-    let body = to_bytes(body, usize::MAX)
+    let body = to_bytes(body, MAX_BUFFERED_BYTES)
         .await
         .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
     Ok((parts, body))
@@ -375,54 +382,20 @@ pub(crate) fn proto_response(message: impl prost::Message) -> Response<Body> {
     response
 }
 
-/// Whether an upstream Connect unary body carries the 5-byte envelope.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Framing {
-    Enveloped,
-    Bare,
-}
-
-impl Framing {
-    pub(crate) fn is_enveloped(self) -> bool {
-        self == Self::Enveloped
-    }
-}
+pub(crate) use connect::Framing;
 
 /// Splits an optional Connect unary envelope off `body`.
 pub(crate) fn unary_payload<'a>(body: &'a [u8], label: &str) -> Result<(Framing, &'a [u8])> {
-    if body.len() < 5 {
-        return Ok((Framing::Bare, body));
-    }
-    let flags = body[0];
-    let length = usize::try_from(u32::from_be_bytes([body[1], body[2], body[3], body[4]]))
-        .unwrap_or(usize::MAX);
-    if length != body.len() - 5 {
-        return Ok((Framing::Bare, body));
-    }
-    if flags != 0 {
-        return Err(Error::Protocol(format!(
-            "cannot patch compressed or terminal {label} frame: flags={flags}"
-        )));
-    }
-    Ok((Framing::Enveloped, &body[5..]))
+    connect::split_unary(body, label)
 }
 
 /// Wraps an encoded unary payload in a Connect envelope when `framing` asks for it.
-pub(crate) fn encode_unary(payload: Vec<u8>, framing: Framing) -> Result<Bytes> {
-    if !framing.is_enveloped() {
-        return Ok(Bytes::from(payload));
-    }
-    let length = u32::try_from(payload.len())
-        .map_err(|_| Error::Protocol("Connect payload exceeds 4 GiB".into()))?;
-    let mut output = BytesMut::with_capacity(5 + payload.len());
-    output.put_u8(0);
-    output.put_u32(length);
-    output.extend_from_slice(&payload);
-    Ok(output.freeze())
+pub(crate) fn encode_unary(payload: &[u8], framing: Framing) -> Result<Bytes> {
+    connect::wrap_unary(payload, framing)
 }
 
 async fn consume_body(request: Request<Body>) -> Result<()> {
-    to_bytes(request.into_body(), usize::MAX)
+    to_bytes(request.into_body(), MAX_BUFFERED_BYTES)
         .await
         .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
     Ok(())
@@ -462,7 +435,7 @@ mod tests {
     use super::*;
     use crate::protocol::{
         connect,
-        proto::{agent::v1 as agent, aiserver::v1 as ai, inference as pb},
+        proto::{agent::v1 as agent, aiserver::v1 as ai, inference::v1 as pb},
     };
     use axum::{
         body::Body,
@@ -552,7 +525,7 @@ mod tests {
             .expect("stream started")
             .unwrap();
         let frames = connect::decode_frames(&frame).unwrap();
-        let ready = pb::RunInferenceServerMessage::decode(frames[0].1.clone()).unwrap();
+        let ready = pb::RunInferenceServerMessage::decode(frames[0].payload.clone()).unwrap();
         assert!(matches!(
             ready.message,
             Some(pb::run_inference_server_message::Message::RunReady(_))

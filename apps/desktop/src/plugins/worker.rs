@@ -34,8 +34,24 @@ use super::{
 use crate::{calls::CallRecorder, model::ModelInvocation, provider::ModelEvent};
 
 const INVOCATION_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_NETWORK_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
+/// Per-request deadline for a plugin's own `fetch`/`stream` calls.
+const NETWORK_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_NETWORK_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STREAM_BYTES: usize = 256 * 1024 * 1024;
+
+/// A prepared plugin network call: everything `fetch`/`stream_open` needs to
+/// run it and attribute the response.
+struct NetworkRequest {
+    request: reqwest::RequestBuilder,
+    origin: url::Url,
+    method: reqwest::Method,
+    recorder: Option<CallRecorder>,
+}
+
+/// Keeps the transport detail of a failed plugin request in the message.
+fn provider_error(error: &reqwest::Error) -> Error {
+    Error::Provider(format!("plugin network request failed: {error}"))
+}
 
 #[cfg(test)]
 static LAST_INVOKE_FRAME: parking_lot::Mutex<Vec<u8>> = parking_lot::Mutex::new(Vec::new());
@@ -52,7 +68,14 @@ pub enum WorkerStreamItem {
 }
 
 type Writer = mpsc::Sender<Vec<u8>>;
+/// The receiving half of one plugin stream, kept for `network.stream.read`.
 type StreamLines = Arc<Mutex<mpsc::Receiver<Result<String>>>>;
+/// How many queued lines one `network.stream.read` call returns. The worker
+/// loop asks again immediately, so a small batch keeps the reply bounded.
+const STREAM_READ_BATCH: usize = 256;
+/// Unread lines buffered between the reader task and the plugin. A stream that
+/// outruns its plugin applies backpressure here instead of growing unbounded.
+const STREAM_LINE_BUFFER: usize = 256;
 
 /// A registered stream: the guard that unregisters it, the stream the caller
 /// reads events from, the sender the worker impl writes them to, and the
@@ -152,6 +175,16 @@ impl Pending {
 #[derive(Clone)]
 pub struct PluginWorker {
     inner: Arc<PluginWorkerInner>,
+}
+
+impl std::fmt::Debug for PluginWorker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PluginWorker")
+            .field("plugin_id", &self.inner.plugin_id)
+            .field("entry", &self.inner.entry)
+            .finish_non_exhaustive()
+    }
 }
 
 struct PluginWorkerInner {
@@ -674,7 +707,7 @@ impl HostContext {
             });
             recorder
                 .request(serde_json::Value::Object(recorded_headers), &recorded_body)
-                .await?;
+                .await;
         }
         Ok((request, recorder))
     }
@@ -696,12 +729,7 @@ impl HostContext {
         &self,
         invocation: &InvocationState,
         params: &serde_json::Value,
-    ) -> Result<(
-        reqwest::RequestBuilder,
-        reqwest::Url,
-        reqwest::Method,
-        Option<CallRecorder>,
-    )> {
+    ) -> Result<NetworkRequest> {
         let raw_url = required_string(params, "url")?;
         let url = url::Url::parse(raw_url)
             .map_err(|error| Error::Config(format!("invalid plugin network URL: {error}")))?;
@@ -724,7 +752,12 @@ impl HostContext {
         let (request, recorder) = self
             .prepare_request(invocation, raw_url, method.clone(), &headers, body)
             .await?;
-        Ok((request, url, method, recorder))
+        Ok(NetworkRequest {
+            request,
+            origin: url,
+            method,
+            recorder,
+        })
     }
 
     async fn fetch(
@@ -732,23 +765,28 @@ impl HostContext {
         invocation: &InvocationState,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let (request, url, method, recorder) = self.request(invocation, &params).await?;
+        let NetworkRequest {
+            request,
+            origin: url,
+            method,
+            recorder,
+        } = self.request(invocation, &params).await?;
         let origin = origin::request_origin(&url)?;
         let catalog_status = invocation.magpie_catalog_status.as_ref().filter(|_| {
             invocation.allowed_origins.contains(&origin)
                 && method == reqwest::Method::GET
                 && url.path() == "/v1/models"
         });
-        let request = request.timeout(Duration::from_secs(60));
+        let request = request.timeout(NETWORK_REQUEST_TIMEOUT);
         let mut response = tokio::select! {
             () = invocation.cancellation.cancelled() => return Err(Error::Cancelled),
             response = request.send() => {
-                response.map_err(|_| Error::Provider("plugin network request failed".into()))?
+                response.map_err(|error| provider_error(&error))?
             }
         };
         let status = response.status().as_u16();
         if let Some(recorder) = &recorder {
-            recorder.response_headers(status).await?;
+            recorder.response_headers(status).await;
         }
         if let Some(catalog_status) = catalog_status {
             catalog_status.store(status, Ordering::Relaxed);
@@ -756,10 +794,9 @@ impl HostContext {
                 return Ok(serde_json::json!({"status": status, "headers": {}, "body": ""}));
             }
         }
-        if response
-            .content_length()
-            .is_some_and(|size| size > MAX_NETWORK_RESPONSE_BYTES)
-        {
+        if response.content_length().is_some_and(|size| {
+            usize::try_from(size).map_or(true, |size| size > MAX_NETWORK_RESPONSE_BYTES)
+        }) {
             return Err(Error::Provider(
                 "plugin network response is larger than allowed".into(),
             ));
@@ -770,14 +807,11 @@ impl HostContext {
             let chunk = tokio::select! {
                 () = invocation.cancellation.cancelled() => return Err(Error::Cancelled),
                 chunk = response.chunk() => {
-                    chunk.map_err(|_| Error::Provider("cannot read plugin network response".into()))?
+                    chunk.map_err(|error| provider_error(&error))?
                 }
             };
             let Some(chunk) = chunk else { break };
-            if u64::try_from(chunk.len()).unwrap_or(u64::MAX)
-                > MAX_NETWORK_RESPONSE_BYTES
-                    .saturating_sub(u64::try_from(body.len()).unwrap_or(u64::MAX))
-            {
+            if chunk.len() > MAX_NETWORK_RESPONSE_BYTES.saturating_sub(body.len()) {
                 return Err(Error::Provider(
                     "plugin network response is larger than allowed".into(),
                 ));
@@ -785,7 +819,7 @@ impl HostContext {
             body.extend_from_slice(&chunk);
         }
         if let Some(recorder) = &recorder {
-            recorder.response_chunk(&body).await?;
+            recorder.response_chunk(&body).await;
         }
         Ok(serde_json::json!({
             "status": status,
@@ -799,25 +833,27 @@ impl HostContext {
         invocation: &InvocationState,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let (request, _, _, recorder) = self.request(invocation, &params).await?;
+        let NetworkRequest {
+            request, recorder, ..
+        } = self.request(invocation, &params).await?;
         let cancellation = invocation.cancellation.clone();
         let response = tokio::select! {
             () = cancellation.cancelled() => return Err(Error::Cancelled),
             response = request.send() => {
-                response.map_err(|_| Error::Provider("plugin network request failed".into()))?
+                response.map_err(|error| provider_error(&error))?
             }
         };
         let status = response.status().as_u16();
         if let Some(recorder) = &recorder {
-            recorder.response_headers(status).await?;
+            recorder.response_headers(status).await;
         }
         let headers = header_map(&response);
-        let (sender, receiver) = mpsc::channel::<Result<String>>(256);
+        let (sender, receiver) = mpsc::channel::<Result<String>>(STREAM_LINE_BUFFER);
         tokio::spawn(async move {
             use futures_util::StreamExt;
             let mut body = response.bytes_stream();
             let mut buffered = Vec::<u8>::new();
-            let mut total = 0_u64;
+            let mut total = 0_usize;
             loop {
                 let chunk = tokio::select! {
                     () = cancellation.cancelled() => {
@@ -835,7 +871,7 @@ impl HostContext {
                         .await;
                     return;
                 };
-                total += u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                total = total.saturating_add(chunk.len());
                 if total > MAX_STREAM_BYTES {
                     let _ = sender
                         .send(Err(Error::Provider(
@@ -844,11 +880,8 @@ impl HostContext {
                         .await;
                     return;
                 }
-                if let Some(recorder) = &recorder
-                    && let Err(error) = recorder.response_chunk(&chunk).await
-                {
-                    let _ = sender.send(Err(error)).await;
-                    return;
+                if let Some(recorder) = &recorder {
+                    recorder.response_chunk(&chunk).await;
                 }
                 buffered.extend_from_slice(&chunk);
                 while let Some(position) = buffered.iter().position(|byte| *byte == b'\n') {
@@ -886,13 +919,15 @@ impl HostContext {
 
     async fn stream_read(&self, params: serde_json::Value) -> Result<serde_json::Value> {
         let stream_id = required_string(&params, "streamId")?;
-        let lines_handle = self
-            .streams
-            .lock()
-            .await
-            .get(stream_id)
-            .cloned()
-            .ok_or_else(|| Error::Protocol(format!("unknown plugin stream: {stream_id}")))?;
+        // Clone out the handle and release both maps' guards before waiting:
+        // the lock must not be held across `recv()`.
+        let lines_handle = {
+            let streams = self.streams.lock().await;
+            streams
+                .get(stream_id)
+                .cloned()
+                .ok_or_else(|| Error::Protocol(format!("unknown plugin stream: {stream_id}")))?
+        };
         let mut receiver = lines_handle.lock().await;
         let mut lines = Vec::new();
         match receiver.recv().await {
@@ -908,7 +943,7 @@ impl HostContext {
                 return Ok(serde_json::json!({ "lines": [], "done": true }));
             }
         }
-        while lines.len() < 256 {
+        while lines.len() < STREAM_READ_BATCH {
             match receiver.try_recv() {
                 Ok(Ok(line)) => lines.push(line),
                 Ok(Err(error)) => {
@@ -1318,20 +1353,18 @@ mod tests {
             recorder(crate::calls::PayloadStorage::Detailed, "first-request").await;
         let host = recording_host();
         let invocation = recorded_invocation(recorder.clone());
-        let (_, _, _, first) = host.request(&invocation, &network_params()).await.unwrap();
-        let (_, _, _, second) = host.request(&invocation, &network_params()).await.unwrap();
-        assert!(first.is_some());
-        assert!(second.is_none());
-        recorder.response_headers(200).await.unwrap();
+        let first = host.request(&invocation, &network_params()).await.unwrap();
+        let second = host.request(&invocation, &network_params()).await.unwrap();
+        assert!(first.recorder.is_some());
+        assert!(second.recorder.is_none());
+        recorder.response_headers(200).await;
         recorder
             .response_chunk(b"data: {\"type\":\"response.created\"}\n\n")
-            .await
-            .unwrap();
-        recorder.response_chunk(b"data: [DONE]\n\n").await.unwrap();
+            .await;
+        recorder.response_chunk(b"data: [DONE]\n\n").await;
         recorder
             .completed(crate::provider::FinishReason::Stop)
-            .await
-            .unwrap();
+            .await;
         let request = store
             .llm_call_request("first-request")
             .await
@@ -1367,14 +1400,13 @@ mod tests {
         let (_, body) = recorded_network_request(&params).unwrap();
         let request_bytes =
             i64::try_from(serde_json::to_string(&body).unwrap().len()).unwrap_or(i64::MAX);
-        let (_, _, _, claimed) = host.request(&invocation, &params).await.unwrap();
-        assert!(claimed.is_some());
-        recorder.response_headers(204).await.unwrap();
-        recorder.response_chunk(b"data: [DONE]\n\n").await.unwrap();
+        let claimed = host.request(&invocation, &params).await.unwrap();
+        assert!(claimed.recorder.is_some());
+        recorder.response_headers(204).await;
+        recorder.response_chunk(b"data: [DONE]\n\n").await;
         recorder
             .completed(crate::provider::FinishReason::Stop)
-            .await
-            .unwrap();
+            .await;
         assert!(
             store
                 .llm_call_request("standard-plugin")

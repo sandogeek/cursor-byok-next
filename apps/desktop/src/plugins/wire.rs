@@ -26,8 +26,8 @@ pub fn llm_request(invocation: &ModelInvocation) -> Result<serde_json::Value> {
             "parameters": tool.parameters,
         })).collect::<Vec<_>>(),
         "reasoning": {
-            "enabled": request.model.reasoning.enabled,
-            "effort": request.model.reasoning.effort,
+            "enabled": request.model.reasoning.is_enabled(),
+            "effort": request.model.reasoning.effort(),
         },
         "latency": match request.model.latency {
             ModelLatency::Fast => "fast",
@@ -192,11 +192,12 @@ fn required_str<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str> 
 }
 
 fn required_index(value: &serde_json::Value) -> Result<usize> {
-    value
+    let index = value
         .get("index")
         .and_then(serde_json::Value::as_u64)
-        .map(|index| usize::try_from(index).unwrap_or(usize::MAX))
-        .ok_or_else(|| Error::Protocol("plugin model event requires index".into()))
+        .ok_or_else(|| Error::Protocol("plugin model event requires index".into()))?;
+    usize::try_from(index)
+        .map_err(|_| Error::Protocol("plugin model event index is too large".into()))
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ use std::process::Output;
 use super::Result;
 use tokio::process::Command;
 
+/// `CREATE_NO_WINDOW`, so a probed process does not flash a console window.
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -34,20 +35,23 @@ async fn terminate_platform_cursor() -> Result<bool> {
     terminate_unix_process("Cursor").await
 }
 
+/// `pgrep`/`pkill` exit code for "no process matched".
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const NO_MATCH_EXIT: i32 = 1;
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn terminate_unix_process(name: &str) -> Result<bool> {
     let listed: Output = Command::new("pgrep").args(["-x", name]).output().await?;
     if !listed.status.success() {
         return match listed.status.code() {
-            // `pgrep` exits 1 when nothing matches.
-            Some(1) => Ok(false),
+            Some(NO_MATCH_EXIT) => Ok(false),
             _ => Err(super::Error::Process(format!(
                 "could not inspect the {name} process"
             ))),
         };
     }
     let killed = Command::new("pkill").args(["-x", name]).status().await?;
-    if killed.success() || killed.code() == Some(1) {
+    if killed.success() || killed.code() == Some(NO_MATCH_EXIT) {
         Ok(true)
     } else {
         Err(super::Error::Process(format!(

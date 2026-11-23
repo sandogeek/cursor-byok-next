@@ -15,7 +15,7 @@ use hyper_util::rt::TokioExecutor;
 use parking_lot::Mutex;
 use url::Url;
 
-use crate::capture::CaptureBody;
+use crate::capture::{CaptureBody, CapturedBody};
 use crate::config::{Config, DEBUG_BASE_PATH, browser_address};
 use crate::decode::{
     ConnectFrameDecoder, capture_limit, decode_captured_content, decode_unary_request,
@@ -24,10 +24,19 @@ use crate::decode::{
     streaming_response_message_type,
 };
 use crate::store::{CaptureId, ExchangeStore, sorted_headers};
-use crate::types::{Error, Exchange, ExchangeSummary, Payload, Result};
+use crate::types::{Error, Exchange, ExchangeState, ExchangeSummary, FrameView, Payload, Result};
 use crate::web;
 
 type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
+
+/// How long a TCP connect to Cursor's API may take before the request fails.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// TCP keepalive idle time, so a quiet SSE stream is not reaped by a NAT.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+/// How long an idle pooled upstream connection is reused.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Concurrent idle connections kept per upstream host.
+const POOL_MAX_IDLE_PER_HOST: usize = 32;
 
 #[derive(Clone)]
 #[expect(
@@ -45,23 +54,31 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(config: Config) -> Result<Arc<Self>> {
+    /// Prepares the capture store and the HTTPS client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when the listen address is not loopback or the
+    /// upstream URL does not parse, and [`Error::Database`] when the store
+    /// cannot open its SQLite file.
+    pub fn new(config: Config) -> Result<Self> {
         let config = config.normalized()?;
         let upstream = Url::parse(&config.upstream_url)
             .map_err(|err| Error::Config(format!("解析固定上游地址：{err}")))?;
         let store = ExchangeStore::persistent(&config.database_path, config.max_exchanges)?;
-        let upstream_url = upstream.as_str().trim_end_matches('/').to_string();
+        let upstream_url = upstream.as_str().trim_end_matches('/').to_owned();
         let database_path = config.database_path.display().to_string();
-        Ok(Arc::new(Self {
+        Ok(Self {
             config,
             upstream,
             upstream_url,
             database_path,
             store,
             client: https_client(),
-        }))
+        })
     }
 
+    /// The debugger's own router; `Arc<Server>` is the axum state.
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
             .route(
@@ -75,10 +92,12 @@ impl Server {
             .with_state(self)
     }
 
+    /// The loopback address the proxy listens on.
     pub fn service_addr(&self) -> &str {
         &self.config.service_addr
     }
 
+    /// The URL a human opens to reach the debug UI.
     pub fn ui_url(&self) -> String {
         format!(
             "http://{}{DEBUG_BASE_PATH}/",
@@ -86,39 +105,47 @@ impl Server {
         )
     }
 
+    /// The SQLite file capturing this session.
     pub fn database_path(&self) -> &str {
         &self.database_path
     }
 
+    /// The upstream every captured request is forwarded to.
     pub fn upstream_url(&self) -> &str {
         &self.upstream_url
     }
 
+    /// The capture store, for the debug API.
     pub fn store(&self) -> &ExchangeStore {
         &self.store
     }
 
+    /// Drops every captured exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] when SQLite cannot delete the rows.
     pub fn clear_exchanges(&self) -> Result<()> {
         self.store.clear()
     }
 
     fn capture_request(&self, request: Request<Body>) -> (CaptureId, Request<Body>) {
-        let path = request.uri().path().to_string();
+        let path = request.uri().path().to_owned();
         let mut upstream_url = self.upstream.clone();
         upstream_url.set_path(&path);
         upstream_url.set_query(request.uri().query());
-        let request_content_type = header_value(request.headers(), "content-type");
+        let request_content_type = header_value(request.headers(), "content-type").to_owned();
         let request_codec = request_content_codec(&path, request.headers());
         let exchange = Exchange {
             summary: ExchangeSummary {
                 id: String::new(),
                 started_at: Utc::now(),
-                method: request.method().as_str().to_string(),
+                method: request.method().as_str().to_owned(),
                 url: upstream_url.to_string(),
-                host: self.upstream.host_str().unwrap_or_default().to_string(),
+                host: self.upstream.host_str().unwrap_or_default().to_owned(),
                 path: path.clone(),
-                status: 0,
-                state: "pending".into(),
+                status: None,
+                state: ExchangeState::Pending,
                 duration_ms: 0,
                 request_bytes: 0,
                 response_bytes: 0,
@@ -133,7 +160,6 @@ impl Server {
                 headers: sorted_headers(request.headers()),
                 content_type: request_content_type.clone(),
                 content_codec: request_codec.clone(),
-                frames: Vec::new(),
                 ..Payload::default()
             },
             response: Payload::default(),
@@ -141,48 +167,53 @@ impl Server {
         let id = self.store.create(exchange);
 
         let (parts, body) = request.into_parts();
-        let captured =
-            self.wrap_request_body(body, id.clone(), path, request_content_type, request_codec);
+        let captured = self.wrap_body(
+            body,
+            Side::Request,
+            id.clone(),
+            path,
+            request_content_type,
+            request_codec,
+        );
         (id, Request::from_parts(parts, Body::new(captured)))
     }
 
-    fn wrap_request_body(
+    fn wrap_body<B>(
         &self,
-        body: Body,
+        body: B,
+        side: Side,
         id: CaptureId,
         path: String,
         content_type: String,
         codec: String,
-    ) -> CaptureBody<Body> {
+    ) -> CaptureBody<B>
+    where
+        B: http_body::Body,
+    {
         let max_frames = self.config.max_frames;
-        let decoder = streaming_request_message_type(&path).map(|message_type| {
+        let decoder = side.streaming_message_type(&path).map(|message_type| {
             let store = self.store.clone();
             let frame_id = id.clone();
             Arc::new(Mutex::new(ConnectFrameDecoder::new(
-                message_type,
-                codec.clone(),
+                &message_type,
+                &codec,
                 max_frames,
                 move |frame| {
                     store.update_transient(&frame_id, |exchange| {
-                        if !frame.kind.is_empty() {
-                            exchange.summary.request_kind.clone_from(&frame.kind);
-                        }
-                        if !frame.request_id.is_empty() {
-                            exchange.summary.request_id.clone_from(&frame.request_id);
-                        }
-                        if frame_count(exchange.request.frames.len()) < max_frames {
-                            exchange.request.frames.push(frame);
-                        }
+                        side.record_frame(exchange, frame);
                     });
                 },
             )))
         });
-        let store = self.store.clone();
-        let finish_id = id;
-        let finish_path = path;
-        let finish_type = content_type;
-        let finish_codec = codec;
         let chunk_decoder = decoder.clone();
+        let target = BodyTarget {
+            id,
+            path,
+            content_type,
+            codec,
+            side,
+        };
+        let store = self.store.clone();
         CaptureBody::new(
             body,
             capture_limit(self.config.max_capture_bytes),
@@ -191,94 +222,20 @@ impl Server {
                     decoder.lock().write(chunk);
                 }
             },
-            move |captured, size, truncated, end| {
+            move |captured| {
                 if let Some(decoder) = decoder {
                     decoder.lock().close();
                 }
-                finish_request_body(
-                    &store,
-                    CapturedBody {
-                        id: finish_id,
-                        path: finish_path,
-                        content_type: finish_type,
-                        codec: finish_codec,
-                        captured,
-                        size,
-                        truncated,
-                        read_err: end.error(),
-                    },
-                );
+                target.store(&store, captured);
             },
         )
     }
 
-    fn wrap_response_body(
-        &self,
-        body: hyper::body::Incoming,
-        id: CaptureId,
-        path: String,
-        content_type: String,
-        codec: String,
-    ) -> CaptureBody<hyper::body::Incoming> {
-        let max_frames = self.config.max_frames;
-        let decoder = streaming_response_message_type(&path).map(|message_type| {
-            let store = self.store.clone();
-            let frame_id = id.clone();
-            Arc::new(Mutex::new(ConnectFrameDecoder::new(
-                message_type,
-                codec.clone(),
-                max_frames,
-                move |frame| {
-                    store.update_transient(&frame_id, |exchange| {
-                        if !frame.kind.is_empty() && frame.kind != "end_stream" {
-                            exchange.summary.response_kind.clone_from(&frame.kind);
-                        }
-                        if !frame.error.is_empty() {
-                            exchange.response.decode_error.clone_from(&frame.error);
-                        }
-                        if frame_count(exchange.response.frames.len()) < max_frames {
-                            exchange.response.frames.push(frame);
-                        }
-                        exchange.summary.frame_count = frame_count(exchange.response.frames.len());
-                    });
-                },
-            )))
-        });
-        let store = self.store.clone();
-        let chunk_decoder = decoder.clone();
-        CaptureBody::new(
-            body,
-            capture_limit(self.config.max_capture_bytes),
-            move |chunk| {
-                if let Some(decoder) = &chunk_decoder {
-                    decoder.lock().write(chunk);
-                }
-            },
-            move |captured, size, truncated, end| {
-                if let Some(decoder) = decoder {
-                    decoder.lock().close();
-                }
-                finish_response_body(
-                    &store,
-                    CapturedBody {
-                        id,
-                        path,
-                        content_type,
-                        codec,
-                        captured,
-                        size,
-                        truncated,
-                        read_err: end.error(),
-                    },
-                );
-            },
-        )
-    }
-
-    fn fail_exchange(&self, id: &CaptureId, error: impl std::fmt::Display) {
+    fn fail_exchange(&self, id: &CaptureId, error: &dyn std::fmt::Display) {
+        let message = error.to_string();
         self.store.update(id, |exchange| {
-            exchange.summary.state = "error".into();
-            exchange.summary.error = error.to_string();
+            exchange.summary.state = ExchangeState::Error;
+            exchange.summary.error.clone_from(&message);
             exchange.summary.duration_ms = elapsed_ms(exchange.summary.started_at);
         });
     }
@@ -295,8 +252,8 @@ fn https_client() -> HttpsClient {
     let mut http = HttpConnector::new();
     http.enforce_http(false);
     http.set_nodelay(true);
-    http.set_connect_timeout(Some(Duration::from_secs(10)));
-    http.set_keepalive(Some(Duration::from_secs(30)));
+    http.set_connect_timeout(Some(CONNECT_TIMEOUT));
+    http.set_keepalive(Some(TCP_KEEPALIVE));
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()
@@ -304,13 +261,13 @@ fn https_client() -> HttpsClient {
         .enable_http2()
         .wrap_connector(http);
     Client::builder(TokioExecutor::new())
-        .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
         .build(https)
 }
 
 async fn proxy(State(server): State<Arc<Server>>, request: Request<Body>) -> Response<Body> {
-    let path = request.uri().path().to_string();
+    let path = request.uri().path().to_owned();
     let (id, captured) = server.capture_request(request);
     let outgoing = match rewrite_upstream(&server.upstream, captured) {
         Ok(request) => request,
@@ -324,25 +281,31 @@ async fn proxy(State(server): State<Arc<Server>>, request: Request<Body>) -> Res
             let status = upstream.status();
             let mut headers = upstream.headers().clone();
             strip_hop_by_hop(&mut headers);
-            let content_type = header_value(&headers, "content-type");
+            let content_type = header_value(&headers, "content-type").to_owned();
             let codec = response_content_codec(&path, &headers);
             server.store.update(&id, |exchange| {
-                exchange.summary.status = i32::from(status.as_u16());
-                exchange.summary.state = "streaming".into();
+                exchange.summary.status = Some(status.as_u16());
+                exchange.summary.state = ExchangeState::Streaming;
                 exchange.summary.duration_ms = elapsed_ms(exchange.summary.started_at);
                 exchange.response.headers = sorted_headers(&headers);
                 exchange.response.content_type.clone_from(&content_type);
                 exchange.response.content_codec.clone_from(&codec);
             });
-            let captured =
-                server.wrap_response_body(upstream.into_body(), id, path, content_type, codec);
+            let captured = server.wrap_body(
+                upstream.into_body(),
+                Side::Response,
+                id,
+                path,
+                content_type,
+                codec,
+            );
             let mut response = Response::new(Body::new(captured));
             *response.status_mut() = status;
             *response.headers_mut() = headers;
             response
         }
         Err(err) => {
-            server.fail_exchange(&id, err);
+            server.fail_exchange(&id, &err);
             gateway_error()
         }
     }
@@ -358,10 +321,9 @@ fn rewrite_upstream(upstream: &Url, request: Request<Body>) -> Result<Request<Bo
     strip_hop_by_hop(&mut parts.headers);
     parts.headers.remove("x-forwarded-for");
     if let Some(host) = upstream.host_str() {
-        let host = if let Some(port) = upstream.port() {
-            format!("{host}:{port}")
-        } else {
-            host.to_string()
+        let host = match upstream.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_owned(),
         };
         if let Ok(value) = HeaderValue::from_str(&host) {
             parts.headers.insert(http::header::HOST, value);
@@ -374,17 +336,14 @@ fn outgoing_uri(upstream: &Url, path_and_query: &str) -> Result<Uri> {
     let mut base = upstream.clone();
     base.set_path("");
     base.set_query(None);
-    format!(
-        "{}{}",
-        base.as_str().trim_end_matches('/'),
-        if path_and_query.starts_with('/') {
-            path_and_query.to_string()
-        } else {
-            format!("/{path_and_query}")
-        }
-    )
-    .parse()
-    .map_err(|err| Error::Config(format!("构造上游地址失败：{err}")))
+    let suffix = if path_and_query.starts_with('/') {
+        path_and_query.to_owned()
+    } else {
+        format!("/{path_and_query}")
+    };
+    format!("{}{suffix}", base.as_str().trim_end_matches('/'))
+        .parse()
+        .map_err(|err| Error::Config(format!("构造上游地址失败：{err}")))
 }
 
 fn gateway_error() -> Response<Body> {
@@ -422,188 +381,266 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
-fn request_content_codec(path: &str, headers: &HeaderMap) -> String {
-    if streaming_request_message_type(path).is_some() {
-        header_value(headers, "connect-content-encoding")
-    } else {
-        header_value(headers, "content-encoding")
-    }
+/// Which half of the exchange a captured body belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Request,
+    Response,
 }
 
-fn response_content_codec(path: &str, headers: &HeaderMap) -> String {
-    if streaming_response_message_type(path).is_some() {
-        return header_value(headers, "connect-content-encoding");
-    }
-    if !decodes_unary_response(path) {
-        let codec = header_value(headers, "connect-content-encoding");
-        if !codec.is_empty() {
-            return codec;
+impl Side {
+    /// The streaming decoder message type for this side's RPC.
+    fn streaming_message_type(self, path: &str) -> Option<String> {
+        match self {
+            Self::Request => streaming_request_message_type(path),
+            Self::Response => streaming_response_message_type(path),
         }
     }
-    header_value(headers, "content-encoding")
+
+    /// Whether a unary protobuf body on this side can be decoded.
+    fn decodes_unary(self, path: &str) -> bool {
+        match self {
+            Self::Request => decodes_unary_request(path),
+            Self::Response => decodes_unary_response(path),
+        }
+    }
+
+    /// The label used in the "body too large to decode" message.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Request => "请求",
+            Self::Response => "响应",
+        }
+    }
+
+    fn payload(self, exchange: &mut Exchange) -> &mut Payload {
+        match self {
+            Self::Request => &mut exchange.request,
+            Self::Response => &mut exchange.response,
+        }
+    }
+
+    /// Records one decoded Connect frame into the summary and payload.
+    fn record_frame(self, exchange: &mut Exchange, frame: FrameView) {
+        let is_end_stream = frame.kind == FrameView::KIND_END_STREAM;
+        match self {
+            Self::Request => {
+                if !frame.kind.is_empty() && !is_end_stream {
+                    exchange.summary.request_kind.clone_from(&frame.kind);
+                }
+                if !frame.request_id.is_empty() {
+                    exchange.summary.request_id.clone_from(&frame.request_id);
+                }
+                exchange.request.frames.push(frame);
+            }
+            Self::Response => {
+                if !frame.kind.is_empty() && !is_end_stream {
+                    exchange.summary.response_kind.clone_from(&frame.kind);
+                }
+                if !frame.error.is_empty() {
+                    exchange.response.decode_error.clone_from(&frame.error);
+                }
+                exchange.response.frames.push(frame);
+                exchange.summary.frame_count = frame_count(exchange.response.frames.len());
+            }
+        }
+    }
 }
 
-struct CapturedBody {
+/// What a finished body is decoded against, fixed when the body was wrapped.
+struct BodyTarget {
     id: CaptureId,
     path: String,
     content_type: String,
     codec: String,
-    captured: Vec<u8>,
+    side: Side,
+}
+
+/// One finished capture, ready to be written into the exchange.
+#[derive(Debug)]
+struct FinishedBody<'a> {
     size: i64,
+    bytes: &'a [u8],
     truncated: bool,
-    read_err: Option<String>,
+    decode_error: Option<String>,
 }
 
-fn finish_request_body(store: &ExchangeStore, body: CapturedBody) {
-    let CapturedBody {
-        id,
-        path,
-        content_type,
-        codec,
-        captured,
-        size,
-        truncated,
-        read_err,
-    } = body;
-    let mut content_decode_err = None;
-    let decode_proto = decodes_unary_request(&path) && is_unary_proto_content_type(&content_type);
-    let mut decompressed = None;
-    if decode_proto && truncated {
-        content_decode_err = Some("请求正文超过抓取上限，无法完整解码".into());
-    } else if decode_proto && !codec.is_empty() && !codec.eq_ignore_ascii_case("identity") {
-        match decompress_payload(&captured, &codec) {
-            Ok(decoded) => decompressed = Some(decoded),
-            Err(err) => content_decode_err = Some(err),
-        }
-    }
-    let decode_payload: &[u8] = decompressed.as_deref().unwrap_or(&captured);
-    let mut decoded_json = String::new();
-    let mut decoded_lang = String::new();
-    let mut kind = String::new();
-    let mut request_id = String::new();
-    let mut conversation_id = String::new();
-    let mut decode_err = content_decode_err;
-    if decode_proto && decode_err.is_none() {
-        let decoded = decode_unary_request(&path, decode_payload);
-        decoded_json = decoded.json;
-        kind = decoded.kind;
-        request_id = decoded.request_id;
-        conversation_id = decoded.conversation_id;
-        decode_err = decoded.error;
-    }
-    if decode_err.is_none() && !decoded_json.is_empty() {
-        decoded_lang = "json".into();
-    } else if !decode_proto {
-        let decoded = decode_captured_content(&captured, &content_type, &codec);
-        decoded_json = decoded.text;
-        decoded_lang = decoded.language;
-        decode_err = decoded.error;
-    }
-    store.update(&id, |exchange| {
-        exchange.summary.request_bytes = size;
-        exchange.request.size = size;
-        exchange.request.raw_hex = raw_hex(&captured);
-        exchange.request.raw_truncated = truncated;
-        if !decoded_json.is_empty() {
-            exchange.request.decoded_json.clone_from(&decoded_json);
-            exchange.request.decoded_lang.clone_from(&decoded_lang);
-        }
-        if !kind.is_empty() {
-            exchange.summary.request_kind.clone_from(&kind);
-        }
-        if !request_id.is_empty() {
-            exchange.summary.request_id.clone_from(&request_id);
-        }
-        if !conversation_id.is_empty() {
-            exchange
-                .summary
-                .conversation_id
-                .clone_from(&conversation_id);
-        }
-        if let Some(err) = &decode_err {
-            exchange.request.decode_error.clone_from(err);
-        }
-        if let Some(err) = read_err {
-            exchange.summary.error = err;
-        }
-    });
+/// The decoded view of one captured body, as the debug UI shows it.
+#[derive(Debug, Default)]
+struct DecodedSide {
+    json: String,
+    language: String,
+    kind: String,
+    request_id: String,
+    conversation_id: String,
 }
 
-fn finish_response_body(store: &ExchangeStore, body: CapturedBody) {
-    let CapturedBody {
-        id,
-        path,
-        content_type,
-        codec,
-        captured,
-        size,
-        truncated,
-        read_err,
-    } = body;
-    let mut content_decode_err = None;
-    let decode_proto = decodes_unary_response(&path) && is_unary_proto_content_type(&content_type);
-    let mut decompressed = None;
-    if decode_proto && truncated {
-        content_decode_err = Some("响应正文超过抓取上限，无法完整解码".into());
-    } else if decode_proto && !codec.is_empty() && !codec.eq_ignore_ascii_case("identity") {
-        match decompress_payload(&captured, &codec) {
-            Ok(decoded) => decompressed = Some(decoded),
-            Err(err) => content_decode_err = Some(err),
-        }
-    }
-    let decode_payload: &[u8] = decompressed.as_deref().unwrap_or(&captured);
-    let mut decoded_json = String::new();
-    let mut decoded_lang = String::new();
-    let mut kind = String::new();
-    let mut decode_err = content_decode_err;
-    if decode_proto && decode_err.is_none() {
-        match decode_unary_response(&path, decode_payload) {
-            Ok(decoded) => {
-                decoded_json = decoded.json;
-                kind = decoded.kind;
+impl BodyTarget {
+    fn store(self, store: &ExchangeStore, captured: CapturedBody) {
+        let CapturedBody {
+            bytes,
+            size,
+            truncated,
+            end,
+        } = captured;
+        let proto =
+            self.side.decodes_unary(&self.path) && is_unary_proto_content_type(&self.content_type);
+        let mut decode_err = None;
+        let mut decompressed = None;
+        if proto && truncated {
+            decode_err = Some(format!(
+                "{}正文超过抓取上限，无法完整解码",
+                self.side.label()
+            ));
+        } else if proto && !self.codec.is_empty() && !self.codec.eq_ignore_ascii_case("identity") {
+            match decompress_payload(&bytes, &self.codec) {
+                Ok(decoded) => decompressed = Some(decoded),
+                Err(err) => decode_err = Some(err.to_string()),
             }
-            Err(err) => decode_err = Some(err),
         }
+        let decode_payload: &[u8] = decompressed.as_deref().unwrap_or(&bytes);
+        let decoded = if proto {
+            if decode_err.is_some() {
+                DecodedSide::default()
+            } else {
+                let (decoded, err) = decode_protobuf(self.side, &self.path, decode_payload);
+                decode_err = err;
+                decoded
+            }
+        } else {
+            let content = decode_captured_content(&bytes, &self.content_type, &self.codec);
+            decode_err = content.error;
+            DecodedSide {
+                json: content.text,
+                language: content.language,
+                ..DecodedSide::default()
+            }
+        };
+
+        let read_error = end.error();
+        let finished = FinishedBody {
+            size,
+            bytes: &bytes,
+            truncated,
+            decode_error: decode_err,
+        };
+        store.update(&self.id, |exchange| {
+            exchange.publish_body(self.side, &decoded, &finished);
+            if let Some(err) = read_error {
+                exchange.summary.state = ExchangeState::Error;
+                exchange.summary.error = err;
+            }
+        });
     }
-    if decode_err.is_none() && !decoded_json.is_empty() {
-        decoded_lang = "json".into();
-    } else if !decode_proto {
-        let decoded = decode_captured_content(&captured, &content_type, &codec);
-        decoded_json = decoded.text;
-        decoded_lang = decoded.language;
-        decode_err = decoded.error;
-    }
-    store.update(&id, |exchange| {
-        exchange.summary.response_bytes = size;
-        exchange.response.size = size;
-        exchange.response.raw_hex = raw_hex(&captured);
-        exchange.response.raw_truncated = truncated;
-        if !decoded_json.is_empty() {
-            exchange.response.decoded_json.clone_from(&decoded_json);
-            exchange.response.decoded_lang.clone_from(&decoded_lang);
-        }
-        if !kind.is_empty() {
-            exchange.summary.response_kind.clone_from(&kind);
-        }
-        if let Some(err) = &decode_err {
-            exchange.response.decode_error.clone_from(err);
-        }
-        exchange.summary.duration_ms = elapsed_ms(exchange.summary.started_at);
-        exchange.summary.state = "completed".into();
-        if let Some(err) = read_err {
-            exchange.summary.state = "error".into();
-            exchange.summary.error = err;
-        }
-    });
 }
 
-fn header_value(headers: &HeaderMap, name: &str) -> String {
+fn decode_protobuf(side: Side, path: &str, payload: &[u8]) -> (DecodedSide, Option<String>) {
+    match side {
+        Side::Request => {
+            let decoded = decode_unary_request(path, payload);
+            (
+                DecodedSide {
+                    json: decoded.json,
+                    kind: decoded.kind,
+                    request_id: decoded.request_id,
+                    conversation_id: decoded.conversation_id,
+                    language: String::new(),
+                },
+                decoded.error,
+            )
+        }
+        Side::Response => match decode_unary_response(path, payload) {
+            Ok(decoded) => (
+                DecodedSide {
+                    json: decoded.json,
+                    kind: decoded.kind,
+                    ..DecodedSide::default()
+                },
+                None,
+            ),
+            Err(err) => (DecodedSide::default(), Some(err.to_string())),
+        },
+    }
+}
+
+impl Exchange {
+    /// Writes one finished body into the summary and payload.
+    fn publish_body(&mut self, side: Side, decoded: &DecodedSide, finished: &FinishedBody<'_>) {
+        let raw_hex = raw_hex(finished.bytes);
+        match side {
+            Side::Request => {
+                self.summary.request_bytes = finished.size;
+                if !decoded.kind.is_empty() {
+                    self.summary.request_kind.clone_from(&decoded.kind);
+                }
+                if !decoded.request_id.is_empty() {
+                    self.summary.request_id.clone_from(&decoded.request_id);
+                }
+                if !decoded.conversation_id.is_empty() {
+                    self.summary
+                        .conversation_id
+                        .clone_from(&decoded.conversation_id);
+                }
+            }
+            Side::Response => {
+                self.summary.response_bytes = finished.size;
+                if !decoded.kind.is_empty() {
+                    self.summary.response_kind.clone_from(&decoded.kind);
+                }
+                self.summary.duration_ms = elapsed_ms(self.summary.started_at);
+                if self.summary.state != ExchangeState::Error {
+                    self.summary.state = ExchangeState::Completed;
+                }
+            }
+        }
+        let is_json = !decoded.json.is_empty();
+        let language = if decoded.language.is_empty() && is_json {
+            "json"
+        } else {
+            decoded.language.as_str()
+        };
+        let payload = side.payload(self);
+        payload.size = finished.size;
+        payload.raw_hex = raw_hex;
+        payload.raw_truncated = finished.truncated;
+        if is_json {
+            payload.decoded_json.clone_from(&decoded.json);
+            language.clone_into(&mut payload.decoded_lang);
+        }
+        if let Some(err) = &finished.decode_error {
+            payload.decode_error.clone_from(err);
+        }
+    }
+}
+
+fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
     headers
         .get(name)
         .and_then(|value| value.to_str().ok())
+        .map(str::trim)
         .unwrap_or_default()
-        .trim()
-        .to_string()
+}
+
+fn request_content_codec(path: &str, headers: &HeaderMap) -> String {
+    let name = if streaming_request_message_type(path).is_some() {
+        "connect-content-encoding"
+    } else {
+        "content-encoding"
+    };
+    header_value(headers, name).to_owned()
+}
+
+fn response_content_codec(path: &str, headers: &HeaderMap) -> String {
+    if streaming_response_message_type(path).is_some() {
+        return header_value(headers, "connect-content-encoding").to_owned();
+    }
+    if !decodes_unary_response(path) {
+        let codec = header_value(headers, "connect-content-encoding");
+        if !codec.is_empty() {
+            return codec.to_owned();
+        }
+    }
+    header_value(headers, "content-encoding").to_owned()
 }
 
 fn elapsed_ms(started_at: chrono::DateTime<Utc>) -> i64 {

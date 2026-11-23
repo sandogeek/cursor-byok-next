@@ -5,6 +5,11 @@ use std::sync::OnceLock;
 
 use crate::error::Error;
 
+/// Checks the generated protos still declare the local loop's required shapes.
+///
+/// # Errors
+///
+/// Returns [`Error::Shape`] naming the file and the declaration that drifted.
 pub fn validate_required_agent_shapes(file: &str, body: &str) -> Result<(), Error> {
     if let Some(block) = proto_block(body, "message", "ExecClientControlMessage")
         && !block.contains("ExecClientStreamClose stream_close = 1;")
@@ -57,10 +62,14 @@ pub fn validate_required_agent_shapes(file: &str, body: &str) -> Result<(), Erro
     Ok(())
 }
 
+/// Whether a rendered proto line is a placeholder the extractor could not fill.
+#[must_use]
 pub fn has_placeholder(line: &str) -> bool {
     placeholder().is_match(line)
 }
 
+/// Returns the braced body of `kind name` in a rendered proto file.
+#[must_use]
 pub fn proto_block<'a>(body: &'a str, kind: &str, name: &str) -> Option<&'a str> {
     let needle = format!("{kind} {name} ");
     let start = body
@@ -96,7 +105,7 @@ fn run_inference() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"rpc\s+RunInference\s*\(\s*stream\s+RunInferenceClientMessage\s*\)\s+returns\s+\(\s*stream\s+RunInferenceServerMessage\s*\)")
-            .expect("run inference")
+            .expect("the RunInference pattern is a compile-time constant")
     })
 }
 
@@ -104,7 +113,7 @@ fn run_inference_sse() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"rpc\s+RunInferenceSSE\s*\(\s*BidiRequestId\s*\)\s+returns\s+\(\s*stream\s+RunInferenceServerMessage\s*\)")
-            .expect("run inference sse")
+            .expect("the RunInferenceSSE pattern is a compile-time constant")
     })
 }
 
@@ -112,6 +121,6 @@ fn placeholder() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"^\s*(optional\s+|repeated\s+)?[A-Za-z_][A-Za-z0-9_.<>]*\s+(field_\d+|unknown)\s*=\s*\d+\s*;")
-            .expect("placeholder")
+            .expect("the placeholder pattern is a compile-time constant")
     })
 }

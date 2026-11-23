@@ -1,4 +1,5 @@
 import { Clipboard, Scroll, signal, Text, View, type JSX } from "nsh";
+import type { CallStatusView } from "cursor-byok-next/native";
 import { t } from "nsh/i18n";
 import { Button as BaseButton } from "nsh/base";
 import { Button } from "./Button";
@@ -50,20 +51,17 @@ export function CodeBlock(props: { label: string; value: string; empty?: string 
   );
 }
 
-export function CallStatus(props: { status: string }) {
+const CALL_STATUS_LABEL: Record<CallStatusView, string> = {
+  running: "calls.status.running",
+  completed: "calls.status.completed",
+  error: "calls.status.error",
+  cancelled: "calls.status.cancelled",
+};
+
+export function CallStatus(props: { status: CallStatusView }) {
   const tone = () =>
-    props.status === "completed" ? "success" : props.status === "error" || props.status === "cancelled" ? "warning" : "neutral";
-  const label = () =>
-    props.status === "running"
-      ? t("calls.status.running")
-      : props.status === "completed"
-        ? t("calls.status.completed")
-        : props.status === "error"
-          ? t("calls.status.error")
-          : props.status === "cancelled"
-            ? t("calls.status.cancelled")
-            : props.status;
-  return <StatusBadge label={label()} tone={tone()} />;
+    props.status === "completed" ? "success" : props.status === "running" ? "neutral" : "warning";
+  return <StatusBadge label={t(CALL_STATUS_LABEL[props.status])} tone={tone()} />;
 }
 
 export function RowButton(props: {

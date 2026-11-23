@@ -3,6 +3,7 @@
 mod anthropic;
 mod chat;
 mod responses;
+mod tools;
 
 use std::{collections::HashMap, time::Duration};
 
@@ -25,7 +26,7 @@ use crate::{
 };
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
-const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_STREAM_BYTES: usize = 256 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_hours(1);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -104,7 +105,7 @@ pub(super) async fn stream(
     let mut response = send_cancellable(builder, &cancellation).await?;
     let status = response.status().as_u16();
     if let Some(recorder) = &recorder {
-        recorder.response_headers(status).await?;
+        recorder.response_headers(status).await;
     }
     if !(200..300).contains(&status) {
         let body = read_error_body(
@@ -180,7 +181,7 @@ async fn read_error_body(
         };
         let Some(chunk) = chunk else { break };
         if let Some(recorder) = recorder {
-            let _ = recorder.response_chunk(&chunk).await;
+            recorder.response_chunk(&chunk).await;
         }
         let remaining = MAX_ERROR_BODY_BYTES - body.len();
         body.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
@@ -198,7 +199,7 @@ async fn read_sse(
     let mut body = response.bytes_stream();
     let mut buffered = Vec::<u8>::new();
     let mut frame = SseFrame::default();
-    let mut total = 0_u64;
+    let mut total = 0_usize;
     loop {
         let chunk = tokio::select! {
             () = cancellation.cancelled() => return Err(Error::Cancelled),
@@ -214,14 +215,14 @@ async fn read_sse(
         let chunk = chunk.map_err(|error| {
             Error::Provider(format!("cannot read plugin network stream: {error}"))
         })?;
-        total = total.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        total = total.saturating_add(chunk.len());
         if total > MAX_STREAM_BYTES {
             return Err(Error::Provider(
                 "plugin network stream is larger than allowed".into(),
             ));
         }
         if let Some(recorder) = recorder {
-            recorder.response_chunk(&chunk).await?;
+            recorder.response_chunk(&chunk).await;
         }
         buffered.extend_from_slice(&chunk);
         if push_buffered_lines(parser, &mut buffered, &mut frame, &mut emit)? {
@@ -356,13 +357,6 @@ impl SawTool {
     }
 }
 
-/// Whether a protocol's terminal event closes the tool call it names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ToolFinish {
-    Open,
-    Done,
-}
-
 fn text(value: &Value) -> Option<&str> {
     value.as_str()
 }
@@ -382,12 +376,45 @@ fn count_usize(value: &Value) -> Option<usize> {
     count_u64(value).and_then(|value| usize::try_from(value).ok())
 }
 
+/// The provider's error detail for an SSE event, if the event is an error.
+///
+/// Every provider family puts the message and an optional error kind in
+/// different places, so this reads all of the known spellings and leaves the
+/// formatting to the adapter that knows its protocol.
+fn event_error_detail(value: &Value) -> Option<(Option<String>, String)> {
+    let is_error = text(value.get("type").unwrap_or(&Value::Null)) == Some("error")
+        || value.get("error").is_some_and(|error| !error.is_null());
+    if !is_error {
+        return None;
+    }
+    let error = value.get("error").unwrap_or(&Value::Null);
+    if let Some(text) = error.as_str() {
+        return Some((None, text.to_owned()));
+    }
+    let details = object(error);
+    let kind = details
+        .and_then(|details| text(details.get("type").unwrap_or(&Value::Null)))
+        .map(str::to_owned);
+    let message = details
+        .and_then(|details| text(details.get("message").unwrap_or(&Value::Null)))
+        .or_else(|| text(value.get("message").unwrap_or(&Value::Null)))
+        .map(str::to_owned);
+    match (kind, message) {
+        (None, None) if error.is_null() => None,
+        (kind, message) => Some((kind, message.unwrap_or_else(|| error.to_string()))),
+    }
+}
+
+/// Parses one SSE payload. A JSON array or scalar is valid JSON but not an
+/// event object, so it is reported as such instead of silently reading as `{}`.
 fn parse_object(payload: &str, label: &str) -> Result<Value> {
     match serde_json::from_str::<Value>(payload) {
         Ok(Value::Object(map)) => Ok(Value::Object(map)),
-        Ok(_) => Ok(Value::Object(serde_json::Map::new())),
-        Err(_) => Err(Error::Provider(format!(
-            "{label} SSE returned invalid JSON"
+        Ok(other) => Err(Error::Provider(format!(
+            "{label} SSE returned {other} where an event object was expected"
+        ))),
+        Err(error) => Err(Error::Provider(format!(
+            "{label} SSE returned invalid JSON: {error}"
         ))),
     }
 }
@@ -448,25 +475,6 @@ fn core_message(message: &ProjectedMessage) -> Result<CoreMessage<'_>> {
         }),
         ProjectedContent::ToolResult(result) => Ok(CoreMessage::Tool(result)),
     }
-}
-
-fn usage_event(
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    total_tokens: Option<u64>,
-    cache_read_tokens: Option<u64>,
-    cache_write_tokens: Option<u64>,
-    reasoning_tokens: Option<u64>,
-) -> ModelEvent {
-    ModelEvent::Usage(crate::model::Usage {
-        input_tokens,
-        context_input_tokens: input_tokens,
-        output_tokens,
-        total_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
-        reasoning_tokens,
-    })
 }
 
 fn truncated_call_id(call_id: &str) -> &str {

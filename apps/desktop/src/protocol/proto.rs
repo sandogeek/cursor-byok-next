@@ -25,7 +25,6 @@ pub mod inference {
     pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/aiserver.v1.rs"));
     }
-    pub use v1::*;
 }
 
 pub mod aiserver {

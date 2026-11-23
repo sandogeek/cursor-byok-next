@@ -3,19 +3,37 @@
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-#[derive(Default)]
+/// Frames kept for a subscriber that attaches late. A Cursor run replays from
+/// the start, so the history is the whole stream; the cap only guards a run
+/// whose consumer never appears.
+const MAX_REPLAY_FRAMES: usize = 4_096;
+
+/// Fans one run's frames out to the streams reading them.
+#[derive(Debug, Default)]
 pub struct OutputHub {
     state: parking_lot::Mutex<OutputState>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct OutputState {
     history: Vec<Bytes>,
     subscribers: Vec<mpsc::UnboundedSender<Bytes>>,
     closed: bool,
+    /// Frames dropped from the front of `history` once it hit the cap.
+    dropped_frames: usize,
 }
 
 impl OutputHub {
+    /// The empty hub.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sends one frame to every live subscriber and keeps it for replay.
+    ///
+    /// Returns whether the frame was accepted; a closed hub drops it, which is
+    /// what makes a late write after `close` harmless.
     pub fn emit(&self, frame: Bytes) -> bool {
         let mut state = self.state.lock();
         if state.closed {
@@ -24,10 +42,16 @@ impl OutputHub {
         state
             .subscribers
             .retain(|subscriber| subscriber.send(frame.clone()).is_ok());
+        if state.history.len() == MAX_REPLAY_FRAMES {
+            state.history.remove(0);
+            state.dropped_frames += 1;
+        }
         state.history.push(frame);
         true
     }
 
+    /// A receiver that first replays the frames already emitted, then follows
+    /// live output. A closed hub yields the replay and then ends.
     pub fn subscribe(&self) -> mpsc::UnboundedReceiver<Bytes> {
         let (sender, receiver) = mpsc::unbounded_channel();
         let mut state = self.state.lock();
@@ -40,6 +64,7 @@ impl OutputHub {
         receiver
     }
 
+    /// Ends the stream. Returns whether this call closed it.
     pub fn close(&self) -> bool {
         let mut state = self.state.lock();
         if state.closed {

@@ -23,6 +23,7 @@ pub const SCALAR_TYPES: [(i32, &str); 15] = [
     (18, "sint64"),
 ];
 
+#[must_use]
 pub fn scalar_name(id: i32) -> Option<&'static str> {
     SCALAR_TYPES
         .iter()
@@ -30,10 +31,12 @@ pub fn scalar_name(id: i32) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
+#[must_use]
 pub fn is_scalar_id(id: i32) -> bool {
     scalar_name(id).is_some()
 }
 
+#[must_use]
 pub fn is_google_pkg(pkg: &str) -> bool {
     pkg == "google.protobuf" || pkg == "google.rpc"
 }
@@ -41,6 +44,7 @@ pub fn is_google_pkg(pkg: &str) -> bool {
 /// Packages the local loop actually compiles and serves.
 pub const LOCAL_LOOP_PACKAGES: [&str; 2] = ["agent.v1", "aiserver.v1"];
 
+#[must_use]
 pub fn is_local_loop_pkg(pkg: &str) -> bool {
     LOCAL_LOOP_PACKAGES.contains(&pkg)
 }
@@ -55,11 +59,123 @@ pub const GOOGLE_WELL_KNOWN: [(&str, &str); 7] = [
     ("Value", "google.protobuf.Value"),
 ];
 
+#[must_use]
 pub fn google_well_known(short: &str) -> Option<&'static str> {
     GOOGLE_WELL_KNOWN
         .iter()
         .find(|(key, _)| *key == short)
         .map(|(_, name)| *name)
+}
+
+/// How a proto declaration stores its value: inline scalar, named message,
+/// named enum, or a map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FieldKind {
+    Scalar,
+    Message,
+    Enum,
+    Map,
+}
+
+impl FieldKind {
+    /// Reads a bundle `kind` string; unknown kinds are treated as scalars,
+    /// which is what the renderer already did with them.
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        match value.trim() {
+            "message" => Self::Message,
+            "enum" => Self::Enum,
+            "map" => Self::Map,
+            _ => Self::Scalar,
+        }
+    }
+
+    /// Whether the declaration points at a named type.
+    #[must_use]
+    pub fn is_named(self) -> bool {
+        matches!(self, Self::Message | Self::Enum)
+    }
+
+    /// The named-kind equivalent of a map value, for symbol lookups.
+    #[must_use]
+    pub fn of_value(kind: ValueKind) -> Self {
+        match kind {
+            ValueKind::Enum => Self::Enum,
+            ValueKind::Scalar => Self::Scalar,
+            ValueKind::Message => Self::Message,
+        }
+    }
+}
+
+/// The value half of a map field, which cannot itself be a map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValueKind {
+    Scalar,
+    Message,
+    Enum,
+}
+
+impl ValueKind {
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        match value.trim() {
+            "message" => Self::Message,
+            "enum" => Self::Enum,
+            _ => Self::Scalar,
+        }
+    }
+
+    #[must_use]
+    pub fn is_named(self) -> bool {
+        matches!(self, Self::Message | Self::Enum)
+    }
+}
+
+/// How a service method streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum MethodKind {
+    #[default]
+    Unary,
+    ServerStreaming,
+    ClientStreaming,
+    BiDiStreaming,
+}
+
+impl MethodKind {
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        match value.trim() {
+            "ServerStreaming" => Self::ServerStreaming,
+            "ClientStreaming" => Self::ClientStreaming,
+            "BiDiStreaming" => Self::BiDiStreaming,
+            _ => Self::Unary,
+        }
+    }
+}
+
+/// What a resolved symbol is declared as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SymbolKind {
+    Message,
+    Enum,
+}
+
+impl SymbolKind {
+    #[must_use]
+    pub fn of(kind: FieldKind) -> Self {
+        match kind {
+            FieldKind::Enum => Self::Enum,
+            FieldKind::Scalar | FieldKind::Message | FieldKind::Map => Self::Message,
+        }
+    }
+
+    #[must_use]
+    pub fn of_value(kind: ValueKind) -> Self {
+        match kind {
+            ValueKind::Enum => Self::Enum,
+            ValueKind::Scalar | ValueKind::Message => Self::Message,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,34 +202,36 @@ impl TypeToken {
 pub struct Field {
     pub no: i32,
     pub name: String,
-    pub kind: String,
+    pub kind: FieldKind,
     pub t: Option<TypeToken>,
-    pub oneof: String,
+    pub oneof: Option<String>,
     pub repeated: bool,
     pub opt: bool,
-    pub map_key: i32,
-    pub map_value_kind: String,
+    pub map_key: Option<i32>,
+    pub map_value_kind: ValueKind,
     pub map_value_t: Option<TypeToken>,
 }
 
 impl Field {
-    pub fn new(no: i32, name: impl Into<String>, kind: impl Into<String>) -> Self {
+    /// Builds a field with no type token, label or map part yet.
+    #[must_use]
+    pub fn new(no: i32, name: &str, kind: FieldKind) -> Self {
         Self {
             no,
-            name: name.into(),
-            kind: kind.into(),
+            name: name.to_owned(),
+            kind,
             t: None,
-            oneof: String::new(),
+            oneof: None,
             repeated: false,
             opt: false,
-            map_key: 0,
-            map_value_kind: String::new(),
+            map_key: None,
+            map_value_kind: ValueKind::Scalar,
             map_value_t: None,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     pub type_name: String,
     pub var_name: String,
@@ -122,16 +240,17 @@ pub struct Message {
     pub package: String,
     pub short_name: String,
     pub pos: u32,
-    pub module_start: u32,
+    /// Byte offset of the enclosing webpack module; `None` at top level.
+    pub module_start: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumValue {
     pub no: i32,
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Enum {
     pub type_name: String,
     pub var_name: String,
@@ -139,18 +258,19 @@ pub struct Enum {
     pub package: String,
     pub short_name: String,
     pub pos: u32,
-    pub module_start: u32,
+    /// Byte offset of the enclosing webpack module; `None` at top level.
+    pub module_start: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Method {
     pub name: String,
     pub input_type: String,
     pub output_type: String,
-    pub kind: String,
+    pub kind: MethodKind,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Service {
     pub type_name: String,
     pub var_name: String,
@@ -158,18 +278,20 @@ pub struct Service {
     pub package: String,
     pub short_name: String,
     pub pos: u32,
-    pub module_start: u32,
+    /// Byte offset of the enclosing webpack module; `None` at top level.
+    pub module_start: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolDef {
     pub type_name: String,
     pub pos: u32,
-    pub kind: String,
-    pub module_start: u32,
+    pub kind: SymbolKind,
+    /// Byte offset of the enclosing webpack module; `None` at top level.
+    pub module_start: Option<u32>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Diagnostics {
     pub total_field_objects: usize,
     pub parsed_field_objects: usize,
@@ -227,7 +349,8 @@ impl Diagnostics {
         self.shape_errors.push(error.to_string());
     }
 
-    pub fn merge_from(&mut self, other: &mut Diagnostics) {
+    /// Folds `other` into `self`, keeping every counter and collection.
+    pub fn merge_from(&mut self, mut other: Diagnostics) {
         self.total_field_objects += other.total_field_objects;
         self.parsed_field_objects += other.parsed_field_objects;
         self.skipped_field_objects += other.skipped_field_objects;
@@ -236,10 +359,20 @@ impl Diagnostics {
         if self.skipped_field_samples.len() > 20 {
             self.skipped_field_samples.truncate(20);
         }
+        for (key, count) in other.unresolved_type_refs {
+            *self.unresolved_type_refs.entry(key).or_insert(0) += count;
+        }
+        self.empty_messages.append(&mut other.empty_messages);
+        self.placeholder_hits.append(&mut other.placeholder_hits);
+        self.missing_declarations
+            .append(&mut other.missing_declarations);
+        self.declared_types += other.declared_types;
+        self.extracted_types += other.extracted_types;
         self.parse_errors.append(&mut other.parse_errors);
         if self.parse_errors.len() > 20 {
             self.parse_errors.truncate(20);
         }
+        self.shape_errors.append(&mut other.shape_errors);
     }
 
     pub fn has_failure(&self) -> bool {
@@ -323,6 +456,7 @@ impl fmt::Display for Diagnostics {
     }
 }
 
+#[must_use]
 pub fn looks_like_full_type_name(r#ref: &str) -> bool {
     let trimmed = r#ref.trim();
     if trimmed.starts_with("google.protobuf.") || trimmed.starts_with("google.rpc.") {
@@ -331,6 +465,7 @@ pub fn looks_like_full_type_name(r#ref: &str) -> bool {
     looks_like_versioned_type(trimmed)
 }
 
+#[must_use]
 pub fn looks_like_versioned_type(value: &str) -> bool {
     let mut parts = value.split('.');
     let Some(first) = parts.next() else {
@@ -355,6 +490,7 @@ pub fn looks_like_versioned_type(value: &str) -> bool {
     saw_version && after_version > 0
 }
 
+#[must_use]
 pub fn looks_like_package_name(value: &str) -> bool {
     let trimmed = value
         .trim()
@@ -374,10 +510,10 @@ pub fn looks_like_package_name(value: &str) -> bool {
         return false;
     }
     let rest: Vec<_> = parts.collect();
-    if rest.is_empty() {
+    let Some(last) = rest.last() else {
         return false;
-    }
-    is_version_token(rest[rest.len() - 1]) && rest.iter().all(|part| is_ident(part))
+    };
+    is_version_token(last) && rest.iter().all(|part| is_ident(part))
 }
 
 /// A type reference split into its package and its name inside that package.
@@ -390,14 +526,16 @@ pub struct TypeName {
 }
 
 impl TypeName {
-    pub fn new(package: impl Into<String>, short: impl Into<String>) -> Self {
+    #[must_use]
+    pub fn new(package: &str, short: &str) -> Self {
         Self {
-            package: package.into(),
-            short: short.into(),
+            package: package.to_owned(),
+            short: short.to_owned(),
         }
     }
 }
 
+#[must_use]
 pub fn parse_type_name(type_name: &str) -> TypeName {
     if let Some(rest) = type_name.strip_prefix("google.protobuf.") {
         return TypeName::new("google.protobuf", rest);
@@ -405,7 +543,7 @@ pub fn parse_type_name(type_name: &str) -> TypeName {
     if let Some(rest) = type_name.strip_prefix("google.rpc.") {
         return TypeName::new("google.rpc", rest);
     }
-    if let Some((package, short)) = split_versioned(type_name) {
+    if let Some(TypeNamePart { package, short }) = split_versioned(type_name) {
         return TypeName::new(package, short);
     }
     match type_name.rsplit_once('.') {
@@ -414,7 +552,12 @@ pub fn parse_type_name(type_name: &str) -> TypeName {
     }
 }
 
-fn split_versioned(type_name: &str) -> Option<(String, String)> {
+struct TypeNamePart<'a> {
+    package: &'a str,
+    short: &'a str,
+}
+
+fn split_versioned(type_name: &str) -> Option<TypeNamePart<'_>> {
     let bytes = type_name.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -425,7 +568,10 @@ fn split_versioned(type_name: &str) -> Option<(String, String)> {
                     j += 1;
                 }
                 if j < bytes.len() && bytes[j] == b'.' {
-                    return Some((type_name[..j].to_string(), type_name[j + 1..].to_string()));
+                    return Some(TypeNamePart {
+                        package: &type_name[..j],
+                        short: &type_name[j + 1..],
+                    });
                 }
             }
         }
@@ -435,14 +581,13 @@ fn split_versioned(type_name: &str) -> Option<(String, String)> {
 }
 
 fn is_version_token(part: &str) -> bool {
-    let mut chars = part.chars();
-    if chars.next() != Some('v') {
+    let Some(rest) = part.strip_prefix('v') else {
         return false;
-    }
-    let rest: String = chars.collect();
+    };
     !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
 }
 
+#[must_use]
 pub fn is_ident(value: &str) -> bool {
     let mut chars = value.chars();
     match chars.next() {
@@ -452,6 +597,7 @@ pub fn is_ident(value: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
+#[must_use]
 pub fn is_field_name(value: &str) -> bool {
     let mut chars = value.chars();
     match chars.next() {

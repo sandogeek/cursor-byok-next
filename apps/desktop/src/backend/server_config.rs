@@ -1,12 +1,7 @@
 //! Keeps Cursor Agent traffic on HTTP/1.1 Connect.
 
-use axum::{
-    body::Body,
-    http::{HeaderValue, Response, StatusCode, header},
-};
+use axum::{body::Body, http::Response};
 use prost::Message;
-
-use crate::Result;
 
 const HTTP2_CONFIG_FORCE_ALL_DISABLED: i32 = 1;
 
@@ -20,15 +15,8 @@ struct ServerConfigResponse {
     cli_sandbox_default_enabled: Option<bool>,
 }
 
-pub async fn get() -> Result<Response<Body>> {
-    let payload = server_config().encode_to_vec();
-    let mut response = Response::new(Body::from(payload));
-    *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/proto"),
-    );
-    Ok(response)
+pub async fn get() -> Response<Body> {
+    super::proto_response(server_config())
 }
 
 fn server_config() -> ServerConfigResponse {

@@ -2,9 +2,8 @@
 
 use oxc::ast::ast::{
     Argument, ArrayExpression, AssignmentTarget, BindingPattern, CallExpression, Expression,
-    FormalParameter, FunctionBody, ObjectPropertyKind, PropertyKey, Statement,
+    FunctionBody, ObjectPropertyKind, PropertyKey, Statement,
 };
-use oxc::str::JSStr;
 use oxc::syntax::operator::UnaryOperator;
 
 pub fn ident_name<'a>(expr: &Expression<'a>) -> Option<&'a str> {
@@ -14,13 +13,9 @@ pub fn ident_name<'a>(expr: &Expression<'a>) -> Option<&'a str> {
     }
 }
 
-pub fn js_str<'a>(value: &'a JSStr<'a>) -> Option<&'a str> {
-    value.as_str()
-}
-
 pub fn string_lit<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
     match expr.get_inner_expression() {
-        Expression::StringLiteral(lit) => js_str(&lit.value),
+        Expression::StringLiteral(lit) => lit.value.as_str(),
         _ => None,
     }
 }
@@ -125,7 +120,7 @@ pub fn property_name<'a>(key: &'a PropertyKey<'a>) -> Option<&'a str> {
     match key {
         PropertyKey::StaticIdentifier(id) => Some(id.name.as_str()),
         PropertyKey::Identifier(id) => Some(id.name.as_str()),
-        PropertyKey::StringLiteral(lit) => js_str(&lit.value),
+        PropertyKey::StringLiteral(lit) => lit.value.as_str(),
         _ => None,
     }
 }
@@ -133,7 +128,7 @@ pub fn property_name<'a>(key: &'a PropertyKey<'a>) -> Option<&'a str> {
 pub fn property_numeric_key(key: &PropertyKey<'_>) -> Option<u32> {
     match key {
         PropertyKey::NumericLiteral(lit) => f64_to_u32(lit.value),
-        PropertyKey::StringLiteral(lit) => js_str(&lit.value).and_then(|value| value.parse().ok()),
+        PropertyKey::StringLiteral(lit) => lit.value.as_str().and_then(|value| value.parse().ok()),
         PropertyKey::StaticIdentifier(id) => id.name.parse().ok(),
         _ => None,
     }
@@ -213,13 +208,6 @@ pub fn array_from_expr<'a>(expr: &'a Expression<'a>) -> Option<&'a ArrayExpressi
             .and_then(array_from_expr),
         _ => None,
     }
-}
-
-pub fn param_names(params: &[FormalParameter<'_>]) -> Vec<String> {
-    params
-        .iter()
-        .filter_map(|param| binding_ident(&param.pattern).map(str::to_string))
-        .collect()
 }
 
 pub fn last_segment(path: &str) -> &str {

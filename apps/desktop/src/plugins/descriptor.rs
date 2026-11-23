@@ -25,12 +25,36 @@ pub struct ProviderDefinition {
     #[serde(default)]
     pub resource_type: Option<String>,
     pub has_models: bool,
-    #[serde(default = "default_catalog_mode")]
-    pub catalog: String,
+    #[serde(default)]
+    pub catalog: CatalogMode,
 }
 
-fn default_catalog_mode() -> String {
-    SNAPSHOT_CATALOG.to_owned()
+/// How a provider's model list is obtained.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogMode {
+    /// Ask the plugin for models the first time they are needed.
+    Live,
+    /// Only the models the plugin stored when a resource was added.
+    #[default]
+    Snapshot,
+}
+
+impl CatalogMode {
+    /// The wire name Cursor and plugin manifests use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => LIVE_CATALOG,
+            Self::Snapshot => SNAPSHOT_CATALOG,
+        }
+    }
+}
+
+impl std::fmt::Display for CatalogMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -49,7 +73,7 @@ pub struct ResourceDefinition {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AddMethodDefinition {
     #[serde(rename = "type")]
-    pub method_type: String,
+    pub method_type: AddMethodKind,
     pub id: String,
     pub display_name: LocalizedText,
     #[serde(default)]
@@ -60,13 +84,55 @@ pub struct AddMethodDefinition {
     pub fields: Vec<FormFieldDefinition>,
 }
 
+/// The kinds of "add a resource" flow a plugin can declare.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AddMethodKind {
+    /// A form the host draws from [`FormFieldDefinition`]s.
+    Form,
+}
+
+impl AddMethodKind {
+    /// The wire name Cursor and plugin manifests use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Form => FORM_ADD_METHOD,
+        }
+    }
+}
+
+/// The host-rendered input kinds a plugin form may ask for.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FormFieldKind {
+    /// A URL the host also registers as a network origin.
+    Url,
+    /// A value the host masks while typing.
+    Secret,
+    /// Free text.
+    Text,
+}
+
+impl FormFieldKind {
+    /// The wire name Cursor and plugin manifests use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Url => FORM_FIELD_URL,
+            Self::Secret => FORM_FIELD_SECRET,
+            Self::Text => FORM_FIELD_TEXT,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FormFieldDefinition {
     pub id: String,
     pub label: LocalizedText,
     #[serde(rename = "type")]
-    pub field_type: String,
+    pub field_type: FormFieldKind,
     #[serde(default)]
     pub required: bool,
     #[serde(default)]
@@ -114,7 +180,7 @@ pub struct PluginProviderDescriptor {
     pub provider_type: String,
     pub resource_type: Option<String>,
     pub has_models: bool,
-    pub catalog: String,
+    pub catalog: CatalogMode,
     pub configured: bool,
     pub models: Vec<PluginModelDescriptor>,
     pub catalog_error: Option<String>,

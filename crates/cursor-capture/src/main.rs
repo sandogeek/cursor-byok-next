@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use cursor_capture::{Config, Server};
 
@@ -18,30 +19,27 @@ async fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-addr" | "--addr" => {
-                if let Some(value) = args.next() {
-                    config.service_addr = value;
-                }
-            }
+            "-addr" | "--addr" => match args.next() {
+                Some(value) => config.service_addr = value,
+                None => return usage_error("--addr needs a value"),
+            },
             "-max-exchanges" | "--max-exchanges" => {
                 let Some(value) = args.next() else {
-                    eprintln!("--max-exchanges needs a value");
-                    return ExitCode::from(2);
+                    return usage_error("--max-exchanges needs a value");
                 };
                 match value.parse() {
                     Ok(max) => config.max_exchanges = max,
                     Err(err) => {
-                        eprintln!("--max-exchanges must be a positive integer: {err}");
-                        return ExitCode::from(2);
+                        return usage_error(&format!(
+                            "--max-exchanges must be a positive integer: {err}"
+                        ));
                     }
                 }
             }
-            "-db" | "--db" => {
-                if let Some(value) = args.next() {
-                    config.database_path = PathBuf::from(value);
-                }
-            }
-            "-open" | "--open" => open_browser = true,
+            "-db" | "--db" => match args.next() {
+                Some(value) => config.database_path = PathBuf::from(value),
+                None => return usage_error("--db needs a path"),
+            },
             "-no-open" | "--no-open" => open_browser = false,
             "-h" | "--help" => {
                 print_usage();
@@ -55,7 +53,7 @@ async fn main() -> ExitCode {
         }
     }
     let server = match Server::new(config) {
-        Ok(server) => server,
+        Ok(server) => Arc::new(server),
         Err(err) => {
             eprintln!("{err}");
             return ExitCode::FAILURE;
@@ -64,7 +62,7 @@ async fn main() -> ExitCode {
     let listener = match tokio::net::TcpListener::bind(server.service_addr()).await {
         Ok(listener) => listener,
         Err(err) => {
-            eprintln!("启动 API 服务监听失败：{err}");
+            eprintln!("无法监听 {}：{err}", server.service_addr());
             return ExitCode::FAILURE;
         }
     };
@@ -75,10 +73,10 @@ async fn main() -> ExitCode {
     println!("调试界面: {}", server.ui_url());
     println!("SQLite: {}", server.database_path());
     if open_browser {
-        let _ = open::that(server.ui_url());
+        report_launch_failure(&server);
     }
 
-    let app = server.router();
+    let app = Arc::clone(&server).router();
     if let Err(err) = axum::serve(listener, app.into_make_service())
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -89,8 +87,24 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Opens the debug UI, reporting a failure instead of silently doing nothing.
+fn report_launch_failure(server: &Server) {
+    let url = server.ui_url();
+    if let Err(err) = open::that(&url) {
+        eprintln!("无法自动打开浏览器（{url}）：{err}");
+    }
+}
+
+fn usage_error(message: &str) -> ExitCode {
+    eprintln!("{message}");
+    print_usage();
+    ExitCode::from(2)
+}
+
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        eprintln!("无法监听中断信号，只能通过关闭进程退出：{err}");
+    }
 }
 
 fn print_usage() {

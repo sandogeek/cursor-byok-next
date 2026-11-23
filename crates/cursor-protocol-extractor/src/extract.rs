@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::merge::{
-    collect_needed_types, compact_strings, declaration_coverage, keep_local_loop_enums,
-    keep_local_loop_messages, keep_local_loop_services, merge_enums_by_type_name,
-    merge_messages_by_type_name, merge_services_by_type_name, normalize_type_references,
-    reclassify_enum_fields, record_empty_messages,
+    collect_needed_types, declaration_coverage, keep_local_loop_enums, keep_local_loop_messages,
+    keep_local_loop_services, merge_enums_by_type_name, merge_messages_by_type_name,
+    merge_services_by_type_name, normalize_type_references, reclassify_enum_fields,
+    record_empty_messages, sorted_dedup,
 };
-use crate::renderer::generate_proto_file;
+use crate::renderer::{CopiedType, ProtoFile, generate_proto_file};
 use crate::resolver::{TypeResolver, build_alias_index, build_module_imports};
 use crate::scan::{BundleScan, scan_source};
 use crate::types::{
@@ -22,21 +22,22 @@ use crate::validate::{has_placeholder, validate_required_agent_shapes};
 
 /// Failures that stop an extraction run.
 #[derive(Debug, thiserror::Error)]
+#[must_use]
 pub enum ExtractError {
-    #[error("failed to read {path}: {source}")]
+    #[error("failed to read {}: {source}", path.display())]
     Read {
-        path: String,
+        path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to write {path}: {source}")]
+    #[error("failed to write {}: {source}", path.display())]
     Write {
-        path: String,
+        path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("{0}")]
-    Validation(String),
+    #[error("extracted protos failed the local-loop shape checks:\n{diagnostics}")]
+    Validation { diagnostics: Box<Diagnostics> },
 }
 
 #[derive(Debug)]
@@ -58,7 +59,7 @@ pub enum Strictness {
     Lenient,
 }
 
-/// Scans each `(file name, source)` pair and renders the local-loop protos.
+/// Scans each JS bundle source and renders the local-loop protos.
 ///
 /// # Errors
 ///
@@ -66,7 +67,7 @@ pub enum Strictness {
 /// diagnostic reports a skipped field, unresolved type, placeholder, missing
 /// declaration or shape mismatch.
 pub fn extract_from_sources(
-    sources: &[(String, String)],
+    sources: &[String],
     strictness: Strictness,
 ) -> Result<ExtractResult, ExtractError> {
     let mut all_messages = Vec::new();
@@ -75,16 +76,22 @@ pub fn extract_from_sources(
     let mut diag = Diagnostics::default();
     let mut declared = Vec::new();
 
-    for (_name, source) in sources {
+    for source in sources {
         let mut scan = scan_source(source);
-        diag.merge_from(&mut scan.diagnostics);
+        let scan_diagnostics = std::mem::take(&mut scan.diagnostics);
+        diag.merge_from(scan_diagnostics);
         declared.append(&mut scan.declared);
         remap_module_imports(&mut scan);
         let aliases = build_alias_index(&scan.aliases);
         let export_aliases = build_alias_index(&scan.export_aliases);
-        let mut resolver =
-            TypeResolver::new(&scan.messages, &scan.enums, &aliases, &export_aliases);
-        resolver.module_imports = build_module_imports(&scan.module_imports, &scan.module_starts);
+        let module_imports = build_module_imports(&scan.module_imports, &scan.module_starts);
+        let resolver = TypeResolver::new(
+            &scan.messages,
+            &scan.enums,
+            &aliases,
+            &export_aliases,
+            module_imports,
+        );
         reclassify_enum_fields(&mut scan.messages, &scan.enums);
         normalize_type_references(&mut scan.messages, &mut scan.services, &resolver);
         reclassify_enum_fields(&mut scan.messages, &scan.enums);
@@ -96,18 +103,33 @@ pub fn extract_from_sources(
     let messages = keep_local_loop_messages(merge_messages_by_type_name(all_messages));
     let enums = keep_local_loop_enums(merge_enums_by_type_name(all_enums));
     let services = keep_local_loop_services(merge_services_by_type_name(all_services));
-    let no_aliases = HashMap::default();
-    let resolver = TypeResolver::new(&messages, &enums, &no_aliases, &no_aliases);
+    let resolver = TypeResolver::new(
+        &messages,
+        &enums,
+        &HashMap::default(),
+        &HashMap::default(),
+        HashMap::default(),
+    );
 
     record_empty_messages(&mut diag, &messages);
     let coverage = declaration_coverage(&declared, &messages, &enums, &services);
     diag.declared_types = coverage.declared;
     diag.extracted_types = coverage.extracted;
-    diag.missing_declarations = compact_strings(coverage.missing);
+    diag.missing_declarations = sorted_dedup(coverage.missing);
 
-    let files = generate_local_loop_protos(&messages, &enums, &services, &resolver, &mut diag);
+    let files = generate_local_loop_protos(
+        &Declarations {
+            messages: &messages,
+            enums: &enums,
+            services: &services,
+        },
+        &resolver,
+        &mut diag,
+    );
     if strictness == Strictness::Strict && diag.has_failure() {
-        return Err(ExtractError::Validation(diag.to_string()));
+        return Err(ExtractError::Validation {
+            diagnostics: Box::new(diag),
+        });
     }
     Ok(ExtractResult {
         messages,
@@ -134,14 +156,14 @@ pub fn extract_from_files(
     output_dir: impl AsRef<Path>,
     strictness: Strictness,
 ) -> Result<ExtractResult, ExtractError> {
-    let mut sources = Vec::new();
+    let mut sources = Vec::with_capacity(input_files.len());
     for path in input_files {
         let path = path.as_ref();
         let text = fs::read_to_string(path).map_err(|source| ExtractError::Read {
-            path: path.display().to_string(),
+            path: path.to_path_buf(),
             source,
         })?;
-        sources.push((path.to_string_lossy().into_owned(), text));
+        sources.push(text);
     }
     let result = extract_from_sources(&sources, strictness)?;
     write_protos(output_dir, &result.files)?;
@@ -154,24 +176,25 @@ pub fn extract_from_files(
 ///
 /// Returns [`ExtractError::Write`] when the temp directory cannot be created,
 /// a file cannot be written, or the directory cannot be swapped in.
+#[expect(
+    clippy::implicit_hasher,
+    reason = "callers always build the default `HashMap`; the extractor is a CLI"
+)]
 pub fn write_protos(
     output_dir: impl AsRef<Path>,
-    files: &HashMap<String, String, impl std::hash::BuildHasher>,
+    files: &HashMap<String, String>,
 ) -> Result<(), ExtractError> {
     let output_dir = output_dir.as_ref();
-    let parent = output_dir.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_or_cwd(output_dir);
     fs::create_dir_all(parent).map_err(|source| ExtractError::Write {
-        path: parent.display().to_string(),
+        path: parent.to_path_buf(),
         source,
     })?;
     let temp_dir = unique_temp_dir(parent, output_dir)?;
     let write_result = (|| {
         for (name, body) in files {
             let path = temp_dir.join(name);
-            fs::write(&path, body).map_err(|source| ExtractError::Write {
-                path: path.display().to_string(),
-                source,
-            })?;
+            fs::write(&path, body).map_err(|source| ExtractError::Write { path, source })?;
         }
         replace_dir(output_dir, &temp_dir)
     })();
@@ -181,6 +204,13 @@ pub fn write_protos(
     write_result
 }
 
+fn parent_or_cwd(path: &Path) -> &Path {
+    path.parent().unwrap_or_else(|| Path::new("."))
+}
+
+/// How many sibling temp names `unique_temp_dir` will try before giving up.
+const TEMP_DIR_ATTEMPTS: u32 = 32;
+
 fn unique_temp_dir(parent: &Path, output_dir: &Path) -> Result<PathBuf, ExtractError> {
     let stem = output_dir
         .file_name()
@@ -189,38 +219,38 @@ fn unique_temp_dir(parent: &Path, output_dir: &Path) -> Result<PathBuf, ExtractE
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
-    for attempt in 0..32 {
+    for attempt in 0..TEMP_DIR_ATTEMPTS {
         let candidate = parent.join(format!(".{stem}.tmp.{nanos}.{attempt}"));
         match fs::create_dir(&candidate) {
             Ok(()) => return Ok(candidate),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(source) => {
                 return Err(ExtractError::Write {
-                    path: candidate.display().to_string(),
+                    path: candidate,
                     source,
                 });
             }
         }
     }
     Err(ExtractError::Write {
-        path: parent.display().to_string(),
+        path: parent.to_path_buf(),
         source: std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            "failed to allocate a unique temp directory",
+            format!("could not allocate a temp directory after {TEMP_DIR_ATTEMPTS} attempts"),
         ),
     })
 }
 
 fn replace_dir(output_dir: &Path, temp_dir: &Path) -> Result<(), ExtractError> {
-    let parent = output_dir.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_or_cwd(output_dir);
     let backup = if output_dir.exists() {
         let backup = unique_temp_dir(parent, output_dir)?;
         fs::remove_dir(&backup).map_err(|source| ExtractError::Write {
-            path: backup.display().to_string(),
+            path: backup.clone(),
             source,
         })?;
         fs::rename(output_dir, &backup).map_err(|source| ExtractError::Write {
-            path: output_dir.display().to_string(),
+            path: output_dir.to_path_buf(),
             source,
         })?;
         Some(backup)
@@ -236,119 +266,148 @@ fn replace_dir(output_dir: &Path, temp_dir: &Path) -> Result<(), ExtractError> {
         }
         Err(source) => {
             if let Some(backup) = backup {
-                let _ = fs::rename(&backup, output_dir);
+                fs::rename(&backup, output_dir).map_err(|rollback| ExtractError::Write {
+                    path: output_dir.to_path_buf(),
+                    source: rollback,
+                })?;
             }
             Err(ExtractError::Write {
-                path: output_dir.display().to_string(),
+                path: output_dir.to_path_buf(),
                 source,
             })
         }
     }
 }
 
+/// One proto file's declarations, plus how each of its short names maps back to
+/// the fully-qualified type it came from.
 fn generate_local_loop_protos(
-    messages: &[Message],
-    enums: &[Enum],
-    services: &[Service],
+    declarations: &Declarations<'_>,
     resolver: &TypeResolver,
     diag: &mut Diagnostics,
 ) -> HashMap<String, String> {
-    let mut packages: HashMap<String, Package> = HashMap::new();
+    let Declarations {
+        messages,
+        enums,
+        services,
+    } = *declarations;
+    let mut packages: HashMap<&str, ProtoFile> = HashMap::new();
     for message in messages {
         packages
-            .entry(message.package.clone())
+            .entry(message.package.as_str())
             .or_default()
             .messages
             .push(message.clone());
     }
     for item in enums {
         packages
-            .entry(item.package.clone())
+            .entry(item.package.as_str())
             .or_default()
             .enums
             .push(item.clone());
     }
     for service in services {
         packages
-            .entry(service.package.clone())
+            .entry(service.package.as_str())
             .or_default()
             .services
             .push(service.clone());
     }
 
-    let mut all_messages = HashMap::new();
-    let mut all_enums = HashMap::new();
-    for (pkg, package) in &packages {
-        if is_google_pkg(pkg) {
-            continue;
-        }
-        for message in &package.messages {
-            all_messages.insert(message.type_name.clone(), message.clone());
-        }
-        for item in &package.enums {
-            all_enums.insert(item.type_name.clone(), item.clone());
-        }
-    }
+    let index = DeclarationIndex::new(messages, enums);
 
     let mut files = HashMap::new();
     for pkg_name in crate::types::LOCAL_LOOP_PACKAGES {
         let package = packages.remove(pkg_name).unwrap_or_default();
-        let (augmented, copied) =
-            copy_external_types(pkg_name, package, resolver, &all_messages, &all_enums);
-        let body = generate_proto_file(
-            pkg_name,
-            &augmented.messages,
-            &augmented.enums,
-            &augmented.services,
-            resolver,
-            &copied,
-            diag,
-        );
-        if let Err(err) =
-            validate_required_agent_shapes(&format!("{}.proto", pkg_name.replace('.', "_")), &body)
-        {
+        let augmented = copy_external_types(pkg_name, package, resolver, &index);
+        let body = generate_proto_file(pkg_name, &augmented, resolver, diag);
+        let file_name = format!("{}.proto", pkg_name.replace('.', "_"));
+        if let Err(err) = validate_required_agent_shapes(&file_name, &body) {
             diag.add_shape_error(&err);
         }
         for (idx, line) in body.lines().enumerate() {
             if has_placeholder(line) {
                 diag.placeholder_hits
-                    .push(format!("{}:{}: {}", pkg_name, idx + 1, line.trim()));
+                    .push(format!("{pkg_name}:{}: {}", idx + 1, line.trim()));
             }
         }
-        files.insert(format!("{}.proto", pkg_name.replace('.', "_")), body);
+        files.insert(file_name, body);
     }
     files
 }
 
-#[derive(Default, Clone)]
-struct Package {
-    messages: Vec<Message>,
-    enums: Vec<Enum>,
-    services: Vec<Service>,
+/// The declarations one extraction produced, by kind.
+#[derive(Clone, Copy)]
+struct Declarations<'a> {
+    messages: &'a [Message],
+    enums: &'a [Enum],
+    services: &'a [Service],
+}
+
+/// Every message and enum by fully-qualified name, so copies can be found
+/// without re-scanning the declaration lists. `google` types are excluded: they
+/// are imported, never copied in.
+struct DeclarationIndex<'a> {
+    messages: HashMap<&'a str, &'a Message>,
+    enums: HashMap<&'a str, &'a Enum>,
+}
+
+impl<'a> DeclarationIndex<'a> {
+    fn new(messages: &'a [Message], enums: &'a [Enum]) -> Self {
+        Self {
+            messages: messages
+                .iter()
+                .filter(|message| !is_google_pkg(&message.package))
+                .map(|message| (message.type_name.as_str(), message))
+                .collect(),
+            enums: enums
+                .iter()
+                .filter(|item| !is_google_pkg(&item.package))
+                .map(|item| (item.type_name.as_str(), item))
+                .collect(),
+        }
+    }
+}
+
+/// How many fixpoint rounds `copy_external_types` will run before giving up on
+/// a reference cycle it could not resolve.
+const COPY_ROUNDS: usize = 20;
+
+/// Builds a cloned copy of a message declared in another package.
+fn copied_message(message: &Message, pkg_name: &str) -> Message {
+    let mut copy = message.clone();
+    pkg_name.clone_into(&mut copy.package);
+    copy
+}
+
+/// Builds a cloned copy of an enum declared in another package.
+fn copied_enum(item: &Enum, pkg_name: &str) -> Enum {
+    let mut copy = item.clone();
+    pkg_name.clone_into(&mut copy.package);
+    copy
 }
 
 fn copy_external_types(
     pkg_name: &str,
-    package: Package,
+    package: ProtoFile,
     resolver: &TypeResolver,
-    all_messages: &HashMap<String, Message>,
-    all_enums: &HashMap<String, Enum>,
-) -> (Package, HashMap<String, String>) {
-    let mut copied = HashMap::new();
-    let mut local_types = HashSet::new();
-    for message in &package.messages {
-        local_types.insert(message.short_name.clone());
-        copied.insert(
-            message.short_name.clone(),
-            format!("local:{}", message.type_name),
-        );
-    }
-    for item in &package.enums {
-        local_types.insert(item.short_name.clone());
-        copied.insert(item.short_name.clone(), format!("local:{}", item.type_name));
-    }
+    index: &DeclarationIndex<'_>,
+) -> ProtoFile {
     let mut result = package;
-    for _ in 0..20 {
+    let mut local_types = HashSet::new();
+    for message in &result.messages {
+        local_types.insert(message.short_name.clone());
+        result
+            .copied
+            .insert(message.short_name.clone(), CopiedType::Local);
+    }
+    for item in &result.enums {
+        local_types.insert(item.short_name.clone());
+        result
+            .copied
+            .insert(item.short_name.clone(), CopiedType::Local);
+    }
+    for _ in 0..COPY_ROUNDS {
         let needed = collect_needed_types(
             pkg_name,
             &result.messages,
@@ -362,22 +421,24 @@ fn copy_external_types(
             if package == pkg_name || is_google_pkg(&package) || local_types.contains(&short) {
                 continue;
             }
-            if let Some(message) = all_messages.get(&type_name) {
-                let mut copy = message.clone();
-                copy.package = pkg_name.to_string();
-                result.messages.push(copy);
-                copied.insert(short.clone(), type_name);
+            if let Some(message) = index.messages.get(type_name.as_str()) {
+                result.messages.push(copied_message(message, pkg_name));
+                result
+                    .copied
+                    .insert(short.clone(), CopiedType::External(type_name));
                 local_types.insert(short);
                 copied_this_round += 1;
-            } else if let Some(item) = all_enums.get(&type_name) {
-                let mut copy = item.clone();
-                copy.package = pkg_name.to_string();
-                result.enums.push(copy);
-                copied.insert(short.clone(), type_name);
+            } else if let Some(item) = index.enums.get(type_name.as_str()) {
+                result.enums.push(copied_enum(item, pkg_name));
+                result
+                    .copied
+                    .insert(short.clone(), CopiedType::External(type_name));
                 local_types.insert(short);
                 copied_this_round += 1;
             } else if is_local_loop_pkg(&package) {
-                copied.insert(short.clone(), type_name);
+                result
+                    .copied
+                    .insert(short.clone(), CopiedType::External(type_name));
                 local_types.insert(short);
             }
         }
@@ -385,15 +446,14 @@ fn copy_external_types(
             break;
         }
     }
-    (result, copied)
+    result
 }
 
 fn remap_module_imports(scan: &mut BundleScan) {
     let id_to_start: HashMap<u32, u32> = scan
         .module_starts
         .iter()
-        .copied()
-        .map(|(start, id)| (id, start))
+        .map(|module| (module.id, module.start))
         .collect();
     for (_, alias, target) in &mut scan.module_imports {
         if alias.is_empty() {

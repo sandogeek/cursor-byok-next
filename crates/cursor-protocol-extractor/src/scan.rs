@@ -16,18 +16,20 @@ use std::sync::OnceLock;
 use crate::ast_util::{
     argument_expr, array_from_expr, assignment_ident, assignment_member, binding_ident,
     callee_tail, f64_to_i32, f64_to_u32, ident_name, is_js_true, last_segment, member_or_ident,
-    number_lit, object_prop, object_prop_shorthand, param_names, property_name,
-    property_numeric_key, returned_expression, string_lit,
+    number_lit, object_prop, object_prop_shorthand, property_name, property_numeric_key,
+    returned_expression, string_lit,
 };
 use crate::compact::{
-    CompactClass, CompactPendingMessage, CompactPrefix, compact_class_name_at,
+    CompactClass, CompactPendingMessage, CompactPrefix, CompactSchema, compact_class_name_at,
     extract_compact_enum_values, finish_compact_messages, package_for_compact_pos,
     parse_compact_schema_array, resolve_compact_package_expr,
 };
 use crate::error::Error;
+use crate::resolver::ModuleStart;
 use crate::types::{
-    Diagnostics, Enum, EnumValue, Field, Message, Method, Service, TypeName, TypeToken,
-    google_well_known, is_field_name, is_google_pkg, is_ident, is_local_loop_pkg, parse_type_name,
+    Diagnostics, Enum, EnumValue, Field, FieldKind, Message, Method, MethodKind, Service, TypeName,
+    TypeToken, ValueKind, google_well_known, is_field_name, is_google_pkg, is_ident,
+    is_local_loop_pkg, parse_type_name,
 };
 
 #[derive(Debug, Default)]
@@ -35,10 +37,10 @@ pub struct BundleScan {
     pub messages: Vec<Message>,
     pub enums: Vec<Enum>,
     pub services: Vec<Service>,
-    pub aliases: Vec<(u32, String, String)>,
-    pub export_aliases: Vec<(u32, String, String)>,
-    pub module_imports: Vec<(u32, String, u32)>,
-    pub module_starts: Vec<(u32, u32)>,
+    pub aliases: Vec<(Option<u32>, String, String)>,
+    pub export_aliases: Vec<(Option<u32>, String, String)>,
+    pub module_imports: Vec<(Option<u32>, String, u32)>,
+    pub module_starts: Vec<ModuleStart>,
     pub declared: Vec<String>,
     pub diagnostics: Diagnostics,
 }
@@ -118,7 +120,7 @@ fn scan_source_once(source: &str) -> BundleScan {
 struct Scanner<'a> {
     source: &'a str,
     scan: BundleScan,
-    module_starts: Vec<(u32, u32)>,
+    module_starts: Vec<ModuleStart>,
     compact_classes: Vec<CompactClass>,
     compact_prefixes: Vec<CompactPrefix>,
     pending_compact: Vec<CompactPendingMessage>,
@@ -139,9 +141,10 @@ struct CurrentClass {
 impl Scanner<'_> {
     fn finish(mut self) -> BundleScan {
         self.qualify_late_prefixes();
-        let compact_enums = self.scan.enums.clone();
+        let compact_enums = std::mem::take(&mut self.scan.enums);
         let pending = std::mem::take(&mut self.pending_compact);
         let compact_messages = finish_compact_messages(pending, &compact_enums);
+        self.scan.enums = compact_enums;
         for message in compact_messages {
             self.push_message(message);
         }
@@ -149,13 +152,13 @@ impl Scanner<'_> {
         self.scan
     }
 
-    fn module_start_for(&self, pos: u32) -> u32 {
+    fn module_start_for(&self, pos: u32) -> Option<u32> {
         match self
             .module_starts
-            .partition_point(|(start, _)| *start <= pos)
+            .partition_point(|module| module.start <= pos)
         {
-            0 => 0,
-            index => self.module_starts[index - 1].0,
+            0 => None,
+            index => Some(self.module_starts[index - 1].start),
         }
     }
 
@@ -484,10 +487,12 @@ impl Scanner<'_> {
     }
 
     fn qualify_late_prefixes(&mut self) {
-        let prefixes = self.compact_prefixes.clone();
+        let prefixes = std::mem::take(&mut self.compact_prefixes);
         let pending = std::mem::take(&mut self.pending_enum_pkgs);
         for (pos, pkg_expr) in pending {
-            let pkg = resolve_compact_package_expr(&pkg_expr, pos, &prefixes);
+            let Some(pkg) = resolve_compact_package_expr(&pkg_expr, pos, &prefixes) else {
+                continue;
+            };
             if !Self::keep_package(&pkg) {
                 continue;
             }
@@ -509,6 +514,7 @@ impl Scanner<'_> {
                 self.enum_index.insert(item.type_name.clone(), index);
             }
         }
+        self.compact_prefixes = prefixes;
         let mut kept = Vec::with_capacity(self.scan.enums.len());
         let mut enum_index = HashMap::new();
         let mut enum_by_pos = HashMap::new();
@@ -563,7 +569,9 @@ impl Scanner<'_> {
             return;
         };
         let pkg = resolve_compact_package_expr(&pkg_expr, call.span.start, &self.compact_prefixes);
-        if !pkg.is_empty() && !Self::keep_package(&pkg) {
+        if let Some(pkg) = &pkg
+            && !Self::keep_package(pkg)
+        {
             return;
         }
         let values = call
@@ -572,13 +580,12 @@ impl Scanner<'_> {
             .and_then(argument_expr)
             .map(|expr| extract_compact_enum_values(self.source_span(expr.span()), short_name))
             .unwrap_or_default();
-        let type_name = if pkg.is_empty() {
-            short_name.to_string()
-        } else {
-            format!("{pkg}.{short_name}")
+        let type_name = match &pkg {
+            Some(pkg) => format!("{pkg}.{short_name}"),
+            None => short_name.to_owned(),
         };
         self.record_enum(&type_name, assigned.unwrap_or(""), values, call.span.start);
-        if pkg.is_empty() {
+        if pkg.is_none() {
             self.pending_enum_pkgs.push((call.span.start, pkg_expr));
         }
     }
@@ -602,19 +609,21 @@ impl Scanner<'_> {
                 continue;
             };
             if alias != target {
-                self.scan.export_aliases.push((
-                    module_start,
-                    alias.to_string(),
-                    target.to_string(),
-                ));
+                self.scan
+                    .export_aliases
+                    .push((module_start, alias.to_owned(), target.to_owned()));
             }
         }
     }
 
     fn handle_module_factory(&mut self, key: u32, params: &FormalParameters<'_>, span: Span) {
-        let names = param_names(&params.items);
-        if names.len() >= 3 {
-            self.module_starts.push((span.start, key));
+        // A webpack module factory takes `(module, exports, require)`; fewer
+        // parameters means this numbered property is not a module.
+        if params.items.len() >= 3 {
+            self.module_starts.push(ModuleStart {
+                start: span.start,
+                id: key,
+            });
         }
     }
 
@@ -638,11 +647,11 @@ impl Scanner<'_> {
         let target_start = self
             .module_starts
             .iter()
-            .find(|(_, id)| *id == module_id)
-            .map_or(module_id, |(start, _)| *start);
+            .find(|module| module.id == module_id)
+            .map_or(module_id, |module| module.start);
         self.scan
             .module_imports
-            .push((current, alias.to_string(), target_start));
+            .push((current, alias.to_owned(), target_start));
     }
 
     fn collect_class(&mut self, class: &Class<'_>, assigned: Option<&str>) {
@@ -696,9 +705,6 @@ impl Scanner<'_> {
                     if property_name(&method.key) == Some("$") {
                         schema = method_returned_array(method);
                     }
-                    if property_name(&method.key) == Some("$p") {
-                        // already captured via class_package_ref
-                    }
                 }
                 _ => {}
             }
@@ -719,16 +725,22 @@ impl Scanner<'_> {
     }
 
     fn record_compact_schema(&mut self, array: &ArrayExpression<'_>, pos: u32) {
-        let snippet = self.source_span(array.span).to_string();
-        let Some((short_name, fields, type_refs)) =
-            parse_compact_schema_array(&snippet, &mut self.scan.diagnostics)
+        let schema = self.source_span(array.span).to_owned();
+        let Some(CompactSchema {
+            short_name,
+            fields,
+            type_refs,
+        }) = parse_compact_schema_array(&schema, &mut self.scan.diagnostics)
         else {
             return;
         };
         if google_well_known(&short_name).is_some() {
             return;
         }
-        let pkg = package_for_compact_pos(pos, &self.compact_classes, &self.compact_prefixes);
+        let Some(pkg) = package_for_compact_pos(pos, &self.compact_classes, &self.compact_prefixes)
+        else {
+            return;
+        };
         if !Self::keep_package(&pkg) {
             return;
         }
@@ -755,6 +767,40 @@ impl Scanner<'_> {
             type_refs,
         });
     }
+    /// Classifies the expression bound to `name` at `pos`, whichever syntax
+    /// (variable declaration, assignment, or sequence tail) produced it.
+    fn classify_init(&mut self, name: &str, pos: u32, expr: &Expression<'_>) {
+        self.maybe_package_prefix(name, expr, pos);
+        match expr.get_inner_expression() {
+            Expression::Identifier(id) => {
+                self.add_alias(pos, name, id.name.as_str());
+            }
+            Expression::ClassExpression(class) => self.collect_class(class, Some(name)),
+            Expression::CallExpression(call) => {
+                self.handle_factory_call(Some(name), call);
+                self.handle_require_call(Some(name), call);
+            }
+            Expression::SequenceExpression(seq) => {
+                let Some(last) = seq.expressions.last() else {
+                    return;
+                };
+                match last.get_inner_expression() {
+                    Expression::Identifier(id) => {
+                        self.add_alias(pos, name, id.name.as_str());
+                    }
+                    Expression::CallExpression(call) => {
+                        self.handle_factory_call(Some(name), call);
+                        self.handle_require_call(Some(name), call);
+                    }
+                    _ => {}
+                }
+            }
+            Expression::ObjectExpression(object) => {
+                self.parse_service_from_object(object, name, pos);
+            }
+            _ => {}
+        }
+    }
 }
 
 impl<'a> Visit<'a> for Scanner<'a> {
@@ -777,66 +823,14 @@ impl<'a> Visit<'a> for Scanner<'a> {
         if let Some(name) = binding_ident(&decl.id)
             && let Some(init) = &decl.init
         {
-            self.maybe_package_prefix(name, init, decl.span.start);
-            match init.get_inner_expression() {
-                Expression::Identifier(id) => {
-                    self.add_alias(decl.span.start, name, id.name.as_str());
-                }
-                Expression::ClassExpression(class) => {
-                    self.collect_class(class, Some(name));
-                }
-                Expression::CallExpression(call) => {
-                    self.handle_factory_call(Some(name), call);
-                    self.handle_require_call(Some(name), call);
-                }
-                Expression::SequenceExpression(seq) => {
-                    if let Some(last) = seq.expressions.last()
-                        && let Expression::CallExpression(call) = last.get_inner_expression()
-                    {
-                        self.handle_factory_call(Some(name), call);
-                        self.handle_require_call(Some(name), call);
-                    }
-                }
-                Expression::ObjectExpression(object) => {
-                    self.parse_service_from_object(object, name, decl.span.start);
-                }
-                _ => {}
-            }
+            self.classify_init(name, decl.span.start, init);
         }
         walk::walk_variable_declarator(self, decl);
     }
 
     fn visit_assignment_expression(&mut self, expr: &oxc::ast::ast::AssignmentExpression<'a>) {
         if let Some(name) = assignment_ident(&expr.left) {
-            self.maybe_package_prefix(name, &expr.right, expr.span.start);
-            match expr.right.get_inner_expression() {
-                Expression::Identifier(id) => {
-                    self.add_alias(expr.span.start, name, id.name.as_str());
-                }
-                Expression::ClassExpression(class) => self.collect_class(class, Some(name)),
-                Expression::CallExpression(call) => {
-                    self.handle_factory_call(Some(name), call);
-                    self.handle_require_call(Some(name), call);
-                }
-                Expression::SequenceExpression(seq) => {
-                    if let Some(last) = seq.expressions.last() {
-                        match last.get_inner_expression() {
-                            Expression::Identifier(id) => {
-                                self.add_alias(expr.span.start, name, id.name.as_str());
-                            }
-                            Expression::CallExpression(call) => {
-                                self.handle_factory_call(Some(name), call);
-                                self.handle_require_call(Some(name), call);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Expression::ObjectExpression(object) => {
-                    self.parse_service_from_object(object, name, expr.span.start);
-                }
-                _ => {}
-            }
+            self.classify_init(name, expr.span.start, &expr.right);
         }
         if let Some((object, prop)) = assignment_member(&expr.left) {
             let assigned_var =
@@ -936,10 +930,10 @@ pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, Error> {
     if !is_field_name(name) {
         return Err(Error::Field(format!("invalid field name: {name}")));
     }
-    let kind = object_prop(expr, "kind")
+    let raw_kind = object_prop(expr, "kind")
         .and_then(string_lit)
         .ok_or_else(|| Error::Field("missing field kind".into()))?;
-    let mut field = Field::new(no, name, kind);
+    let mut field = Field::new(no, name, FieldKind::parse(raw_kind));
     if let Some(enum_call) =
         object_prop(expr, "T").and_then(|value| match value.get_inner_expression() {
             Expression::CallExpression(call) if callee_tail(call) == Some("getEnumType") => {
@@ -965,7 +959,7 @@ pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, Error> {
         && is_ident(oneof)
         && !oneof.contains('$')
     {
-        field.oneof = oneof.to_string();
+        field.oneof = Some(oneof.to_owned());
     }
     if object_prop(expr, "repeated").is_some_and(is_js_true) {
         field.repeated = true;
@@ -973,16 +967,16 @@ pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, Error> {
     if object_prop(expr, "opt").is_some_and(is_js_true) {
         field.opt = true;
     }
-    if field.kind == "map" {
+    if field.kind == FieldKind::Map {
         if let Some(key) = object_prop(expr, "K")
             .and_then(number_lit)
             .and_then(f64_to_i32)
         {
-            field.map_key = key;
+            field.map_key = Some(key);
         }
         if let Some(value) = object_prop(expr, "V") {
-            if let Some(kind) = object_prop(value, "kind").and_then(string_lit) {
-                field.map_value_kind = kind.to_string();
+            if let Some(raw) = object_prop(value, "kind").and_then(string_lit) {
+                field.map_value_kind = ValueKind::parse(raw);
             }
             field.map_value_t = object_prop(value, "T").and_then(type_token_from_expr);
         }
@@ -1014,7 +1008,9 @@ fn parse_methods(object: &ObjectExpression<'_>) -> Vec<Method> {
         };
         let kind = object_prop(&prop.value, "kind")
             .and_then(member_or_ident)
-            .map_or_else(|| "Unary".into(), |value| last_segment(&value).to_string());
+            .map_or(MethodKind::Unary, |value| {
+                MethodKind::parse(last_segment(&value))
+            });
         methods.push(Method {
             name: name.to_string(),
             input_type: input,

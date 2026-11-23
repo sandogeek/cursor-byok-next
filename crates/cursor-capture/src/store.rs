@@ -13,9 +13,33 @@ use tokio::sync::broadcast;
 use crate::decode::hydrate_stored_exchange;
 use crate::types::{
     ConversationSummary, Error, Exchange, ExchangeSummary, Header, Result, StoreEvent,
+    StoreEventKind,
 };
 
 const EVENT_CAPACITY: usize = 256;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Attaches the failed operation to a SQLite error.
+trait SqliteContext<T> {
+    fn context(self, operation: &'static str) -> Result<T>;
+}
+
+impl<T> SqliteContext<T> for std::result::Result<T, rusqlite::Error> {
+    fn context(self, operation: &'static str) -> Result<T> {
+        self.map_err(|source| Error::database(operation, source))
+    }
+}
+
+/// Attaches the failed operation to a JSON error.
+trait JsonContext<T> {
+    fn context(self, operation: &'static str) -> Result<T>;
+}
+
+impl<T> JsonContext<T> for std::result::Result<T, serde_json::Error> {
+    fn context(self, operation: &'static str) -> Result<T> {
+        self.map_err(|source| Error::json(operation, source))
+    }
+}
 
 /// Whether an update should also be written through to SQLite.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -31,20 +55,31 @@ fn row_limit(max: usize) -> i64 {
     i64::try_from(max).unwrap_or(i64::MAX)
 }
 
+/// A new exchange, as returned by `ExchangeStore::create`.
 #[derive(Clone)]
-#[expect(
-    missing_debug_implementations,
-    reason = "the store owns a rusqlite Connection, which has no Debug impl"
-)]
+#[must_use]
+pub(crate) struct CaptureId {
+    generation: u64,
+    number: String,
+}
+
+#[derive(Clone)]
 pub struct ExchangeStore {
     inner: Arc<Mutex<Inner>>,
     events: broadcast::Sender<StoreEvent>,
 }
 
-#[derive(Clone)]
-pub(crate) struct CaptureId {
-    generation: u64,
-    number: String,
+impl std::fmt::Debug for ExchangeStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.inner.lock();
+        f.debug_struct("ExchangeStore")
+            .field("database_path", &inner.database_path)
+            .field("retained", &inner.exchanges.len())
+            .field("max", &inner.max)
+            .field("last_error", &inner.last_error)
+            .field("subscribers", &self.events.receiver_count())
+            .finish()
+    }
 }
 
 struct Inner {
@@ -59,6 +94,8 @@ struct Inner {
 }
 
 impl ExchangeStore {
+    /// Creates a store that keeps at most `max` exchanges in memory.
+    #[must_use]
     pub fn memory(max: i32) -> Self {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         Self {
@@ -76,16 +113,22 @@ impl ExchangeStore {
         }
     }
 
+    /// Creates a store backed by the SQLite file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the database's directory cannot be created,
+    /// and [`Error::Database`] when the database cannot be opened, migrated or
+    /// read.
     pub fn persistent(path: impl AsRef<Path>, max: i32) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|err| Error::Database(format!("创建 SQLite 数据目录失败: {err}")))?;
+                .map_err(|source| Error::io("creating the SQLite directory", source))?;
         }
-        let db = Connection::open(path)
-            .map_err(|err| Error::Database(format!("打开 SQLite 数据库失败: {err}")))?;
-        db.busy_timeout(Duration::from_millis(5_000))
-            .map_err(|err| Error::Database(err.to_string()))?;
+        let db = Connection::open(path).context("opening the database")?;
+        db.busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .context("setting the busy timeout")?;
         db.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 5000;
@@ -105,7 +148,7 @@ impl ExchangeStore {
                 ON exchanges(conversation_id, started_at_ms DESC);
              CREATE INDEX IF NOT EXISTS exchanges_request_idx ON exchanges(request_id);",
         )
-        .map_err(|err| Error::Database(format!("初始化 SQLite 数据库失败: {err}")))?;
+        .context("initializing the schema")?;
 
         let store = Self::memory(max);
         {
@@ -116,7 +159,7 @@ impl ExchangeStore {
                     [],
                     |row| row.get(0),
                 )
-                .map_err(|err| Error::Database(err.to_string()))?;
+                .context("reading the highest exchange id")?;
             inner.next_number = u64::try_from(maximum.max(0)).unwrap_or(u64::MAX) + 1;
             inner.db = Some(db);
             inner.database_path = path.display().to_string();
@@ -132,16 +175,15 @@ impl ExchangeStore {
         };
         let mut stmt = db
             .prepare("SELECT payload_json FROM exchanges")
-            .map_err(|err| Error::Database(format!("读取待回填的 SQLite 抓包记录失败: {err}")))?;
+            .context("preparing the backfill read")?;
         let rows = stmt
             .query_map([], |row| row.get::<_, Vec<u8>>(0))
-            .map_err(|err| Error::Database(err.to_string()))?;
+            .context("querying rows to backfill")?;
         let mut exchanges = Vec::new();
         for payload in rows {
-            let payload = payload.map_err(|err| Error::Database(err.to_string()))?;
-            let mut exchange: Exchange = serde_json::from_slice(&payload).map_err(|err| {
-                Error::Database(format!("解析待回填的 SQLite 抓包记录失败: {err}"))
-            })?;
+            let payload = payload.context("reading a backfill row")?;
+            let mut exchange: Exchange =
+                serde_json::from_slice(&payload).context("decoding a backfill row")?;
             if hydrate_stored_exchange(&mut exchange) {
                 exchanges.push(exchange);
             }
@@ -152,10 +194,9 @@ impl ExchangeStore {
         }
         let tx = db
             .transaction()
-            .map_err(|err| Error::Database(err.to_string()))?;
+            .context("opening the backfill transaction")?;
         for exchange in &exchanges {
-            let payload =
-                serde_json::to_vec(exchange).map_err(|err| Error::Database(err.to_string()))?;
+            let payload = serde_json::to_vec(exchange).context("encoding a backfilled exchange")?;
             tx.execute(
                 "UPDATE exchanges SET payload_json = ?, conversation_id = ?, request_id = ?, updated_at_ms = ? WHERE id = ?",
                 params![
@@ -166,10 +207,9 @@ impl ExchangeStore {
                     exchange.summary.id
                 ],
             )
-            .map_err(|err| Error::Database(err.to_string()))?;
+            .context("writing a backfilled exchange")?;
         }
-        tx.commit()
-            .map_err(|err| Error::Database(err.to_string()))?;
+        tx.commit().context("committing the backfill")?;
         Ok(())
     }
 
@@ -182,17 +222,17 @@ impl ExchangeStore {
                 "SELECT payload_json, conversation_id FROM exchanges
                  ORDER BY started_at_ms DESC, id DESC LIMIT ?",
             )
-            .map_err(|err| Error::Database(format!("读取 SQLite 抓包记录失败: {err}")))?;
+            .context("preparing the recent-rows read")?;
         let rows = stmt
             .query_map([row_limit(inner.max)], |row| {
                 Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
             })
-            .map_err(|err| Error::Database(err.to_string()))?;
+            .context("querying recent rows")?;
         let mut loaded = Vec::new();
         for row in rows {
-            let (payload, conversation_id) = row.map_err(|err| Error::Database(err.to_string()))?;
-            let mut exchange: Exchange = serde_json::from_slice(&payload)
-                .map_err(|err| Error::Database(format!("解析 SQLite 抓包记录失败: {err}")))?;
+            let (payload, conversation_id) = row.context("reading a recent row")?;
+            let mut exchange: Exchange =
+                serde_json::from_slice(&payload).context("decoding a recent row")?;
             exchange.summary.conversation_id = conversation_id;
             loaded.push(exchange);
         }
@@ -206,19 +246,23 @@ impl ExchangeStore {
     }
 
     pub(crate) fn create(&self, mut exchange: Exchange) -> CaptureId {
-        let mut inner = self.inner.lock();
-        let id = CaptureId {
-            generation: inner.generation,
-            number: inner.next_number.to_string(),
+        let (id, event) = {
+            let mut inner = self.inner.lock();
+            let id = CaptureId {
+                generation: inner.generation,
+                number: inner.next_number.to_string(),
+            };
+            inner.next_number += 1;
+            exchange.summary.id.clone_from(&id.number);
+            cache_exchange(&mut inner, exchange);
+            persist_locked(&mut inner, &id.number);
+            let event = StoreEvent {
+                kind: StoreEventKind::Created,
+                id: Some(id.number.clone()),
+            };
+            (id, event)
         };
-        inner.next_number += 1;
-        exchange.summary.id.clone_from(&id.number);
-        cache_exchange(&mut inner, exchange);
-        persist_locked(&mut inner, &id.number);
-        self.publish(StoreEvent {
-            kind: "created".into(),
-            id: Some(id.number.clone()),
-        });
+        self.publish(event);
         id
     }
 
@@ -236,43 +280,52 @@ impl ExchangeStore {
         apply: impl FnOnce(&mut Exchange),
         persistence: Persistence,
     ) {
-        let mut inner = self.inner.lock();
-        if id.generation != inner.generation {
-            return;
-        }
-        let id = id.number.as_str();
-        if !inner.exchanges.contains_key(id) {
-            match load_persisted_locked(&mut inner, id) {
-                Ok(Some(loaded)) => cache_exchange(&mut inner, loaded),
-                Ok(None) => return,
-                Err(err) => {
-                    inner.last_error = err.to_string();
-                    return;
+        let event = {
+            let mut inner = self.inner.lock();
+            if id.generation != inner.generation {
+                return;
+            }
+            let number = id.number.as_str();
+            if !inner.exchanges.contains_key(number) {
+                match load_persisted_locked(&mut inner, number) {
+                    Ok(Some(loaded)) => cache_exchange(&mut inner, loaded),
+                    Ok(None) => return,
+                    Err(err) => {
+                        inner.last_error = err.to_string();
+                        return;
+                    }
                 }
             }
-        }
-        let Some(exchange) = inner.exchanges.get_mut(id) else {
-            return;
+            let Some(exchange) = inner.exchanges.get_mut(number) else {
+                return;
+            };
+            let previous_request_id = exchange.summary.request_id.clone();
+            let previous_conversation_id = exchange.summary.conversation_id.clone();
+            apply(exchange);
+            if exchange.summary.request_id != previous_request_id
+                || exchange.summary.conversation_id != previous_conversation_id
+            {
+                let request_id = exchange.summary.request_id.clone();
+                let conversation_id = exchange.summary.conversation_id.clone();
+                associate_conversation_locked(&mut inner, number, &request_id, conversation_id);
+            }
+            if persistence == Persistence::Write {
+                persist_locked(&mut inner, number);
+            }
+            StoreEvent {
+                kind: StoreEventKind::Updated,
+                id: Some(number.to_owned()),
+            }
         };
-        let previous_request_id = exchange.summary.request_id.clone();
-        let previous_conversation_id = exchange.summary.conversation_id.clone();
-        apply(exchange);
-        if exchange.summary.request_id != previous_request_id
-            || exchange.summary.conversation_id != previous_conversation_id
-        {
-            let request_id = exchange.summary.request_id.clone();
-            let conversation_id = exchange.summary.conversation_id.clone();
-            associate_conversation_locked(&mut inner, id, &request_id, conversation_id);
-        }
-        if persistence == Persistence::Write {
-            persist_locked(&mut inner, id);
-        }
-        self.publish(StoreEvent {
-            kind: "updated".into(),
-            id: Some(id.to_string()),
-        });
+        self.publish(event);
     }
 
+    /// Lists exchange summaries, filtered to `conversation_id` when non-empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] when the database cannot be read, and
+    /// [`Error::Json`] when a stored payload cannot be decoded.
     pub fn summaries(&self, conversation_id: &str) -> Result<Vec<ExchangeSummary>> {
         let mut inner = self.inner.lock();
         if inner.db.is_none() {
@@ -286,44 +339,32 @@ impl ExchangeStore {
             let Some(db) = inner.db.as_mut() else {
                 return Ok(Vec::new());
             };
-            let mut collected = Vec::new();
-            if conversation_id.is_empty() {
-                let mut stmt = db
-                    .prepare(
-                        "SELECT payload_json, conversation_id FROM exchanges
-                         ORDER BY started_at_ms DESC, id DESC",
-                    )
-                    .map_err(|err| Error::Database(err.to_string()))?;
-                let mapped = stmt
-                    .query_map([], |row| {
-                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .map_err(|err| Error::Database(err.to_string()))?;
-                for row in mapped {
-                    collected.push(row.map_err(|err| Error::Database(err.to_string()))?);
-                }
+            let sql = if conversation_id.is_empty() {
+                "SELECT payload_json, conversation_id FROM exchanges
+                 ORDER BY started_at_ms DESC, id DESC"
             } else {
-                let mut stmt = db
-                    .prepare(
-                        "SELECT payload_json, conversation_id FROM exchanges
-                         WHERE conversation_id = ? ORDER BY started_at_ms DESC, id DESC",
-                    )
-                    .map_err(|err| Error::Database(err.to_string()))?;
-                let mapped = stmt
-                    .query_map([conversation_id], |row| {
-                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .map_err(|err| Error::Database(err.to_string()))?;
-                for row in mapped {
-                    collected.push(row.map_err(|err| Error::Database(err.to_string()))?);
-                }
+                "SELECT payload_json, conversation_id FROM exchanges
+                 WHERE conversation_id = ? ORDER BY started_at_ms DESC, id DESC"
+            };
+            let mut stmt = db.prepare(sql).context("preparing the summary read")?;
+            let mut map_row =
+                |row: &rusqlite::Row<'_>| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?));
+            let mapped = if conversation_id.is_empty() {
+                stmt.query_map([], &mut map_row)
+            } else {
+                stmt.query_map([conversation_id], &mut map_row)
+            }
+            .context("querying exchange summaries")?;
+            let mut collected = Vec::new();
+            for row in mapped {
+                collected.push(row.context("reading a summary row")?);
             }
             collected
         };
         let mut result = Vec::new();
         for (payload, persisted_conversation_id) in rows {
             let mut exchange: Exchange =
-                serde_json::from_slice(&payload).map_err(|err| Error::Database(err.to_string()))?;
+                serde_json::from_slice(&payload).context("decoding a summary row")?;
             exchange.summary.conversation_id = persisted_conversation_id;
             if let Some(current) = inner.exchanges.get(&exchange.summary.id) {
                 result.push(current.summary.clone());
@@ -334,6 +375,12 @@ impl ExchangeStore {
         Ok(result)
     }
 
+    /// Loads one exchange, from the cache or the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] when the database cannot be read, and
+    /// [`Error::Json`] when the stored payload cannot be decoded.
     pub fn get(&self, id: &str) -> Result<Option<Exchange>> {
         let mut inner = self.inner.lock();
         if let Some(exchange) = inner.exchanges.get(id) {
@@ -345,28 +392,41 @@ impl ExchangeStore {
         load_persisted_locked(&mut inner, id)
     }
 
+    /// Deletes every exchange from the cache and the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] when the rows cannot be deleted.
     pub fn clear(&self) -> Result<()> {
-        {
+        let event = {
             let mut inner = self.inner.lock();
             if let Some(db) = inner.db.as_mut()
-                && let Err(err) = db.execute("DELETE FROM exchanges", [])
+                && let Err(err) = db
+                    .execute("DELETE FROM exchanges", [])
+                    .context("clearing rows")
             {
                 inner.last_error = err.to_string();
-                return Err(Error::Database(err.to_string()));
+                return Err(err);
             }
             inner.order.clear();
             inner.exchanges.clear();
             inner.last_error.clear();
             inner.generation += 1;
             inner.next_number = 1;
-            self.publish(StoreEvent {
-                kind: "cleared".into(),
+            StoreEvent {
+                kind: StoreEventKind::Cleared,
                 id: None,
-            });
-        }
+            }
+        };
+        self.publish(event);
         Ok(())
     }
 
+    /// Groups the stored exchanges by conversation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] when the aggregate query fails.
     pub fn conversations(&self) -> Result<Vec<ConversationSummary>> {
         let mut inner = self.inner.lock();
         if inner.db.is_some() {
@@ -380,7 +440,7 @@ impl ExchangeStore {
                                 COALESCE(SUM(request_bytes), 0), COALESCE(SUM(response_bytes), 0)
                          FROM exchanges GROUP BY conversation_id ORDER BY MAX(started_at_ms) DESC",
                     )
-                    .map_err(|err| Error::Database(err.to_string()))?;
+                    .context("preparing the conversation query")?;
                 let mapped = stmt
                     .query_map([], |row| {
                         Ok((
@@ -391,10 +451,10 @@ impl ExchangeStore {
                             row.get::<_, i64>(4)?,
                         ))
                     })
-                    .map_err(|err| Error::Database(err.to_string()))?;
+                    .context("querying conversations")?;
                 let mut collected = Vec::new();
                 for row in mapped {
-                    collected.push(row.map_err(|err| Error::Database(err.to_string()))?);
+                    collected.push(row.context("reading a conversation row")?);
                 }
                 collected
             };
@@ -436,6 +496,8 @@ impl ExchangeStore {
         Ok(result)
     }
 
+    /// The store's database path and last persistence failure.
+    #[must_use]
     pub fn status(&self) -> StoreStatus {
         let inner = self.inner.lock();
         StoreStatus {
@@ -444,14 +506,19 @@ impl ExchangeStore {
         }
     }
 
+    /// Subscribes to the store's change events.
+    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<StoreEvent> {
         self.events.subscribe()
     }
 
     fn publish(&self, event: StoreEvent) {
+        // No subscriber is a normal state (the debug UI is closed).
         let _ = self.events.send(event);
     }
 
+    /// The SQLite path, or an empty path for the in-memory store.
+    #[must_use]
     pub fn database_path(&self) -> PathBuf {
         PathBuf::from(self.inner.lock().database_path.clone())
     }
@@ -483,32 +550,35 @@ fn persist_locked(inner: &mut Inner, id: &str) {
     };
     match serde_json::to_vec(exchange) {
         Ok(payload) => {
-            match db.execute(
-                "INSERT INTO exchanges (
-                    id, started_at_ms, conversation_id, request_id, state, request_bytes,
-                    response_bytes, payload_json, updated_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                ON CONFLICT(id) DO UPDATE SET
-                    started_at_ms = excluded.started_at_ms,
-                    conversation_id = excluded.conversation_id,
-                    request_id = excluded.request_id,
-                    state = excluded.state,
-                    request_bytes = excluded.request_bytes,
-                    response_bytes = excluded.response_bytes,
-                    payload_json = excluded.payload_json,
-                    updated_at_ms = excluded.updated_at_ms",
-                params![
-                    exchange.summary.id,
-                    exchange.summary.started_at.timestamp_millis(),
-                    exchange.summary.conversation_id,
-                    exchange.summary.request_id,
-                    exchange.summary.state,
-                    exchange.summary.request_bytes,
-                    exchange.summary.response_bytes,
-                    payload,
-                    Utc::now().timestamp_millis()
-                ],
-            ) {
+            match db
+                .execute(
+                    "INSERT INTO exchanges (
+                        id, started_at_ms, conversation_id, request_id, state, request_bytes,
+                        response_bytes, payload_json, updated_at_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    ON CONFLICT(id) DO UPDATE SET
+                        started_at_ms = excluded.started_at_ms,
+                        conversation_id = excluded.conversation_id,
+                        request_id = excluded.request_id,
+                        state = excluded.state,
+                        request_bytes = excluded.request_bytes,
+                        response_bytes = excluded.response_bytes,
+                        payload_json = excluded.payload_json,
+                        updated_at_ms = excluded.updated_at_ms",
+                    params![
+                        exchange.summary.id,
+                        exchange.summary.started_at.timestamp_millis(),
+                        exchange.summary.conversation_id,
+                        exchange.summary.request_id,
+                        exchange.summary.state.label(),
+                        exchange.summary.request_bytes,
+                        exchange.summary.response_bytes,
+                        payload,
+                        Utc::now().timestamp_millis()
+                    ],
+                )
+                .context("writing an exchange row")
+            {
                 Ok(_) => inner.last_error.clear(),
                 Err(err) => inner.last_error = err.to_string(),
             }
@@ -517,6 +587,7 @@ fn persist_locked(inner: &mut Inner, id: &str) {
     }
 }
 
+/// Loads one exchange from SQLite into the in-memory window.
 fn load_persisted_locked(inner: &mut Inner, id: &str) -> Result<Option<Exchange>> {
     let Some(db) = inner.db.as_mut() else {
         return Ok(None);
@@ -528,12 +599,12 @@ fn load_persisted_locked(inner: &mut Inner, id: &str) -> Result<Option<Exchange>
             |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
-        .map_err(|err| Error::Database(err.to_string()))?;
+        .context("loading an exchange row")?;
     let Some((payload, conversation_id)) = row else {
         return Ok(None);
     };
     let mut persisted: Exchange =
-        serde_json::from_slice(&payload).map_err(|err| Error::Database(err.to_string()))?;
+        serde_json::from_slice(&payload).context("decoding a stored exchange")?;
     persisted.summary.conversation_id = conversation_id;
     Ok(Some(persisted))
 }
@@ -559,17 +630,15 @@ fn associate_conversation_locked(
     }
     if conversation_id.is_empty()
         && let Some(db) = inner.db.as_mut()
-    {
-        let _ = db.query_row(
+        && let Ok(found) = db.query_row(
             "SELECT conversation_id FROM exchanges
              WHERE request_id = ? AND conversation_id != ''
              ORDER BY started_at_ms DESC LIMIT 1",
             [request_id],
-            |row| {
-                conversation_id = row.get(0)?;
-                Ok(())
-            },
-        );
+            |row| row.get::<_, String>(0),
+        )
+    {
+        conversation_id = found;
     }
     if conversation_id.is_empty() {
         return;
@@ -593,23 +662,27 @@ fn associate_conversation_locked(
         persist_locked(inner, &id);
     }
     if let Some(db) = inner.db.as_mut()
-        && let Err(err) = db.execute(
-            "UPDATE exchanges SET conversation_id = ?, updated_at_ms = ?
-             WHERE request_id = ? AND conversation_id = ''",
-            params![conversation_id, Utc::now().timestamp_millis(), request_id],
-        )
+        && let Err(err) = db
+            .execute(
+                "UPDATE exchanges SET conversation_id = ?, updated_at_ms = ?
+                 WHERE request_id = ? AND conversation_id = ''",
+                params![conversation_id, Utc::now().timestamp_millis(), request_id],
+            )
+            .context("associating stored rows with a conversation")
     {
         inner.last_error = err.to_string();
     }
 }
 
+/// Sorts the request's headers by name, hiding credential values.
+#[must_use]
 pub fn sorted_headers(headers: &http::HeaderMap) -> Vec<Header> {
     let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
     for (name, value) in headers {
         grouped
-            .entry(name.as_str().to_string())
+            .entry(name.as_str().to_owned())
             .or_default()
-            .push(value.to_str().unwrap_or_default().to_string());
+            .push(value.to_str().unwrap_or_default().to_owned());
     }
     let mut result: Vec<Header> = grouped
         .into_iter()

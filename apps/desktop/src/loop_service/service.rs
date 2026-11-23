@@ -25,7 +25,7 @@ use crate::{
     plugins::{ADAPTER_ID_PREFIX, PluginHost, PluginModelDescriptor},
     protocol::{
         connect,
-        proto::{agent::v1 as agent, inference as pb},
+        proto::{agent::v1 as agent, inference::v1 as pb},
     },
     provider::ModelEvent,
 };
@@ -105,10 +105,11 @@ impl Drop for Subscription {
     }
 }
 
+/// The plugin model a run is pinned to, as the run itself needs it.
+#[derive(Debug)]
 struct LocalModel {
     display_name: String,
     vendor: String,
-    context_window_tokens: Option<u64>,
 }
 
 struct ServeContext {
@@ -197,7 +198,7 @@ impl InferenceService {
                 "routing Cursor RunInference to BYOK provider"
             );
             let (sender, receiver) = mpsc::channel(64);
-            let output = Arc::new(OutputHub::default());
+            let output = Arc::new(OutputHub::new());
             let run = Arc::new(Run {
                 input: sender,
                 output: Arc::clone(&output),
@@ -216,7 +217,6 @@ impl InferenceService {
                     model: configured.map(|model| LocalModel {
                         display_name: model.display_name,
                         vendor: model.provider_type,
-                        context_window_tokens: None,
                     }),
                     knowledge: self.knowledge.clone(),
                 },
@@ -286,6 +286,11 @@ impl InferenceService {
 }
 
 impl Run {
+    /// Appends one client message in sequence order.
+    ///
+    /// The sequence number is checked and advanced around the send, so two
+    /// appends cannot observe the same `next` value. The lock is released once
+    /// the send completes: nothing after it touches the counter.
     pub async fn append(&self, seqno: i64, message: pb::RunInferenceClientMessage) -> Result<()> {
         let mut next = self.next_seqno.lock().await;
         if seqno < *next {
@@ -297,12 +302,11 @@ impl Run {
                 *next
             )));
         }
-        self.input
-            .send(message)
-            .await
-            .map_err(|_| Error::Protocol("RunInference stream has ended".into()))?;
+        let sent = self.input.send(message).await;
+        // Advance even when the receiver is gone: the sequence stays consistent
+        // with what the client believes it appended.
         *next += 1;
-        Ok(())
+        sent.map_err(|_| Error::Protocol("RunInference stream has ended".into()))
     }
 }
 
@@ -322,6 +326,13 @@ async fn serve(
         knowledge,
     } = context;
     let models = plugins.configured_models().await;
+    let run_setup = RunSetup {
+        run_id: &run_id,
+        conversation_id: &conversation_id,
+        model_id: &model_id,
+        models: &models,
+        model: model.as_ref(),
+    };
     let mut loop_state = LoopState {
         output: Arc::clone(&output),
         cancellation,
@@ -330,8 +341,11 @@ async fn serve(
         finished: false,
         disconnected: false,
         provider_call_index: 0,
-        configured_context_window: model.as_ref().and_then(|model| model.context_window_tokens),
-        run_context_window: model.as_ref().and_then(|model| model.context_window_tokens),
+        // A plugin model carries no context-window figure: the descriptor the
+        // provider reports is the only source, and the run learns it from the
+        // client's own requested model instead.
+        configured_context_window: None,
+        run_context_window: None,
     };
     {
         use pb::run_inference_client_message::Message;
@@ -349,24 +363,15 @@ async fn serve(
             match message.message {
                 Some(Message::RunRequest(request)) => {
                     let ready = loop_state.run_ready_message(
+                        &run_setup,
                         &request,
-                        model.as_ref(),
-                        &models,
-                        &model_id,
                         knowledge.local_cursor_rules(),
                     );
                     emit(&output, ready);
                 }
                 Some(Message::InvokeModel(invoke)) => {
                     loop_state
-                        .start_invocation(
-                            &plugins,
-                            &calls,
-                            &models,
-                            (&run_id, &conversation_id, &model_id),
-                            model.as_ref(),
-                            invoke,
-                        )
+                        .start_invocation(&run_setup, &plugins, &calls, &models, invoke)
                         .await;
                 }
                 Some(Message::CancelInvocation(cancel)) => {
@@ -421,10 +426,8 @@ struct LoopState {
 impl LoopState {
     fn run_ready_message(
         &mut self,
+        setup: &RunSetup<'_>,
         request: &pb::RunInferenceRunRequest,
-        model: Option<&LocalModel>,
-        models: &[PluginModelDescriptor],
-        model_id: &str,
         rules: Vec<agent::CursorRule>,
     ) -> pb::run_inference_server_message::Message {
         let requested_window = project::requested_context_window(request.requested_model.as_ref())
@@ -432,28 +435,29 @@ impl LoopState {
             .flatten();
         self.run_context_window = requested_window.or(self.configured_context_window);
         if self.run_context_window.is_none() {
-            tracing::info!(model_id, "inference_context_window_unknown");
+            tracing::info!(
+                model_id = setup.model_id,
+                "inference_context_window_unknown"
+            );
         }
-        pb::run_inference_server_message::Message::RunReady(run_ready(
-            request,
-            model,
-            models,
-            model_id,
-            self.run_context_window,
-            rules,
-        ))
+        pb::run_inference_server_message::Message::RunReady(pb::RunInferenceRunReady {
+            summarization: Some(summarization_config(request, self.run_context_window)),
+            prompt_model_metadata: Some(
+                setup.prompt_model_metadata(request, self.run_context_window),
+            ),
+            non_file_rules: rules,
+            ..setup.run_ready_defaults(request)
+        })
     }
 
     async fn start_invocation(
         &mut self,
+        setup: &RunSetup<'_>,
         plugins: &PluginHost,
         calls: &CallStore,
         models: &[PluginModelDescriptor],
-        ids: (&str, &str, &str),
-        model: Option<&LocalModel>,
         invoke: pb::RunInferenceInvokeModel,
     ) {
-        let (run_id, conversation_id, model_id) = ids;
         let id = invoke.invocation_id.clone();
         let Some(request) = invoke.request else {
             invocation_error(&self.output, id, "RunInference model request is missing");
@@ -467,28 +471,20 @@ impl LoopState {
             );
             return;
         }
-        let request = match project::project(&request, model_id, self.run_context_window, models) {
-            Ok(request) => request,
-            Err(error) => {
-                invocation_error(&self.output, id, &error.to_string());
-                return;
-            }
-        };
+        let request =
+            match project::project(&request, setup.model_id, self.run_context_window, models) {
+                Ok(request) => request,
+                Err(error) => {
+                    invocation_error(&self.output, id, &error.to_string());
+                    return;
+                }
+            };
         let context_window_tokens = request.model.context_window_tokens;
         let cancellation = self.cancellation.child_token();
         self.invocations
             .lock()
             .insert(id.clone(), cancellation.clone());
-        let recorder = start_recorder(
-            calls,
-            &id,
-            run_id,
-            conversation_id,
-            self.provider_call_index,
-            &request,
-            model,
-        )
-        .await;
+        let recorder = start_recorder(setup, calls, &id, self.provider_call_index, &request).await;
         self.tasks.spawn(serve_invocation(
             plugins.clone(),
             Arc::clone(&self.output),
@@ -497,8 +493,8 @@ impl LoopState {
             recorder,
             ModelInvocation {
                 call_id: id,
-                run_id: run_id.to_owned(),
-                conversation_id: conversation_id.to_owned(),
+                run_id: setup.run_id.to_owned(),
+                conversation_id: setup.conversation_id.to_owned(),
                 provider_call_index: self.provider_call_index,
                 request,
             },
@@ -519,38 +515,67 @@ impl LoopState {
         }
     }
 
+    /// Waits for every invocation, then closes the stream unless the client
+    /// already went away.
     async fn finish(mut self) {
-        while self.tasks.join_next().await.is_some() {}
+        while let Some(joined) = self.tasks.join_next().await {
+            if let Err(error) = joined
+                && !error.is_cancelled()
+            {
+                tracing::warn!(%error, "a RunInference invocation panicked");
+            }
+        }
         if !self.disconnected {
             self.output.emit(connect::encode_end_stream());
         }
     }
 }
 
-fn run_ready(
-    request: &pb::RunInferenceRunRequest,
-    model: Option<&LocalModel>,
-    models: &[PluginModelDescriptor],
-    model_id: &str,
-    context_window_tokens: Option<u64>,
-    non_file_rules: Vec<agent::CursorRule>,
-) -> pb::RunInferenceRunReady {
-    let (display_name, vendor) = model.map_or_else(
-        || (String::new(), "openai".into()),
-        |model| (model.display_name.clone(), model.vendor.clone()),
-    );
-    let anthropic = vendor.eq_ignore_ascii_case("anthropic")
-        || vendor.eq_ignore_ascii_case("messages")
-        || display_name.to_ascii_lowercase().contains("claude");
-    let name = display_name.to_ascii_lowercase();
-    let claude = anthropic && name.contains("claude");
-    let gpt5 = !anthropic && name.starts_with("gpt-5");
-    pb::RunInferenceRunReady {
-        resolved_model: request.requested_model.clone(),
-        supports_self_summary: true,
-        summarization: Some(summarization_config(request, context_window_tokens)),
-        routed_model_display_name: (!display_name.is_empty()).then_some(display_name),
-        prompt_model_metadata: Some(pb::RunInferencePromptModelMetadata {
+/// The identity a Run carries into every invocation and into `RunReady`.
+#[derive(Clone, Copy, Debug)]
+struct RunSetup<'a> {
+    run_id: &'a str,
+    conversation_id: &'a str,
+    model_id: &'a str,
+    models: &'a [PluginModelDescriptor],
+    model: Option<&'a LocalModel>,
+}
+
+impl RunSetup<'_> {
+    /// The `RunReady` fields that do not depend on the client's request.
+    fn run_ready_defaults(&self, request: &pb::RunInferenceRunRequest) -> pb::RunInferenceRunReady {
+        let display_name = self
+            .model
+            .map(|model| model.display_name.clone())
+            .unwrap_or_default();
+        pb::RunInferenceRunReady {
+            resolved_model: request.requested_model.clone(),
+            supports_self_summary: true,
+            routed_model_display_name: (!display_name.is_empty()).then_some(display_name),
+            accepts_aborted_finish: true,
+            accepts_subagent_model_resolution: true,
+            ..pb::RunInferenceRunReady::default()
+        }
+    }
+
+    /// Prompt-model metadata, derived from the vendor and display name the
+    /// model advertises.
+    fn prompt_model_metadata(
+        &self,
+        request: &pb::RunInferenceRunRequest,
+        context_window_tokens: Option<u64>,
+    ) -> pb::RunInferencePromptModelMetadata {
+        let (display_name, vendor) = self.model.map_or_else(
+            || (String::new(), "openai".to_owned()),
+            |model| (model.display_name.clone(), model.vendor.clone()),
+        );
+        let anthropic = vendor.eq_ignore_ascii_case("anthropic")
+            || vendor.eq_ignore_ascii_case("messages")
+            || display_name.to_ascii_lowercase().contains("claude");
+        let name = display_name.to_ascii_lowercase();
+        let claude = anthropic && name.contains("claude");
+        let gpt5 = !anthropic && name.starts_with("gpt-5");
+        pb::RunInferencePromptModelMetadata {
             vendor: if anthropic { "anthropic" } else { "openai" }.into(),
             prompt_version: "latest".into(),
             is_claude_4x: claude,
@@ -565,13 +590,9 @@ fn run_ready(
                 tool_name: "AskQuestion".into(),
                 ..Default::default()
             }),
-            subagent_model_config: Some(subagent_model_config(model_id, models, request)),
+            subagent_model_config: Some(subagent_model_config(self.model_id, self.models, request)),
             ..Default::default()
-        }),
-        non_file_rules,
-        accepts_aborted_finish: true,
-        accepts_subagent_model_resolution: true,
-        ..Default::default()
+        }
     }
 }
 
@@ -738,7 +759,7 @@ async fn serve_invocation(
     } {
         match next {
             Ok(event) => {
-                let _ = recorder.event(&event).await;
+                recorder.event(&event).await;
                 for response in model_responses(event, &mut tool_calls, context_window_tokens) {
                     emit(
                         &output,
@@ -764,7 +785,7 @@ async fn serve_invocation(
                         ),
                     );
                 }
-                let _ = recorder.failed(&value).await;
+                recorder.failed(&value).await;
                 error = Some(message);
                 break;
             }
@@ -772,10 +793,10 @@ async fn serve_invocation(
     }
     if !recorder.is_finished() {
         if cancellation.is_cancelled() {
-            let _ = recorder.cancelled().await;
+            recorder.cancelled().await;
         } else {
             let ended = Error::Provider("provider stream ended without Done".into());
-            let _ = recorder.failed(&ended).await;
+            recorder.failed(&ended).await;
         }
     }
     invocations.lock().remove(&id);
@@ -993,27 +1014,25 @@ pub(crate) fn decode_append(data: &[u8]) -> Result<pb::RunInferenceClientMessage
 }
 
 async fn start_recorder(
+    setup: &RunSetup<'_>,
     store: &CallStore,
     call_id: &str,
-    run_id: &str,
-    conversation_id: &str,
     provider_call_index: u64,
     request: &crate::model::ModelRequest,
-    model: Option<&LocalModel>,
 ) -> CallRecorder {
     let request_url = plugin_request_url(&request.model.model_id);
     let display_name = request
         .model
         .display_name
         .clone()
-        .or_else(|| model.map(|model| model.display_name.clone()))
+        .or_else(|| setup.model.map(|model| model.display_name.clone()))
         .unwrap_or_else(|| request_url.model.clone());
     CallRecorder::start(
         store.clone(),
         NewLlmCall {
             call_id: call_id.into(),
-            run_id: run_id.into(),
-            conversation_id: conversation_id.into(),
+            run_id: setup.run_id.into(),
+            conversation_id: setup.conversation_id.into(),
             provider_call_index: i64::try_from(provider_call_index).unwrap_or(i64::MAX),
             model_hash: request.model.model_id.clone(),
             provider_type: request_url.provider.clone(),
@@ -1022,7 +1041,7 @@ async fn start_recorder(
             request_url: request_url.url,
             model_id: request_url.model,
             display_name,
-            reasoning_effort: request.model.reasoning.effort.clone(),
+            reasoning_effort: request.model.reasoning.effort().map(str::to_owned),
             fast: request.model.latency == ModelLatency::Fast,
             message_count: request.history.len(),
             tool_count: request.prompt.tools.len(),
@@ -1056,7 +1075,7 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(1);
         let run = Arc::new(Run {
             input: sender,
-            output: Arc::new(OutputHub::default()),
+            output: Arc::new(OutputHub::new()),
             next_seqno: AsyncMutex::new(0),
             subscriptions: Mutex::default(),
             cancellation: CancellationToken::new(),
@@ -1121,7 +1140,7 @@ mod tests {
 
     #[test]
     fn output_replays_until_close_then_releases_its_history() {
-        let output = OutputHub::default();
+        let output = OutputHub::new();
         output.emit(Bytes::from_static(b"first"));
         let mut receiver = output.subscribe();
         assert_eq!(receiver.try_recv().unwrap(), Bytes::from_static(b"first"));

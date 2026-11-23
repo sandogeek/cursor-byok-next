@@ -25,7 +25,17 @@ use super::{CaState, Error, Result};
 
 /// A loaded issuer, ready to sign leaf certificates.
 pub struct LoadedCa {
-    pub issuer: Issuer<'static, KeyPair>,
+    issuer: Issuer<'static, KeyPair>,
+}
+
+impl LoadedCa {
+    /// Takes the issuer the proxy signs leaf certificates with.
+    ///
+    /// This hands over the CA private key, so the caller must be the thing that
+    /// terminates TLS.
+    pub fn into_issuer(self) -> Issuer<'static, KeyPair> {
+        self.issuer
+    }
 }
 
 impl std::fmt::Debug for LoadedCa {
@@ -34,6 +44,12 @@ impl std::fmt::Debug for LoadedCa {
         formatter.debug_struct("LoadedCa").finish_non_exhaustive()
     }
 }
+
+/// How long a generated CA stays valid. Ten years outlasts any Cursor install,
+/// and regenerating would mean asking the user to trust a new CA again.
+const CA_LIFETIME: Duration = Duration::days(3652);
+/// Backdated `not_before`, so a clock a few minutes slow still accepts the CA.
+const CLOCK_SKEW: Duration = Duration::minutes(5);
 
 /// Owns the CA files: generating them once, loading them, and telling whether
 /// the system trusts them.
@@ -147,13 +163,13 @@ impl CaManager {
             KeyUsagePurpose::KeyCertSign,
             KeyUsagePurpose::CrlSign,
         ];
-        params.not_before = OffsetDateTime::now_utc() - Duration::minutes(5);
-        params.not_after = OffsetDateTime::now_utc() + Duration::days(3652);
+        params.not_before = OffsetDateTime::now_utc() - CLOCK_SKEW;
+        params.not_after = OffsetDateTime::now_utc() + CA_LIFETIME;
         let cert = params
             .self_signed(&key)
             .map_err(|error| Error::Config(format!("generate CA certificate: {error}")))?;
-        write_atomic(&self.key_path(), key.serialize_pem().as_bytes(), 0o600)?;
-        write_atomic(&self.cert_path(), cert.pem().as_bytes(), 0o644)?;
+        crate::atomic::write_with_mode(&self.key_path(), key.serialize_pem().as_bytes(), 0o600)?;
+        crate::atomic::write_with_mode(&self.cert_path(), cert.pem().as_bytes(), 0o644)?;
         tracing::info!(dir = %self.dir.display(), "generated the local CA");
         Ok(())
     }
@@ -184,19 +200,6 @@ fn parse_issuer(cert: &str, key: &str) -> Result<Issuer<'static, KeyPair>> {
     }
     Issuer::from_ca_cert_pem(cert, key)
         .map_err(|error| Error::Config(format!("parse CA certificate: {error}")))
-}
-
-fn write_atomic(path: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
-    #[cfg(not(unix))]
-    let _ = mode;
-    let temp = path.with_extension("tmp");
-    fs::write(&temp, data)?;
-    #[cfg(unix)]
-    fs::set_permissions(&temp, fs::Permissions::from_mode(mode))?;
-    fs::rename(&temp, path)?;
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]

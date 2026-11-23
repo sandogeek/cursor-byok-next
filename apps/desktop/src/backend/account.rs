@@ -13,6 +13,14 @@ use crate::{Result, backend::proxy};
 const LOCAL_AUTH_ID: &str = "cursor-local-user";
 const LOCAL_EMAIL: &str = "cursor@ai.com";
 const LOCAL_ULTRA_PLAN_INCLUDED_CENTS: i32 = 20_000;
+/// The local plan never expires, so the billing cycle has to end far enough out
+/// that no Cursor build can reason about a rollover.
+const LOCAL_PLAN_HORIZON_DAYS: i64 = 10 * 365;
+/// The cycle already started this long ago, so `now` sits well inside it.
+const LOCAL_PLAN_CYCLE_STARTED_DAYS: i64 = 30;
+/// The usage bar hides itself past roughly this spend; a local plan is never
+/// near it, so the number only has to be larger than any real invoice.
+const USAGE_DISPLAY_THRESHOLD: i32 = 99_999_999;
 
 #[derive(Clone, PartialEq, Message)]
 struct GetEmailResponse {
@@ -224,8 +232,10 @@ pub async fn current_period_usage(
     super::local_or_forward(upstream, request, || {
         let now = chrono::Utc::now();
         Ok(proto(GetCurrentPeriodUsageResponse {
-            billing_cycle_start: (now - chrono::Duration::days(30)).timestamp_millis(),
-            billing_cycle_end: (now + chrono::Duration::days(10 * 365)).timestamp_millis(),
+            billing_cycle_start: (now - chrono::Duration::days(LOCAL_PLAN_CYCLE_STARTED_DAYS))
+                .timestamp_millis(),
+            billing_cycle_end: (now + chrono::Duration::days(LOCAL_PLAN_HORIZON_DAYS))
+                .timestamp_millis(),
             plan_usage: Some(PlanUsage {
                 total_spend: 0,
                 included_spend: LOCAL_ULTRA_PLAN_INCLUDED_CENTS,
@@ -242,7 +252,7 @@ pub async fn current_period_usage(
             spend_limit_usage: Some(SpendLimitUsage {
                 limit_type: "user".into(),
             }),
-            display_threshold: Some(99_999_999),
+            display_threshold: Some(USAGE_DISPLAY_THRESHOLD),
             enabled: true,
             display_message: "Ultra plan active".into(),
             auto_model_selected_display_message: Some("Ultra plan active".into()),

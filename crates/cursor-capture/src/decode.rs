@@ -11,6 +11,48 @@ use serde::Serialize;
 use crate::config::{DEFAULT_MAX_FRAMES, MAX_CONNECT_FRAME_BYTES};
 use crate::types::{Exchange, FrameView, Payload};
 
+/// How much brotli output the debug view reads per chunk.
+const INFLATE_CHUNK_BYTES: usize = 4096;
+/// The protobuf messages the capture view unwraps by hand.
+const BIDI_REQUEST_ID_MESSAGE: &str = "aiserver.v1.BidiRequestId";
+const BIDI_APPEND_MESSAGE: &str = "aiserver.v1.BidiAppendRequest";
+const AGENT_CLIENT_MESSAGE: &str = "agent.v1.AgentClientMessage";
+/// Connect frame flag bits, from the Connect protocol spec.
+const CONNECT_FLAG_COMPRESSED: u8 = 0x01;
+const CONNECT_FLAG_END_STREAM: u8 = 0x02;
+
+/// Why a stored or captured payload could not be decoded for display.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DecodeError {
+    /// The payload was not valid hex.
+    #[error("payload is not valid hex: {0}")]
+    Hex(String),
+    /// A compressed payload could not be inflated.
+    #[error("cannot inflate payload: {0}")]
+    Inflate(String),
+    /// A protobuf message did not match its descriptor.
+    #[error("cannot decode protobuf: {0}")]
+    Protobuf(String),
+    /// The message type is not in the embedded descriptor set.
+    #[error("unknown protobuf message type {0}")]
+    UnknownType(String),
+    /// The content encoding is one this crate does not implement.
+    #[error("unsupported content encoding {0}")]
+    UnsupportedCodec(String),
+    /// The decompressed payload exceeded the frame cap.
+    #[error("{label} inflates past the {limit} byte limit")]
+    Oversized {
+        /// Which payload inflated too far.
+        label: &'static str,
+        /// The cap it crossed.
+        limit: usize,
+    },
+    /// The captured frames could not be inspected.
+    #[error("frame buffer is unusable: {0}")]
+    Frames(String),
+}
+
+/// One Cursor RPC this debugger knows by name.
 pub const BIDI_APPEND_PATH: &str = "/aiserver.v1.BidiService/BidiAppend";
 pub const FORK_BACKGROUND_COMPOSER_PATH: &str =
     "/aiserver.v1.BackgroundComposerService/ForkBackgroundComposer";
@@ -32,23 +74,27 @@ static POOL: LazyLock<DescriptorPool> = LazyLock::new(|| {
 /// Frame and message lengths travel over the wire as `i32`. Cursor never sends
 /// a frame past `MAX_CONNECT_FRAME_BYTES`, so anything larger is clamped
 /// instead of wrapping into a negative length.
-fn payload_length(len: usize) -> i32 {
-    i32::try_from(len).unwrap_or(i32::MAX)
-}
-
+#[must_use]
 pub fn frame_count(len: usize) -> i32 {
     i32::try_from(len).unwrap_or(i32::MAX)
 }
 
 /// A capture limit stored as `i32`, as the `usize` a buffer needs.
+#[must_use]
 pub fn capture_limit(limit: i32) -> usize {
     usize::try_from(limit.max(0)).unwrap_or(usize::MAX)
 }
 
+/// The most decompressed bytes a frame may hold. This is the Cursor Connect
+/// frame ceiling, not a policy limit of this crate.
+const MAX_DECOMPRESSED_BYTES: usize = MAX_CONNECT_FRAME_BYTES;
+/// How much of a frame's payload the debug UI shows as hex before eliding.
+const HEX_CLIP_BYTES: usize = 4096;
+
 /// One byte past the decompressed-size cap, so `io::copy` can detect an
 /// oversized payload rather than truncating it.
 fn frame_limit_bytes() -> u64 {
-    u64::try_from(MAX_CONNECT_FRAME_BYTES.saturating_add(1)).unwrap_or(u64::MAX)
+    u64::try_from(MAX_DECOMPRESSED_BYTES.saturating_add(1)).unwrap_or(u64::MAX)
 }
 
 static CURSOR_DESCRIPTORS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cursor.bin"));
@@ -68,23 +114,39 @@ pub struct ConnectFrameDecoder {
     on_frame: Box<dyn FnMut(FrameView) + Send>,
 }
 
+impl std::fmt::Debug for ConnectFrameDecoder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectFrameDecoder")
+            .field("message_type", &self.message_type)
+            .field("codec", &self.codec)
+            .field("buffered", &self.buffer.len())
+            .field("max_frames", &self.max_frames)
+            .field("frame_count", &self.frame_count)
+            .field("on_frame", &"<callback>")
+            .finish()
+    }
+}
+
 impl ConnectFrameDecoder {
+    /// Builds a decoder for one captured stream direction.
     pub fn new(
-        message_type: impl Into<String>,
-        codec: impl Into<String>,
+        message_type: &str,
+        codec: &str,
         max_frames: i32,
         on_frame: impl FnMut(FrameView) + Send + 'static,
     ) -> Self {
         Self {
             buffer: Vec::new(),
-            message_type: message_type.into(),
-            codec: codec.into().trim().to_string(),
+            message_type: message_type.to_owned(),
+            codec: codec.trim().to_owned(),
             max_frames,
             frame_count: 0,
             on_frame: Box::new(on_frame),
         }
     }
 
+    /// Feeds one chunk of captured bytes through the decoder.
     pub fn write(&mut self, payload: &[u8]) {
         if payload.is_empty() || self.frame_count >= self.max_frames {
             return;
@@ -92,16 +154,16 @@ impl ConnectFrameDecoder {
         self.buffer.extend_from_slice(payload);
         while self.buffer.len() >= 5 && self.frame_count < self.max_frames {
             let flags = self.buffer[0];
-            let length = usize::try_from(u32::from_be_bytes(
-                self.buffer[1..5].try_into().expect("4 bytes"),
-            ))
-            .unwrap_or(usize::MAX);
-            if length > MAX_CONNECT_FRAME_BYTES {
+            let Ok(header) = <[u8; 4]>::try_from(&self.buffer[1..5]) else {
+                return;
+            };
+            let length = usize::try_from(u32::from_be_bytes(header)).unwrap_or(usize::MAX);
+            if length > MAX_DECOMPRESSED_BYTES {
                 self.emit(FrameView {
                     flags,
-                    length: payload_length(length),
+                    length: frame_count(length),
                     error: "Connect 帧长度异常".into(),
-                    ..empty_frame()
+                    ..FrameView::default()
                 });
                 self.buffer.clear();
                 return;
@@ -116,13 +178,14 @@ impl ConnectFrameDecoder {
         }
     }
 
+    /// Flushes a truncated trailing frame as an error frame.
     pub fn close(&mut self) {
         if !self.buffer.is_empty() && self.frame_count < self.max_frames {
             self.emit(FrameView {
-                length: payload_length(self.buffer.len()),
-                raw_hex: clipped_hex(&self.buffer, 4096),
+                length: frame_count(self.buffer.len()),
+                raw_hex: clipped_hex(&self.buffer, HEX_CLIP_BYTES),
                 error: "流结束时仍有不完整的 Connect 帧".into(),
-                ..empty_frame()
+                ..FrameView::default()
             });
         }
         self.buffer.clear();
@@ -137,17 +200,17 @@ impl ConnectFrameDecoder {
     fn decode(&self, flags: u8, payload: &[u8]) -> FrameView {
         let mut frame = FrameView {
             flags,
-            length: payload_length(payload.len()),
-            compressed: flags & 0x01 != 0,
-            end_stream: flags & 0x02 != 0,
-            raw_hex: clipped_hex(payload, 4096),
-            ..empty_frame()
+            length: frame_count(payload.len()),
+            compressed: flags & CONNECT_FLAG_COMPRESSED != 0,
+            end_stream: flags & CONNECT_FLAG_END_STREAM != 0,
+            raw_hex: clipped_hex(payload, HEX_CLIP_BYTES),
+            ..FrameView::default()
         };
         let decoded = if frame.compressed {
             match decompress_payload(payload, &self.codec) {
                 Ok(bytes) => bytes,
                 Err(err) => {
-                    frame.error = err;
+                    frame.error = err.to_string();
                     return frame;
                 }
             }
@@ -155,7 +218,7 @@ impl ConnectFrameDecoder {
             payload.to_vec()
         };
         if frame.end_stream {
-            frame.kind = "end_stream".into();
+            frame.kind = FrameView::KIND_END_STREAM.into();
             frame.message_type = "connect.error.v1.EndStreamResponse".into();
             frame.json = pretty_json(&decoded);
             return frame;
@@ -166,7 +229,7 @@ impl ConnectFrameDecoder {
             Some(Ok(message)) => {
                 frame.message_type.clone_from(&self.message_type);
                 frame.kind = active_oneof_name(&message);
-                if self.message_type == "aiserver.v1.BidiRequestId" {
+                if self.message_type == BIDI_REQUEST_ID_MESSAGE {
                     frame.request_id = string_field(&message, "request_id");
                 }
                 frame.json = marshal_proto_json(&message);
@@ -207,7 +270,7 @@ pub fn decode_unary_request(path: &str, payload: &[u8]) -> DecodedUnary {
 }
 
 fn decode_bidi_append_request(payload: &[u8]) -> DecodedUnary {
-    let request = match decode_named_message("aiserver.v1.BidiAppendRequest", payload) {
+    let request = match decode_named_message(BIDI_APPEND_MESSAGE, payload) {
         Some(Ok(request)) => request,
         Some(Err(err)) => {
             return DecodedUnary {
@@ -231,7 +294,7 @@ fn decode_bidi_append_request(payload: &[u8]) -> DecodedUnary {
             json: outer,
             kind: "bidi_append".into(),
             request_id,
-            error: Some(err),
+            error: Some(err.to_string()),
             ..DecodedUnary::default()
         },
         Ok(None) => DecodedUnary {
@@ -278,14 +341,12 @@ struct BidiAppendView {
 
 fn decode_bidi_client_message(
     request: &DynamicMessage,
-) -> Result<Option<(DynamicMessage, String)>, String> {
+) -> Result<Option<(DynamicMessage, String)>, DecodeError> {
     let data = string_field(request, "data");
     if !data.trim().is_empty() {
         let payload = hex::decode(data.trim())
-            .map_err(|err| format!("decode hex agent client message failed: {err}"))?;
-        let message = decode_named_message("agent.v1.AgentClientMessage", &payload)
-            .ok_or_else(|| "未知的 protobuf 消息类型".to_string())?
-            .map_err(|err| format!("decode agent client message failed: {err}"))?;
+            .map_err(|err| DecodeError::Hex(format!("agent client message: {err}")))?;
+        let message = decode_required(AGENT_CLIENT_MESSAGE, &payload)?;
         let kind = active_oneof_name(&message);
         return Ok(Some((message, kind)));
     }
@@ -293,11 +354,18 @@ fn decode_bidi_client_message(
     if binary.is_empty() {
         return Ok(None);
     }
-    let message = decode_named_message("agent.v1.AgentClientMessage", &binary)
-        .ok_or_else(|| "未知的 protobuf 消息类型".to_string())?
-        .map_err(|err| format!("decode binary agent client message failed: {err}"))?;
+    let message = decode_required(AGENT_CLIENT_MESSAGE, &binary)?;
     let kind = active_oneof_name(&message);
     Ok(Some((message, kind)))
+}
+
+/// Decodes a message this crate is sure exists in the descriptor set.
+fn decode_required(message_type: &str, payload: &[u8]) -> Result<DynamicMessage, DecodeError> {
+    let descriptor = POOL
+        .get_message_by_name(message_type)
+        .ok_or_else(|| DecodeError::UnknownType(message_type.to_owned()))?;
+    DynamicMessage::decode(descriptor, payload)
+        .map_err(|err| DecodeError::Protobuf(err.to_string()))
 }
 
 fn conversation_id_from_client_message(message: &DynamicMessage) -> String {
@@ -326,11 +394,18 @@ pub struct DecodedResponse {
     pub kind: String,
 }
 
-pub fn decode_unary_response(path: &str, payload: &[u8]) -> Result<DecodedResponse, String> {
+/// Decodes a unary Cursor response into its JSON view.
+///
+/// # Errors
+///
+/// Returns [`DecodeError::Protobuf`] when the payload does not match the
+/// method's response schema.
+pub fn decode_unary_response(path: &str, payload: &[u8]) -> Result<DecodedResponse, DecodeError> {
     let Some((descriptor, kind)) = unary_response_message(path) else {
         return Ok(DecodedResponse::default());
     };
-    let message = DynamicMessage::decode(descriptor, payload).map_err(|err| err.to_string())?;
+    let message = DynamicMessage::decode(descriptor, payload)
+        .map_err(|err| DecodeError::Protobuf(err.to_string()))?;
     Ok(DecodedResponse {
         json: marshal_proto_json(&message),
         kind,
@@ -338,7 +413,7 @@ pub fn decode_unary_response(path: &str, payload: &[u8]) -> Result<DecodedRespon
 }
 
 pub fn hydrate_stored_exchange(exchange: &mut Exchange) -> bool {
-    if exchange.summary.state != "completed" && exchange.summary.state != "streaming" {
+    if !exchange.summary.state.is_replayable() {
         return false;
     }
     let request_frames = hydrate_stored_request_frames(exchange);
@@ -372,7 +447,7 @@ fn hydrate_stored_request_frames(exchange: &mut Exchange) -> bool {
     ) {
         Ok(frames) if !frames.is_empty() => {
             for frame in &frames {
-                if !frame.kind.is_empty() && frame.kind != "end_stream" {
+                if !frame.kind.is_empty() && frame.kind != FrameView::KIND_END_STREAM {
                     exchange.summary.request_kind.clone_from(&frame.kind);
                 }
                 if !frame.request_id.is_empty() {
@@ -382,7 +457,7 @@ fn hydrate_stored_request_frames(exchange: &mut Exchange) -> bool {
             exchange.request.frames = frames;
         }
         Ok(_) => {}
-        Err(err) => exchange.request.decode_error = err,
+        Err(err) => exchange.request.decode_error = err.to_string(),
     }
     true
 }
@@ -405,14 +480,14 @@ fn hydrate_stored_response_frames(exchange: &mut Exchange) -> bool {
         Ok(frames) if !frames.is_empty() => {
             exchange.summary.frame_count = frame_count(frames.len());
             for frame in &frames {
-                if !frame.kind.is_empty() && frame.kind != "end_stream" {
+                if !frame.kind.is_empty() && frame.kind != FrameView::KIND_END_STREAM {
                     exchange.summary.response_kind.clone_from(&frame.kind);
                 }
             }
             exchange.response.frames = frames;
         }
         Ok(_) => {}
-        Err(err) => exchange.response.decode_error = err,
+        Err(err) => exchange.response.decode_error = err.to_string(),
     }
     true
 }
@@ -443,7 +518,7 @@ fn hydrate_stored_unary_request(exchange: &mut Exchange) -> bool {
                 exchange.summary.conversation_id = decoded.conversation_id;
             }
         }
-        Err(err) => exchange.request.decode_error = err,
+        Err(err) => exchange.request.decode_error = err.to_string(),
     }
     true
 }
@@ -463,9 +538,9 @@ fn hydrate_stored_unary_response(exchange: &mut Exchange) -> bool {
                 exchange.summary.response_kind = decoded.kind;
             }
             Ok(_) => {}
-            Err(err) => exchange.response.decode_error = err,
+            Err(err) => exchange.response.decode_error = err.to_string(),
         },
-        Err(err) => exchange.response.decode_error = err,
+        Err(err) => exchange.response.decode_error = err.to_string(),
     }
     true
 }
@@ -518,7 +593,7 @@ pub fn decode_captured_content(payload: &[u8], content_type: &str, codec: &str) 
         Ok(decoded) => decoded,
         Err(err) => {
             return DecodedContent {
-                error: Some(err),
+                error: Some(err.to_string()),
                 ..DecodedContent::default()
             };
         }
@@ -592,19 +667,27 @@ fn json_valid(payload: &[u8]) -> bool {
 }
 
 /// Reads a decompressor to the end, refusing anything past the frame cap.
-fn inflate_limited(mut reader: impl Read, label: &str) -> Result<Vec<u8>, String> {
+fn inflate_limited(mut reader: impl Read, label: &'static str) -> Result<Vec<u8>, DecodeError> {
     let mut result = Vec::new();
     io::copy(&mut reader.by_ref().take(frame_limit_bytes()), &mut result)
-        .map_err(|err| format!("读取 {label} 内容失败：{err}"))?;
-    if result.len() > MAX_CONNECT_FRAME_BYTES {
-        return Err(format!(
-            "{label} 解压后超过 {MAX_CONNECT_FRAME_BYTES} 字节限制"
-        ));
+        .map_err(|err| DecodeError::Inflate(format!("reading {label}: {err}")))?;
+    if result.len() > MAX_DECOMPRESSED_BYTES {
+        return Err(DecodeError::Oversized {
+            label,
+            limit: MAX_DECOMPRESSED_BYTES,
+        });
     }
     Ok(result)
 }
 
-pub fn decode_http_content(payload: &[u8], codec: &str) -> Result<Vec<u8>, String> {
+/// Decompresses `payload` for every encoding named in `codec`, outermost last.
+///
+/// # Errors
+///
+/// Returns [`DecodeError::UnsupportedCodec`] for an encoding this crate does
+/// not implement, and [`DecodeError::Inflate`]/[`DecodeError::Oversized`] when
+/// decompression fails or exceeds the frame cap.
+pub fn decode_http_content(payload: &[u8], codec: &str) -> Result<Vec<u8>, DecodeError> {
     let encodings: Vec<_> = codec
         .split(',')
         .map(|item| item.trim().to_ascii_lowercase())
@@ -619,10 +702,10 @@ pub fn decode_http_content(payload: &[u8], codec: &str) -> Result<Vec<u8>, Strin
                 decoded = inflate_limited(inflater, "deflate")?;
             }
             "br" => {
-                let decompressor = Decompressor::new(decoded.as_slice(), 4096);
+                let decompressor = Decompressor::new(decoded.as_slice(), INFLATE_CHUNK_BYTES);
                 decoded = inflate_limited(decompressor, "Brotli")?;
             }
-            other => return Err(format!("暂不支持内容编码 {other:?}")),
+            other => return Err(DecodeError::UnsupportedCodec(other.to_owned())),
         }
     }
     Ok(decoded)
@@ -675,23 +758,35 @@ fn text_language(media_type: &str) -> String {
     .into()
 }
 
+/// Re-decodes the stored Connect frames of one exchange side.
+///
+/// # Errors
+///
+/// Returns [`DecodeError::Hex`] when the stored hex is malformed and
+/// [`DecodeError::Frames`] when the frame buffer is unusable.
 pub fn decode_stored_connect_frames(
     raw_hex_value: &str,
     message_type: &str,
     codec: &str,
-) -> Result<Vec<FrameView>, String> {
+) -> Result<Vec<FrameView>, DecodeError> {
     let payload = hex::decode(raw_hex_value.trim())
-        .map_err(|err| format!("解析已存储 Connect 正文失败：{err}"))?;
+        .map_err(|err| DecodeError::Hex(format!("stored Connect body: {err}")))?;
     let frames = Arc::new(Mutex::new(Vec::new()));
     let collected = Arc::clone(&frames);
     let mut decoder =
         ConnectFrameDecoder::new(message_type, codec, DEFAULT_MAX_FRAMES, move |frame| {
-            collected.lock().expect("frame lock").push(frame);
+            // The UI cannot observe the frames before this call returns, so a
+            // poisoned lock only means a previous decode panicked.
+            if let Ok(mut frames) = collected.lock() {
+                frames.push(frame);
+            }
         });
     decoder.write(&payload);
     decoder.close();
-    let frames = frames.lock().expect("frame lock");
-    Ok(frames.clone())
+    let mut frames = frames
+        .lock()
+        .map_err(|err| DecodeError::Frames(err.to_string()))?;
+    Ok(std::mem::take(&mut *frames))
 }
 
 pub fn is_unary_proto_content_type(content_type: &str) -> bool {
@@ -701,9 +796,15 @@ pub fn is_unary_proto_content_type(content_type: &str) -> bool {
     )
 }
 
-pub fn decode_stored_raw_payload(raw_hex_value: &str, codec: &str) -> Result<Vec<u8>, String> {
-    let payload =
-        hex::decode(raw_hex_value.trim()).map_err(|err| format!("解析已存储正文失败：{err}"))?;
+/// Decodes a stored payload's hex and content encoding.
+///
+/// # Errors
+///
+/// Returns [`DecodeError::Hex`] for malformed hex and the inflate errors for a
+/// codec this crate cannot apply.
+pub fn decode_stored_raw_payload(raw_hex_value: &str, codec: &str) -> Result<Vec<u8>, DecodeError> {
+    let payload = hex::decode(raw_hex_value.trim())
+        .map_err(|err| DecodeError::Hex(format!("stored body: {err}")))?;
     if codec.is_empty() || codec.eq_ignore_ascii_case("identity") {
         return Ok(payload);
     }
@@ -923,27 +1024,17 @@ pub fn raw_hex(payload: &[u8]) -> String {
     hex::encode(payload)
 }
 
-pub fn decompress_payload(payload: &[u8], codec: &str) -> Result<Vec<u8>, String> {
+/// Inflates a gzip payload, rejecting any other encoding.
+///
+/// # Errors
+///
+/// Returns [`DecodeError::UnsupportedCodec`] for a non-gzip codec and the
+/// inflate errors when the stream is corrupt or too large.
+pub fn decompress_payload(payload: &[u8], codec: &str) -> Result<Vec<u8>, DecodeError> {
     if !codec.is_empty() && !codec.eq_ignore_ascii_case("gzip") {
-        return Err(format!("暂不支持压缩算法 {codec:?}"));
+        return Err(DecodeError::UnsupportedCodec(codec.to_owned()));
     }
     inflate_limited(GzDecoder::new(payload), "gzip")
-}
-
-fn empty_frame() -> FrameView {
-    FrameView {
-        index: 0,
-        flags: 0,
-        length: 0,
-        compressed: false,
-        end_stream: false,
-        kind: String::new(),
-        message_type: String::new(),
-        request_id: String::new(),
-        json: String::new(),
-        raw_hex: String::new(),
-        error: String::new(),
-    }
 }
 
 fn string_field(message: &DynamicMessage, name: &str) -> String {

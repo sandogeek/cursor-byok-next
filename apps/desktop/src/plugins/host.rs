@@ -23,7 +23,7 @@ use super::{
     catalog::{PluginCatalog, PluginEntry},
     data::PluginDataStore,
     descriptor::{
-        FORM_ADD_METHOD, FORM_FIELD_URL, LIVE_CATALOG, PluginDescriptor, PluginModelDescriptor,
+        CatalogMode, FormFieldKind, PluginDescriptor, PluginModelDescriptor,
         PluginProviderDescriptor, PluginResourceDescriptor, PluginResourceView, ProviderDefinition,
         ResourceDefinition, ResourcePresentation, parse_model_id,
     },
@@ -65,6 +65,10 @@ struct HostInner {
     entries: RwLock<Option<Vec<PluginEntry>>>,
     workers: Mutex<HashMap<String, Arc<PluginWorker>>>,
     live_catalogs: Mutex<HashMap<LiveCatalogKey, LiveCatalogEntry>>,
+    /// Serializes the mutations that read the catalog, call into the plugin and
+    /// then write plugin state. The worker round-trip runs while this is held on
+    /// purpose: two interleaved form submits could otherwise write resources
+    /// derived from the same stale snapshot.
     operations: Mutex<()>,
     executable: RwLock<Option<std::path::PathBuf>>,
 }
@@ -185,11 +189,6 @@ impl PluginHost {
                     "plugin '{plugin_id}' does not define form method '{method_id}'"
                 ))
             })?;
-        if method.method_type != FORM_ADD_METHOD {
-            return Err(Error::Config(format!(
-                "plugin '{plugin_id}' add method '{method_id}' is not a form method"
-            )));
-        }
         let values = values
             .as_object()
             .cloned()
@@ -208,7 +207,7 @@ impl PluginHost {
                     field.id
                 )));
             }
-            if field.field_type == FORM_FIELD_URL && !raw.is_empty() {
+            if field.field_type == FormFieldKind::Url && !raw.is_empty() {
                 submit_origins.insert(origin::origin_from_url(raw)?);
             }
             submitted.insert(field.id.clone(), serde_json::Value::String(raw.to_owned()));
@@ -277,6 +276,15 @@ impl PluginHost {
         Ok(())
     }
 
+    /// Re-asks one provider for its model list and updates the cache.
+    ///
+    /// A refresh the provider rejects is not an error for the caller: the cached
+    /// models stay usable and the failure shows up as `catalogError` in the next
+    /// [`PluginHost::snapshot`], next to the button that asked for it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the runtime is missing or the plugin or provider is unknown.
     pub async fn refresh_catalog(&self, plugin_id: &str, provider_id: &str) -> Result<()> {
         let _operation = self.inner.operations.lock().await;
         let executable = self.executable().await?;
@@ -365,7 +373,7 @@ impl PluginHost {
                 .invocation_resource(&plugin_id, &provider, &upstream_id)
                 .await?;
             let mut model_snapshot = stored.snapshot();
-            if provider.catalog == LIVE_CATALOG
+            if provider.catalog == CatalogMode::Live
                 && let Some(upstream) = live_upstream_id(&upstream_id)
                 && let Some(object) = model_snapshot.as_object_mut()
             {
@@ -427,7 +435,7 @@ impl PluginHost {
         let Some(resource_type) = &provider.resource_type else {
             return Ok(None);
         };
-        if provider.catalog != LIVE_CATALOG {
+        if provider.catalog != CatalogMode::Live {
             let record = self.select_resource(plugin_id, resource_type).await?;
             return Ok(Some((resource_type.clone(), record)));
         }
@@ -523,7 +531,7 @@ impl PluginHost {
                 provider_type: provider.provider_type.clone(),
                 resource_type: provider.resource_type.clone(),
                 has_models: provider.has_models,
-                catalog: provider.catalog.clone(),
+                catalog: provider.catalog,
                 configured,
                 catalog_error,
                 models: stored
@@ -678,7 +686,7 @@ impl PluginHost {
         refresh: CatalogRefresh,
         only: Option<&HashSet<String>>,
     ) -> ProviderCatalog {
-        if !provider.has_models || provider.catalog != LIVE_CATALOG {
+        if !provider.has_models || provider.catalog != CatalogMode::Live {
             return ProviderCatalog::default();
         }
         let Some(resource_type) = provider.resource_type.as_deref() else {
@@ -704,7 +712,7 @@ impl PluginHost {
                 .await;
             models.extend(catalog.models);
             if let Some(error) = catalog.error {
-                errors.push(format!("{}：{error}", record.key));
+                errors.push(format!("{}: {error}", record.key));
             }
         }
         ProviderCatalog {
@@ -764,8 +772,12 @@ impl PluginHost {
         provider: &ProviderDefinition,
         resource: Option<&ResourceRecord>,
     ) -> Result<Vec<StoredModel>> {
-        let snapshot = resource
-            .map(|record| record.snapshot(provider.resource_type.as_deref().unwrap_or_default()));
+        // A resource record is only meaningful with the type it was stored
+        // under, so a provider that declares no type gets no snapshot.
+        let snapshot = match (provider.resource_type.as_deref(), resource) {
+            (Some(resource_type), Some(record)) => Some(record.snapshot(resource_type)),
+            _ => None,
+        };
         let value = self
             .worker(entry, executable)
             .await
@@ -1233,7 +1245,7 @@ mod tests {
         (host, model_id)
     }
 
-    fn invocation(model_id: String, parts: Vec<crate::model::ContentPart>) -> ModelInvocation {
+    fn invocation(model_id: &str, parts: Vec<crate::model::ContentPart>) -> ModelInvocation {
         ModelInvocation {
             call_id: "call".into(),
             run_id: "run".into(),
@@ -1286,7 +1298,7 @@ mod tests {
         .await;
         let responses_host =
             configured_invocation_host(&temp.path().join("responses"), responses.0).await;
-        let mut file_invocation = invocation(responses_host.1, vec![pdf_part()]);
+        let mut file_invocation = invocation(&responses_host.1, vec![pdf_part()]);
         file_invocation.request.model.max_output_tokens = Some(8192);
         drain(
             responses_host
@@ -1311,7 +1323,7 @@ mod tests {
         let chat = invocation_gateway("/v1/chat/completions", "data: [DONE]\n\n").await;
         let chat_host = configured_invocation_host(&temp.path().join("chat"), chat.0).await;
         drain(chat_host.0.stream_model(
-            invocation(chat_host.1, vec![pdf_part()]),
+            invocation(&chat_host.1, vec![pdf_part()]),
             CancellationToken::new(),
             None,
         ))
@@ -1343,7 +1355,7 @@ mod tests {
         };
         let cancellation = CancellationToken::new();
         let mut stream = messages_host.0.stream_model(
-            invocation(messages_host.1, vec![file]),
+            invocation(&messages_host.1, vec![file]),
             cancellation.clone(),
             None,
         );
@@ -1420,18 +1432,17 @@ mod tests {
         )
         .await;
         let mut stream = host.0.stream_model(
-            invocation(host.1, Vec::new()),
+            invocation(&host.1, Vec::new()),
             CancellationToken::new(),
             Some(recorder.clone()),
         );
         while let Some(event) = stream.next().await {
-            recorder.event(&event.unwrap()).await.unwrap();
+            recorder.event(&event.unwrap()).await;
         }
         if !recorder.is_finished() {
             recorder
                 .completed(crate::provider::FinishReason::Stop)
-                .await
-                .unwrap();
+                .await;
         }
         let call = store.llm_call("call").await.unwrap().unwrap();
         assert_eq!(call.http_status, Some(200));
@@ -1478,7 +1489,7 @@ mod tests {
         .await;
         let cancellation = CancellationToken::new();
         let mut stream = host.0.stream_model(
-            invocation(host.1, Vec::new()),
+            invocation(&host.1, Vec::new()),
             cancellation.clone(),
             Some(recorder.clone()),
         );
@@ -1491,9 +1502,9 @@ mod tests {
             .expect("the invocation must reach the test gateway");
         cancellation.cancel();
         while stream.next().await.is_some() {}
-        recorder.cancelled().await.unwrap();
+        recorder.cancelled().await;
         let call = store.llm_call("cancelled-call").await.unwrap().unwrap();
-        assert_eq!(call.status, "cancelled");
+        assert_eq!(call.status, crate::calls::CallStatus::Cancelled);
         messages.4.abort();
     }
 
@@ -1508,7 +1519,7 @@ mod tests {
             invocation_gateway_with_status("/v1/chat/completions", "unauthorized\n", 401).await;
         let host = configured_invocation_host(temp.path(), gateway.0).await;
         let mut stream = host.0.stream_model(
-            invocation(host.1, Vec::new()),
+            invocation(&host.1, Vec::new()),
             CancellationToken::new(),
             None,
         );
@@ -1572,7 +1583,7 @@ mod tests {
         let host = configured_invocation_host(&temp.path().join("frames"), gateway.0).await;
         let mut short = host.0.stream_model(
             invocation(
-                host.1.clone(),
+                &host.1,
                 vec![crate::model::ContentPart::Text {
                     text: "hello".into(),
                 }],
@@ -1610,7 +1621,7 @@ mod tests {
                 data: vec![0_u8; 1024 * 1024],
             }]),
         });
-        let mut long_invocation = invocation(host.1.clone(), Vec::new());
+        let mut long_invocation = invocation(&host.1, Vec::new());
         long_invocation.request.history = long_history;
         let mut long = host
             .0

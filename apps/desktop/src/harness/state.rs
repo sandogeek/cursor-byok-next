@@ -7,9 +7,69 @@
 
 use std::{fs, path::PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::Result;
+
+/// The port the user asked takeover to bind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PortChoice {
+    /// No choice was saved, so the port bound last is reused.
+    #[default]
+    Unset,
+    /// The user asked for a fresh OS-assigned port, even if a fixed one worked.
+    OsAssigned,
+    /// A specific port the user typed.
+    Fixed(u16),
+}
+
+impl PortChoice {
+    /// The choice `port` expresses at the TSX boundary: `null` is no choice and
+    /// `0` asks the OS to pick.
+    #[must_use]
+    pub fn from_boundary(port: Option<u16>) -> Self {
+        match port {
+            None => Self::Unset,
+            Some(0) => Self::OsAssigned,
+            Some(port) => Self::Fixed(port),
+        }
+    }
+
+    /// The `null | number` the TSX boundary and `harness.json` both use.
+    #[must_use]
+    pub fn to_boundary(self) -> Option<u16> {
+        match self {
+            Self::Unset => None,
+            Self::OsAssigned => Some(0),
+            Self::Fixed(port) => Some(port),
+        }
+    }
+
+    /// The port to request from the OS, given the one bound last.
+    #[must_use]
+    pub fn request(self, last_bound: Option<u16>, fallback: u16) -> u16 {
+        match self {
+            Self::Fixed(port) => port,
+            // An explicit "let the OS pick" overrides the remembered port.
+            Self::OsAssigned => 0,
+            Self::Unset => last_bound.unwrap_or(fallback),
+        }
+    }
+}
+
+impl Serialize for PortChoice {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.to_boundary().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PortChoice {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        Ok(Self::from_boundary(Option::<u16>::deserialize(
+            deserializer,
+        )?))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,12 +77,12 @@ pub struct HarnessState {
     /// Whether the user turned takeover on.
     pub enabled: bool,
     /// The port the proxy bound last, so a restart can try it again.
-    pub proxy_port: u16,
-    /// The port the user chose in system settings. `Some(0)` asks the OS to
-    /// pick; `None` means no choice was ever saved, so the last bound port is
-    /// reused. Kept apart from `proxy_port` so a chosen port survives a run
-    /// that could not bind it.
-    pub preferred_port: Option<u16>,
+    #[serde(default)]
+    pub proxy_port: Option<u16>,
+    /// What the user asked for, kept apart from `proxy_port` so a choice
+    /// survives a run that could not bind it.
+    #[serde(default)]
+    pub preferred_port: PortChoice,
 }
 
 #[derive(Debug)]
@@ -31,12 +91,15 @@ pub struct HarnessStateStore {
 }
 
 impl HarnessStateStore {
+    /// A store over an explicit file, for tests.
+    #[must_use]
     pub fn at(path: PathBuf) -> Self {
         Self { path }
     }
 
     /// A missing or unreadable file means "off": never take over on the
     /// strength of a file we cannot read.
+    #[must_use]
     pub fn load(&self) -> HarnessState {
         fs::read_to_string(&self.path)
             .ok()
@@ -44,14 +107,19 @@ impl HarnessStateStore {
             .unwrap_or_default()
     }
 
+    /// Writes the intent atomically, so a crash cannot leave half a file.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the directory cannot be created, the state cannot be
+    /// serialized, or the file cannot be written.
     pub fn save(&self, state: HarnessState) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let data = serde_json::to_vec_pretty(&state)?;
-        let temp = self.path.with_extension("json.tmp");
-        fs::write(&temp, [data.as_slice(), b"\n"].concat())?;
-        fs::rename(temp, &self.path)?;
+        let mut data = serde_json::to_vec_pretty(&state)?;
+        data.push(b'\n');
+        crate::atomic::write(&self.path, &data)?;
         Ok(())
     }
 }
@@ -74,8 +142,8 @@ mod tests {
         let store = HarnessStateStore::at(dir.path().join("harness.json"));
         let state = HarnessState {
             enabled: true,
-            proxy_port: 41000,
-            preferred_port: Some(41000),
+            proxy_port: Some(41000),
+            preferred_port: PortChoice::Fixed(41000),
         };
 
         store.save(state).unwrap();
@@ -89,8 +157,8 @@ mod tests {
         let store = HarnessStateStore::at(dir.path().join("harness.json"));
         let state = HarnessState {
             enabled: false,
-            proxy_port: 41000,
-            preferred_port: None,
+            proxy_port: Some(41000),
+            preferred_port: PortChoice::Unset,
         };
 
         store.save(state).unwrap();
@@ -107,14 +175,12 @@ mod tests {
         let store = HarnessStateStore::at(dir.path().join("harness.json"));
         std::fs::write(&store.path, r#"{"enabled": true, "proxyPort": 41000}"#).unwrap();
 
-        // A missing `Option` field is `None` in serde itself; no migration code
-        // writes it, so this is just the shape of "no choice saved".
         assert_eq!(
             store.load(),
             HarnessState {
                 enabled: true,
-                proxy_port: 41000,
-                preferred_port: None,
+                proxy_port: Some(41000),
+                preferred_port: PortChoice::Unset,
             }
         );
     }
@@ -126,5 +192,21 @@ mod tests {
         std::fs::write(&store.path, "{ not json").unwrap();
 
         assert_eq!(store.load(), HarnessState::default());
+    }
+
+    #[test]
+    fn the_choice_and_the_last_bound_port_do_not_overlap() {
+        let os_pick = PortChoice::from_boundary(Some(0));
+        let fixed = PortChoice::from_boundary(Some(42000));
+        let unset = PortChoice::from_boundary(None);
+
+        assert_eq!(os_pick.to_boundary(), Some(0));
+        assert_eq!(fixed.to_boundary(), Some(42000));
+        assert_eq!(unset.to_boundary(), None);
+
+        assert_eq!(os_pick.request(Some(41000), 39831), 0);
+        assert_eq!(fixed.request(Some(41000), 39831), 42000);
+        assert_eq!(unset.request(Some(41000), 39831), 41000);
+        assert_eq!(unset.request(None, 39831), 39831);
     }
 }

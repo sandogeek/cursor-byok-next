@@ -17,7 +17,7 @@ use crate::{
 
 use super::{
     CallStore, NewLlmCall,
-    store::{BufferedLlmChunk, PayloadStorage},
+    store::{BufferedLlmChunk, CallOutcome, CallStatus, PayloadStorage},
 };
 
 #[derive(Clone)]
@@ -47,9 +47,7 @@ impl Drop for CancelOnDrop {
             return;
         };
         runtime.spawn(async move {
-            if let Err(error) = recorder.cancelled().await {
-                tracing::warn!(call_id = %recorder.inner.call_id, %error, "failed to mark dropped LLM call cancelled");
-            }
+            recorder.cancelled().await;
         });
     }
 }
@@ -227,17 +225,15 @@ impl CallRecorder {
         }
     }
 
-    pub async fn request(
-        &self,
-        headers: serde_json::Value,
-        body: &serde_json::Value,
-    ) -> Result<()> {
+    /// Records the request. Recording never fails the call: a write error only
+    /// marks the store degraded, because the provider response is unaffected.
+    pub async fn request(&self, headers: serde_json::Value, body: &serde_json::Value) {
         if self.is_finished() {
-            return Ok(());
+            return;
         }
         let _lifecycle = self.inner.lifecycle.lock().await;
         if self.is_finished() {
-            return Ok(());
+            return;
         }
         self.observe(
             self.inner
@@ -246,16 +242,17 @@ impl CallRecorder {
                 .await,
             "cannot record LLM request",
         );
-        Ok(())
     }
 
-    pub async fn response_headers(&self, status: u16) -> Result<()> {
+    /// Records the upstream HTTP status. See [`CallRecorder::request`] for why
+    /// this cannot fail.
+    pub async fn response_headers(&self, status: u16) {
         if self.is_finished() {
-            return Ok(());
+            return;
         }
         let _lifecycle = self.inner.lifecycle.lock().await;
         if self.is_finished() {
-            return Ok(());
+            return;
         }
         self.observe(
             self.inner
@@ -268,16 +265,17 @@ impl CallRecorder {
                 .await,
             "cannot record LLM response headers",
         );
-        Ok(())
     }
 
-    pub async fn response_chunk(&self, data: &[u8]) -> Result<()> {
+    /// Queues one raw response chunk. See [`CallRecorder::request`] for why
+    /// this cannot fail.
+    pub async fn response_chunk(&self, data: &[u8]) {
         if self.is_finished() {
-            return Ok(());
+            return;
         }
         let sender = self.inner.observations.lock().await.clone();
         let Some(sender) = sender else {
-            return Ok(());
+            return;
         };
         if sender
             .send(Observation {
@@ -290,21 +288,21 @@ impl CallRecorder {
             self.inner.store.mark_degraded();
             tracing::warn!(call_id = %self.inner.call_id, "LLM response recorder stopped");
         }
-        Ok(())
     }
 
-    pub async fn event(&self, event: &ModelEvent) -> Result<()> {
-        if matches!(event, ModelEvent::Done(_))
-            && let ModelEvent::Done(reason) = event
-        {
-            return self.completed(*reason).await;
+    /// Records one parsed provider event, including the terminal `Done`. See
+    /// [`CallRecorder::request`] for why this cannot fail.
+    pub async fn event(&self, event: &ModelEvent) {
+        if let ModelEvent::Done(reason) = event {
+            self.completed(*reason).await;
+            return;
         }
         if self.is_finished() {
-            return Ok(());
+            return;
         }
         let mut lifecycle = self.inner.lifecycle.lock().await;
         if self.is_finished() {
-            return Ok(());
+            return;
         }
         if is_valid_response_event(event) && !lifecycle.first_valid_response_recorded {
             match self
@@ -342,18 +340,19 @@ impl CallRecorder {
         }
         drop(lifecycle);
         if let ModelEvent::Usage(usage) = event {
-            self.usage(*usage).await?;
+            self.usage(*usage).await;
         }
-        Ok(())
     }
 
-    pub async fn usage(&self, usage: crate::model::Usage) -> Result<()> {
+    /// Records token usage. See [`CallRecorder::request`] for why this cannot
+    /// fail.
+    pub async fn usage(&self, usage: crate::model::Usage) {
         if self.is_finished() {
-            return Ok(());
+            return;
         }
         let _lifecycle = self.inner.lifecycle.lock().await;
         if self.is_finished() {
-            return Ok(());
+            return;
         }
         self.observe(
             self.inner
@@ -362,41 +361,39 @@ impl CallRecorder {
                 .await,
             "cannot record LLM usage",
         );
-        Ok(())
     }
 
-    pub async fn completed(&self, reason: FinishReason) -> Result<()> {
-        self.finish("completed", Some(finish_reason(reason)), None, None)
-            .await
+    /// Marks the call completed. Finishing twice is a no-op.
+    pub async fn completed(&self, reason: FinishReason) {
+        self.finish(CallOutcome::completed(finish_reason(reason), 0))
+            .await;
     }
 
-    pub async fn failed(&self, error: &crate::Error) -> Result<()> {
-        self.finish(
-            "error",
-            None,
-            Some(error_kind(error)),
-            Some(&error.to_string()),
-        )
-        .await
+    /// Marks the call failed, recording why.
+    pub async fn failed(&self, error: &crate::Error) {
+        let message = error.to_string();
+        self.finish(CallOutcome {
+            status: CallStatus::Error,
+            finish_reason: None,
+            elapsed_ms: 0,
+            error_kind: Some(error_kind(error)),
+            error_message: Some(&message),
+        })
+        .await;
     }
 
-    pub async fn cancelled(&self) -> Result<()> {
-        self.finish("cancelled", None, None, None).await
+    /// Marks the call cancelled.
+    pub async fn cancelled(&self) {
+        self.finish(CallOutcome::cancelled(0)).await;
     }
 
-    async fn finish(
-        &self,
-        status: &str,
-        reason: Option<&str>,
-        error_kind: Option<&str>,
-        error_message: Option<&str>,
-    ) -> Result<()> {
+    async fn finish(&self, mut outcome: CallOutcome<'_>) {
         if self.is_finished() {
-            return Ok(());
+            return;
         }
         let _lifecycle = self.inner.lifecycle.lock().await;
         if self.is_finished() {
-            return Ok(());
+            return;
         }
         self.inner.observations.lock().await.take();
         if let Some(writer) = self.inner.writer.lock().await.take()
@@ -405,24 +402,19 @@ impl CallRecorder {
             self.inner.store.mark_degraded();
             tracing::warn!(call_id = %self.inner.call_id, %error, "LLM response recorder stopped unexpectedly");
         }
+        // The caller's builders cannot know the elapsed time, so it is stamped
+        // once here, at the only place that observes the finish.
+        outcome.elapsed_ms = elapsed_ms(self.inner.started);
         if let Err(error) = self
             .inner
             .store
-            .finish_llm_call(
-                &self.inner.call_id,
-                status,
-                reason,
-                elapsed_ms(self.inner.started),
-                error_kind,
-                error_message,
-            )
+            .finish_llm_call(&self.inner.call_id, outcome)
             .await
         {
             self.inner.store.mark_degraded();
             tracing::warn!(call_id = %self.inner.call_id, %error, "cannot finish LLM call record");
         }
         self.inner.finished.store(true, Ordering::Release);
-        Ok(())
     }
 
     /// A failed record keeps the call going: the store is degraded, the
@@ -495,13 +487,12 @@ mod tests {
         drop(recorder.cancel_on_drop());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         loop {
-            let status = store
-                .llm_call("cancel-on-drop")
-                .await
-                .unwrap()
-                .map(|call| call.status)
-                .unwrap_or_default();
-            if status == "cancelled" {
+            let call = store.llm_call("cancel-on-drop").await.unwrap();
+            let Some(status) = call.map(|call| call.status) else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            if status == CallStatus::Cancelled {
                 break;
             }
             assert!(
@@ -517,11 +508,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = CallStore::at(directory.path().join("calls.db"));
         let recorder = CallRecorder::start(store.clone(), sample("events")).await;
-        recorder.event(&ModelEvent::ThinkingStart).await.unwrap();
-        recorder
-            .event(&ModelEvent::TextDelta("hello".into()))
-            .await
-            .unwrap();
+        recorder.event(&ModelEvent::ThinkingStart).await;
+        recorder.event(&ModelEvent::TextDelta("hello".into())).await;
         recorder
             .event(&ModelEvent::Usage(crate::model::Usage {
                 input_tokens: Some(8),
@@ -529,29 +517,20 @@ mod tests {
                 total_tokens: Some(10),
                 ..Default::default()
             }))
-            .await
-            .unwrap();
-        recorder
-            .event(&ModelEvent::Done(FinishReason::Stop))
-            .await
-            .unwrap();
-        recorder
-            .event(&ModelEvent::TextDelta("late".into()))
-            .await
-            .unwrap();
+            .await;
+        recorder.event(&ModelEvent::Done(FinishReason::Stop)).await;
+        recorder.event(&ModelEvent::TextDelta("late".into())).await;
         recorder
             .event(&ModelEvent::Usage(crate::model::Usage {
                 input_tokens: Some(99),
                 ..Default::default()
             }))
-            .await
-            .unwrap();
+            .await;
         recorder
             .event(&ModelEvent::Done(FinishReason::Length))
-            .await
-            .unwrap();
+            .await;
         let call = store.llm_call("events").await.unwrap().unwrap();
-        assert_eq!(call.status, "completed");
+        assert_eq!(call.status, CallStatus::Completed);
         assert_eq!(call.finish_reason.as_deref(), Some("stop"));
         assert_eq!(call.input_tokens, Some(8));
         assert!(call.ttfr_ms.is_some());
@@ -568,11 +547,10 @@ mod tests {
                 serde_json::json!({"content-type": "application/json"}),
                 &serde_json::json!({"model": "test"}),
             )
-            .await
-            .unwrap();
-        recorder.response_headers(200).await.unwrap();
-        recorder.response_chunk(b"data: [DONE]\n\n").await.unwrap();
-        recorder.completed(FinishReason::Stop).await.unwrap();
+            .await;
+        recorder.response_headers(200).await;
+        recorder.response_chunk(b"data: [DONE]\n\n").await;
+        recorder.completed(FinishReason::Stop).await;
         assert!(store.llm_call_request("metrics").await.unwrap().is_none());
         assert_eq!(
             store.llm_call_chunks("metrics").await.unwrap(),
@@ -592,11 +570,10 @@ mod tests {
         let recorder = CallRecorder::start(store.clone(), sample("failed")).await;
         recorder
             .failed(&crate::Error::Provider("boom".into()))
-            .await
-            .unwrap();
-        recorder.cancelled().await.unwrap();
+            .await;
+        recorder.cancelled().await;
         let call = store.llm_call("failed").await.unwrap().unwrap();
-        assert_eq!(call.status, "error");
+        assert_eq!(call.status, CallStatus::Error);
         assert_eq!(call.error_kind.as_deref(), Some("provider"));
         assert_eq!(call.error_message.as_deref(), Some("boom"));
     }

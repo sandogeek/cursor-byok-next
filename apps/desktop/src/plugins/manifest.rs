@@ -2,7 +2,6 @@
 
 use std::{collections::HashSet, path::Path};
 
-use regex::Regex;
 use serde::Deserialize;
 
 use super::{Error, Result};
@@ -45,10 +44,10 @@ impl PluginManifest {
         }
         validate_id(&self.id, "plugin id")?;
         required(&self.name, "plugin name")?;
-        parse_version(&self.version)
+        Version::parse(&self.version)
             .ok_or_else(|| Error::Config(format!("invalid plugin version: {}", self.version)))?;
         if let Some(minimum) = &self.min_app_version {
-            parse_version(minimum)
+            Version::parse(minimum)
                 .ok_or_else(|| Error::Config(format!("invalid plugin minAppVersion: {minimum}")))?;
         }
         validate_entry_path(directory, &self.entry)?;
@@ -67,34 +66,52 @@ impl PluginManifest {
     }
 }
 
-pub(super) fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
-    let core = value.split(['-', '+']).next()?;
-    let mut parts = core.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    parts.next().is_none().then_some((major, minor, patch))
+/// A `major.minor.patch` plugin version, ignoring pre-release and build tags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct Version {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+impl Version {
+    /// Parses `major.minor.patch`, ignoring anything after `-` or `+`.
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        let core = value.split(['-', '+']).next()?;
+        let mut parts = core.split('.');
+        let version = Self {
+            major: parts.next()?.parse().ok()?,
+            minor: parts.next()?.parse().ok()?,
+            patch: parts.next()?.parse().ok()?,
+        };
+        parts.next().is_none().then_some(version)
+    }
 }
 
 pub(super) fn version_at_least(actual: &str, minimum: &str) -> bool {
-    match (parse_version(actual), parse_version(minimum)) {
+    match (Version::parse(actual), Version::parse(minimum)) {
         (Some(actual), Some(minimum)) => actual >= minimum,
         _ => false,
     }
 }
 
+/// Ids are `[a-z0-9]+` runs joined by `.`, `_` or `-`, e.g. `dev.example.app`.
 pub(super) fn validate_id(value: &str, label: &str) -> Result<()> {
-    static ID: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    #[expect(
-        clippy::unwrap_used,
-        reason = "the pattern is a literal that always compiles"
-    )]
-    let expression = ID.get_or_init(|| Regex::new(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$").unwrap());
-    if expression.is_match(value) {
+    if is_dotted_id(value) {
         Ok(())
     } else {
         Err(Error::Config(format!("invalid {label}: {value}")))
     }
+}
+
+fn is_dotted_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.split(['.', '_', '-']).all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
 }
 
 fn validate_network_host(value: &str) -> Result<()> {

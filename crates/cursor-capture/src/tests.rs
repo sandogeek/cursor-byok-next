@@ -22,7 +22,7 @@ use crate::decode::{
     streaming_request_message_type, streaming_response_message_type,
 };
 use crate::store::ExchangeStore;
-use crate::types::{Exchange, ExchangeSummary, Payload};
+use crate::types::{Exchange, ExchangeState, ExchangeSummary, Payload};
 
 #[test]
 fn loopback_address_is_required() {
@@ -160,8 +160,8 @@ fn sample_exchange(id: &str, conversation_id: &str, request_id: &str) -> Exchang
             url: "https://api2.cursor.sh/agent.v1.AgentService/RunSSE".into(),
             host: "api2.cursor.sh".into(),
             path: "/agent.v1.AgentService/RunSSE".into(),
-            status: 200,
-            state: "completed".into(),
+            status: Some(200),
+            state: ExchangeState::Completed,
             duration_ms: 12,
             request_bytes: 4,
             response_bytes: 8,
@@ -181,7 +181,7 @@ fn sample_exchange(id: &str, conversation_id: &str, request_id: &str) -> Exchang
 fn store_associates_conversation_by_request_id() {
     let dir = TempDir::new().unwrap();
     let store = ExchangeStore::persistent(dir.path().join("capture.db"), 20).unwrap();
-    store.create(sample_exchange("1", "conv-a", "req-a"));
+    let _ = store.create(sample_exchange("1", "conv-a", "req-a"));
     let id = store.create(sample_exchange("2", "", ""));
     store.update(&id, |exchange| {
         exchange.summary.request_id = "req-a".into();
@@ -212,13 +212,15 @@ async fn debug_api_serves_original_ui_and_status() {
 
     let capture_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = capture_listener.local_addr().unwrap();
-    let server = Server::new(Config {
-        service_addr: addr.to_string(),
-        upstream_url: upstream,
-        database_path: dir.path().join("capture.db"),
-        ..Config::default()
-    })
-    .unwrap();
+    let server = Arc::new(
+        Server::new(Config {
+            service_addr: addr.to_string(),
+            upstream_url: upstream,
+            database_path: dir.path().join("capture.db"),
+            ..Config::default()
+        })
+        .unwrap(),
+    );
     let app = Arc::clone(&server).router();
 
     let ui = app
@@ -294,7 +296,7 @@ async fn stream_completes_and_persists_both_chunks() {
     let body = first_stream_chunk(Arc::clone(&server).router()).await;
     assert_eq!(
         server.store().get("1").unwrap().unwrap().summary.state,
-        "streaming"
+        ExchangeState::Streaming
     );
 
     gate.notify_one();
@@ -308,7 +310,7 @@ async fn stream_completes_and_persists_both_chunks() {
 
     let reopened = ExchangeStore::persistent(dir.path().join("stream.db"), 20).unwrap();
     let exchange = reopened.get("1").unwrap().unwrap();
-    assert_eq!(exchange.summary.state, "completed");
+    assert_eq!(exchange.summary.state, ExchangeState::Completed);
     assert_eq!(exchange.summary.response_bytes, 11);
     assert_eq!(exchange.response.raw_hex, hex::encode("firstsecond"));
 }
@@ -322,7 +324,7 @@ async fn clear_during_stream_does_not_overwrite_reused_id() {
     let old_body = first_stream_chunk(app.clone()).await;
     assert_eq!(
         server.store().get("1").unwrap().unwrap().summary.state,
-        "streaming"
+        ExchangeState::Streaming
     );
 
     let clear = app
@@ -363,7 +365,7 @@ async fn clear_during_stream_does_not_overwrite_reused_id() {
             .unwrap(),
     ] {
         assert_eq!(exchange.summary.path, "/new");
-        assert_eq!(exchange.summary.state, "completed");
+        assert_eq!(exchange.summary.state, ExchangeState::Completed);
         assert_eq!(exchange.response.raw_hex, hex::encode("new"));
     }
 }
@@ -377,7 +379,7 @@ async fn dropping_partial_stream_records_an_error_but_empty_body_completes() {
     drop(first_stream_chunk(app.clone()).await);
 
     let exchange = server.store().get("1").unwrap().unwrap();
-    assert_eq!(exchange.summary.state, "error");
+    assert_eq!(exchange.summary.state, ExchangeState::Error);
     assert!(exchange.summary.error.contains("取消"));
     assert_eq!(exchange.response.raw_hex, hex::encode("first"));
 
@@ -389,7 +391,7 @@ async fn dropping_partial_stream_records_an_error_but_empty_body_completes() {
     drop(response);
     assert_eq!(
         server.store().get("2").unwrap().unwrap().summary.state,
-        "completed"
+        ExchangeState::Completed
     );
 }
 
@@ -413,12 +415,14 @@ async fn serve_stream_fixture(dir: &TempDir, gate: Arc<tokio::sync::Notify>) -> 
             axum::routing::get(|| async { StatusCode::NO_CONTENT }),
         );
     tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
-    Server::new(Config {
-        upstream_url,
-        database_path: dir.path().join("stream.db"),
-        ..Config::default()
-    })
-    .unwrap()
+    Arc::new(
+        Server::new(Config {
+            upstream_url,
+            database_path: dir.path().join("stream.db"),
+            ..Config::default()
+        })
+        .unwrap(),
+    )
 }
 
 async fn first_stream_chunk(app: axum::Router) -> Body {

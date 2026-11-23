@@ -39,7 +39,7 @@ use self::{
     ca::CaManager,
     proxy::{ProxyRuntime, Routing},
     settings::SettingsStore,
-    state::{HarnessState, HarnessStateStore},
+    state::{HarnessState, HarnessStateStore, PortChoice},
 };
 
 pub use self::account::request_uses_local_cursor_token;
@@ -47,6 +47,10 @@ pub use self::process::terminate_cursor as quit_cursor;
 pub use self::proxy::{Routing as ProxyRouting, UPSTREAM_URL_HEADER, is_cursor_host};
 
 /// Errors from copying Cursor's files and from running the proxy.
+///
+/// `Config` and `Process` carry their own description because they report
+/// violated invariants of this app ("the CA is not trusted", "Cursor is not
+/// running") rather than a wrapped foreign error.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{0}")]
@@ -54,13 +58,22 @@ pub enum Error {
     #[error("{0}")]
     Process(String),
     #[error("{0}")]
-    Database(String),
-    #[error("{0}")]
     Proxy(String),
+    #[error("cannot read Cursor's account database: {source}")]
+    Database {
+        #[source]
+        source: sqlx::Error,
+    },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+}
+
+impl From<sqlx::Error> for Error {
+    fn from(source: sqlx::Error) -> Self {
+        Self::Database { source }
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -168,17 +181,6 @@ const DEFAULT_PROXY_PORT: u16 = 39831;
 #[cfg(not(target_os = "windows"))]
 const DEFAULT_PROXY_PORT: u16 = 0;
 
-/// The port `enable` asks for: the user's choice when there is one (a saved
-/// `0` means "let the OS pick"), else the port bound last so Cursor's existing
-/// settings keep working, else the platform default.
-fn preferred_port(intent: HarnessState) -> u16 {
-    match (intent.preferred_port, intent.proxy_port) {
-        (Some(port), _) => port,
-        (None, bound) if bound != 0 => bound,
-        (None, _) => DEFAULT_PROXY_PORT,
-    }
-}
-
 impl CursorHarness {
     /// Restores the previous run's intent and port, if any.
     pub fn new(paths: HarnessPaths) -> Self {
@@ -277,7 +279,7 @@ impl CursorHarness {
     /// keeps its previous value.
     pub async fn set_preferred_port(&self, port: Option<u16>) -> Result<HarnessStatus> {
         let _operation = self.operation.lock().await;
-        self.update_intent(|intent| intent.preferred_port = port)?;
+        self.update_intent(|intent| intent.preferred_port = PortChoice::from_boundary(port))?;
         Ok(self.report().await)
     }
 
@@ -293,7 +295,7 @@ impl CursorHarness {
     /// Restores a wanted takeover without propagating recovery errors to the
     /// status screen. `report` exposes the resulting degraded state instead.
     async fn restore(&self) {
-        if !self.intent.read().enabled || self.ca_state() != CaState::Ready {
+        if !self.intent.read().enabled || self.ca_state().await != CaState::Ready {
             return;
         }
         let healthy = {
@@ -311,7 +313,7 @@ impl CursorHarness {
     /// Probes independently, so one unreadable file cannot hide the rest of
     /// the integration state. An inconsistent or unreadable state is degraded.
     async fn report(&self) -> HarnessStatus {
-        let ca = self.ca_state();
+        let ca = self.ca_state().await;
         let proxy = self.proxy.lock().await;
         let proxy_url = proxy.url();
         let settings_url = proxy_url.clone().or_else(|| self.saved_proxy_url());
@@ -333,22 +335,35 @@ impl CursorHarness {
             settings_applied,
             proxy_port: proxy.port(),
             proxy_url,
-            preferred_proxy_port: self.intent.read().preferred_port,
+            preferred_proxy_port: self.intent.read().preferred_port.to_boundary(),
             data_dir: self.paths.data_dir.display().to_string(),
             ca_install_command: self.paths.ca.install_command(),
         }
     }
 
-    fn ca_state(&self) -> CaState {
-        self.paths.ca.state().unwrap_or_else(|error| {
-            tracing::warn!(%error, "could not inspect the local CA");
-            CaState::Invalid
-        })
+    /// Reads the CA state. It touches the filesystem and, on macOS, runs
+    /// `security`, so it must not block the async runtime.
+    async fn ca_state(&self) -> CaState {
+        let paths = Arc::clone(&self.paths);
+        let inspected = tokio::task::spawn_blocking(move || paths.ca.state()).await;
+        match inspected {
+            Ok(Ok(state)) => state,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "could not inspect the local CA");
+                CaState::Invalid
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the CA inspection task failed");
+                CaState::Invalid
+            }
+        }
     }
 
     fn saved_proxy_url(&self) -> Option<String> {
-        let port = self.intent.read().proxy_port;
-        (port != 0).then(|| format!("http://127.0.0.1:{port}"))
+        self.intent
+            .read()
+            .proxy_port
+            .map(|port| format!("http://127.0.0.1:{port}"))
     }
 
     async fn enable(&self) -> Result<()> {
@@ -384,7 +399,10 @@ impl CursorHarness {
         // Reuse the port the user chose, else the one Cursor's settings were
         // already pointed at, so a restart never invalidates them. A saved `0`
         // is the user asking for a fresh OS pick, so it is not a fallback.
-        let preferred = preferred_port(*self.intent.read());
+        let intent = *self.intent.read();
+        let preferred = intent
+            .preferred_port
+            .request(intent.proxy_port, DEFAULT_PROXY_PORT);
         let ca = self.paths.ca.load()?;
         let started = proxy.start(self.routing.clone(), ca, preferred).await?;
         if started.port != preferred {
@@ -397,11 +415,18 @@ impl CursorHarness {
         // The proxy is running now; release the lock before writing files.
         drop(proxy);
         if let Err(error) = self.apply(&started.url).await {
-            let _ = self.paths.settings.clear_proxy_settings(&started.url);
+            // The proxy is up but Cursor was never pointed at it, so stop it.
+            // A rollback that also fails is worth a log line: Cursor's settings
+            // may still name the port that is about to close.
+            if let Err(cleanup) = self.paths.settings.clear_proxy_settings(&started.url) {
+                tracing::warn!(%cleanup, "could not roll back Cursor proxy settings");
+            }
             self.proxy.lock().await.stop().await;
             return Err(error);
         }
-        if let Err(error) = self.update_intent(|intent| intent.proxy_port = started.port) {
+        if let Err(error) = self.update_intent(|intent| intent.proxy_port = Some(started.port)) {
+            // `harness.json` could not record the port, so the next start would
+            // reuse a stale one. Undo the settings write with the proxy.
             if let Err(cleanup) = self.paths.settings.clear_proxy_settings(&started.url) {
                 tracing::warn!(%cleanup, "could not roll back Cursor proxy settings");
             }
@@ -514,8 +539,8 @@ mod tests {
             .unwrap();
         *harness.intent.write() = HarnessState {
             enabled: true,
-            proxy_port: 41000,
-            preferred_port: None,
+            proxy_port: Some(41000),
+            preferred_port: PortChoice::Unset,
         };
 
         harness.disable().await.unwrap();
@@ -546,8 +571,8 @@ mod tests {
             .state
             .save(HarnessState {
                 enabled: false,
-                proxy_port: 41000,
-                preferred_port: None,
+                proxy_port: Some(41000),
+                preferred_port: PortChoice::Unset,
             })
             .unwrap();
         *harness.intent.write() = harness.paths.state.load();
@@ -565,8 +590,8 @@ mod tests {
             .unwrap();
         *harness.intent.write() = HarnessState {
             enabled: false,
-            proxy_port: 41000,
-            preferred_port: None,
+            proxy_port: Some(41000),
+            preferred_port: PortChoice::Unset,
         };
 
         let status = harness.status().await;
@@ -582,8 +607,11 @@ mod tests {
         let status = harness.set_preferred_port(Some(41000)).await.unwrap();
 
         assert_eq!(status.preferred_proxy_port, Some(41000));
-        assert_eq!(harness.paths.state.load().preferred_port, Some(41000));
-        assert_eq!(harness.paths.state.load().proxy_port, 0);
+        assert_eq!(
+            harness.paths.state.load().preferred_port,
+            PortChoice::Fixed(41000)
+        );
+        assert_eq!(harness.paths.state.load().proxy_port, None);
     }
 
     #[tokio::test]
@@ -592,37 +620,32 @@ mod tests {
         let harness = harness(&dir);
         *harness.intent.write() = HarnessState {
             enabled: false,
-            proxy_port: 41000,
-            preferred_port: None,
+            proxy_port: Some(41000),
+            preferred_port: PortChoice::Unset,
         };
 
         let status = harness.set_preferred_port(Some(0)).await.unwrap();
 
         assert_eq!(status.preferred_proxy_port, Some(0));
-        assert_eq!(preferred_port(*harness.intent.read()), 0);
+        let intent = *harness.intent.read();
+        assert_eq!(
+            intent
+                .preferred_port
+                .request(intent.proxy_port, DEFAULT_PROXY_PORT),
+            0
+        );
     }
 
     #[test]
     fn the_port_to_bind_prefers_the_choice_over_the_last_bind() {
-        let chosen = HarnessState {
-            enabled: true,
-            proxy_port: 41000,
-            preferred_port: Some(42000),
-        };
-        assert_eq!(preferred_port(chosen), 42000);
+        let chosen = PortChoice::Fixed(42000).request(Some(41000), DEFAULT_PROXY_PORT);
+        assert_eq!(chosen, 42000);
 
-        let never_chosen = HarnessState {
-            proxy_port: 41000,
-            preferred_port: None,
-            ..HarnessState::default()
-        };
-        assert_eq!(preferred_port(never_chosen), 41000);
+        let never_chosen = PortChoice::Unset.request(Some(41000), DEFAULT_PROXY_PORT);
+        assert_eq!(never_chosen, 41000);
 
-        let first_run = HarnessState {
-            preferred_port: None,
-            ..HarnessState::default()
-        };
-        assert_eq!(preferred_port(first_run), DEFAULT_PROXY_PORT);
+        let first_run = PortChoice::Unset.request(None, DEFAULT_PROXY_PORT);
+        assert_eq!(first_run, DEFAULT_PROXY_PORT);
     }
 
     #[tokio::test]

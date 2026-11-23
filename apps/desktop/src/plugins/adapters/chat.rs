@@ -4,29 +4,23 @@ use serde_json::{Value, json};
 
 use super::{
     CoreMessage, ProtocolParser, SawTool, ToolNames, core_message, count_usize, data_url, object,
-    parse_object, text, usage_event,
+    parse_object, text,
 };
 use crate::{
-    model::{ContentPart, ModelInvocation, ModelLatency},
+    model::{ContentPart, ModelInvocation, ModelLatency, Usage},
     plugins::{Error, Result},
     provider::{FinishReason, ModelEvent},
 };
 
-const REPLAY_KIND: &str = "openai_chat";
+use super::tools::ToolCalls;
 
-struct ToolState {
-    call_id: String,
-    name: String,
-    arguments: String,
-    emitted: usize,
-    started: bool,
-}
+const REPLAY_KIND: &str = "openai_chat";
 
 pub(super) struct Parser {
     text_open: bool,
     thinking_open: bool,
     reasoning: String,
-    tools: std::collections::BTreeMap<usize, ToolState>,
+    tools: ToolCalls,
     tool_names: ToolNames,
     final_usage: Option<ModelEvent>,
     finish: Option<FinishReason>,
@@ -39,7 +33,7 @@ impl Parser {
             text_open: false,
             thinking_open: false,
             reasoning: String::new(),
-            tools: std::collections::BTreeMap::new(),
+            tools: ToolCalls::new(),
             tool_names,
             final_usage: None,
             finish: None,
@@ -112,17 +106,27 @@ impl ProtocolParser for Parser {
                     .and_then(count_usize)
                     .unwrap_or(position);
                 let function = tool_delta.get("function").and_then(object);
-                for event in update_tool(
-                    index,
-                    tool_delta.get("id").and_then(text),
-                    function
-                        .and_then(|function| text(function.get("name").unwrap_or(&Value::Null))),
-                    function.and_then(|function| {
-                        text(function.get("arguments").unwrap_or(&Value::Null))
-                    }),
-                    &mut self.tools,
-                    &self.tool_names,
-                ) {
+                let tool = self.tools.entry(index).or_default();
+                if let Some(call_id) = tool_delta.get("id").and_then(text) {
+                    tool.merge_call_id(call_id);
+                }
+                if let Some(name) =
+                    function.and_then(|function| text(function.get("name").unwrap_or(&Value::Null)))
+                {
+                    tool.merge_name(name);
+                }
+                if let Some(delta) = function
+                    .and_then(|function| text(function.get("arguments").unwrap_or(&Value::Null)))
+                {
+                    tool.push_arguments(delta);
+                }
+                for event in [
+                    tool.take_start(index, &self.tool_names),
+                    tool.take_arguments_delta(index),
+                ]
+                .into_iter()
+                .flatten()
+                {
                     emit(event);
                 }
             }
@@ -141,30 +145,23 @@ impl ProtocolParser for Parser {
             emit(ModelEvent::TextEnd);
         }
         for (index, tool) in &mut self.tools {
-            if !tool.started {
-                if tool.name.is_empty() {
+            if !tool.is_started() {
+                if tool.name_text().is_none() {
                     return Err(Error::Provider(
                         "OpenAI Chat tool call is missing name".into(),
                     ));
                 }
-                if tool.call_id.is_empty() {
-                    tool.call_id = format!("call-{index}");
+                tool.default_call_id(*index);
+                if let Some(event) = tool.take_start(*index, &self.tool_names) {
+                    emit(event);
                 }
-                tool.started = true;
-                emit(ModelEvent::ToolCallStart {
-                    index: *index,
-                    call_id: super::truncated_call_id(&tool.call_id).to_owned(),
-                    name: self.tool_names.restore(&tool.name),
-                });
-                if !tool.arguments.is_empty() {
-                    tool.emitted = tool.arguments.len();
-                    emit(ModelEvent::ToolCallArgumentsDelta {
-                        index: *index,
-                        delta: tool.arguments.clone(),
-                    });
+                if let Some(event) = tool.take_arguments_delta(*index) {
+                    emit(event);
                 }
             }
-            emit(ModelEvent::ToolCallEnd { index: *index });
+            if let Some(event) = tool.take_end(*index) {
+                emit(event);
+            }
         }
         if let Some(usage) = self.final_usage.take() {
             emit(usage);
@@ -270,8 +267,8 @@ pub(super) fn build_body(
     if let Some(tokens) = request.model.max_output_tokens {
         object.insert("max_completion_tokens".into(), tokens.into());
     }
-    if let Some(effort) = &request.model.reasoning.effort {
-        object.insert("reasoning_effort".into(), effort.clone().into());
+    if let Some(effort) = request.model.reasoning.effort() {
+        object.insert("reasoning_effort".into(), effort.into());
     }
     if request.model.latency == ModelLatency::Fast {
         object.insert("service_tier".into(), "fast".into());
@@ -375,85 +372,28 @@ fn chat_content(parts: &[ContentPart]) -> Result<Value> {
         .collect()
 }
 
-fn merge_fragment(target: &str, fragment: &str) -> String {
-    if target == fragment || target.ends_with(fragment) {
-        target.to_owned()
-    } else if fragment.starts_with(target) {
-        fragment.to_owned()
-    } else {
-        format!("{target}{fragment}")
-    }
-}
-
-fn update_tool(
-    index: usize,
-    call_id: Option<&str>,
-    name: Option<&str>,
-    arguments_delta: Option<&str>,
-    tools: &mut std::collections::BTreeMap<usize, ToolState>,
-    tool_names: &ToolNames,
-) -> Vec<ModelEvent> {
-    let tool = tools.entry(index).or_insert_with(|| ToolState {
-        call_id: String::new(),
-        name: String::new(),
-        arguments: String::new(),
-        emitted: 0,
-        started: false,
-    });
-    if let Some(call_id) = call_id {
-        tool.call_id = merge_fragment(&tool.call_id, call_id);
-    }
-    if let Some(name) = name {
-        tool.name = merge_fragment(&tool.name, name);
-    }
-    if let Some(delta) = arguments_delta {
-        tool.arguments.push_str(delta);
-    }
-    let mut events = Vec::new();
-    if !tool.started && !tool.call_id.is_empty() && !tool.name.is_empty() {
-        tool.started = true;
-        events.push(ModelEvent::ToolCallStart {
-            index,
-            call_id: super::truncated_call_id(&tool.call_id).to_owned(),
-            name: tool_names.restore(&tool.name),
-        });
-    }
-    if tool.started && tool.emitted < tool.arguments.len() {
-        events.push(ModelEvent::ToolCallArgumentsDelta {
-            index,
-            delta: tool.arguments[tool.emitted..].to_owned(),
-        });
-        tool.emitted = tool.arguments.len();
-    }
-    events
-}
-
+/// `OpenAI` Chat only carries the message; the error class adds nothing.
 fn event_error(value: &Value) -> Option<String> {
-    let kind = text(value.get("type").unwrap_or(&Value::Null));
-    let error = value.get("error").filter(|error| !error.is_null());
-    if kind != Some("error") && error.is_none() {
-        return None;
-    }
-    if let Some(text) = error.and_then(Value::as_str) {
-        return Some(text.to_owned());
-    }
-    object(error.unwrap_or(&Value::Null))
-        .and_then(|error| text(error.get("message").unwrap_or(&Value::Null)).map(str::to_owned))
-        .or_else(|| text(value.get("message").unwrap_or(&Value::Null)).map(str::to_owned))
-        .or_else(|| error.map(std::string::ToString::to_string))
+    super::event_error_detail(value).map(|(_, message)| message)
 }
 
 fn chat_usage(value: &Value) -> ModelEvent {
     let usage = object(value).cloned().unwrap_or_default();
     let details = usage.get("prompt_tokens_details").and_then(object);
     let completion = usage.get("completion_tokens_details").and_then(object);
-    usage_event(
-        usage.get("prompt_tokens").and_then(count_u64_value),
-        usage.get("completion_tokens").and_then(count_u64_value),
-        usage.get("total_tokens").and_then(count_u64_value),
-        details.and_then(|details| details.get("cached_tokens").and_then(count_u64_value)),
-        None,
-        completion.and_then(|details| details.get("reasoning_tokens").and_then(count_u64_value)),
+    ModelEvent::Usage(
+        Usage::new(
+            usage.get("prompt_tokens").and_then(count_u64_value),
+            usage.get("completion_tokens").and_then(count_u64_value),
+            usage.get("total_tokens").and_then(count_u64_value),
+        )
+        .with_cache_read(
+            details.and_then(|details| details.get("cached_tokens").and_then(count_u64_value)),
+        )
+        .with_reasoning(
+            completion
+                .and_then(|details| details.get("reasoning_tokens").and_then(count_u64_value)),
+        ),
     )
 }
 
@@ -477,7 +417,7 @@ mod tests {
     use crate::{
         model::{
             ContentPart, ModelLatency, ProjectedContent, ProjectedMessage, ProviderReplayState,
-            Role, ToolCallContent, ToolDefinition,
+            Reasoning, Role, ToolCallContent, ToolDefinition,
         },
         plugins::adapters::{ToolNames, collect_events, tests::invocation},
     };
@@ -490,7 +430,7 @@ mod tests {
     fn builds_chat_body_with_usage_and_fast_tier() {
         let mut invocation = invocation();
         invocation.request.model.max_output_tokens = Some(128);
-        invocation.request.model.reasoning.effort = Some("low".into());
+        invocation.request.model.reasoning = Reasoning::Effort("low".into());
         invocation.request.model.latency = ModelLatency::Fast;
         invocation.request.prompt.tools = vec![ToolDefinition {
             name: "lookup".into(),

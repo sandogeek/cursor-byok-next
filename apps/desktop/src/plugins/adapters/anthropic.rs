@@ -270,19 +270,18 @@ impl Parser {
                     .saturating_add(self.usage.cache_read.unwrap_or_default())
                     .saturating_add(self.usage.cache_write.unwrap_or_default())
             });
-            emit(ModelEvent::Usage(crate::model::Usage {
-                input_tokens: self.usage.input,
-                context_input_tokens,
-                output_tokens: self.usage.output,
-                total_tokens: self.usage.total.or_else(|| {
-                    context_input_tokens
-                        .zip(self.usage.output)
-                        .map(|(input, output)| input.saturating_add(output))
-                }),
-                cache_read_tokens: self.usage.cache_read,
-                cache_write_tokens: self.usage.cache_write,
-                reasoning_tokens: self.usage.reasoning,
-            }));
+            let total_tokens = self.usage.total.or_else(|| {
+                context_input_tokens
+                    .zip(self.usage.output)
+                    .map(|(input, output)| input.saturating_add(output))
+            });
+            emit(ModelEvent::Usage(
+                crate::model::Usage::new(self.usage.input, self.usage.output, total_tokens)
+                    .with_context_input(context_input_tokens)
+                    .with_cache_read(self.usage.cache_read)
+                    .with_cache_write(self.usage.cache_write)
+                    .with_reasoning(self.usage.reasoning),
+            ));
         }
         emit(ModelEvent::Done(final_reason(self.finish, self.saw_tool)));
     }
@@ -385,13 +384,13 @@ pub(super) fn build_body(
                 .collect::<Value>(),
         );
     }
-    if request.model.reasoning.enabled {
+    if request.model.reasoning.is_enabled() {
         object.insert(
             "thinking".into(),
             json!({ "type": "adaptive", "display": "summarized" }),
         );
     }
-    if let Some(effort) = &request.model.reasoning.effort {
+    if let Some(effort) = request.model.reasoning.effort() {
         object.insert("output_config".into(), json!({ "effort": effort }));
     }
     super::merge_extra_params(&mut body, &request.model.extra_params)?;
@@ -578,26 +577,12 @@ fn mark_cache_breakpoint(messages: &mut [Value]) {
     }
 }
 
+/// Anthropic names the error class, so keep it in front of the message.
 fn event_error(value: &Value) -> Option<String> {
-    let kind = text(value.get("type").unwrap_or(&Value::Null));
-    if kind != Some("error") && value.get("error").is_none_or(Value::is_null) {
-        return None;
-    }
-    let error = value.get("error").unwrap_or(&Value::Null);
-    if let Some(text) = error.as_str() {
-        return Some(text.to_owned());
-    }
-    let details = object(error);
-    let kind = details.and_then(|details| text(details.get("type").unwrap_or(&Value::Null)));
-    let message = details
-        .and_then(|details| text(details.get("message").unwrap_or(&Value::Null)))
-        .or_else(|| text(value.get("message").unwrap_or(&Value::Null)));
-    match (kind, message) {
-        (Some(kind), Some(message)) => Some(format!("{kind}: {message}")),
-        (None, Some(message)) => Some(message.to_owned()),
-        (Some(kind), None) => Some(kind.to_owned()),
-        (None, None) => Some(error.to_string()),
-    }
+    super::event_error_detail(value).map(|(kind, message)| match kind {
+        Some(kind) => format!("{kind}: {message}"),
+        None => message,
+    })
 }
 
 fn empty_usage() -> UsageState {
@@ -687,7 +672,7 @@ mod tests {
     use super::*;
     use crate::{
         model::{
-            ContentPart, ProjectedContent, ProjectedMessage, ProviderReplayState, Role,
+            ContentPart, ProjectedContent, ProjectedMessage, ProviderReplayState, Reasoning, Role,
             ToolCallContent, ToolDefinition, ToolResultContent,
         },
         plugins::adapters::{ToolNames, collect_events, tests::invocation},
@@ -705,8 +690,7 @@ mod tests {
             description: "Look up".into(),
             parameters: json!({ "type": "object" }),
         }];
-        invocation.request.model.reasoning.enabled = true;
-        invocation.request.model.reasoning.effort = Some("high".into());
+        invocation.request.model.reasoning = Reasoning::Effort("high".into());
         let body = build_body("claude-sonnet-4-5", &invocation, &names(&invocation)).unwrap();
         assert_eq!(body["max_tokens"], 65_000);
         assert_eq!(

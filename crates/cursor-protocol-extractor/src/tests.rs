@@ -3,10 +3,10 @@
 use std::collections::HashMap;
 
 use super::{
-    BundleScan, Enum, Field, Message, Service, Strictness, TypeContext, TypeToken,
-    declaration_coverage, extract_from_sources, has_placeholder, merge_messages_by_type_name,
-    parse_field_object_source, reclassify_enum_fields, resolver_from_scan, scan_source,
-    validate_required_agent_shapes,
+    BundleScan, Enum, Field, FieldKind, Message, Service, Strictness, SymbolKind, TypeContext,
+    TypeToken, ValueKind, declaration_coverage, extract_from_sources, has_placeholder,
+    merge_messages_by_type_name, parse_field_object_source, reclassify_enum_fields,
+    resolver_from_scan, scan_source, validate_required_agent_shapes,
 };
 
 fn field_by_name<'a>(fields: &'a [Field], name: &str) -> Option<&'a Field> {
@@ -86,13 +86,13 @@ fn webpack_export_alias_resolves_service_message_type() {
         .resolve_type_name(
             "r.KS",
             TypeContext::new("agent.v1", scan.source_end(), service.module_start),
-            "message",
+            SymbolKind::Message,
         )
         .or_else(|| {
             resolver.resolve_type_name(
                 "r.KS",
                 TypeContext::new("agent.v1", u32::MAX, service.module_start),
-                "message",
+                SymbolKind::Message,
             )
         });
     assert_eq!(type_name.as_deref(), Some("agent.v1.AgentClientMessage"));
@@ -109,7 +109,7 @@ fn resolver_prefers_expected_kind_over_current_package() {
             package: "git_forge.v1".into(),
             short_name: "GetTagResponse".into(),
             pos: 10,
-            module_start: 1,
+            module_start: Some(1),
         }],
         &[Enum {
             type_name: "origin.v1.TeamGroupKind".into(),
@@ -118,13 +118,18 @@ fn resolver_prefers_expected_kind_over_current_package() {
             package: "origin.v1".into(),
             short_name: "TeamGroupKind".into(),
             pos: 20,
-            module_start: 1,
+            module_start: Some(1),
         }],
         &HashMap::default(),
         &HashMap::default(),
+        HashMap::default(),
     );
     let type_name = resolver
-        .resolve_type_name("nt", TypeContext::new("origin.v1", 30, 1), "message")
+        .resolve_type_name(
+            "nt",
+            TypeContext::new("origin.v1", 30, Some(1)),
+            SymbolKind::Message,
+        )
         .expect("cross-package message");
     assert_eq!(type_name, "git_forge.v1.GetTagResponse");
 }
@@ -160,10 +165,10 @@ fn modern_factory_syntax_extracts_in_app_ad_service_types() {
     let service = &scan.services[0];
     let context = TypeContext::new(&service.package, service.pos, service.module_start);
     let input = resolver
-        .resolve_type_name(&method.input_type, context, "message")
+        .resolve_type_name(&method.input_type, context, SymbolKind::Message)
         .expect("input");
     let output = resolver
-        .resolve_type_name(&method.output_type, context, "message")
+        .resolve_type_name(&method.output_type, context, SymbolKind::Message)
         .expect("output");
     assert_eq!(input, "aiserver.v1.HasSeenAdRequest");
     assert_eq!(output, "aiserver.v1.HasSeenAdResponse");
@@ -171,16 +176,30 @@ fn modern_factory_syntax_extracts_in_app_ad_service_types() {
 
 #[test]
 fn resolver_maps_dotted_google_well_known_types() {
-    let resolver = super::TypeResolver::new(&[], &[], &HashMap::default(), &HashMap::default());
+    let resolver = super::TypeResolver::new(
+        &[],
+        &[],
+        &HashMap::default(),
+        &HashMap::default(),
+        HashMap::default(),
+    );
     assert_eq!(
         resolver
-            .resolve_type_name("r.Empty", TypeContext::new("aiserver.v1", 0, 0), "message")
+            .resolve_type_name(
+                "r.Empty",
+                TypeContext::new("aiserver.v1", 0, None),
+                SymbolKind::Message
+            )
             .as_deref(),
         Some("google.protobuf.Empty")
     );
     assert_eq!(
         resolver
-            .resolve_type_name("r.Value", TypeContext::new("aiserver.v1", 0, 0), "message")
+            .resolve_type_name(
+                "r.Value",
+                TypeContext::new("aiserver.v1", 0, None),
+                SymbolKind::Message
+            )
             .as_deref(),
         Some("google.protobuf.Value")
     );
@@ -203,9 +222,11 @@ fn assignment_alias_resolves_standard_protobuf_type() {
             TypeContext::new(
                 "aiserver.v1",
                 u32::MAX,
-                scan.messages.last().map_or(0, |m| m.module_start),
+                scan.messages
+                    .last()
+                    .and_then(|message| message.module_start),
             ),
-            "message",
+            SymbolKind::Message,
         )
         .expect("alias");
     assert_eq!(type_name, "google.protobuf.Timestamp");
@@ -228,7 +249,7 @@ var Service={typeName:"aiserver.v1.TestService",methods:{}};
         package: "aiserver.v1".into(),
         short_name: "Request".into(),
         pos: 0,
-        module_start: 0,
+        module_start: None,
     }];
     let services = vec![Service {
         type_name: "aiserver.v1.TestService".into(),
@@ -237,7 +258,7 @@ var Service={typeName:"aiserver.v1.TestService",methods:{}};
         package: "aiserver.v1".into(),
         short_name: "TestService".into(),
         pos: 0,
-        module_start: 0,
+        module_start: None,
     }];
     let coverage = declaration_coverage(&scan.declared, &messages, &[], &services);
     assert_eq!((coverage.declared, coverage.extracted), (3, 2));
@@ -285,21 +306,21 @@ fn merge_messages_prefers_primary_bundle_and_keeps_supplemental_types() {
             type_name: "aiserver.v1.Shared".into(),
             var_name: String::new(),
             internal_name: String::new(),
-            fields: vec![Field::new(1, "primary", "scalar")],
+            fields: vec![Field::new(1, "primary", FieldKind::Scalar)],
             package: "aiserver.v1".into(),
             short_name: "Shared".into(),
             pos: 0,
-            module_start: 0,
+            module_start: None,
         },
         Message {
             type_name: "aiserver.v1.Shared".into(),
             var_name: String::new(),
             internal_name: String::new(),
-            fields: vec![Field::new(1, "supplemental", "scalar")],
+            fields: vec![Field::new(1, "supplemental", FieldKind::Scalar)],
             package: "aiserver.v1".into(),
             short_name: "Shared".into(),
             pos: 0,
-            module_start: 0,
+            module_start: None,
         },
         Message {
             type_name: "aiserver.v1.LegacyOnly".into(),
@@ -309,7 +330,7 @@ fn merge_messages_prefers_primary_bundle_and_keeps_supplemental_types() {
             package: "aiserver.v1".into(),
             short_name: "LegacyOnly".into(),
             pos: 0,
-            module_start: 0,
+            module_start: None,
         },
     ]);
     assert_eq!(merged.len(), 2);
@@ -325,13 +346,13 @@ fn merge_messages_prefers_qualified_type_references() {
         internal_name: String::new(),
         fields: vec![Field {
             t: Some(TypeToken::Named("uR".into())),
-            oneof: "result".into(),
-            ..Field::new(5, "edit_result", "message")
+            oneof: Some("result".into()),
+            ..Field::new(5, "edit_result", FieldKind::Message)
         }],
         package: "aiserver.v1".into(),
         short_name: "BuiltinToolResult".into(),
         pos: 0,
-        module_start: 0,
+        module_start: None,
     };
     let qualified = Message {
         type_name: "aiserver.v1.BuiltinToolResult".into(),
@@ -339,13 +360,13 @@ fn merge_messages_prefers_qualified_type_references() {
         internal_name: String::new(),
         fields: vec![Field {
             t: Some(TypeToken::Named("aiserver.v1.EditResult".into())),
-            oneof: "result".into(),
-            ..Field::new(5, "edit_result", "message")
+            oneof: Some("result".into()),
+            ..Field::new(5, "edit_result", FieldKind::Message)
         }],
         package: "aiserver.v1".into(),
         short_name: "BuiltinToolResult".into(),
         pos: 0,
-        module_start: 0,
+        module_start: None,
     };
     let merged = merge_messages_by_type_name(vec![unresolved, qualified]);
     assert_eq!(
@@ -360,37 +381,37 @@ fn merge_messages_prefers_more_complete_definition() {
         type_name: "aiserver.v1.RunInferencePromptModelMetadata".into(),
         var_name: String::new(),
         internal_name: String::new(),
-        fields: vec![Field::new(1, "vendor", "scalar")],
+        fields: vec![Field::new(1, "vendor", FieldKind::Scalar)],
         package: "aiserver.v1".into(),
         short_name: "RunInferencePromptModelMetadata".into(),
         pos: 0,
-        module_start: 0,
+        module_start: None,
     };
     let complete = Message {
         type_name: "aiserver.v1.RunInferencePromptModelMetadata".into(),
         var_name: String::new(),
         internal_name: String::new(),
         fields: vec![
-            Field::new(1, "vendor", "scalar"),
+            Field::new(1, "vendor", FieldKind::Scalar),
             Field {
                 t: Some(TypeToken::Named(
                     "aiserver.v1.RunInferenceAgentModeConfig".into(),
                 )),
                 repeated: true,
-                ..Field::new(46, "agent_mode_configs", "message")
+                ..Field::new(46, "agent_mode_configs", FieldKind::Message)
             },
             Field {
                 t: Some(TypeToken::Named(
                     "aiserver.v1.RunInferenceAskQuestionConfig".into(),
                 )),
                 opt: true,
-                ..Field::new(48, "ask_question_config", "message")
+                ..Field::new(48, "ask_question_config", FieldKind::Message)
             },
         ],
         package: "aiserver.v1".into(),
         short_name: "RunInferencePromptModelMetadata".into(),
         pos: 0,
-        module_start: 0,
+        module_start: None,
     };
     let merged = merge_messages_by_type_name(vec![subset, complete]);
     assert_eq!(merged.len(), 1);
@@ -474,9 +495,9 @@ fn assert_run_inference_maps(by_type: &HashMap<String, Message>) {
         .get("aiserver.v1.RunInferenceRunReady")
         .expect("run ready");
     let labels = field_by_name(&ready.fields, "metric_labels").expect("metric_labels");
-    assert_eq!(labels.kind, "map");
-    assert_eq!(labels.map_key, 9);
-    assert_eq!(labels.map_value_kind, "scalar");
+    assert_eq!(labels.kind, FieldKind::Map);
+    assert_eq!(labels.map_key, Some(9));
+    assert_eq!(labels.map_value_kind, ValueKind::Scalar);
 }
 
 #[test]
@@ -537,11 +558,7 @@ fn no_strict_extract_keeps_files_when_required_shapes_are_missing() {
 var Keep=n.makeMessageType("aiserver.v1.Keep",()=>[{no:1,name:"id",kind:"scalar",T:9}]);
 var Ads={typeName:"aiserver.v1.InAppAdService",methods:{ping:{name:"Ping",I:Keep,O:Keep,kind:n.MethodKind.Unary}}};
 "#;
-    let result = extract_from_sources(
-        &[("bundle.js".to_string(), BUNDLE.to_string())],
-        Strictness::Lenient,
-    )
-    .expect("extract");
+    let result = extract_from_sources(&[BUNDLE.to_string()], Strictness::Lenient).expect("extract");
     assert!(result.files.contains_key("aiserver_v1.proto"));
     assert_eq!(result.diagnostics.shape_errors, Vec::<String>::new());
 }
@@ -566,11 +583,7 @@ var Keep=n.makeMessageType("agent.v1.Keep",()=>[{no:1,name:"id",kind:"scalar",T:
 var Drop=n.makeMessageType("origin.v1.Drop",()=>[{no:1,name:"id",kind:"scalar",T:9}]);
 var Ads={typeName:"aiserver.v1.InAppAdService",methods:{ping:{name:"Ping",I:Keep,O:Keep,kind:n.MethodKind.Unary}}};
 "#;
-    let result = extract_from_sources(
-        &[("bundle.js".to_string(), BUNDLE.to_string())],
-        Strictness::Lenient,
-    )
-    .expect("extract");
+    let result = extract_from_sources(&[BUNDLE.to_string()], Strictness::Lenient).expect("extract");
     assert!(
         result
             .messages

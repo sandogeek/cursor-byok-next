@@ -189,11 +189,12 @@ impl StoredModel {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PluginStateStore {
     data: PluginDataStore,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UpsertOutcome {
     pub added: usize,
     pub updated: usize,

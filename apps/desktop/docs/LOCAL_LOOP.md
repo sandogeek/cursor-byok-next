@@ -78,7 +78,8 @@ Local serve()
 | 14 | 后端启动 | Tokio 应用启动阶段创建 | 同步构造只建共享状态；异步成员用当前 runtime 启动，`Idle → Starting → Running`；失败或 panic 回 `Idle` | nsh 引擎线程不在 Tokio 上下文中；直接 `spawn` 会 panic 并毒化锁，失败必须能被后续状态刷新重试 |
 | 15 | 后端任务所有权 | 服务端持有长生命周期 `Backend` | `BackendWatch.backend: OnceLock<Backend>` 持有；`Backend` 的 `JoinHandle` 随进程存活 | 原先用 `std::mem::forget` 泄漏句柄；放进 `OnceLock` 表达“只启动一次、活到进程结束”，也让重复启动能被记录 |
 | 16 | 状态锁 | `std::sync::Mutex`，poison 时清毒继续 | `parking_lot::Mutex`，无 poison 状态 | 状态锁中毒后继续用是未定义的状态；换成无 poison 的锁后不需要恢复分支，也不需要额外测试 |
-
+| 17 | 重放历史上限 | 重放缓冲不设上限，随 Run 增长 | `OutputHub` 只保留最近 `MAX_REPLAY_FRAMES`（4096）帧，更早的帧计入 `dropped_frames` | 订阅者迟到时重放整条流是常态；无上限的历史让一个没人读的 Run 一直占内存。`Cursor` 的 SSE 每帧很小，4096 帧远大于正常重连窗口 |
+| 18 | 适配器工具累积 | 每个适配器各自维护 `ToolState` 与 `update_tool`，`Chat` 用 `String`、`Responses` 用 `Option<String>` + `ended` | 统一为 `adapters/tools.rs` 的 `ToolState`：`merge_call_id`/`merge_name` 处理片段，`take_start`/`take_arguments_delta`/`take_end` 各自只在未发出时返回事件 | 两种协议对同一件事（何时发 start / 参数增量 / end）的簿记只写一次；`String` 与 `Option` 的差异由空值判定吸收，事件序列不变 |
 
 ## 必须保持的不变量
 

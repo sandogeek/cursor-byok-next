@@ -13,10 +13,10 @@ use tokio::io::AsyncReadExt;
 use super::{Error, Result, descriptor::PluginModuleDefinition};
 
 const DEFINITION_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const OUTPUT_PREFIX: &str = "CURSOR_BYOK_NEXT_PLUGIN_DEFINITION:";
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PluginDefinitionLoader {
     workspace: Arc<RuntimeDirectory>,
     sdk_dir: PathBuf,
@@ -26,6 +26,7 @@ pub struct PluginDefinitionLoader {
     worker: PathBuf,
 }
 
+#[derive(Debug)]
 struct RuntimeDirectory(PathBuf);
 
 impl Drop for RuntimeDirectory {
@@ -140,8 +141,11 @@ impl PluginDefinitionLoader {
             .take()
             .ok_or_else(|| Error::Config("cannot capture plugin definition error output".into()))?;
         let (stdout, stderr, status) = tokio::time::timeout(DEFINITION_TIMEOUT, async move {
-            let (stdout, stderr, status) =
-                tokio::join!(read_limited(stdout), read_limited(stderr), child.wait());
+            let (stdout, stderr, status) = tokio::join!(
+                read_limited(stdout, MAX_OUTPUT_BYTES),
+                read_limited(stderr, MAX_OUTPUT_BYTES),
+                child.wait()
+            );
             Ok::<_, Error>((stdout?, stderr?, status?))
         })
         .await
@@ -165,13 +169,14 @@ pub(super) fn file_url(path: &Path) -> Result<url::Url> {
     })
 }
 
-async fn read_limited(reader: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
+/// Reads at most `limit` bytes, reporting an overrun instead of truncating.
+async fn read_limited(reader: impl tokio::io::AsyncRead + Unpin, limit: usize) -> Result<Vec<u8>> {
+    let cap = u64::try_from(limit).expect("the output cap fits in u64");
     let mut bytes = Vec::new();
-    reader
-        .take(MAX_OUTPUT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .await?;
-    if bytes.len() > usize::try_from(MAX_OUTPUT_BYTES).unwrap_or(usize::MAX) {
+    // Read one byte past the cap so an overrun is distinguishable from an
+    // exactly-at-cap output.
+    reader.take(cap + 1).read_to_end(&mut bytes).await?;
+    if bytes.len() > limit {
         return Err(Error::Config(
             "plugin definition output is larger than allowed".into(),
         ));
@@ -199,8 +204,14 @@ mod tests {
     fn parses_form_and_live_descriptor_fields() {
         let output = br#"CURSOR_BYOK_NEXT_PLUGIN_DEFINITION:{"providers":[{"id":"gateway","displayName":"Gateway","description":null,"providerType":"openai","resourceType":"gateway","hasModels":true,"catalog":"live"}],"resources":[{"type":"gateway","displayName":"Gateways","add":[{"type":"form","id":"connect","displayName":"Connect","description":null,"fields":[{"id":"base-url","label":"URL","type":"url","required":true,"placeholder":null}]}],"canRefresh":false,"canRemove":false}]}"#;
         let descriptor = parse_definition_output(output).unwrap();
-        assert_eq!(descriptor.providers[0].catalog, "live");
-        assert_eq!(descriptor.resources[0].add[0].method_type, "form");
+        assert_eq!(
+            descriptor.providers[0].catalog,
+            crate::plugins::descriptor::CatalogMode::Live
+        );
+        assert_eq!(
+            descriptor.resources[0].add[0].method_type,
+            crate::plugins::descriptor::AddMethodKind::Form
+        );
         assert_eq!(descriptor.resources[0].add[0].fields[0].id, "base-url");
     }
 }

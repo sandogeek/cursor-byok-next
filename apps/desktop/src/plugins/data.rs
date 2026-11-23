@@ -11,7 +11,10 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use super::{Error, Result};
 
-#[derive(Clone)]
+/// Rejects ids and keys that could escape their plugin directory.
+const MAX_COMPONENT_BYTES: usize = 128;
+
+#[derive(Clone, Debug)]
 pub struct PluginDataStore {
     root: PathBuf,
     locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
@@ -129,16 +132,20 @@ fn write_once(
     let mut file = options.open(temporary)?;
     let written = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
-    let result = written.and_then(|()| std::fs::rename(temporary, target));
-    if result.is_err() {
-        let _ = std::fs::remove_file(temporary);
+    if let Err(error) = written.and_then(|()| std::fs::rename(temporary, target)) {
+        // The temporary file is disposable; a failed cleanup must not mask the
+        // write error the caller needs.
+        if let Err(cleanup) = std::fs::remove_file(temporary) {
+            tracing::debug!(%cleanup, "could not remove a plugin data temporary file");
+        }
+        return Err(error.into());
     }
-    result.map_err(Into::into)
+    Ok(())
 }
 
 fn validate_component(value: &str, label: &str) -> Result<()> {
     if value.is_empty()
-        || value.len() > 128
+        || value.len() > MAX_COMPONENT_BYTES
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))

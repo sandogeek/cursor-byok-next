@@ -16,9 +16,14 @@ use futures_util::StreamExt;
 use rust_embed::Embed;
 use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::config::DEBUG_BASE_PATH;
 use crate::proxy::Server;
+use crate::types::StoreEvent;
+
+/// How often a quiet SSE connection is nudged so proxies keep it open.
+const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
 
 #[derive(Embed)]
 #[folder = "web"]
@@ -63,7 +68,7 @@ async fn handle_exchange_list(
     let conversation_id = query.conversation_id.unwrap_or_default().trim().to_string();
     match server.store().summaries(&conversation_id) {
         Ok(summaries) => axum::Json(summaries).into_response(),
-        Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }
 
@@ -74,21 +79,21 @@ async fn handle_exchange_detail(
     match server.store().get(id.trim()) {
         Ok(Some(exchange)) => axum::Json(exchange).into_response(),
         Ok(None) => json_error(StatusCode::NOT_FOUND, "请求记录不存在"),
-        Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }
 
 async fn handle_clear_exchanges(State(server): State<Arc<Server>>) -> Response {
     match server.clear_exchanges() {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }
 
 async fn handle_conversation_list(State(server): State<Arc<Server>>) -> Response {
     match server.store().conversations() {
         Ok(conversations) => axum::Json(conversations).into_response(),
-        Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }
 
@@ -99,18 +104,21 @@ async fn handle_events(
     let stream = async_stream::stream! {
         yield Ok(Event::default().event("ready").data("{}"));
         let mut updates = BroadcastStream::new(rx);
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+        let mut heartbeat = tokio::time::interval(SSE_HEARTBEAT);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 event = updates.next() => {
                     match event {
                         Some(Ok(event)) => {
-                            let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
-                            yield Ok(Event::default().event("update").data(payload));
+                            yield Ok(Event::default().event("update").data(event_payload(&event)));
                         }
-                        Some(Err(_)) => {
-                            yield Ok(Event::default().event("update").data(r#"{"type":"updated"}"#));
+                        // The browser is behind: tell it to refetch rather than
+                        // replay the changes it missed.
+                        Some(Err(BroadcastStreamRecvError::Lagged(_))) => {
+                            yield Ok(Event::default()
+                                .event("update")
+                                .data(r#"{"type":"cleared"}"#));
                         }
                         None => break,
                     }
@@ -121,11 +129,7 @@ async fn handle_events(
             }
         }
     };
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("heartbeat"),
-    )
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_HEARTBEAT).text("heartbeat"))
 }
 
 async fn static_file(request: Request<Body>) -> Response {
@@ -166,8 +170,17 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
     response
 }
 
-fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
-    let mut response = axum::Json(serde_json::json!({ "error": message.into() })).into_response();
+fn json_error(status: StatusCode, message: &str) -> Response {
+    let mut response = axum::Json(serde_json::json!({ "error": message })).into_response();
     *response.status_mut() = status;
     response
+}
+
+/// Serializes a store event for the SSE stream.
+fn event_payload(event: &StoreEvent) -> String {
+    let mut value = serde_json::json!({ "type": event.kind.label() });
+    if let Some(id) = &event.id {
+        value["id"] = serde_json::Value::String(id.clone());
+    }
+    value.to_string()
 }

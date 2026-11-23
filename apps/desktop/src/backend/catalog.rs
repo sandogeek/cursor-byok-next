@@ -32,6 +32,14 @@ const EFFORTS: [(&str, &str); 5] = [
     ("max", "Max"),
 ];
 const DEFAULT_CONTEXT: &str = "200k";
+/// Cursor shows no degradation warning for `0`.
+const DEGRADATION_NONE: i32 = 0;
+/// Section index of the plugin group in the model picker.
+const NAMED_MODEL_SECTION: i32 = 1;
+/// Picker badges use `1` for the plain text variant.
+const BADGE_TEXT_VARIANT: i32 = 1;
+/// Vendor id Cursor reserves for user-provided models.
+const VENDOR_ID_BYOK: i32 = 6;
 
 #[derive(Clone, PartialEq, Message)]
 struct AvailableModelsAddition {
@@ -380,6 +388,14 @@ enum FastMode {
     On,
 }
 
+impl FastMode {
+    const ALL: [Self; 2] = [Self::Off, Self::On];
+
+    const fn is_on(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
 fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
     let tooltip = TooltipData {
         markdown_content: model.description.clone(),
@@ -394,7 +410,7 @@ fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
         name: model.id.clone(),
         default_on: true,
         supports_agent: Some(true),
-        degradation_status: Some(0),
+        degradation_status: Some(DEGRADATION_NONE),
         tooltip_data: Some(tooltip.clone()),
         supports_thinking: Some(true),
         supports_images: Some(model.images),
@@ -411,15 +427,15 @@ fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
         parameter_definitions: model_parameters(&contexts),
         variants,
         legacy_slugs,
-        named_model_section_index: Some(1),
+        named_model_section_index: Some(NAMED_MODEL_SECTION),
         vendor_name: Some(model.provider_type.clone()),
         vendor: Some(AvailableModelVendor {
-            id: 6,
+            id: VENDOR_ID_BYOK,
             display_name: model.provider_type.clone(),
         }),
         model_picker_badges: vec![ModelPickerBadge {
             label: model.plugin_name.clone(),
-            variant: 1,
+            variant: BADGE_TEXT_VARIANT,
             dismiss_on_selection: false,
         }],
     }
@@ -489,31 +505,41 @@ fn model_parameters(contexts: &[(String, String)]) -> Vec<ModelParameterDefiniti
     parameters
 }
 
+/// The naming context shared by every variant of one model.
+struct VariantLabels<'a> {
+    name: &'a str,
+    display_name: &'a str,
+    context: &'a str,
+    context_name: &'a str,
+}
+
+/// The two axes a variant selects on: reasoning effort and the Fast tier.
+#[derive(Clone, Copy)]
+struct VariantSelection<'a> {
+    effort: (&'a str, &'a str),
+    fast: FastMode,
+}
+
 fn model_variants(
     name: &str,
     display_name: &str,
     tooltip: &TooltipData,
     contexts: &[(String, String)],
 ) -> Vec<ModelVariant> {
-    let efforts: &[Option<(&str, &str)>] = &[
-        Some(EFFORTS[0]),
-        Some(EFFORTS[1]),
-        Some(EFFORTS[2]),
-        Some(EFFORTS[3]),
-        Some(EFFORTS[4]),
-    ];
-    let mut variants = Vec::with_capacity(contexts.len() * efforts.len() * 2);
+    let mut variants = Vec::with_capacity(contexts.len() * EFFORTS.len() * FastMode::ALL.len());
     for (context, context_name) in contexts {
-        for effort in efforts {
-            for fast in [FastMode::Off, FastMode::On] {
+        let labels = VariantLabels {
+            name,
+            display_name,
+            context,
+            context_name,
+        };
+        for effort in EFFORTS {
+            for fast in FastMode::ALL {
                 variants.push(model_variant(
-                    name,
-                    display_name,
+                    &labels,
                     tooltip,
-                    context,
-                    context_name,
-                    *effort,
-                    fast,
+                    VariantSelection { effort, fast },
                 ));
             }
         }
@@ -522,22 +548,24 @@ fn model_variants(
 }
 
 fn model_variant(
-    name: &str,
-    display_name: &str,
+    labels: &VariantLabels<'_>,
     tooltip: &TooltipData,
-    context: &str,
-    context_name: &str,
-    effort: Option<(&str, &str)>,
-    fast_mode: FastMode,
+    selection: VariantSelection<'_>,
 ) -> ModelVariant {
-    let fast = fast_mode == FastMode::On;
+    let VariantLabels {
+        name,
+        display_name,
+        context,
+        context_name,
+    } = *labels;
+    let VariantSelection { effort, fast } = selection;
+    let (effort, effort_name) = effort;
+    let fast = fast.is_on();
     let mut suffix = Vec::with_capacity(3);
     if context != DEFAULT_CONTEXT {
         suffix.push(context_name);
     }
-    if let Some((_, effort_name)) = effort {
-        suffix.push(effort_name);
-    }
+    suffix.push(effort_name);
     if fast {
         suffix.push("Fast");
     }
@@ -549,22 +577,21 @@ fn model_variant(
             "{display_name} <span style=\"color: var(--cursor-text-tertiary);\">{suffix}</span>"
         )
     };
-    let is_default =
-        context == DEFAULT_CONTEXT && !fast && effort.is_none_or(|(effort, _)| effort == "high");
-    let mut parameter_values = vec![ModelParameterValue {
-        id: "context".into(),
-        value: context.into(),
-    }];
-    if let Some((effort, _)) = effort {
-        parameter_values.push(ModelParameterValue {
+    let is_default = context == DEFAULT_CONTEXT && !fast && effort == "high";
+    let parameter_values = vec![
+        ModelParameterValue {
+            id: "context".into(),
+            value: context.into(),
+        },
+        ModelParameterValue {
             id: "reasoning".into(),
             value: effort.into(),
-        });
-    }
-    parameter_values.push(ModelParameterValue {
-        id: "fast".into(),
-        value: fast.to_string(),
-    });
+        },
+        ModelParameterValue {
+            id: "fast".into(),
+            value: fast.to_string(),
+        },
+    ];
     ModelVariant {
         parameter_values,
         display_name: display_name.clone(),
@@ -573,17 +600,11 @@ fn model_variant(
         is_default_non_max_config: is_default.then_some(true),
         tooltip_data: Some(tooltip.clone()),
         display_name_outside_picker: Some(display_name),
-        variant_string_representation: Some(match effort {
-            Some((effort, _)) => {
-                format!("{name}[context={context},reasoning={effort},fast={fast}]")
-            }
-            None => format!("{name}[context={context},fast={fast}]"),
-        }),
+        variant_string_representation: Some(format!(
+            "{name}[context={context},reasoning={effort},fast={fast}]"
+        )),
         legacy_slug: Some(format!(
-            "{name}-{context}{}{}",
-            effort
-                .map(|(effort, _)| format!("-{effort}"))
-                .unwrap_or_default(),
+            "{name}-{context}-{effort}{}",
             if fast { "-fast" } else { "" }
         )),
     }

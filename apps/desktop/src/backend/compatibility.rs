@@ -16,21 +16,30 @@ pub async fn available_docs(
     Extension(proxy): Extension<CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    super::local_or_forward(proxy, request, || Ok(proto(EmptyResponse {}))).await
+    super::local_or_forward(proxy, request, || {
+        Ok(super::proto_response(EmptyResponse {}))
+    })
+    .await
 }
 
 pub async fn effective_user_plugins(
     Extension(proxy): Extension<CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    super::local_or_forward(proxy, request, || Ok(proto(EmptyResponse {}))).await
+    super::local_or_forward(proxy, request, || {
+        Ok(super::proto_response(EmptyResponse {}))
+    })
+    .await
 }
 
 pub async fn user_privacy_mode(
     Extension(proxy): Extension<CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    super::local_or_forward(proxy, request, || Ok(proto(EmptyResponse {}))).await
+    super::local_or_forward(proxy, request, || {
+        Ok(super::proto_response(EmptyResponse {}))
+    })
+    .await
 }
 
 pub async fn update_conversation_metadata(
@@ -38,13 +47,11 @@ pub async fn update_conversation_metadata(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     super::local_or_forward(proxy, request, || {
-        Ok(proto(agent::UpdateConversationMetadataResponse {}))
+        Ok(super::proto_response(
+            agent::UpdateConversationMetadataResponse {},
+        ))
     })
     .await
-}
-
-fn proto(message: impl Message) -> Response<Body> {
-    super::proto_response(message)
 }
 
 #[cfg(test)]
@@ -62,7 +69,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_unary_mock_is_bare_protobuf_without_connect_frame() {
-        let response = proto(EmptyResponse {});
+        let response = super::super::proto_response(EmptyResponse {});
         assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert!(body.is_empty());

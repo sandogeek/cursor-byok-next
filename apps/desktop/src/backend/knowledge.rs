@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Error, Result,
+    backend::MAX_BUFFERED_BYTES,
     protocol::{connect, proto::agent::v1 as pb},
 };
 
@@ -51,6 +52,7 @@ struct RuleMeta {
     git_origin: String,
 }
 
+#[derive(Debug)]
 pub struct RuleStore {
     root: PathBuf,
 }
@@ -100,7 +102,7 @@ impl RuleStore {
 
     pub fn upsert(&self, record: &RuleRecord) -> Result<()> {
         validate_id(&record.id)?;
-        write_atomic(&self.rule_path(&record.id), record.knowledge.as_bytes())?;
+        crate::atomic::write(&self.rule_path(&record.id), record.knowledge.as_bytes())?;
         let mut meta = self.read_meta();
         meta.rules.insert(record.id.clone(), rule_meta(record));
         self.write_meta(&meta)
@@ -135,7 +137,8 @@ impl RuleStore {
     }
 
     fn write_meta(&self, meta: &Meta) -> Result<()> {
-        write_atomic(&self.meta_path(), &serde_json::to_vec_pretty(meta)?)
+        crate::atomic::write(&self.meta_path(), &serde_json::to_vec_pretty(meta)?)?;
+        Ok(())
     }
 }
 
@@ -199,24 +202,6 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let directory = path
-        .parent()
-        .ok_or_else(|| Error::Config("rule path has no parent".into()))?;
-    let temporary = directory.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
-    let mut file = std::fs::File::create(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    #[cfg(windows)]
-    remove_file_if_exists(path)?;
-    std::fs::rename(&temporary, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&temporary);
-    })?;
-    Ok(())
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -377,7 +362,11 @@ pub async fn list(
         records.retain(|record| record.git_origin == git_origin);
     }
     if let Some(limit) = message.limit.filter(|limit| *limit >= 0) {
-        records.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        // A limit that does not fit this platform's `usize` simply keeps every
+        // record, which is what a limit larger than the list means.
+        if let Ok(limit) = usize::try_from(limit) {
+            records.truncate(limit);
+        }
     }
     Ok(proto(KnowledgeBaseListResponse {
         success: true,
@@ -423,7 +412,7 @@ pub async fn remove(
 
 async fn buffered(request: Request<Body>) -> Result<(axum::http::request::Parts, Bytes)> {
     let (parts, body) = request.into_parts();
-    let body = to_bytes(body, usize::MAX)
+    let body = to_bytes(body, MAX_BUFFERED_BYTES)
         .await
         .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
     Ok((parts, body))

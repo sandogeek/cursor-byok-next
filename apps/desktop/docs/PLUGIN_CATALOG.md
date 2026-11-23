@@ -54,6 +54,7 @@ cursor-byok/server/plugins/build-in/magpie/ apps/desktop/plugins/build-in/magpie
 | 8 | 失败反馈 | 通用插件错误 | 按资源保留旧目录和失败信息；存储读失败单独提示；不回显网关响应体 | 让用户区分离线、未配置与本地存储故障 |
 | 9 | 插件源类型检查 | 桌面端单独 `tsconfig.node.json`，`include: ["plugins/**/*.ts"]` | 应用 `tsconfig.json` 纳入 `plugins/**` 并映射四个 SDK specifier | NSH 应用只有一份 tsconfig；插件源不再落在任何 TS 工程外，编辑器与 `tsc` 才能解析 `cursor-byok-next:*` |
 | 10 | `import` / `actions` 能力 | 资源定义携带导入与动作描述，SDK worker 有 `import.parse` / `resource.action` | 三处一起删除：`ResourceDefinition` 字段、`sdk/plugin.ts` 的 `__descriptor` 输出、`sdk/worker.ts` 的两个 method | beta 不做向后兼容：宿主没有执行路径，保留类型与字段只会让插件以为导入和动作可用。重新移植时按 `resource.ts`/`plugin.ts`/`worker.ts`/`descriptor.rs` 四层一起补 |
+| 11 | catalog 与表单字段类型 | `catalog` / `methodType` / `fieldType` 是自由字符串，校验时手写 `matches!` | `CatalogMode`、`AddMethodKind`、`FormFieldKind` 枚举，serde 按 `snake_case` 解析，未知值在反序列化时就失败 | 插件声明里只有这三种取值；枚举让“不在列表里”变成解析错误，不用在每个使用点重复校验。边界仍输出字符串，插件协议不变 |
 
 ## 必须保持的不变量
 

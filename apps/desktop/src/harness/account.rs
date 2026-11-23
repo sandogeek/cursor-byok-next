@@ -63,23 +63,19 @@ impl AccountStore {
             .create_if_missing(true)
             // Cursor keeps this file open while it runs.
             .busy_timeout(std::time::Duration::from_secs(5));
-        let mut connection = SqliteConnection::connect_with(&options)
-            .await
-            .map_err(|error| Error::Database(error.to_string()))?;
+        let mut connection = SqliteConnection::connect_with(&options).await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)",
         )
         .execute(&mut connection)
-        .await
-        .map_err(|error| Error::Database(error.to_string()))?;
+        .await?;
 
         let token = local_token()?;
         let account =
             sqlx::query("SELECT CAST(value AS TEXT) AS value FROM ItemTable WHERE key = ?")
                 .bind("cursorAuth/accessToken")
                 .fetch_optional(&mut connection)
-                .await
-                .map_err(|error| Error::Database(error.to_string()))?;
+                .await?;
         if account.is_some_and(|row| {
             row.try_get::<String, _>("value")
                 .is_ok_and(|value| !value.trim().is_empty() && !is_local_cursor_token(&value))
@@ -96,22 +92,15 @@ impl AccountStore {
             ("cursorAuth/stripeMembershipType", MEMBERSHIP_TYPE),
             ("cursorAuth/stripeSubscriptionStatus", SUBSCRIPTION_STATUS),
         ];
-        let mut transaction = connection
-            .begin()
-            .await
-            .map_err(|error| Error::Database(error.to_string()))?;
+        let mut transaction = connection.begin().await?;
         for (key, value) in values {
             sqlx::query("INSERT OR REPLACE INTO ItemTable(key, value) VALUES(?, ?)")
                 .bind(key)
                 .bind(value)
                 .execute(&mut *transaction)
-                .await
-                .map_err(|error| Error::Database(error.to_string()))?;
+                .await?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|error| Error::Database(error.to_string()))?;
+        transaction.commit().await?;
         tracing::info!(
             email = EMAIL,
             subject = SUBJECT,

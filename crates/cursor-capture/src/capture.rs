@@ -5,80 +5,146 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
+use pin_project_lite::pin_project;
 
 type OnChunk = Box<dyn FnMut(&[u8]) + Send + 'static>;
-type OnDone = Box<dyn FnOnce(Vec<u8>, i64, bool, BodyEnd) + Send + 'static>;
+type OnDone = Box<dyn FnOnce(CapturedBody) + Send + 'static>;
 
+/// How a captured body ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BodyEnd {
+    /// The stream reached its end-of-stream marker.
     Complete,
+    /// Reading the stream failed. The error is flattened to text because the
+    /// body's error type is generic and the debug UI only shows text.
     ReadError(String),
+    /// The body was dropped before it finished.
     Cancelled,
 }
 
 impl BodyEnd {
+    /// The message to show, or `None` when the body finished normally.
     pub(crate) fn error(self) -> Option<String> {
         match self {
             Self::Complete => None,
-            Self::ReadError(error) => Some(error),
+            Self::ReadError(message) => Some(message),
             Self::Cancelled => Some("正文传输在读完前取消".into()),
         }
     }
 }
 
-pub struct CaptureBody<B: Body> {
-    inner: B,
-    buffer: Vec<u8>,
+/// The diagnostic copy of one body, handed to the store when the stream ends.
+#[derive(Debug)]
+pub(crate) struct CapturedBody {
+    /// At most the configured capture limit of leading bytes.
+    pub(crate) bytes: Vec<u8>,
+    /// How many bytes the body actually carried.
+    pub(crate) size: i64,
+    /// Whether `bytes` stopped before the body did.
+    pub(crate) truncated: bool,
+    /// How the body ended.
+    pub(crate) end: BodyEnd,
+}
+
+/// The leading bytes of a body, capped at `limit`.
+#[derive(Debug)]
+struct CaptureBuffer {
+    bytes: Vec<u8>,
     limit: usize,
     size: i64,
     truncated: bool,
-    done: bool,
-    on_chunk: Option<OnChunk>,
-    on_done: Option<OnDone>,
+}
+
+impl CaptureBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            size: 0,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.size += i64::try_from(chunk.len()).unwrap_or(i64::MAX);
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if remaining > 0 {
+            let captured = remaining.min(chunk.len());
+            self.bytes.extend_from_slice(&chunk[..captured]);
+        }
+        let buffered = i64::try_from(self.bytes.len()).unwrap_or(i64::MAX);
+        if self.bytes.len() >= self.limit && self.size > buffered {
+            self.truncated = true;
+        }
+    }
+
+    fn take(&mut self, end: BodyEnd) -> CapturedBody {
+        CapturedBody {
+            bytes: std::mem::take(&mut self.bytes),
+            size: self.size,
+            truncated: self.truncated,
+            end,
+        }
+    }
+}
+
+pin_project! {
+    /// Wraps a body, forwarding every frame and keeping a bounded copy.
+    pub struct CaptureBody<B: Body> {
+        #[pin]
+        inner: B,
+        captured: CaptureBuffer,
+        done: bool,
+        on_chunk: Option<OnChunk>,
+        on_done: Option<OnDone>,
+    }
+
+    impl<B: Body> PinnedDrop for CaptureBody<B> {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+            if *this.done {
+                return;
+            }
+            *this.done = true;
+            let Some(on_done) = this.on_done.take() else {
+                return;
+            };
+            // An empty body can be known-complete without ever being polled, so
+            // `is_end_stream` decides; a body dropped mid-stream did not finish.
+            let end = if this.inner.is_end_stream() {
+                BodyEnd::Complete
+            } else {
+                BodyEnd::Cancelled
+            };
+            on_done(this.captured.take(end));
+        }
+    }
+}
+
+impl<B: Body> std::fmt::Debug for CaptureBody<B> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CaptureBody")
+            .field("captured", &self.captured)
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<B: Body> CaptureBody<B> {
+    /// Wraps `inner`, forwarding each chunk to `on_chunk`.
     pub fn new(
         inner: B,
         limit: usize,
         on_chunk: impl FnMut(&[u8]) + Send + 'static,
-        on_done: impl FnOnce(Vec<u8>, i64, bool, BodyEnd) + Send + 'static,
+        on_done: impl FnOnce(CapturedBody) + Send + 'static,
     ) -> Self {
         Self {
             inner,
-            buffer: Vec::new(),
-            limit,
-            size: 0,
-            truncated: false,
+            captured: CaptureBuffer::new(limit),
             done: false,
             on_chunk: Some(Box::new(on_chunk)),
             on_done: Some(Box::new(on_done)),
-        }
-    }
-
-    fn capture_chunk(&mut self, chunk: &[u8]) {
-        self.size += i64::try_from(chunk.len()).unwrap_or(i64::MAX);
-        let remaining = self.limit.saturating_sub(self.buffer.len());
-        if remaining > 0 {
-            let captured = remaining.min(chunk.len());
-            self.buffer.extend_from_slice(&chunk[..captured]);
-        }
-        let buffered = i64::try_from(self.buffer.len()).unwrap_or(i64::MAX);
-        if self.buffer.len() >= self.limit && self.size > buffered {
-            self.truncated = true;
-        }
-        if let Some(on_chunk) = self.on_chunk.as_mut() {
-            on_chunk(chunk);
-        }
-    }
-
-    fn finish(&mut self, end: BodyEnd) {
-        if self.done {
-            return;
-        }
-        self.done = true;
-        let captured = std::mem::take(&mut self.buffer);
-        if let Some(on_done) = self.on_done.take() {
-            on_done(captured, self.size, self.truncated, end);
         }
     }
 }
@@ -95,29 +161,28 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
-        // CaptureBody is structurally pinned only through `inner`; other fields
-        // are never pinned, so projecting them as `&mut` is sound.
-        //
-        // SAFETY: `self` is pinned for the whole call and `inner` is the only
-        // field read through the projection. The `&mut Self` never escapes this
-        // function, so the pinning guarantee is upheld.
-        let this = unsafe { self.get_unchecked_mut() };
-        // SAFETY: `this.inner` was pinned in place by `self`; it is not moved or
-        // dropped before this borrow ends, so the pin contract holds.
-        let inner = unsafe { Pin::new_unchecked(&mut this.inner) };
-        match inner.poll_frame(cx) {
+        let mut this = self.project();
+        match this.inner.as_mut().poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
-                    this.capture_chunk(data);
+                    this.captured.push(data);
+                    if let Some(on_chunk) = this.on_chunk.as_mut() {
+                        on_chunk(data);
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(err))) => {
-                this.finish(BodyEnd::ReadError(err.to_string()));
+                finish(
+                    this.captured,
+                    this.done,
+                    this.on_done,
+                    BodyEnd::ReadError(err.to_string()),
+                );
                 Poll::Ready(Some(Err(err)))
             }
             Poll::Ready(None) => {
-                this.finish(BodyEnd::Complete);
+                finish(this.captured, this.done, this.on_done, BodyEnd::Complete);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -133,13 +198,18 @@ where
     }
 }
 
-impl<B: Body> Drop for CaptureBody<B> {
-    fn drop(&mut self) {
-        let end = if self.inner.is_end_stream() {
-            BodyEnd::Complete
-        } else {
-            BodyEnd::Cancelled
-        };
-        self.finish(end);
+/// Hands the captured copy to the store exactly once per body.
+fn finish(
+    captured: &mut CaptureBuffer,
+    done: &mut bool,
+    on_done: &mut Option<OnDone>,
+    end: BodyEnd,
+) {
+    if *done {
+        return;
+    }
+    *done = true;
+    if let Some(on_done) = on_done.take() {
+        on_done(captured.take(end));
     }
 }

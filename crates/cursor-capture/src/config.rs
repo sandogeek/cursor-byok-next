@@ -1,6 +1,6 @@
 //! Configuration and loopback address helpers for the protocol debugger.
 
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use crate::types::Error;
@@ -14,6 +14,8 @@ pub const DEFAULT_MAX_FRAMES: i32 = 2000;
 pub const DEFAULT_DATABASE_NAME: &str = "cursor-proxy-debugger.db";
 pub const MAX_CONNECT_FRAME_BYTES: usize = 64 << 20;
 
+/// Everything the debugger needs to start: where it listens, what it captures,
+/// and where it stores the captures.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub service_addr: String,
@@ -38,7 +40,16 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Fills in defaults for empty fields and asserts the listener is loopback.
+    /// The default configuration.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replaces blank fields with defaults and validates the listen address.
+    ///
+    /// A limit that is zero or negative falls back to its default rather than
+    /// being rejected, so a caller can pass through an unset CLI flag.
     ///
     /// # Errors
     ///
@@ -51,15 +62,9 @@ impl Config {
         if self.upstream_url.trim().is_empty() {
             self.upstream_url = DEFAULT_UPSTREAM_URL.into();
         }
-        if self.max_exchanges <= 0 {
-            self.max_exchanges = DEFAULT_MAX_EXCHANGES;
-        }
-        if self.max_capture_bytes <= 0 {
-            self.max_capture_bytes = DEFAULT_MAX_CAPTURE_BYTES;
-        }
-        if self.max_frames <= 0 {
-            self.max_frames = DEFAULT_MAX_FRAMES;
-        }
+        self.max_exchanges = positive_or(self.max_exchanges, DEFAULT_MAX_EXCHANGES);
+        self.max_capture_bytes = positive_or(self.max_capture_bytes, DEFAULT_MAX_CAPTURE_BYTES);
+        self.max_frames = positive_or(self.max_frames, DEFAULT_MAX_FRAMES);
         if self.database_path.as_os_str().is_empty() {
             self.database_path = default_database_path();
         }
@@ -68,6 +73,12 @@ impl Config {
     }
 }
 
+fn positive_or(value: i32, fallback: i32) -> i32 {
+    if value > 0 { value } else { fallback }
+}
+
+/// Where the capture database lives when the caller does not choose.
+#[must_use]
 pub fn default_database_path() -> PathBuf {
     dirs::home_dir().map_or_else(
         || PathBuf::from(DEFAULT_DATABASE_NAME),
@@ -75,54 +86,73 @@ pub fn default_database_path() -> PathBuf {
     )
 }
 
+/// The address a human should open, with wildcard hosts mapped to loopback.
+#[must_use]
 pub fn browser_address(address: &str) -> String {
-    let Ok((host, port)) = split_host_port(address) else {
-        return address.to_string();
+    let Ok(addr) = LoopbackAddress::parse(address) else {
+        return address.to_owned();
     };
-    let host = if host.is_empty() || host == "0.0.0.0" || host == "::" {
-        "127.0.0.1"
-    } else {
-        host
-    };
-    join_host_port(host, port)
+    addr.browser()
 }
 
-pub fn validate_loopback_address(address: &str) -> Result<(), Error> {
-    let (host, _) = split_host_port(address)
-        .map_err(|()| Error::Config(format!("调试服务监听地址无效：{address}")))?;
-    if host.eq_ignore_ascii_case("localhost") {
-        return Ok(());
-    }
-    let ip: IpAddr = host
-        .parse()
-        .map_err(|_| Error::Config("调试服务只能监听本机回环地址".into()))?;
-    if ip.is_loopback() {
-        Ok(())
-    } else {
-        Err(Error::Config("调试服务只能监听本机回环地址".into()))
-    }
+/// A validated `host:port` that the debugger may listen on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopbackAddress {
+    /// `127.0.0.1`, `::1`, or a literal `localhost`.
+    host: String,
+    port: u16,
 }
 
-fn split_host_port(address: &str) -> Result<(&str, &str), ()> {
-    if let Some(rest) = address.strip_prefix('[') {
-        let (host, tail) = rest.split_once(']').ok_or(())?;
-        let port = tail.strip_prefix(':').ok_or(())?;
-        if port.is_empty() {
-            return Err(());
+impl LoopbackAddress {
+    /// Parses `host:port`, accepting only loopback hosts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when the address has no port, the port is not
+    /// a number, or the host is not loopback.
+    pub fn parse(address: &str) -> Result<Self, Error> {
+        if let Ok(socket) = address.parse::<SocketAddr>() {
+            if !socket.ip().is_loopback() {
+                return Err(Error::Config(format!(
+                    "调试服务只能监听本机回环地址：{address}"
+                )));
+            }
+            return Ok(Self {
+                host: socket.ip().to_string(),
+                port: socket.port(),
+            });
         }
-        return Ok((host, port));
+        match address.rsplit_once(':') {
+            Some((host, port)) if host.eq_ignore_ascii_case("localhost") => {
+                let port = port
+                    .parse()
+                    .map_err(|_| Error::Config(format!("调试服务监听端口无效：{address}")))?;
+                Ok(Self {
+                    host: "127.0.0.1".to_owned(),
+                    port,
+                })
+            }
+            _ => Err(Error::Config(format!("调试服务监听地址无效：{address}"))),
+        }
     }
-    let (host, port) = address.rsplit_once(':').ok_or(())?;
-    if port.is_empty() || port.contains(':') {
-        return Err(());
+
+    /// The address a browser on this machine can reach.
+    #[must_use]
+    pub fn browser(&self) -> String {
+        let host = self.host.as_str();
+        if host.contains(':') {
+            format!("[{host}]:{}", self.port)
+        } else {
+            format!("{host}:{}", self.port)
+        }
     }
-    Ok((host, port))
 }
 
-fn join_host_port(host: &str, port: &str) -> String {
-    if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
+/// Rejects listen addresses that other machines could reach.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] for a malformed address or a non-loopback host.
+pub fn validate_loopback_address(address: &str) -> Result<(), Error> {
+    LoopbackAddress::parse(address).map(|_| ())
 }

@@ -4,27 +4,31 @@ use std::collections::HashMap;
 
 use crate::ast_util::last_segment;
 use crate::types::{
-    Enum, Message, SymbolDef, google_well_known, looks_like_full_type_name, parse_type_name,
+    Enum, Message, SymbolDef, SymbolKind, google_well_known, looks_like_full_type_name,
+    parse_type_name,
 };
 
-pub type AliasIndex = HashMap<u32, HashMap<String, Vec<String>>>;
-pub type ModuleImports = HashMap<u32, HashMap<String, u32>>;
+/// Aliases declared in one module, keyed by the symbol they resolve to.
+pub type AliasIndex = HashMap<Option<u32>, HashMap<String, Vec<String>>>;
+/// Imported module ids per module, valued by the imported module's byte offset.
+pub type ModuleImports = HashMap<Option<u32>, HashMap<String, u32>>;
 
-/// Where a type reference appears: the package it prefers, its byte offset and
-/// the byte offset where its module starts.
-#[derive(Clone, Copy, Debug)]
+/// A declaration's position inside a bundle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TypeContext<'a> {
     /// Package whose definitions win ties during resolution.
     pub package: &'a str,
     /// Byte offset of the referencing declaration.
     pub pos: u32,
-    /// Byte offset where the referencing module starts, or `0` when unknown.
-    pub module_start: u32,
+    /// Byte offset where the referencing module starts, or `None` outside a
+    /// webpack module.
+    pub module_start: Option<u32>,
 }
 
 impl<'a> TypeContext<'a> {
     /// Builds a context for the declaration that starts at `pos` in `package`.
-    pub fn new(package: &'a str, pos: u32, module_start: u32) -> Self {
+    #[must_use]
+    pub fn new(package: &'a str, pos: u32, module_start: Option<u32>) -> Self {
         Self {
             package,
             pos,
@@ -33,29 +37,37 @@ impl<'a> TypeContext<'a> {
     }
 }
 
+/// An index of every declared symbol, alias and short name in a bundle.
 #[derive(Debug, Default)]
 pub struct TypeResolver {
     by_symbol: HashMap<String, Vec<SymbolDef>>,
     by_alias: HashMap<String, Vec<SymbolDef>>,
     by_short: HashMap<String, Vec<SymbolDef>>,
-    pub module_imports: ModuleImports,
+    module_imports: ModuleImports,
 }
 
 impl TypeResolver {
+    /// Indexes every declaration, its aliases, and the module imports that
+    /// dotted references may fall back to.
+    #[must_use]
     pub fn new(
         messages: &[Message],
         enums: &[Enum],
         aliases: &AliasIndex,
         export_aliases: &AliasIndex,
+        module_imports: ModuleImports,
     ) -> Self {
-        let mut resolver = Self::default();
+        let mut resolver = Self {
+            module_imports,
+            ..Self::default()
+        };
         for message in messages {
             resolver.add(
                 &message.var_name,
                 &message.type_name,
                 message.pos,
                 message.module_start,
-                "message",
+                SymbolKind::Message,
             );
             if !message.internal_name.is_empty() && message.internal_name != message.var_name {
                 resolver.add(
@@ -63,7 +75,7 @@ impl TypeResolver {
                     &message.type_name,
                     message.pos,
                     message.module_start,
-                    "message",
+                    SymbolKind::Message,
                 );
             }
             for alias in aliases_for_symbols(
@@ -75,7 +87,7 @@ impl TypeResolver {
                     &message.type_name,
                     message.pos,
                     message.module_start,
-                    "message",
+                    SymbolKind::Message,
                 );
             }
             for alias in aliases_for_symbols(
@@ -87,7 +99,7 @@ impl TypeResolver {
                     &message.type_name,
                     message.pos,
                     message.module_start,
-                    "message",
+                    SymbolKind::Message,
                 );
             }
         }
@@ -97,34 +109,53 @@ impl TypeResolver {
                 &item.type_name,
                 item.pos,
                 item.module_start,
-                "enum",
+                SymbolKind::Enum,
             );
             for alias in aliases_for_symbols(aliases.get(&item.module_start), &[&item.var_name]) {
-                resolver.add_alias(&alias, &item.type_name, item.pos, item.module_start, "enum");
+                resolver.add_alias(
+                    &alias,
+                    &item.type_name,
+                    item.pos,
+                    item.module_start,
+                    SymbolKind::Enum,
+                );
             }
             for alias in
                 aliases_for_symbols(export_aliases.get(&item.module_start), &[&item.var_name])
             {
-                resolver.add_alias(&alias, &item.type_name, item.pos, item.module_start, "enum");
+                resolver.add_alias(
+                    &alias,
+                    &item.type_name,
+                    item.pos,
+                    item.module_start,
+                    SymbolKind::Enum,
+                );
             }
         }
         resolver
     }
 
-    fn add(&mut self, symbol: &str, type_name: &str, pos: u32, module_start: u32, kind: &str) {
+    fn add(
+        &mut self,
+        symbol: &str,
+        type_name: &str,
+        pos: u32,
+        module_start: Option<u32>,
+        kind: SymbolKind,
+    ) {
         let symbol = symbol.trim();
         let type_name = type_name.trim();
         if symbol.is_empty() || type_name.is_empty() {
             return;
         }
         let def = SymbolDef {
-            type_name: type_name.to_string(),
+            type_name: type_name.to_owned(),
             pos,
-            kind: kind.to_string(),
+            kind,
             module_start,
         };
         self.by_symbol
-            .entry(symbol.to_string())
+            .entry(symbol.to_owned())
             .or_default()
             .push(def.clone());
         let short_name = parse_type_name(type_name).short;
@@ -144,12 +175,12 @@ impl TypeResolver {
         }
         if let Some((_, last)) = short_name.rsplit_once('.') {
             self.by_short
-                .entry(last.to_string())
+                .entry(last.to_owned())
                 .or_default()
                 .push(def.clone());
         }
         if let Some((_, last)) = underscore.rsplit_once('_') {
-            self.by_short.entry(last.to_string()).or_default().push(def);
+            self.by_short.entry(last.to_owned()).or_default().push(def);
         }
     }
 
@@ -158,8 +189,8 @@ impl TypeResolver {
         symbol: &str,
         type_name: &str,
         pos: u32,
-        module_start: u32,
-        kind: &str,
+        module_start: Option<u32>,
+        kind: SymbolKind,
     ) {
         let symbol = symbol.trim();
         let type_name = type_name.trim();
@@ -167,35 +198,36 @@ impl TypeResolver {
             return;
         }
         self.by_alias
-            .entry(symbol.to_string())
+            .entry(symbol.to_owned())
             .or_default()
             .push(SymbolDef {
-                type_name: type_name.to_string(),
+                type_name: type_name.to_owned(),
                 pos,
-                kind: kind.to_string(),
+                kind,
                 module_start,
             });
     }
 
-    /// Resolves `type_ref` from `context`, preferring definitions of `expected_kind`.
+    /// Resolves `type_ref` from `context`, preferring definitions of `expected`.
     ///
     /// Tries, in order: an exact symbol, a re-export alias, and a short name.
     /// Dotted references also fall back to their imported module, then to the
     /// well-known types.
     ///
     /// Returns `None` when nothing matches.
+    #[must_use]
     pub fn resolve_type_name(
         &self,
         type_ref: &str,
         context: TypeContext<'_>,
-        expected_kind: &str,
+        expected: SymbolKind,
     ) -> Option<String> {
         let trimmed = type_ref.trim();
         if trimmed.is_empty() {
             return None;
         }
         if looks_like_full_type_name(trimmed) {
-            return Some(trimmed.to_string());
+            return Some(trimmed.to_owned());
         }
         if trimmed.contains('.')
             && let Some(type_name) = well_known_type_name(trimmed)
@@ -207,13 +239,13 @@ impl TypeResolver {
         } else {
             ModuleScope::SameModuleFirst
         };
-        if let Some(name) = self.resolve_by_symbol(trimmed, context, expected_kind, scope) {
+        if let Some(name) = self.resolve_by_symbol(trimmed, context, expected, scope) {
             return Some(name);
         }
-        if let Some(name) = self.resolve_by_alias(trimmed, context, 0, expected_kind) {
+        if let Some(name) = self.resolve_by_alias(trimmed, context, None, expected) {
             return Some(name);
         }
-        if let Some(name) = self.resolve_by_short(trimmed, context, expected_kind, scope) {
+        if let Some(name) = self.resolve_by_short(trimmed, context, expected, scope) {
             return Some(name);
         }
         if !trimmed.contains('.') {
@@ -225,23 +257,18 @@ impl TypeResolver {
             .module_imports
             .get(&context.module_start)
             .and_then(|imports| imports.get(first))
-            .copied()
-            .unwrap_or(0);
-        if let Some(name) = self.resolve_by_alias(last, context, target_module, expected_kind) {
+            .copied();
+        if let Some(name) = self.resolve_by_alias(last, context, target_module, expected) {
             return Some(name);
         }
-        if let Some(name) =
-            self.resolve_by_symbol(last, context, expected_kind, ModuleScope::AnyModule)
+        if let Some(name) = self.resolve_by_symbol(last, context, expected, ModuleScope::AnyModule)
         {
             return Some(name);
         }
-        if let Some(name) =
-            self.resolve_by_short(last, context, expected_kind, ModuleScope::AnyModule)
-        {
+        if let Some(name) = self.resolve_by_short(last, context, expected, ModuleScope::AnyModule) {
             return Some(name);
         }
-        if let Some(name) =
-            self.resolve_by_symbol(first, context, expected_kind, ModuleScope::AnyModule)
+        if let Some(name) = self.resolve_by_symbol(first, context, expected, ModuleScope::AnyModule)
         {
             return Some(name);
         }
@@ -258,20 +285,25 @@ enum ModuleScope {
     AnyModule,
 }
 
+impl ModuleScope {
+    fn module_filter(self, context: TypeContext<'_>) -> Option<u32> {
+        match self {
+            Self::SameModuleFirst => context.module_start,
+            Self::AnyModule => None,
+        }
+    }
+}
+
 impl TypeResolver {
     fn resolve_by_symbol(
         &self,
         symbol: &str,
         context: TypeContext<'_>,
-        expected_kind: &str,
+        expected: SymbolKind,
         scope: ModuleScope,
     ) -> Option<String> {
         let candidates = self.by_symbol.get(symbol)?;
-        let module_start = match scope {
-            ModuleScope::SameModuleFirst => context.module_start,
-            ModuleScope::AnyModule => 0,
-        };
-        pick_best_definition(candidates, context, module_start, expected_kind)
+        pick_best_definition(candidates, context, scope.module_filter(context), expected)
             .map(|definition| definition.type_name.clone())
     }
 
@@ -279,11 +311,11 @@ impl TypeResolver {
         &self,
         symbol: &str,
         context: TypeContext<'_>,
-        target_module_start: u32,
-        expected_kind: &str,
+        target_module_start: Option<u32>,
+        expected: SymbolKind,
     ) -> Option<String> {
         let candidates = self.by_alias.get(symbol)?;
-        pick_best_definition(candidates, context, target_module_start, expected_kind)
+        pick_best_definition(candidates, context, target_module_start, expected)
             .map(|definition| definition.type_name.clone())
     }
 
@@ -291,15 +323,11 @@ impl TypeResolver {
         &self,
         symbol: &str,
         context: TypeContext<'_>,
-        expected_kind: &str,
+        expected: SymbolKind,
         scope: ModuleScope,
     ) -> Option<String> {
         let candidates = self.by_short.get(symbol)?;
-        let module_start = match scope {
-            ModuleScope::SameModuleFirst => context.module_start,
-            ModuleScope::AnyModule => 0,
-        };
-        pick_best_definition(candidates, context, module_start, expected_kind)
+        pick_best_definition(candidates, context, scope.module_filter(context), expected)
             .map(|definition| definition.type_name.clone())
     }
 }
@@ -309,22 +337,21 @@ impl TypeResolver {
 fn pick_best_definition<'a>(
     candidates: &'a [SymbolDef],
     context: TypeContext<'_>,
-    module_start: u32,
-    expected_kind: &str,
+    module_start: Option<u32>,
+    expected: SymbolKind,
 ) -> Option<&'a SymbolDef> {
     let mut filtered: Vec<&SymbolDef> = candidates.iter().collect();
-    let expected_kind = expected_kind.trim();
-    if !expected_kind.is_empty() {
-        narrow(&mut filtered, |item| item.kind == expected_kind);
-    }
+    narrow(&mut filtered, |item| item.kind == expected);
     let preferred_package = context.package.trim();
     if !preferred_package.is_empty() {
         narrow(&mut filtered, |item| {
             parse_type_name(&item.type_name).package == preferred_package
         });
     }
-    if module_start > 0 {
-        narrow(&mut filtered, |item| item.module_start == module_start);
+    if let Some(module_start) = module_start {
+        narrow(&mut filtered, |item| {
+            item.module_start == Some(module_start)
+        });
     }
     filtered.into_iter().min_by(|a, b| {
         let distance_a = a.pos.abs_diff(context.pos);
@@ -343,21 +370,27 @@ fn narrow(filtered: &mut Vec<&SymbolDef>, keep: impl Fn(&&SymbolDef) -> bool + C
     }
 }
 
+/// Returns the `google_well_known` type a short name refers to, if any.
+#[must_use]
 pub fn well_known_type_name(r#ref: &str) -> Option<String> {
     let last = last_segment(r#ref.trim());
-    google_well_known(last).map(str::to_string)
+    google_well_known(last).map(str::to_owned)
 }
 
+/// The bare type name to emit when a reference cannot be resolved.
+#[must_use]
 pub fn fallback_type_token(r#ref: &str) -> String {
     let token = r#ref.trim();
     if token.is_empty() {
-        return token.to_string();
+        return token.to_owned();
     }
-    last_segment(token).to_string()
+    last_segment(token).to_owned()
 }
 
-pub fn build_alias_index(aliases: &[(u32, String, String)]) -> AliasIndex {
-    let mut direct: HashMap<u32, HashMap<String, String>> = HashMap::new();
+/// Groups alias declarations by the module they appear in.
+#[must_use]
+pub fn build_alias_index(aliases: &[(Option<u32>, String, String)]) -> AliasIndex {
+    let mut direct: HashMap<Option<u32>, HashMap<String, String>> = HashMap::new();
     for (module_start, alias, target) in aliases {
         if alias.is_empty() || target.is_empty() || alias == target {
             continue;
@@ -425,14 +458,23 @@ fn aliases_for_symbols(
     result
 }
 
+/// A webpack module: where it starts in the bundle and the id `require` uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleStart {
+    pub start: u32,
+    pub id: u32,
+}
+
+/// Maps each module's imported aliases to the byte offset of the module they
+/// came from.
+#[must_use]
 pub fn build_module_imports(
-    entries: &[(u32, String, u32)],
-    module_starts: &[(u32, u32)],
+    entries: &[(Option<u32>, String, u32)],
+    module_starts: &[ModuleStart],
 ) -> ModuleImports {
     let id_to_start: HashMap<u32, u32> = module_starts
         .iter()
-        .copied()
-        .map(|(start, id)| (id, start))
+        .map(|module| (module.id, module.start))
         .collect();
     let mut imports = ModuleImports::new();
     for (module_start, alias, target) in entries {

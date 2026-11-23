@@ -3,7 +3,7 @@
 use axum::{
     body::{Body, Bytes},
     extract::Extension,
-    http::{HeaderValue, Request, Response, StatusCode, header},
+    http::{Request, Response},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use prost::Message;
@@ -70,7 +70,8 @@ fn patch_upstream(response: proxy::BufferedResponse) -> Result<Response<Body>> {
     let mut config = serde_json::from_str::<Value>(&message.config)?;
     configure_agent_gates(&mut config)?;
     message.config = serde_json::to_string(&config)?;
-    Ok(response.with_body(super::encode_unary(message.encode_to_vec(), framing)?))
+    let body = message.encode_to_vec();
+    Ok(response.with_body(super::encode_unary(&body, framing)?))
 }
 
 fn local_response() -> Result<Response<Body>> {
@@ -96,18 +97,7 @@ fn local_response() -> Result<Response<Body>> {
         config: serde_json::to_string(&config)?,
         generated_at_ms,
     };
-    let body = message.encode_to_vec();
-    let length = body.len();
-    let mut response = Response::new(Body::from(body));
-    *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/proto"),
-    );
-    response
-        .headers_mut()
-        .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
-    Ok(response)
+    Ok(super::proto_response(message))
 }
 
 fn configure_agent_gates(config: &mut Value) -> Result<()> {
@@ -121,7 +111,8 @@ fn configure_agent_gates(config: &mut Value) -> Result<()> {
         .as_object_mut()
         .ok_or_else(|| Error::Protocol("Statsig feature_gates must be an object".into()))?;
     for (key, enabled) in overrides {
-        gates.insert(key.clone(), feature_gate(&key, Enabled::from(enabled)));
+        let gate = feature_gate(&key, Enabled::from(enabled));
+        gates.insert(key, gate);
     }
     Ok(())
 }
@@ -144,11 +135,10 @@ fn djb2(value: &str) -> String {
 }
 
 fn feature_gate(name: &str, enabled: Enabled) -> Value {
-    let rule = match enabled {
-        Enabled::Enabled => "local_enabled",
-        Enabled::Disabled => "local_disabled",
+    let (rule, enabled) = match enabled {
+        Enabled::Enabled => ("local_enabled", true),
+        Enabled::Disabled => ("local_disabled", false),
     };
-    let enabled = enabled == Enabled::Enabled;
     json!({
         "name": name,
         "value": enabled,

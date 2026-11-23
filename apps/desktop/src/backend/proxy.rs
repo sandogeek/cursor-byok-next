@@ -8,25 +8,43 @@ use axum::{
     http::{HeaderValue, Request, Response, header},
 };
 
-use crate::{Result, harness};
+use crate::{Result, backend::MAX_BUFFERED_BYTES, harness};
 
 const CURSOR_UPSTREAM: &str = "https://api2.cursor.sh";
+/// Cursor's upstream answers in well under this; a hung socket must not pin a
+/// task for the app's whole lifetime.
+const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long the shared client keeps an idle connection to Cursor's API.
+const UPSTREAM_POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(90);
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CursorProxy {
     client: reqwest::Client,
     upstream: String,
 }
 
+/// One client for every forwarded call: timeouts on connect and response, and
+/// pooled connections to the single upstream host.
+fn upstream_client() -> reqwest::Client {
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(UPSTREAM_TIMEOUT)
+        .pool_idle_timeout(UPSTREAM_POOL_IDLE)
+        .build()
+        .unwrap_or_default()
+}
+
 impl Default for CursorProxy {
     fn default() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: upstream_client(),
             upstream: CURSOR_UPSTREAM.into(),
         }
     }
 }
 
+#[derive(Debug)]
 pub struct BufferedResponse {
     pub status: axum::http::StatusCode,
     pub headers: axum::http::HeaderMap,
@@ -137,7 +155,7 @@ pub async fn forward_buffered(
         header::ACCEPT_ENCODING,
         axum::http::HeaderValue::from_static("identity"),
     );
-    let body = to_bytes(body, usize::MAX)
+    let body = to_bytes(body, MAX_BUFFERED_BYTES)
         .await
         .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
     let upstream = proxy
@@ -211,7 +229,7 @@ impl CursorProxy {
     #[expect(dead_code, reason = "test-only constructor")]
     pub fn with_upstream(upstream: String) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: upstream_client(),
             upstream,
         }
     }

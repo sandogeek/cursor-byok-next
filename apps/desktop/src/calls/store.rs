@@ -19,7 +19,10 @@ use tokio::sync::{Mutex, OnceCell};
 
 use crate::{Result, model::Usage, time::now_ms};
 
+/// SQLite has no enum type, so each [`CallStatus`] stores its wire name.
 const MAX_RETAINED_CALLS: i64 = 1000;
+/// How many of the newest calls the UI list may request at once.
+const MAX_LIST_LIMIT: i64 = 500;
 const MAX_STORED_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// Stored response payloads stop at 1 MiB; SQLite stores the total as `i64`.
@@ -80,7 +83,7 @@ pub struct LlmCallSummary {
     pub display_name: String,
     pub reasoning_effort: Option<String>,
     pub fast: bool,
-    pub status: String,
+    pub status: CallStatus,
     pub finish_reason: Option<String>,
     pub created_at_ms: i64,
     pub request_started_at_ms: Option<i64>,
@@ -114,6 +117,43 @@ pub struct LlmCallSummary {
     pub response_truncated: bool,
 }
 
+/// How a call ended, as `finish_llm_call` records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallOutcome<'a> {
+    pub status: CallStatus,
+    pub finish_reason: Option<&'a str>,
+    /// Time from request start to the terminal state.
+    pub elapsed_ms: i64,
+    pub error_kind: Option<&'a str>,
+    pub error_message: Option<&'a str>,
+}
+
+impl<'a> CallOutcome<'a> {
+    /// A call that finished at the provider's own end-of-stream.
+    #[must_use]
+    pub fn completed(finish_reason: &'a str, elapsed_ms: i64) -> Self {
+        Self {
+            status: CallStatus::Completed,
+            finish_reason: Some(finish_reason),
+            elapsed_ms,
+            error_kind: None,
+            error_message: None,
+        }
+    }
+
+    /// A call the client dropped before the stream ended.
+    #[must_use]
+    pub fn cancelled(elapsed_ms: i64) -> Self {
+        Self {
+            status: CallStatus::Cancelled,
+            finish_reason: None,
+            elapsed_ms,
+            error_kind: None,
+            error_message: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LlmCallRequest {
     pub headers: serde_json::Value,
@@ -143,6 +183,51 @@ pub struct CallSnapshot {
     pub detailed: bool,
     pub storage: CallStorage,
     pub degraded: bool,
+}
+
+/// Where a call is in its lifecycle. The persisted column holds
+/// [`CallStatus::as_str`], which matches the names the UI shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallStatus {
+    /// Accepted and waiting for the provider's first byte.
+    Running,
+    /// The provider finished the stream normally.
+    Completed,
+    /// The provider or the request failed.
+    Error,
+    /// The client dropped the stream before it finished.
+    Cancelled,
+}
+
+impl CallStatus {
+    /// The value stored in `llm_calls.status` and shown by the call list.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Error => "error",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parses a stored status. Unknown values read as [`CallStatus::Error`],
+    /// because a row this build cannot name also cannot be called finished.
+    #[must_use]
+    pub fn from_stored(text: &str) -> Self {
+        match text {
+            "running" => Self::Running,
+            "completed" => Self::Completed,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Error,
+        }
+    }
+}
+
+impl std::fmt::Display for CallStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Whether a call stores payload bodies or only their metrics.
@@ -220,9 +305,9 @@ struct Connected {
 }
 
 impl CallStore {
-    pub fn at(path: impl Into<PathBuf>) -> Self {
+    pub fn at(path: PathBuf) -> Self {
         Self {
-            path: path.into(),
+            path,
             connected: Arc::new(OnceCell::new()),
             degraded: Arc::new(AtomicBool::new(false)),
         }
@@ -533,19 +618,20 @@ impl CallStore {
         Ok(())
     }
 
-    pub async fn finish_llm_call(
-        &self,
-        call_id: &str,
-        status: &str,
-        finish_reason: Option<&str>,
-        elapsed_ms: i64,
-        error_kind: Option<&str>,
-        error_message: Option<&str>,
-    ) -> Result<()> {
+    /// Marks a running call finished. A call that already finished is left
+    /// alone, which is what makes a late `failed` after `completed` harmless.
+    pub async fn finish_llm_call(&self, call_id: &str, outcome: CallOutcome<'_>) -> Result<()> {
+        let CallOutcome {
+            status,
+            finish_reason,
+            elapsed_ms,
+            error_kind,
+            error_message,
+        } = outcome;
         let connected = self.connected().await?;
         let _write = connected.writes.lock().await;
         sqlx::query("UPDATE llm_calls SET status = ?, finish_reason = ?, finished_at_ms = ?, duration_ms = ?, error_kind = ?, error_message = ? WHERE call_id = ? AND status = 'running'")
-            .bind(status)
+            .bind(status.as_str())
             .bind(finish_reason)
             .bind(now_ms())
             .bind(elapsed_ms)
@@ -563,7 +649,7 @@ impl CallStore {
         let rows = sqlx::query(&format!(
             "SELECT {LLM_CALL_COLUMNS} FROM llm_calls ORDER BY created_at_ms DESC, rowid DESC LIMIT ?"
         ))
-        .bind(limit.clamp(1, 500))
+        .bind(limit.clamp(1, MAX_LIST_LIMIT))
         .fetch_all(&connected.pool)
         .await
         .map_err(|error| self.fail(error))?;
@@ -753,7 +839,7 @@ fn summary_from_row(row: &SqliteRow) -> Result<LlmCallSummary> {
         display_name: row.try_get("display_name")?,
         reasoning_effort: row.try_get("reasoning_effort")?,
         fast: row.try_get("fast")?,
-        status: row.try_get("status")?,
+        status: CallStatus::from_stored(&row.try_get::<String, _>("status")?),
         finish_reason: row.try_get("finish_reason")?,
         created_at_ms: row.try_get("created_at_ms")?,
         request_started_at_ms: row.try_get("request_started_at_ms")?,
@@ -824,11 +910,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .finish_llm_call("plugin-call", "completed", Some("stop"), 10, None, None)
+            .finish_llm_call("plugin-call", CallOutcome::completed("stop", 10))
             .await
             .unwrap();
         let call = store.llm_call("plugin-call").await.unwrap().unwrap();
-        assert_eq!(call.status, "completed");
+        assert_eq!(call.status, CallStatus::Completed);
         assert_eq!(call.finish_reason.as_deref(), Some("stop"));
         assert_eq!(
             call.model_hash.as_deref(),
@@ -902,7 +988,7 @@ mod tests {
         store.record_llm_first_text("timing", 18).await.unwrap();
         store.record_llm_first_text("timing", 50).await.unwrap();
         store
-            .finish_llm_call("timing", "cancelled", None, 20, None, None)
+            .finish_llm_call("timing", CallOutcome::cancelled(20))
             .await
             .unwrap();
         store
@@ -918,14 +1004,14 @@ mod tests {
             .await
             .unwrap();
         store
-            .finish_llm_call("timing", "completed", Some("stop"), 99, None, None)
+            .finish_llm_call("timing", CallOutcome::completed("stop", 99))
             .await
             .unwrap();
         let call = store.llm_call("timing").await.unwrap().unwrap();
         assert_eq!(call.ttfr_ms, Some(12));
         assert_eq!(call.ttft_ms, Some(18));
         assert_eq!(call.input_tokens, None);
-        assert_eq!(call.status, "cancelled");
+        assert_eq!(call.status, CallStatus::Cancelled);
         assert_eq!(call.duration_ms, Some(20));
     }
 
@@ -986,7 +1072,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .finish_llm_call("finished", "cancelled", None, 20, None, None)
+            .finish_llm_call("finished", CallOutcome::cancelled(20))
             .await
             .unwrap();
         let before = store.llm_call("finished").await.unwrap().unwrap();
@@ -1118,7 +1204,7 @@ mod tests {
     async fn a_failed_read_returns_a_degraded_snapshot() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("missing").join("calls.db");
-        let store = CallStore::at(&path);
+        let store = CallStore::at(path.clone());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"not a database").unwrap();
         let snapshot = store.snapshot(20).await;

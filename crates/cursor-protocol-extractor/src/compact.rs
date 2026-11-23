@@ -1,12 +1,16 @@
 //! Compact protobuf `$()` schema and `enumType` / `QT` value parsing.
 
+use std::collections::HashMap;
+
 use crate::error::Error;
 use crate::types::{
-    Diagnostics, Enum, EnumValue, Field, Message, TypeToken, google_well_known, is_field_name,
-    is_scalar_id, looks_like_full_type_name, looks_like_package_name,
+    Diagnostics, Enum, EnumValue, Field, FieldKind, Message, TypeToken, ValueKind,
+    google_well_known, is_field_name, is_scalar_id, looks_like_full_type_name,
+    looks_like_package_name,
 };
 
 #[derive(Debug, Clone)]
+/// A compact-schema class, whose `$p` declares the package of its messages.
 pub struct CompactClass {
     pub name: String,
     pub extends: String,
@@ -16,22 +20,43 @@ pub struct CompactClass {
 }
 
 #[derive(Debug, Clone)]
+/// A package-name constant the compact schema refers to by identifier.
 pub struct CompactPrefix {
     pub name: String,
     pub package: String,
     pub pos: u32,
 }
 
+/// A compact-schema message awaiting its type references.
+#[derive(Debug, Clone)]
 pub struct CompactPendingMessage {
     pub msg: Message,
     pub type_refs: Vec<String>,
 }
 
+/// One `$(…)` schema entry: the message name, its fields, and the indices that
+/// the `#n` type references point into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactSchema {
+    pub short_name: String,
+    pub fields: Vec<Field>,
+    pub type_refs: Vec<String>,
+}
+
+/// Compact-declaration lookups for `#n` references, keyed by construction site.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompactIndex {
+    pub by_var: HashMap<String, String>,
+    pub by_short: HashMap<String, String>,
+}
+
+/// The package declared by the innermost compact class around `pos`.
+#[must_use]
 pub fn package_for_compact_pos(
     pos: u32,
     classes: &[CompactClass],
     prefixes: &[CompactPrefix],
-) -> String {
+) -> Option<String> {
     let mut current = innermost_compact_class(pos, classes);
     let mut seen = Vec::new();
     while let Some(class) = current {
@@ -39,13 +64,12 @@ pub fn package_for_compact_pos(
             break;
         }
         seen.push(class.name.clone());
-        let pkg = resolve_compact_package_expr(&class.package_ref, class.start, prefixes);
-        if !pkg.is_empty() {
-            return pkg;
+        if let Some(pkg) = resolve_compact_package_expr(&class.package_ref, class.start, prefixes) {
+            return Some(pkg);
         }
         current = compact_class_by_name(&class.extends, class.start, classes);
     }
-    String::new()
+    None
 }
 
 pub fn innermost_compact_class(pos: u32, classes: &[CompactClass]) -> Option<&CompactClass> {
@@ -76,30 +100,37 @@ pub fn compact_class_name_at(pos: u32, classes: &[CompactClass]) -> String {
         .unwrap_or_default()
 }
 
-pub fn resolve_compact_package_expr(expr: &str, pos: u32, prefixes: &[CompactPrefix]) -> String {
+/// Resolves a compact package expression to a dotted package name, or `None`
+/// when the expression names no known prefix and is not itself a package name.
+#[must_use]
+pub fn resolve_compact_package_expr(
+    expr: &str,
+    pos: u32,
+    prefixes: &[CompactPrefix],
+) -> Option<String> {
     let expr = expr
         .trim()
         .trim_matches(|c| c == '"' || c == '\'')
-        .trim_end_matches('.')
-        .to_string();
+        .trim_end_matches('.');
     if expr.is_empty() {
-        return String::new();
+        return None;
     }
-    if looks_like_package_name(&expr) {
-        return expr;
+    if looks_like_package_name(expr) {
+        return Some(expr.to_owned());
     }
     prefixes
         .iter()
         .filter(|prefix| prefix.name == expr)
         .min_by_key(|prefix| (prefix.pos.abs_diff(pos), prefix.pos))
         .map(|prefix| prefix.package.clone())
-        .unwrap_or_default()
 }
 
+/// Parses one `$(…)` schema array into its message name, fields and type refs.
+#[must_use]
 pub fn parse_compact_schema_array(
     array_text: &str,
     diag: &mut Diagnostics,
-) -> Option<(String, Vec<Field>, Vec<String>)> {
+) -> Option<CompactSchema> {
     let body = array_text
         .trim()
         .trim_start_matches('[')
@@ -126,7 +157,11 @@ pub fn parse_compact_schema_array(
             Err(err) => diag.add_skipped_field(part, &err),
         }
     }
-    Some((short_name.to_string(), fields, type_refs))
+    Some(CompactSchema {
+        short_name: short_name.to_owned(),
+        fields,
+        type_refs,
+    })
 }
 
 pub fn split_compact_first_string(body: &str) -> Option<(String, &str)> {
@@ -212,22 +247,22 @@ pub fn parse_compact_field(spec: &str) -> Result<Field, Error> {
     let type_spec = parts.next().unwrap_or("").trim();
     let (type_part, oneof) = split_compact_type_and_oneof(type_spec);
     let (raw, flag) = split_compact_flag(type_part);
-    let mut field = Field::new(no, name, "scalar");
+    let mut field = Field::new(no, name, FieldKind::Scalar);
     field.repeated = flag == Some('*');
     field.opt = flag == Some('?');
-    field.oneof = oneof.unwrap_or_default();
+    field.oneof = oneof;
 
     if let Some((key, value)) = raw.split_once(',') {
-        field.kind = "map".into();
+        field.kind = FieldKind::Map;
         let scalar = compact_scalar(key).ok_or_else(invalid)?;
-        field.map_key = scalar;
-        let (kind, token) = compact_type_token(value);
+        field.map_key = Some(scalar);
+        let (kind, token) = compact_value_token(value);
         field.map_value_kind = kind;
         field.map_value_t = Some(token);
         return Ok(field);
     }
-    let (kind, token) = compact_type_token(raw);
-    field.kind = kind;
+    let (value_kind, token) = compact_value_token(raw);
+    field.kind = FieldKind::of_value(value_kind);
     field.t = Some(token);
     Ok(field)
 }
@@ -255,34 +290,33 @@ fn compact_scalar(token: &str) -> Option<i32> {
     is_scalar_id(value).then_some(value)
 }
 
-fn compact_type_token(token: &str) -> (String, TypeToken) {
+fn compact_value_token(token: &str) -> (ValueKind, TypeToken) {
     if let Some(scalar) = compact_scalar(token) {
-        ("scalar".into(), TypeToken::Scalar(scalar))
+        (ValueKind::Scalar, TypeToken::Scalar(scalar))
     } else {
-        ("message".into(), TypeToken::Named(token.to_string()))
+        (ValueKind::Message, TypeToken::Named(token.to_owned()))
     }
 }
 
-pub fn compact_type_index(
-    pending: &[CompactPendingMessage],
-    enums: &[Enum],
-) -> (
-    std::collections::HashMap<String, String>,
-    std::collections::HashMap<String, String>,
-) {
-    let mut by_var = std::collections::HashMap::new();
-    let mut by_short = std::collections::HashMap::new();
+/// Indexes compact and enum declarations by variable name and by short name.
+#[must_use]
+pub fn compact_type_index(pending: &[CompactPendingMessage], enums: &[Enum]) -> CompactIndex {
+    let mut index = CompactIndex::default();
     let mut add = |var_name: &str, short_name: &str, type_name: &str| {
         if type_name.is_empty() {
             return;
         }
         if !var_name.is_empty() {
-            by_var.insert(var_name.to_string(), type_name.to_string());
+            index
+                .by_var
+                .insert(var_name.to_owned(), type_name.to_owned());
         }
         if !short_name.is_empty() {
-            by_short.insert(short_name.to_string(), type_name.to_string());
+            index
+                .by_short
+                .insert(short_name.to_owned(), type_name.to_owned());
             if let Some((_, last)) = short_name.rsplit_once('.') {
-                by_short.insert(last.to_string(), type_name.to_string());
+                index.by_short.insert(last.to_owned(), type_name.to_owned());
             }
         }
     };
@@ -300,22 +334,25 @@ pub fn compact_type_index(
             &enum_item.type_name,
         );
     }
-    (by_var, by_short)
+    index
 }
 
 pub fn qualify_compact_fields(
     fields: &mut [Field],
     type_refs: &[String],
     pkg: &str,
-    by_var: &std::collections::HashMap<String, String>,
-    by_short: &std::collections::HashMap<String, String>,
+    index: &CompactIndex,
 ) {
     let qualify = |token: Option<TypeToken>| match token {
         Some(TypeToken::Named(r#ref)) if r#ref.starts_with('#') => {
-            let index = r#ref.trim_start_matches('#').parse::<usize>().ok();
-            match index.and_then(|i| type_refs.get(i)) {
+            let target = r#ref
+                .trim_start_matches('#')
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| type_refs.get(i));
+            match target {
                 Some(resolved) => Some(TypeToken::Named(qualify_compact_type_ref(
-                    resolved, pkg, by_var, by_short,
+                    resolved, pkg, index,
                 ))),
                 None => Some(TypeToken::Named(r#ref)),
             }
@@ -323,7 +360,7 @@ pub fn qualify_compact_fields(
         other => other,
     };
     for field in fields {
-        if field.kind == "map" {
+        if field.kind == FieldKind::Map {
             field.map_value_t = qualify(field.map_value_t.take());
         } else {
             field.t = qualify(field.t.take());
@@ -331,34 +368,30 @@ pub fn qualify_compact_fields(
     }
 }
 
-pub fn qualify_compact_type_ref(
-    r#ref: &str,
-    pkg: &str,
-    by_var: &std::collections::HashMap<String, String>,
-    by_short: &std::collections::HashMap<String, String>,
-) -> String {
+#[must_use]
+pub fn qualify_compact_type_ref(r#ref: &str, pkg: &str, index: &CompactIndex) -> String {
     let r#ref = r#ref.trim();
     if r#ref.is_empty() {
-        return r#ref.to_string();
+        return r#ref.to_owned();
     }
-    if let Some(type_name) = by_var.get(r#ref) {
+    if let Some(type_name) = index.by_var.get(r#ref) {
         return type_name.clone();
     }
     let last = crate::ast_util::last_segment(r#ref);
-    if let Some(type_name) = by_var.get(last) {
+    if let Some(type_name) = index.by_var.get(last) {
         return type_name.clone();
     }
     if let Some(type_name) = google_well_known(last) {
-        return type_name.to_string();
+        return type_name.to_owned();
     }
     if looks_like_full_type_name(r#ref) {
-        return r#ref.to_string();
+        return r#ref.to_owned();
     }
-    if let Some(type_name) = by_short.get(last) {
+    if let Some(type_name) = index.by_short.get(last) {
         return type_name.clone();
     }
     if pkg.is_empty() {
-        last.to_string()
+        last.to_owned()
     } else {
         format!("{pkg}.{last}")
     }
@@ -422,15 +455,10 @@ pub fn finish_compact_messages(
     mut pending: Vec<CompactPendingMessage>,
     enums: &[Enum],
 ) -> Vec<Message> {
-    let (by_var, by_short) = compact_type_index(&pending, enums);
+    let index = compact_type_index(&pending, enums);
     for item in &mut pending {
-        qualify_compact_fields(
-            &mut item.msg.fields,
-            &item.type_refs,
-            &item.msg.package,
-            &by_var,
-            &by_short,
-        );
+        let pkg = item.msg.package.clone();
+        qualify_compact_fields(&mut item.msg.fields, &item.type_refs, &pkg, &index);
     }
     pending.into_iter().map(|item| item.msg).collect()
 }

@@ -10,7 +10,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use super::{
     Error, Result,
     definition::PluginDefinitionLoader,
-    descriptor::PluginModuleDefinition,
+    descriptor::{CatalogMode, PluginModuleDefinition},
     manifest::{PluginManifest, validate_id},
 };
 
@@ -20,13 +20,13 @@ const MAX_ICON_BYTES: u64 = 1024 * 1024;
 /// crate version tracks the release.
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PluginCatalog {
     directory: PathBuf,
     definition_loader: PluginDefinitionLoader,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct PluginEntry {
     pub entry: PathBuf,
     pub manifest: PluginManifest,
@@ -108,7 +108,13 @@ async fn load_plugin(
     loader: &PluginDefinitionLoader,
     executable: &Path,
 ) -> Result<PluginEntry> {
-    let LoadedManifest { manifest, icon } = load_manifest(directory)?;
+    // Reading the manifest and the icon touches the filesystem; keep it off the
+    // async runtime.
+    let directory_owned = directory.to_path_buf();
+    let LoadedManifest { manifest, icon } =
+        tokio::task::spawn_blocking(move || load_manifest(&directory_owned))
+            .await
+            .map_err(|error| Error::Runtime(format!("plugin manifest task failed: {error}")))??;
     let entry = directory.join(&manifest.entry).canonicalize()?;
     let definition = loader.load(executable, &entry).await?;
     validate_definition(&manifest.id, &definition)?;
@@ -159,16 +165,7 @@ fn validate_definition(plugin_id: &str, definition: &PluginModuleDefinition) -> 
                 provider.id
             )));
         }
-        if !matches!(
-            provider.catalog.as_str(),
-            super::descriptor::SNAPSHOT_CATALOG | super::descriptor::LIVE_CATALOG
-        ) {
-            return Err(Error::Config(format!(
-                "plugin '{plugin_id}' provider '{}' uses unsupported catalog '{}'",
-                provider.id, provider.catalog
-            )));
-        }
-        if provider.catalog == super::descriptor::LIVE_CATALOG {
+        if provider.catalog == CatalogMode::Live {
             if !provider.has_models {
                 return Err(Error::Config(format!(
                     "plugin '{plugin_id}' provider '{}' live catalog requires models",
@@ -218,12 +215,6 @@ fn validate_definition(plugin_id: &str, definition: &PluginModuleDefinition) -> 
         }
         for method in &resource.add {
             validate_id(&method.id, "plugin add method id")?;
-            if method.method_type != super::descriptor::FORM_ADD_METHOD {
-                return Err(Error::Config(format!(
-                    "plugin '{plugin_id}' add method '{}' uses unsupported type '{}'",
-                    method.id, method.method_type
-                )));
-            }
             validate_form_fields(plugin_id, &method.id, &method.fields)?;
         }
     }
@@ -247,17 +238,6 @@ fn validate_form_fields(
             return Err(Error::Config(format!(
                 "plugin '{plugin_id}' form method '{method_id}' contains duplicate field '{}'",
                 field.id
-            )));
-        }
-        if !matches!(
-            field.field_type.as_str(),
-            super::descriptor::FORM_FIELD_URL
-                | super::descriptor::FORM_FIELD_SECRET
-                | super::descriptor::FORM_FIELD_TEXT
-        ) {
-            return Err(Error::Config(format!(
-                "plugin '{plugin_id}' form field '{}' uses unsupported type '{}'",
-                field.id, field.field_type
             )));
         }
         validate_localized_text(
@@ -311,6 +291,7 @@ mod tests {
     use crate::plugins::descriptor::{
         AddMethodDefinition, FormFieldDefinition, ProviderDefinition, ResourceDefinition,
     };
+    use crate::plugins::descriptor::{AddMethodKind, FormFieldKind};
 
     #[test]
     fn embedded_magpie_ignores_installed_manifests_and_source() {
@@ -379,13 +360,13 @@ mod tests {
                 provider_type: "openai".into(),
                 resource_type: Some("gateway".into()),
                 has_models: true,
-                catalog: "live".into(),
+                catalog: CatalogMode::Live,
             }],
             resources: vec![ResourceDefinition {
                 resource_type: "gateway".into(),
                 display_name: serde_json::json!("Gateways"),
                 add: vec![AddMethodDefinition {
-                    method_type: "form".into(),
+                    method_type: AddMethodKind::Form,
                     id: "connect".into(),
                     display_name: serde_json::json!("Connect"),
                     description: serde_json::Value::Null,
@@ -393,7 +374,7 @@ mod tests {
                     fields: vec![FormFieldDefinition {
                         id: "base-url".into(),
                         label: serde_json::json!("URL"),
-                        field_type: "url".into(),
+                        field_type: FormFieldKind::Url,
                         required: true,
                         placeholder: serde_json::json!("http://127.0.0.1:3425"),
                     }],

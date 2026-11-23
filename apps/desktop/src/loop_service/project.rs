@@ -7,13 +7,13 @@ use crate::{
     Error, Result,
     model::{
         ContentPart, ModelRequest, ModelSpec, ProjectedContent, ProjectedMessage, PromptSpec,
-        ProviderReplayState, Role, ToolCallContent, ToolDefinition, ToolResultContent,
+        ProviderReplayState, Reasoning, Role, ToolCallContent, ToolDefinition, ToolResultContent,
         parse_token_count,
     },
     plugins::PluginModelDescriptor,
     protocol::{
         json::{prost_json, prost_struct},
-        proto::inference as pb,
+        proto::inference::v1 as pb,
     },
 };
 
@@ -30,14 +30,17 @@ pub(crate) fn project(
     models: &[PluginModelDescriptor],
 ) -> Result<ModelRequest> {
     let model = project_model(input, model_id, configured_context_window_tokens)?;
-    let (instructions, prefix_len) = project_instructions(&input.messages)?;
+    let instructions = Instructions::collect(&input.messages)?;
     Ok(ModelRequest {
         prompt: PromptSpec {
-            instructions,
+            instructions: instructions.text,
             tools: project_tools(input, models),
         },
         model,
-        history: project_history(&input.messages[prefix_len..], prefix_len)?,
+        history: project_history(
+            &input.messages[instructions.consumed..],
+            instructions.consumed,
+        )?,
     })
 }
 
@@ -64,12 +67,13 @@ fn project_model(
         model.extra_params = Value::Object(extra);
     }
     if let Some(requested) = &input.requested_model {
-        model.reasoning.enabled = requested.max_mode;
+        if requested.max_mode {
+            model.reasoning = Reasoning::Adaptive;
+        }
         for parameter in &requested.parameters {
             match parameter.id.as_str() {
                 "effort" | "reasoning" => {
-                    model.reasoning.effort = Some(parameter.value.clone());
-                    model.reasoning.enabled = true;
+                    model.reasoning = Reasoning::Effort(parameter.value.clone());
                 }
                 "context" => {
                     model.context_window_tokens = Some(parse_context_tokens(&parameter.value)?);
@@ -109,19 +113,31 @@ fn project_tools(
         .collect()
 }
 
-/// Concatenates the leading system messages into the prompt instructions and
-/// reports how many messages they consumed.
-fn project_instructions(messages: &[pb::InferenceCoreMessage]) -> Result<(String, usize)> {
-    let mut instructions = Vec::new();
-    let mut consumed = 0;
-    for message in messages {
-        if message.role != ROLE_SYSTEM_MESSAGE {
-            break;
+/// The prompt instructions Cursor's leading system messages express, plus how
+/// many messages they consumed.
+struct Instructions {
+    text: String,
+    consumed: usize,
+}
+
+impl Instructions {
+    /// Concatenates the leading system messages until the first non-system one.
+    fn collect(messages: &[pb::InferenceCoreMessage]) -> Result<Self> {
+        let mut segments = Vec::new();
+        for (consumed, message) in messages.iter().enumerate() {
+            if message.role != ROLE_SYSTEM_MESSAGE {
+                return Ok(Self {
+                    text: segments.join("\n\n"),
+                    consumed,
+                });
+            }
+            segments.push(text_parts(&parts(message.content.as_ref())?));
         }
-        instructions.push(text_parts(&parts(message.content.as_ref())?));
-        consumed += 1;
+        Ok(Self {
+            text: segments.join("\n\n"),
+            consumed: messages.len(),
+        })
     }
-    Ok((instructions.join("\n\n"), consumed))
 }
 
 /// Projects the conversation after `prefix_len` system messages. `index` keeps

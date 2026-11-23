@@ -5,8 +5,8 @@ mod store;
 
 pub use recorder::CallRecorder;
 pub use store::{
-    CallSnapshot, CallStorage, CallStore, LlmCallRequest, LlmCallResponseChunk, LlmCallSummary,
-    NewLlmCall, PayloadStorage,
+    CallOutcome, CallSnapshot, CallStatus, CallStorage, CallStore, LlmCallRequest,
+    LlmCallResponseChunk, LlmCallSummary, NewLlmCall, PayloadStorage,
 };
 
 pub fn is_sensitive_header(name: &str) -> bool {

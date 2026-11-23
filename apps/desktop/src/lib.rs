@@ -6,6 +6,8 @@
 //! willing to talk to this app (proxy, CA, local account). The screens that
 //! drive it come next; this file is the typed boundary they will call.
 
+mod atomic;
+
 pub mod backend;
 pub mod calls;
 pub mod error;
@@ -35,7 +37,7 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 
 use self::backend::Backend;
-use self::calls::{CallStore, PayloadStorage};
+use self::calls::{CallStatus, CallStore, PayloadStorage};
 use self::harness::{
     CaState as HarnessCa, CursorHarness, Error as HarnessError, HarnessPaths, HarnessStatus,
     IntegrationState as HarnessIntegration,
@@ -320,7 +322,7 @@ impl From<HostProvider> for PluginProvider {
             description: LocalizedText(value.description),
             provider_type: value.provider_type,
             resource_type: value.resource_type,
-            catalog: value.catalog,
+            catalog: value.catalog.to_string(),
             configured: value.configured,
             catalog_error: value.catalog_error,
             models: value.models.into_iter().map(Into::into).collect(),
@@ -370,7 +372,7 @@ impl From<plugins::FormFieldDefinition> for PluginFormField {
         Self {
             id: value.id,
             label: LocalizedText(value.label),
-            field_type: value.field_type,
+            field_type: value.field_type.as_str().to_owned(),
             required: value.required,
             placeholder: LocalizedText(value.placeholder),
         }
@@ -392,11 +394,17 @@ impl From<HostResourceView> for PluginResourceView {
 impl From<HostFormSubmit> for PluginFormResult {
     fn from(value: HostFormSubmit) -> Self {
         Self {
-            added: u32::try_from(value.added).unwrap_or(u32::MAX),
-            updated: u32::try_from(value.updated).unwrap_or(u32::MAX),
+            added: saturating_u32(value.added),
+            updated: saturating_u32(value.updated),
             model_sync_error: value.model_sync_error,
         }
     }
+}
+
+/// A count the TSX boundary shows as `u32`; a resource count never reaches
+/// `u32::MAX`, and saturating is the honest answer if it somehow did.
+fn saturating_u32(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 /// A plugin runtime snapshot the settings page shows.
@@ -640,6 +648,30 @@ impl Plugins {
     }
 }
 
+/// Whether a recorded call is still running or has finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PropEnum)]
+pub enum CallStatusView {
+    /// Accepted, waiting for the provider's first byte.
+    Running,
+    /// The provider finished the stream normally.
+    Completed,
+    /// The provider or the request failed.
+    Error,
+    /// The client dropped the stream before it finished.
+    Cancelled,
+}
+
+impl From<CallStatus> for CallStatusView {
+    fn from(value: CallStatus) -> Self {
+        match value {
+            CallStatus::Running => Self::Running,
+            CallStatus::Completed => Self::Completed,
+            CallStatus::Error => Self::Error,
+            CallStatus::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
 /// One recorded Magpie model call.
 #[derive(Debug, Clone, PartialEq, JsObject)]
 #[expect(
@@ -673,8 +705,8 @@ pub struct CallRecord {
     pub reasoning_effort: Option<String>,
     /// Whether the call asked for fast latency.
     pub fast: bool,
-    /// `running`, `completed`, `error`, or `cancelled`.
-    pub status: String,
+    /// Where the call is in its lifecycle.
+    pub status: CallStatusView,
     /// Provider finish reason, when completed.
     pub finish_reason: Option<String>,
     /// When the call row was created.
@@ -812,7 +844,7 @@ impl From<calls::LlmCallSummary> for CallRecord {
             display_name: value.display_name,
             reasoning_effort: value.reasoning_effort,
             fast: value.fast,
-            status: value.status,
+            status: value.status.into(),
             finish_reason: value.finish_reason,
             created_at_ms: value.created_at_ms,
             request_started_at_ms: value.request_started_at_ms,

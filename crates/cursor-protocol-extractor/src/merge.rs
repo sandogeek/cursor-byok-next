@@ -4,10 +4,20 @@ use std::collections::{HashMap, HashSet};
 
 use crate::resolver::{TypeContext, TypeResolver};
 use crate::types::{
-    Diagnostics, Enum, Field, Message, Service, TypeName, TypeToken, is_google_pkg,
-    is_local_loop_pkg, parse_type_name,
+    Diagnostics, Enum, Field, FieldKind, Message, Service, SymbolKind, TypeName, TypeToken,
+    ValueKind, is_google_pkg, is_local_loop_pkg, parse_type_name,
 };
 
+/// A definition's field count outweighs any per-field marker when choosing
+/// between duplicate declarations.
+const FIELD_COUNT_WEIGHT: i32 = 10;
+/// Maps and oneofs are rare in Cursor bundles, so they break ties in favour of
+/// the declaration that modelled the wire shape more closely.
+const MAP_FIELD_WEIGHT: i32 = 2;
+const ONEOF_FIELD_WEIGHT: i32 = 1;
+
+/// Keeps only messages the local loop compiles or serves.
+#[must_use]
 pub fn keep_local_loop_messages(messages: Vec<Message>) -> Vec<Message> {
     messages
         .into_iter()
@@ -15,6 +25,8 @@ pub fn keep_local_loop_messages(messages: Vec<Message>) -> Vec<Message> {
         .collect()
 }
 
+/// Keeps only enums the local loop compiles or serves.
+#[must_use]
 pub fn keep_local_loop_enums(enums: Vec<Enum>) -> Vec<Enum> {
     enums
         .into_iter()
@@ -22,6 +34,8 @@ pub fn keep_local_loop_enums(enums: Vec<Enum>) -> Vec<Enum> {
         .collect()
 }
 
+/// Keeps only services the local loop serves.
+#[must_use]
 pub fn keep_local_loop_services(services: Vec<Service>) -> Vec<Service> {
     services
         .into_iter()
@@ -29,6 +43,8 @@ pub fn keep_local_loop_services(services: Vec<Service>) -> Vec<Service> {
         .collect()
 }
 
+/// Merges duplicate messages, keeping the most complete declaration.
+#[must_use]
 pub fn merge_messages_by_type_name(messages: Vec<Message>) -> Vec<Message> {
     let mut index = HashMap::new();
     let mut merged = Vec::new();
@@ -46,13 +62,13 @@ pub fn merge_messages_by_type_name(messages: Vec<Message>) -> Vec<Message> {
 }
 
 fn message_completeness(message: &Message) -> i32 {
-    let mut score = length_score(message.fields.len()) * 10;
+    let mut score = length_score(message.fields.len()) * FIELD_COUNT_WEIGHT;
     for field in &message.fields {
-        if field.kind == "map" {
-            score += 2;
+        if field.kind == FieldKind::Map {
+            score += MAP_FIELD_WEIGHT;
         }
-        if !field.oneof.is_empty() {
-            score += 1;
+        if field.oneof.is_some() {
+            score += ONEOF_FIELD_WEIGHT;
         }
         score += type_ref_completeness(field.t.as_ref());
         score += type_ref_completeness(field.map_value_t.as_ref());
@@ -70,6 +86,8 @@ fn length_score(len: usize) -> i32 {
     i32::try_from(len).unwrap_or(i32::MAX)
 }
 
+/// Merges duplicate enums, keeping the most complete declaration.
+#[must_use]
 pub fn merge_enums_by_type_name(enums: Vec<Enum>) -> Vec<Enum> {
     let mut index = HashMap::new();
     let mut merged = Vec::new();
@@ -87,13 +105,15 @@ pub fn merge_enums_by_type_name(enums: Vec<Enum>) -> Vec<Enum> {
 }
 
 fn enum_completeness(item: &Enum) -> i32 {
-    let mut score = length_score(item.values.len()) * 10;
+    let mut score = length_score(item.values.len()) * FIELD_COUNT_WEIGHT;
     for value in &item.values {
         score += length_score(value.name.len());
     }
     score
 }
 
+/// Merges duplicate services, keeping the most complete declaration.
+#[must_use]
 pub fn merge_services_by_type_name(services: Vec<Service>) -> Vec<Service> {
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut merged: Vec<Service> = Vec::new();
@@ -111,14 +131,19 @@ pub fn merge_services_by_type_name(services: Vec<Service>) -> Vec<Service> {
 }
 
 fn service_completeness(service: &Service) -> i32 {
-    let mut score = length_score(service.methods.len()) * 10;
+    let mut score = length_score(service.methods.len()) * FIELD_COUNT_WEIGHT;
     for method in &service.methods {
-        score += type_ref_completeness(Some(&TypeToken::Named(method.input_type.clone())));
-        score += type_ref_completeness(Some(&TypeToken::Named(method.output_type.clone())));
+        score += name_completeness(&method.input_type);
+        score += name_completeness(&method.output_type);
     }
     score
 }
 
+fn name_completeness(type_ref: &str) -> i32 {
+    TypeToken::Named(type_ref.to_owned()).completeness()
+}
+
+/// Rewrites field and method type references to fully-qualified names.
 pub fn normalize_type_references(
     messages: &mut [Message],
     services: &mut [Service],
@@ -127,16 +152,14 @@ pub fn normalize_type_references(
     for message in messages {
         let context = TypeContext::new(&message.package, message.pos, message.module_start);
         for field in &mut message.fields {
-            if field.kind == "message" || field.kind == "enum" {
-                field.t = resolve_token(field.t.take(), context, &field.kind, resolver);
+            if field.kind.is_named() {
+                field.t = resolve_token(field.t.take(), context, field.kind, resolver);
             }
-            if field.kind == "map"
-                && (field.map_value_kind == "message" || field.map_value_kind == "enum")
-            {
+            if field.kind == FieldKind::Map && field.map_value_kind.is_named() {
                 field.map_value_t = resolve_token(
                     field.map_value_t.take(),
                     context,
-                    &field.map_value_kind,
+                    FieldKind::of_value(field.map_value_kind),
                     resolver,
                 );
             }
@@ -145,10 +168,13 @@ pub fn normalize_type_references(
     for service in services {
         let context = TypeContext::new(&service.package, service.pos, service.module_start);
         for method in &mut service.methods {
-            if let Some(name) = resolver.resolve_type_name(&method.input_type, context, "message") {
+            if let Some(name) =
+                resolver.resolve_type_name(&method.input_type, context, SymbolKind::Message)
+            {
                 method.input_type = name;
             }
-            if let Some(name) = resolver.resolve_type_name(&method.output_type, context, "message")
+            if let Some(name) =
+                resolver.resolve_type_name(&method.output_type, context, SymbolKind::Message)
             {
                 method.output_type = name;
             }
@@ -159,49 +185,44 @@ pub fn normalize_type_references(
 fn resolve_token(
     token: Option<TypeToken>,
     context: TypeContext<'_>,
-    kind: &str,
+    kind: FieldKind,
     resolver: &TypeResolver,
 ) -> Option<TypeToken> {
     match token {
         Some(TypeToken::Named(symbol)) if !symbol.trim().is_empty() => resolver
-            .resolve_type_name(&symbol, context, kind)
+            .resolve_type_name(&symbol, context, SymbolKind::of(kind))
             .map(TypeToken::Named)
             .or(Some(TypeToken::Named(symbol))),
         other => other,
     }
 }
 
+/// Re-labels message fields that actually name an enum.
 pub fn reclassify_enum_fields(messages: &mut [Message], enums: &[Enum]) {
     let mut enum_names = HashSet::new();
     for item in enums {
         enum_names.insert(item.type_name.clone());
         enum_names.insert(item.short_name.clone());
         if let Some((_, last)) = item.short_name.rsplit_once('.') {
-            enum_names.insert(last.to_string());
+            enum_names.insert(last.to_owned());
         }
     }
-    let reclassify = |kind: &mut String, token: Option<&TypeToken>| {
-        if kind != "message" {
-            return;
-        }
-        let Some(TypeToken::Named(name)) = token else {
-            return;
-        };
-        if enum_names.contains(name) {
-            *kind = "enum".into();
-            return;
-        }
-        let short = parse_type_name(name).short;
-        if enum_names.contains(&short) {
-            *kind = "enum".into();
-        }
-    };
+    let is_enum =
+        |name: &str| enum_names.contains(name) || enum_names.contains(&parse_type_name(name).short);
     for message in messages {
         for field in &mut message.fields {
-            if field.kind == "map" {
-                reclassify(&mut field.map_value_kind, field.map_value_t.as_ref());
-            } else {
-                reclassify(&mut field.kind, field.t.as_ref());
+            if field.kind == FieldKind::Map {
+                if field.map_value_kind == ValueKind::Message
+                    && let Some(TypeToken::Named(name)) = &field.map_value_t
+                    && is_enum(name)
+                {
+                    field.map_value_kind = ValueKind::Enum;
+                }
+            } else if field.kind == FieldKind::Message
+                && let Some(TypeToken::Named(name)) = &field.t
+                && is_enum(name)
+            {
+                field.kind = FieldKind::Enum;
             }
         }
     }
@@ -218,6 +239,8 @@ pub struct DeclarationCoverage {
     pub missing: Vec<String>,
 }
 
+/// Counts how much of the bundle's declarations the extraction captured.
+#[must_use]
 pub fn declaration_coverage(
     declared: &[String],
     messages: &[Message],
@@ -258,17 +281,52 @@ pub fn declaration_coverage(
     }
 }
 
-pub fn compact_strings(mut values: Vec<String>) -> Vec<String> {
+/// Sorts and removes duplicate names so diagnostics are stable.
+#[must_use]
+pub fn sorted_dedup(mut values: Vec<String>) -> Vec<String> {
     values.sort();
     values.dedup();
     values
 }
 
+/// Records messages that parsed with no fields.
 pub fn record_empty_messages(diag: &mut Diagnostics, messages: &[Message]) {
     for message in messages {
         if message.fields.is_empty() {
             diag.empty_messages.push(message.type_name.clone());
         }
+    }
+}
+
+/// The resolution inputs every type-reference collector needs.
+struct RefScope<'a> {
+    current_package: &'a str,
+    resolver: &'a TypeResolver,
+}
+
+impl RefScope<'_> {
+    /// Records `type_ref` unless it resolves inside the package being rendered.
+    fn collect(
+        &self,
+        type_ref: &str,
+        context: TypeContext<'_>,
+        needed: &mut HashSet<String>,
+        local_types: &HashSet<String>,
+    ) {
+        let Some(type_name) =
+            self.resolver
+                .resolve_type_name(type_ref, context, SymbolKind::Message)
+        else {
+            return;
+        };
+        let TypeName { package, short } = parse_type_name(&type_name);
+        if package.is_empty() || package == self.current_package || is_google_pkg(&package) {
+            return;
+        }
+        if local_types.contains(&short) {
+            return;
+        }
+        needed.insert(type_name);
     }
 }
 
@@ -283,92 +341,43 @@ pub fn collect_needed_types(
     resolver: &TypeResolver,
     local_types: &HashSet<String>,
 ) -> HashSet<String> {
+    let scope = RefScope {
+        current_package,
+        resolver,
+    };
     let mut needed = HashSet::new();
     for message in messages {
         let context = TypeContext::new(&message.package, message.pos, message.module_start);
-        for field in &message.fields {
-            collect_field_refs(
-                field,
-                current_package,
-                context,
-                resolver,
-                &mut needed,
-                local_types,
-            );
+        let references = message.fields.iter().flat_map(field_type_references);
+        for type_ref in references {
+            scope.collect(type_ref, context, &mut needed, local_types);
         }
     }
     for service in services {
         let context = TypeContext::new(&service.package, service.pos, service.module_start);
-        for method in &service.methods {
-            collect_type_ref(
-                &method.input_type,
-                current_package,
-                context,
-                resolver,
-                &mut needed,
-                local_types,
-            );
-            collect_type_ref(
-                &method.output_type,
-                current_package,
-                context,
-                resolver,
-                &mut needed,
-                local_types,
-            );
+        let references = service
+            .methods
+            .iter()
+            .flat_map(|method| [method.input_type.as_str(), method.output_type.as_str()]);
+        for type_ref in references {
+            scope.collect(type_ref, context, &mut needed, local_types);
         }
     }
     needed
 }
 
-/// Records every named message or enum type a field points at.
-fn collect_field_refs(
-    field: &Field,
-    current_package: &str,
-    context: TypeContext<'_>,
-    resolver: &TypeResolver,
-    needed: &mut HashSet<String>,
-    local_types: &HashSet<String>,
-) {
-    let references = [
-        (field.t.as_ref(), field.kind.as_str()),
-        (field.map_value_t.as_ref(), field.map_value_kind.as_str()),
-    ];
-    for (token, kind) in references {
-        if !matches!(kind, "message" | "enum") {
-            continue;
-        }
-        if let Some(TypeToken::Named(name)) = token {
-            collect_type_ref(
-                name,
-                current_package,
-                context,
-                resolver,
-                needed,
-                local_types,
-            );
-        }
+/// The named types one field refers to: its own type and, for a map, its value.
+fn field_type_references(field: &Field) -> Vec<&str> {
+    let mut references = Vec::with_capacity(2);
+    if field.kind.is_named()
+        && let Some(TypeToken::Named(name)) = &field.t
+    {
+        references.push(name.as_str());
     }
-}
-
-/// Records `type_ref` unless it resolves inside the package being rendered.
-fn collect_type_ref(
-    type_ref: &str,
-    current_package: &str,
-    context: TypeContext<'_>,
-    resolver: &TypeResolver,
-    needed: &mut HashSet<String>,
-    local_types: &HashSet<String>,
-) {
-    let Some(type_name) = resolver.resolve_type_name(type_ref, context, "message") else {
-        return;
-    };
-    let TypeName { package, short } = parse_type_name(&type_name);
-    if package.is_empty() || package == current_package || is_google_pkg(&package) {
-        return;
+    if field.map_value_kind.is_named()
+        && let Some(TypeToken::Named(name)) = &field.map_value_t
+    {
+        references.push(name.as_str());
     }
-    if local_types.contains(&short) {
-        return;
-    }
-    needed.insert(type_name);
+    references
 }

@@ -58,7 +58,9 @@ InvokeModel
 | 12 | 指标名称 | TTFB / stream event | 响应头耗时 / 原始网络分块数 | 名称与实现一致；首块时间取到达偏移，而非 flush 时刻 |
 | 13 | 调用记录的模型坐标 | 解构 `plugin_request_url` 的三元组 | `PluginRequestUrl { model, provider, url }` | 具名字段让“模型 id / provider 族 / 请求 URL”在写入 `NewLlmCall` 时不会错位 |
 | 14 | 记录暂停时钟 | 各自 `SystemTime` 调用 | 统一 `crate::time::now_ms()`，饱和到 `i64::MAX` | 三处（calls/plugins/knowledge）曾各有一份 `now_ms`，行为已一致，合并后只留一份 |
-
+| 15 | 调用状态 | 状态列是自由字符串，读写各处手写匹配 | `CallStatus { Running, Completed, Error, Cancelled }`，`as_str`/`from_stored` 集中转换；TSX 边界是 `CallStatusView` 联合类型 | 非法状态在 Rust 里无法构造；界面按联合类型分支，不再猜字符串 |
+| 16 | 终态写入 | `finish_llm_call` 六个位置参数 | `CallOutcome { status, finish_reason, elapsed_ms, error_kind, error_message }`，配 `completed`/`cancelled` 构造器 | 六个相邻参数里交换任意两个都能编译；具名结构让终态字段不会错位 |
+| 17 | 记录失败 | `record_*` 返回 `Result`，调用处必须处理 | `record_*` 不再返回错误：写失败只把 store 标成 degraded，不影响模型调用 | 记录是观测副作用；让它成为调用链上的失败点会让一次 SQLite 抖动中断用户的生成 |
 
 ## 必须保持的不变量
 

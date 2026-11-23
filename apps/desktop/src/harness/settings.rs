@@ -4,20 +4,29 @@
 //! contract, and `settings_match` is the only proof that a freshly written
 //! proxy is actually in effect.
 
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{collections::BTreeMap, fs, io, path::PathBuf};
 
 use serde_json::Value;
 
 use super::{Error, Result};
 
 const NO_PROXY_KEY: &str = "http.noProxy";
-const KEYS: [&str; 5] = [
-    "http.proxy",
-    "http.proxyKerberosServicePrincipal",
-    "http.proxySupport",
-    "cursor.general.disableHttp2",
-    "http.experimental.systemCertificatesV2",
+/// The exact values takeover writes. A proxy is "managed" only when all of them
+/// still hold, which is what keeps this app from deleting someone else's proxy.
+const PROXY_KEY: &str = "http.proxy";
+const KERBEROS_KEY: &str = "http.proxyKerberosServicePrincipal";
+const SUPPORT_KEY: &str = "http.proxySupport";
+const DISABLE_HTTP2_KEY: &str = "cursor.general.disableHttp2";
+const SYSTEM_CERTS_KEY: &str = "http.experimental.systemCertificatesV2";
+/// Every key takeover writes; clearing removes exactly these.
+const MANAGED_KEYS: [&str; 5] = [
+    PROXY_KEY,
+    KERBEROS_KEY,
+    SUPPORT_KEY,
+    DISABLE_HTTP2_KEY,
+    SYSTEM_CERTS_KEY,
 ];
+const PROXY_SUPPORT_ON: &str = "on";
 
 /// Cursor's user settings file, edited in place.
 #[derive(Debug)]
@@ -26,6 +35,12 @@ pub struct SettingsStore {
 }
 
 impl SettingsStore {
+    /// Cursor's real settings file.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the home directory cannot be resolved or the platform is one
+    /// this app does not support.
     pub fn managed() -> Result<Self> {
         let home = dirs::home_dir()
             .ok_or_else(|| Error::Config("cannot resolve the user home directory".into()))?;
@@ -46,29 +61,42 @@ impl SettingsStore {
         Ok(Self { path })
     }
 
+    /// A store over an explicit file, for tests.
+    #[must_use]
     pub fn at(path: PathBuf) -> Self {
         Self { path }
     }
 
     /// Writes every managed key, and drops `http.noProxy` so no exclusion can
     /// bypass the proxy.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the existing file cannot be parsed or the new one written.
     pub fn write_proxy_settings(&self, proxy_url: &str) -> Result<()> {
         let mut settings = self.read()?;
         settings.remove(NO_PROXY_KEY);
-        settings.insert(KEYS[0].into(), Value::String(proxy_url.into()));
-        settings.insert(KEYS[1].into(), Value::String(proxy_url.into()));
-        settings.insert(KEYS[2].into(), Value::String("on".into()));
-        settings.insert(KEYS[3].into(), Value::Bool(true));
-        settings.insert(KEYS[4].into(), Value::Bool(true));
+        let url = Value::String(proxy_url.to_owned());
+        settings.insert(PROXY_KEY.to_owned(), url.clone());
+        settings.insert(KERBEROS_KEY.to_owned(), url);
+        settings.insert(SUPPORT_KEY.to_owned(), Value::String("on".to_owned()));
+        settings.insert(DISABLE_HTTP2_KEY.to_owned(), Value::Bool(true));
+        settings.insert(SYSTEM_CERTS_KEY.to_owned(), Value::Bool(true));
         self.write(&settings)
     }
 
+    /// Removes the managed keys, but only when all of them still match
+    /// `proxy_url`. Returns whether anything was removed.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the file cannot be parsed or rewritten.
     pub fn clear_proxy_settings(&self, proxy_url: &str) -> Result<bool> {
         let mut settings = self.read()?;
         if !matches_managed_proxy(&settings, proxy_url) {
             return Ok(false);
         }
-        for key in KEYS {
+        for key in MANAGED_KEYS {
             settings.remove(key);
         }
         self.write(&settings)?;
@@ -77,18 +105,30 @@ impl SettingsStore {
 
     /// Reads settings even when no current proxy URL exists, so corruption is
     /// still visible to the status screen rather than looking like "disabled".
+    ///
+    /// # Errors
+    ///
+    /// Fails when the file exists but cannot be parsed.
     pub fn settings_state(&self, proxy_url: Option<&str>) -> Result<Option<bool>> {
         let settings = self.read()?;
         Ok(proxy_url.map(|url| matches_managed_proxy(&settings, url)))
     }
 
     /// Whether all five managed keys hold exactly what takeover writes.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the file exists but cannot be parsed.
     pub fn settings_match(&self, proxy_url: &str) -> Result<bool> {
         Ok(matches_managed_proxy(&self.read()?, proxy_url))
     }
 
     /// Clears only the complete settings written for this harness's proxy. A
     /// loopback proxy belonging to another tool is not a managed signature.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the file cannot be parsed or rewritten.
     pub fn clear_stale_managed_settings(&self, proxy_url: &str) -> Result<bool> {
         self.clear_proxy_settings(proxy_url)
     }
@@ -97,9 +137,7 @@ impl SettingsStore {
     fn read(&self) -> Result<BTreeMap<String, Value>> {
         let data = match fs::read_to_string(&self.path) {
             Ok(data) => data,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(BTreeMap::new());
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
             Err(error) => return Err(error.into()),
         };
         if data.trim().is_empty() {
@@ -111,27 +149,23 @@ impl SettingsStore {
 
     /// Cursor may be running: replace atomically, never truncate in place.
     fn write(&self, settings: &BTreeMap<String, Value>) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let data = serde_json::to_vec_pretty(settings)?;
-        let temp = self.path.with_extension("json.tmp");
-        fs::write(&temp, [data.as_slice(), b"\n"].concat())?;
-        fs::rename(temp, &self.path)?;
+        let mut data = serde_json::to_vec_pretty(settings)?;
+        data.push(b'\n');
+        crate::atomic::write(&self.path, &data)?;
         Ok(())
     }
 }
 
-/// The host of a proxy URL such as `http://127.0.0.1:41000`.
+/// Whether `settings` hold the exact managed signature for `proxy_url`.
 fn matches_managed_proxy(settings: &BTreeMap<String, Value>, proxy_url: &str) -> bool {
     let loopback = loopback_host(proxy_url)
         .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1"));
     loopback
-        && settings.get(KEYS[0]).and_then(Value::as_str) == Some(proxy_url)
-        && settings.get(KEYS[1]).and_then(Value::as_str) == Some(proxy_url)
-        && settings.get(KEYS[2]).and_then(Value::as_str) == Some("on")
-        && settings.get(KEYS[3]).and_then(Value::as_bool) == Some(true)
-        && settings.get(KEYS[4]).and_then(Value::as_bool) == Some(true)
+        && settings.get(PROXY_KEY).and_then(Value::as_str) == Some(proxy_url)
+        && settings.get(KERBEROS_KEY).and_then(Value::as_str) == Some(proxy_url)
+        && settings.get(SUPPORT_KEY).and_then(Value::as_str) == Some(PROXY_SUPPORT_ON)
+        && settings.get(DISABLE_HTTP2_KEY).and_then(Value::as_bool) == Some(true)
+        && settings.get(SYSTEM_CERTS_KEY).and_then(Value::as_bool) == Some(true)
 }
 
 /// The host of a proxy URL such as `http://127.0.0.1:41000`.
@@ -195,7 +229,7 @@ mod tests {
             .unwrap();
 
         let after = settings.read().unwrap();
-        assert_eq!(after.len(), before - KEYS.len());
+        assert_eq!(after.len(), before - MANAGED_KEYS.len());
         assert!(!settings.settings_match("http://127.0.0.1:41000").unwrap());
     }
 

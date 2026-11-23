@@ -19,11 +19,17 @@ fn main() -> ExitCode {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-input" | "--input" => {
-                if let Some(path) = args.next() {
-                    inputs.push(PathBuf::from(path));
-                }
+                let Some(path) = args.next() else {
+                    return missing_value("-input");
+                };
+                inputs.push(PathBuf::from(path));
             }
-            "-output" | "--output" => output = args.next().map(PathBuf::from),
+            "-output" | "--output" => {
+                let Some(path) = args.next() else {
+                    return missing_value("-output");
+                };
+                output = Some(PathBuf::from(path));
+            }
             "-strict" | "--strict" => strict = true,
             "-no-strict" | "--no-strict" => strict = false,
             "-h" | "--help" => {
@@ -54,12 +60,10 @@ fn main() -> ExitCode {
     match extract_from_files(&inputs, &output, strictness) {
         Ok(result) => {
             eprint!("{}", result.diagnostics);
-            eprintln!(
-                "提取完成: {} 个消息, {} 个枚举, {} 个服务",
-                result.messages.len(),
-                result.enums.len(),
-                result.services.len()
-            );
+            let messages = result.messages.len();
+            let enums = result.enums.len();
+            let services = result.services.len();
+            eprintln!("提取完成: {messages} 个消息, {enums} 个枚举, {services} 个服务");
             eprintln!("Output directory: {}", output.display());
             ExitCode::SUCCESS
         }
@@ -68,6 +72,12 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn missing_value(flag: &str) -> ExitCode {
+    eprintln!("{flag} needs a value");
+    print_usage();
+    ExitCode::from(2)
 }
 
 fn print_usage() {
