@@ -61,9 +61,14 @@ runs:
           exit 1
         fi
 
-        # The archive holds `nsh/bin` and `nsh/runtime`; `bsdtar` on the
-        # Windows runners reads the .zip the same way.
-        tar -xf "$download/$asset" -C "$extract"
+        # The archive holds `nsh/bin` and `nsh/runtime`; on Windows the
+        # GUI tar (bsdtar) extracts the .zip, since Git Bash's `tar` would
+        # read `D:/...` as a remote host.
+        if [[ "${RUNNER_OS_NAME}" == "Windows" ]]; then
+          "/c/Windows/System32/tar.exe" -xf "$download/$asset" -C "$extract"
+        else
+          tar -xf "$download/$asset" -C "$extract"
+        fi
         bin="$(cd "$extract/nsh/bin" && pwd)"
         # Later steps find `nsh` through this; `nsh` itself finds its
         # runtimes next to the executable, so either path form works.
