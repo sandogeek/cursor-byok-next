@@ -40,14 +40,14 @@ pub fn router() -> Router<Arc<Server>> {
 }
 
 async fn handle_status(State(server): State<Arc<Server>>) -> impl IntoResponse {
-    let (database_path, database_error) = server.store().status();
+    let status = server.store().status();
     axum::Json(serde_json::json!({
         "serviceAddr": server.service_addr(),
         "debugPath": format!("{DEBUG_BASE_PATH}/"),
         "upstreamURL": server.upstream_url(),
-        "running": server.running(),
-        "databasePath": database_path,
-        "databaseError": database_error,
+        "running": true,
+        "databasePath": status.database_path,
+        "databaseError": status.last_error,
     }))
 }
 

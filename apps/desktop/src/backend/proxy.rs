@@ -5,7 +5,7 @@ use std::time::Instant;
 use axum::{
     body::{Body, Bytes, to_bytes},
     extract::Extension,
-    http::{Request, Response, header},
+    http::{HeaderValue, Request, Response, header},
 };
 
 use crate::{Result, harness};
@@ -35,23 +35,32 @@ pub struct BufferedResponse {
 
 impl BufferedResponse {
     pub fn into_response(self) -> Response<Body> {
-        let body = self.body.clone();
-        self.with_body(body)
+        let Self {
+            status,
+            headers,
+            body,
+        } = self;
+        with_body(status, headers, body)
     }
 
-    pub fn with_body(mut self, body: Bytes) -> Response<Body> {
-        self.headers.insert(
-            header::CONTENT_LENGTH,
-            body.len()
-                .to_string()
-                .parse()
-                .expect("body length is always a valid header value"),
-        );
-        let mut response = Response::new(Body::from(body));
-        *response.status_mut() = self.status;
-        *response.headers_mut() = self.headers;
-        response
+    pub fn with_body(self, body: Bytes) -> Response<Body> {
+        let Self {
+            status, headers, ..
+        } = self;
+        with_body(status, headers, body)
     }
+}
+
+fn with_body(
+    status: axum::http::StatusCode,
+    mut headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    response
 }
 
 pub async fn forward(

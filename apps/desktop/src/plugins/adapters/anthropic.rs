@@ -773,7 +773,6 @@ mod tests {
                     name: "lookup".into(),
                     content: "sunny".into(),
                     is_error: false,
-                    image: None,
                     provider_parts: Vec::new(),
                 }),
             },

@@ -42,9 +42,7 @@ use self::{
     state::{HarnessState, HarnessStateStore},
 };
 
-pub use self::account::{
-    is_local_cursor_authorization, local_token, request_uses_local_cursor_token,
-};
+pub use self::account::request_uses_local_cursor_token;
 pub use self::process::terminate_cursor as quit_cursor;
 pub use self::proxy::{Routing as ProxyRouting, UPSTREAM_URL_HEADER, is_cursor_host};
 
@@ -388,23 +386,23 @@ impl CursorHarness {
         // is the user asking for a fresh OS pick, so it is not a fallback.
         let preferred = preferred_port(*self.intent.read());
         let ca = self.paths.ca.load()?;
-        let (url, actual_port) = proxy.start(self.routing.clone(), ca, preferred).await?;
-        if actual_port != preferred {
+        let started = proxy.start(self.routing.clone(), ca, preferred).await?;
+        if started.port != preferred {
             tracing::warn!(
                 requested = preferred,
-                actual_port,
+                actual_port = started.port,
                 "the preferred proxy port was taken"
             );
         }
         // The proxy is running now; release the lock before writing files.
         drop(proxy);
-        if let Err(error) = self.apply(&url).await {
-            let _ = self.paths.settings.clear_proxy_settings(&url);
+        if let Err(error) = self.apply(&started.url).await {
+            let _ = self.paths.settings.clear_proxy_settings(&started.url);
             self.proxy.lock().await.stop().await;
             return Err(error);
         }
-        if let Err(error) = self.update_intent(|intent| intent.proxy_port = actual_port) {
-            if let Err(cleanup) = self.paths.settings.clear_proxy_settings(&url) {
+        if let Err(error) = self.update_intent(|intent| intent.proxy_port = started.port) {
+            if let Err(cleanup) = self.paths.settings.clear_proxy_settings(&started.url) {
                 tracing::warn!(%cleanup, "could not roll back Cursor proxy settings");
             }
             self.proxy.lock().await.stop().await;

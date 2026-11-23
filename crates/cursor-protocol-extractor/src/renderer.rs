@@ -5,9 +5,9 @@ use std::{
     fmt::Write as _,
 };
 
-use crate::resolver::{TypeResolver, fallback_type_token};
+use crate::resolver::{TypeContext, TypeResolver, fallback_type_token};
 use crate::types::{
-    Diagnostics, Enum, Field, Message, Service, TypeToken, parse_type_name, scalar_name,
+    Diagnostics, Enum, Field, Message, Service, TypeName, TypeToken, parse_type_name, scalar_name,
 };
 
 #[derive(Default)]
@@ -17,10 +17,10 @@ struct TypeNode {
     children: BTreeMap<String, TypeNode>,
 }
 
-/// Formats straight into `out`; writing to a `String` cannot fail.
+/// Formats straight into `out`. Writing to a `String` is infallible, so the
+/// `Result` is discarded rather than turned into a panic path.
 fn emit(out: &mut String, args: std::fmt::Arguments<'_>) {
-    out.write_fmt(args)
-        .expect("writing to a String cannot fail");
+    let _ = out.write_fmt(args);
 }
 
 pub fn generate_proto_file(
@@ -32,7 +32,7 @@ pub fn generate_proto_file(
     copied: &HashMap<String, String>,
     diag: &mut Diagnostics,
 ) -> String {
-    let imports = collect_imports(pkg_name, messages, services, resolver);
+    let imports = collect_imports(messages, services, resolver);
     let mut out = String::new();
     out.push_str("syntax = \"proto3\";\n\n");
     emit(&mut out, format_args!("package {pkg_name};\n\n"));
@@ -80,25 +80,10 @@ pub fn generate_proto_file(
             &mut out,
             format_args!("service {} {{\n", service.short_name),
         );
+        let context = TypeContext::new(pkg_name, service.pos, service.module_start);
         for method in &service.methods {
-            let input = resolve_method_type(
-                &method.input_type,
-                resolver,
-                pkg_name,
-                service.pos,
-                service.module_start,
-                copied,
-                diag,
-            );
-            let output = resolve_method_type(
-                &method.output_type,
-                resolver,
-                pkg_name,
-                service.pos,
-                service.module_start,
-                copied,
-                diag,
-            );
+            let input = resolve_method_type(&method.input_type, resolver, context, copied, diag);
+            let output = resolve_method_type(&method.output_type, resolver, context, copied, diag);
             let line = match method.kind.as_str() {
                 "ServerStreaming" => format!(
                     "  rpc {}({}) returns (stream {}) {{}}\n",
@@ -232,7 +217,7 @@ fn write_message_fields(
     indent: usize,
 ) {
     let indent_str = "  ".repeat(indent);
-    let (preferred_pkg, _) = parse_type_name(&message.type_name);
+    let context = TypeContext::new(&message.package, message.pos, message.module_start);
     let mut oneofs: BTreeMap<String, Vec<&Field>> = BTreeMap::new();
     let mut regular = Vec::new();
     for field in &message.fields {
@@ -243,17 +228,8 @@ fn write_message_fields(
         }
     }
     for field in regular {
-        let field_type = resolve_field_type(
-            field,
-            resolver,
-            &message.short_name,
-            &message.package,
-            &preferred_pkg,
-            message.pos,
-            message.module_start,
-            copied,
-            diag,
-        );
+        let field_type =
+            resolve_field_type(field, resolver, &message.short_name, context, copied, diag);
         let prefix = if field.repeated {
             "repeated "
         } else if field.opt {
@@ -272,17 +248,8 @@ fn write_message_fields(
     for (oneof_name, fields) in oneofs {
         emit(out, format_args!("{indent_str}oneof {oneof_name} {{\n"));
         for field in fields {
-            let field_type = resolve_field_type(
-                field,
-                resolver,
-                &message.short_name,
-                &message.package,
-                &preferred_pkg,
-                message.pos,
-                message.module_start,
-                copied,
-                diag,
-            );
+            let field_type =
+                resolve_field_type(field, resolver, &message.short_name, context, copied, diag);
             emit(
                 out,
                 format_args!(
@@ -298,27 +265,19 @@ fn write_message_fields(
 fn resolve_method_type(
     type_ref: &str,
     resolver: &TypeResolver,
-    current_pkg: &str,
-    context_pos: u32,
-    context_module_start: u32,
+    context: TypeContext<'_>,
     copied: &HashMap<String, String>,
     diag: &mut Diagnostics,
 ) -> String {
-    let Some(type_name) = resolver.resolve_type_name(
-        type_ref,
-        context_pos,
-        context_module_start,
-        current_pkg,
-        "message",
-    ) else {
+    let Some(type_name) = resolver.resolve_type_name(type_ref, context, "message") else {
         diag.add_unresolved_type(&format!("method:{type_ref}"));
         return fallback_type_token(type_ref);
     };
-    let (ref_pkg, short_name) = parse_type_name(&type_name);
-    if ref_pkg == current_pkg || ref_pkg.is_empty() || copied.contains_key(&short_name) {
-        short_name
+    let TypeName { package, short } = parse_type_name(&type_name);
+    if package == context.package || package.is_empty() || copied.contains_key(&short) {
+        short
     } else {
-        format!("{ref_pkg}.{short_name}")
+        format!("{package}.{short}")
     }
 }
 
@@ -326,44 +285,35 @@ fn resolve_field_type(
     field: &Field,
     resolver: &TypeResolver,
     parent_path: &str,
-    current_pkg: &str,
-    preferred_pkg: &str,
-    context_pos: u32,
-    context_module_start: u32,
+    context: TypeContext<'_>,
     copied: &HashMap<String, String>,
     diag: &mut Diagnostics,
 ) -> String {
     let mut resolve_named = |type_ref: &str, expected_kind: &str| {
-        let Some(type_name) = resolver.resolve_type_name(
-            type_ref,
-            context_pos,
-            context_module_start,
-            preferred_pkg,
-            expected_kind,
-        ) else {
+        let Some(type_name) = resolver.resolve_type_name(type_ref, context, expected_kind) else {
             diag.add_unresolved_type(&format!("{expected_kind}:{type_ref}"));
             return fallback_type_token(type_ref);
         };
-        let (ref_pkg, short_name) = parse_type_name(&type_name);
-        if !parent_path.is_empty() && short_name.starts_with(&format!("{parent_path}.")) {
-            return short_name[parent_path.len() + 1..].to_string();
+        let TypeName { package, short } = parse_type_name(&type_name);
+        if !parent_path.is_empty() && short.starts_with(&format!("{parent_path}.")) {
+            return short[parent_path.len() + 1..].to_string();
         }
-        if ref_pkg == current_pkg || ref_pkg.is_empty() || copied.contains_key(&short_name) {
-            short_name
+        if package == context.package || package.is_empty() || copied.contains_key(&short) {
+            short
         } else {
-            format!("{ref_pkg}.{short_name}")
+            format!("{package}.{short}")
         }
     };
 
-    if field.kind == "scalar" {
-        if let Some(TypeToken::Scalar(id)) = field.t {
-            return scalar_name(id).unwrap_or("bytes").to_string();
-        }
+    if field.kind == "scalar"
+        && let Some(TypeToken::Scalar(id)) = field.t
+    {
+        return scalar_name(id).unwrap_or("bytes").to_string();
     }
-    if field.kind == "message" || field.kind == "enum" {
-        if let Some(TypeToken::Named(name)) = &field.t {
-            return resolve_named(name, &field.kind);
-        }
+    if (field.kind == "message" || field.kind == "enum")
+        && let Some(TypeToken::Named(name)) = &field.t
+    {
+        return resolve_named(name, &field.kind);
     }
     if field.kind == "map" {
         let key = scalar_name(field.map_key).unwrap_or("string");
@@ -385,73 +335,52 @@ fn resolve_field_type(
     "bytes".into()
 }
 
+/// The `google/protobuf/*` and `google/rpc/*` imports the file needs.
 pub fn collect_imports(
-    current_pkg: &str,
     messages: &[Message],
     services: &[Service],
     resolver: &TypeResolver,
 ) -> HashSet<String> {
     let mut imports = HashSet::new();
-    let mut add =
-        |r#ref: &str, context_pos: u32, context_module_start: u32, expected_kind: &str| {
-            let Some(type_name) = resolver.resolve_type_name(
-                r#ref,
-                context_pos,
-                context_module_start,
-                current_pkg,
-                expected_kind,
-            ) else {
-                return;
-            };
-            let (ref_pkg, short_name) = parse_type_name(&type_name);
-            if ref_pkg == "google.protobuf" {
-                imports.insert(google_protobuf_import(&short_name).to_string());
-            } else if ref_pkg == "google.rpc" {
-                imports.insert(
-                    if short_name == "Code" {
-                        "google/rpc/code.proto"
-                    } else {
-                        "google/rpc/status.proto"
-                    }
-                    .to_string(),
-                );
-            }
+    let mut add = |type_ref: &str, context: TypeContext<'_>, expected_kind: &str| {
+        let Some(type_name) = resolver.resolve_type_name(type_ref, context, expected_kind) else {
+            return;
         };
-    for message in messages {
-        for field in &message.fields {
-            if field.kind == "message" || field.kind == "enum" {
-                if let Some(TypeToken::Named(name)) = &field.t {
-                    add(name, message.pos, message.module_start, &field.kind);
+        let TypeName { package, short } = parse_type_name(&type_name);
+        if package == "google.protobuf" {
+            imports.insert(google_protobuf_import(&short).to_string());
+        } else if package == "google.rpc" {
+            imports.insert(
+                if short == "Code" {
+                    "google/rpc/code.proto"
+                } else {
+                    "google/rpc/status.proto"
                 }
+                .to_string(),
+            );
+        }
+    };
+    for message in messages {
+        let context = TypeContext::new(&message.package, message.pos, message.module_start);
+        for field in &message.fields {
+            if (field.kind == "message" || field.kind == "enum")
+                && let Some(TypeToken::Named(name)) = &field.t
+            {
+                add(name, context, &field.kind);
             }
             if field.kind == "map"
                 && (field.map_value_kind == "message" || field.map_value_kind == "enum")
+                && let Some(TypeToken::Named(name)) = &field.map_value_t
             {
-                if let Some(TypeToken::Named(name)) = &field.map_value_t {
-                    add(
-                        name,
-                        message.pos,
-                        message.module_start,
-                        &field.map_value_kind,
-                    );
-                }
+                add(name, context, &field.map_value_kind);
             }
         }
     }
     for service in services {
+        let context = TypeContext::new(&service.package, service.pos, service.module_start);
         for method in &service.methods {
-            add(
-                &method.input_type,
-                service.pos,
-                service.module_start,
-                "message",
-            );
-            add(
-                &method.output_type,
-                service.pos,
-                service.module_start,
-                "message",
-            );
+            add(&method.input_type, context, "message");
+            add(&method.output_type, context, "message");
         }
     }
     imports

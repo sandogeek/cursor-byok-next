@@ -116,39 +116,47 @@ impl ObservationWriter {
 
     async fn run(mut self) {
         loop {
-            let received = if self.chunks.is_empty() {
-                self.receiver.recv().await
-            } else {
-                let deadline = tokio::time::Instant::from_std(
-                    self.first_chunk_at.expect("buffer timestamp") + MAX_BUFFER_AGE,
-                );
-                tokio::select! {
-                    received = self.receiver.recv() => received,
-                    () = tokio::time::sleep_until(deadline) => {
+            let Some(first_chunk_at) = self.first_chunk_at.filter(|_| !self.chunks.is_empty())
+            else {
+                let Some(observation) = self.receiver.recv().await else {
+                    self.flush().await;
+                    return;
+                };
+                self.record(observation).await;
+                continue;
+            };
+            let deadline = tokio::time::Instant::from_std(first_chunk_at + MAX_BUFFER_AGE);
+            tokio::select! {
+                received = self.receiver.recv() => {
+                    let Some(observation) = received else {
                         self.flush().await;
-                        continue;
-                    }
+                        return;
+                    };
+                    self.record(observation).await;
                 }
-            };
-            let Some(observation) = received else {
-                self.flush().await;
-                return;
-            };
-            self.chunks.push(if self.storage.keeps_payloads() {
-                BufferedLlmChunk::new(self.next_chunk, observation.elapsed_ms, &observation.data)
-            } else {
-                BufferedLlmChunk::metrics(
-                    self.next_chunk,
-                    observation.elapsed_ms,
-                    observation.data.len(),
-                )
-            });
-            self.next_chunk += 1;
-            self.bytes += observation.data.len();
-            self.first_chunk_at.get_or_insert_with(Instant::now);
-            if self.chunks.len() >= MAX_BUFFERED_CHUNKS || self.bytes >= MAX_BUFFERED_BYTES {
-                self.flush().await;
+                () = tokio::time::sleep_until(deadline) => {
+                    self.flush().await;
+                }
             }
+        }
+    }
+
+    /// Adds one observation to the buffer, flushing when it is time to write.
+    async fn record(&mut self, observation: Observation) {
+        self.chunks.push(if self.storage.keeps_payloads() {
+            BufferedLlmChunk::new(self.next_chunk, observation.elapsed_ms, &observation.data)
+        } else {
+            BufferedLlmChunk::metrics(
+                self.next_chunk,
+                observation.elapsed_ms,
+                observation.data.len(),
+            )
+        });
+        self.next_chunk += 1;
+        self.bytes += observation.data.len();
+        self.first_chunk_at.get_or_insert_with(Instant::now);
+        if self.chunks.len() >= MAX_BUFFERED_CHUNKS || self.bytes >= MAX_BUFFERED_BYTES {
+            self.flush().await;
         }
     }
 
@@ -428,12 +436,7 @@ impl CallRecorder {
 }
 
 fn started_at_ms(started: Instant, offset_ms: i64) -> i64 {
-    let epoch_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let epoch_ms = i64::try_from(epoch_ms).unwrap_or(i64::MAX);
-    epoch_ms.saturating_sub(elapsed_ms(started).saturating_sub(offset_ms))
+    crate::time::now_ms().saturating_sub(elapsed_ms(started).saturating_sub(offset_ms))
 }
 
 fn elapsed_ms(started: Instant) -> i64 {

@@ -2,10 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::resolver::TypeResolver;
+use crate::resolver::{TypeContext, TypeResolver};
 use crate::types::{
-    Diagnostics, Enum, Field, Message, Service, TypeToken, is_google_pkg, is_local_loop_pkg,
-    parse_type_name,
+    Diagnostics, Enum, Field, Message, Service, TypeName, TypeToken, is_google_pkg,
+    is_local_loop_pkg, parse_type_name,
 };
 
 pub fn keep_local_loop_messages(messages: Vec<Message>) -> Vec<Message> {
@@ -125,25 +125,17 @@ pub fn normalize_type_references(
     resolver: &TypeResolver,
 ) {
     for message in messages {
+        let context = TypeContext::new(&message.package, message.pos, message.module_start);
         for field in &mut message.fields {
             if field.kind == "message" || field.kind == "enum" {
-                field.t = resolve_token(
-                    field.t.take(),
-                    message.pos,
-                    message.module_start,
-                    &message.package,
-                    &field.kind,
-                    resolver,
-                );
+                field.t = resolve_token(field.t.take(), context, &field.kind, resolver);
             }
             if field.kind == "map"
                 && (field.map_value_kind == "message" || field.map_value_kind == "enum")
             {
                 field.map_value_t = resolve_token(
                     field.map_value_t.take(),
-                    message.pos,
-                    message.module_start,
-                    &message.package,
+                    context,
                     &field.map_value_kind,
                     resolver,
                 );
@@ -151,23 +143,13 @@ pub fn normalize_type_references(
         }
     }
     for service in services {
+        let context = TypeContext::new(&service.package, service.pos, service.module_start);
         for method in &mut service.methods {
-            if let Some(name) = resolver.resolve_type_name(
-                &method.input_type,
-                service.pos,
-                service.module_start,
-                &service.package,
-                "message",
-            ) {
+            if let Some(name) = resolver.resolve_type_name(&method.input_type, context, "message") {
                 method.input_type = name;
             }
-            if let Some(name) = resolver.resolve_type_name(
-                &method.output_type,
-                service.pos,
-                service.module_start,
-                &service.package,
-                "message",
-            ) {
+            if let Some(name) = resolver.resolve_type_name(&method.output_type, context, "message")
+            {
                 method.output_type = name;
             }
         }
@@ -176,15 +158,13 @@ pub fn normalize_type_references(
 
 fn resolve_token(
     token: Option<TypeToken>,
-    pos: u32,
-    module_start: u32,
-    pkg: &str,
+    context: TypeContext<'_>,
     kind: &str,
     resolver: &TypeResolver,
 ) -> Option<TypeToken> {
     match token {
         Some(TypeToken::Named(symbol)) if !symbol.trim().is_empty() => resolver
-            .resolve_type_name(&symbol, pos, module_start, pkg, kind)
+            .resolve_type_name(&symbol, context, kind)
             .map(TypeToken::Named)
             .or(Some(TypeToken::Named(symbol))),
         other => other,
@@ -211,7 +191,7 @@ pub fn reclassify_enum_fields(messages: &mut [Message], enums: &[Enum]) {
             *kind = "enum".into();
             return;
         }
-        let (_, short) = parse_type_name(name);
+        let short = parse_type_name(name).short;
         if enum_names.contains(&short) {
             *kind = "enum".into();
         }
@@ -227,16 +207,27 @@ pub fn reclassify_enum_fields(messages: &mut [Message], enums: &[Enum]) {
     }
 }
 
+/// How much of the bundle's declarations the extraction captured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationCoverage {
+    /// Non-Google declarations the bundle announced.
+    pub declared: usize,
+    /// Announced declarations that made it into the output.
+    pub extracted: usize,
+    /// Declared but never parsed, sorted.
+    pub missing: Vec<String>,
+}
+
 pub fn declaration_coverage(
     declared: &[String],
     messages: &[Message],
     enums: &[Enum],
     services: &[Service],
-) -> (usize, usize, Vec<String>) {
+) -> DeclarationCoverage {
     let mut declared_set = HashSet::new();
     for type_name in declared {
-        let (pkg, _) = parse_type_name(type_name);
-        if !type_name.is_empty() && !is_google_pkg(&pkg) && is_local_loop_pkg(&pkg) {
+        let package = parse_type_name(type_name).package;
+        if !type_name.is_empty() && !is_google_pkg(&package) && is_local_loop_pkg(&package) {
             declared_set.insert(type_name.clone());
         }
     }
@@ -260,7 +251,11 @@ pub fn declaration_coverage(
         }
     }
     missing.sort();
-    (declared_set.len(), matched, missing)
+    DeclarationCoverage {
+        declared: declared_set.len(),
+        extracted: matched,
+        missing,
+    }
 }
 
 pub fn compact_strings(mut values: Vec<String>) -> Vec<String> {
@@ -277,8 +272,12 @@ pub fn record_empty_messages(diag: &mut Diagnostics, messages: &[Message]) {
     }
 }
 
+/// The definitions a proto file still needs, split by role.
+///
+/// Each declaration contributes references seen from its own position, so
+/// resolution prefers the module the declaration lives in.
 pub fn collect_needed_types(
-    current_pkg: &str,
+    current_package: &str,
     messages: &[Message],
     services: &[Service],
     resolver: &TypeResolver,
@@ -286,14 +285,12 @@ pub fn collect_needed_types(
 ) -> HashSet<String> {
     let mut needed = HashSet::new();
     for message in messages {
-        let (preferred_pkg, _) = parse_type_name(&message.type_name);
+        let context = TypeContext::new(&message.package, message.pos, message.module_start);
         for field in &message.fields {
             collect_field_refs(
                 field,
-                current_pkg,
-                &preferred_pkg,
-                message.pos,
-                message.module_start,
+                current_package,
+                context,
                 resolver,
                 &mut needed,
                 local_types,
@@ -301,21 +298,20 @@ pub fn collect_needed_types(
         }
     }
     for service in services {
+        let context = TypeContext::new(&service.package, service.pos, service.module_start);
         for method in &service.methods {
-            collect_method_ref(
+            collect_type_ref(
                 &method.input_type,
-                current_pkg,
-                service.pos,
-                service.module_start,
+                current_package,
+                context,
                 resolver,
                 &mut needed,
                 local_types,
             );
-            collect_method_ref(
+            collect_type_ref(
                 &method.output_type,
-                current_pkg,
-                service.pos,
-                service.module_start,
+                current_package,
+                context,
                 resolver,
                 &mut needed,
                 local_types,
@@ -325,72 +321,53 @@ pub fn collect_needed_types(
     needed
 }
 
+/// Records every named message or enum type a field points at.
 fn collect_field_refs(
     field: &Field,
-    current_pkg: &str,
-    preferred_pkg: &str,
-    context_pos: u32,
-    context_module_start: u32,
+    current_package: &str,
+    context: TypeContext<'_>,
     resolver: &TypeResolver,
     needed: &mut HashSet<String>,
     local_types: &HashSet<String>,
 ) {
-    let mut refs = Vec::new();
-    if field.kind == "message" || field.kind == "enum" {
-        if let Some(TypeToken::Named(name)) = &field.t {
-            refs.push((name.as_str(), field.kind.as_str()));
-        }
-    }
-    if field.kind == "map" && (field.map_value_kind == "message" || field.map_value_kind == "enum")
-    {
-        if let Some(TypeToken::Named(name)) = &field.map_value_t {
-            refs.push((name.as_str(), field.map_value_kind.as_str()));
-        }
-    }
-    for (r#ref, kind) in refs {
-        let Some(type_name) = resolver.resolve_type_name(
-            r#ref,
-            context_pos,
-            context_module_start,
-            preferred_pkg,
-            kind,
-        ) else {
-            continue;
-        };
-        let (ref_pkg, short_name) = parse_type_name(&type_name);
-        if ref_pkg.is_empty() || ref_pkg == current_pkg || is_google_pkg(&ref_pkg) {
+    let references = [
+        (field.t.as_ref(), field.kind.as_str()),
+        (field.map_value_t.as_ref(), field.map_value_kind.as_str()),
+    ];
+    for (token, kind) in references {
+        if !matches!(kind, "message" | "enum") {
             continue;
         }
-        if local_types.contains(&short_name) {
-            continue;
+        if let Some(TypeToken::Named(name)) = token {
+            collect_type_ref(
+                name,
+                current_package,
+                context,
+                resolver,
+                needed,
+                local_types,
+            );
         }
-        needed.insert(type_name);
     }
 }
 
-fn collect_method_ref(
-    r#ref: &str,
-    current_pkg: &str,
-    context_pos: u32,
-    context_module_start: u32,
+/// Records `type_ref` unless it resolves inside the package being rendered.
+fn collect_type_ref(
+    type_ref: &str,
+    current_package: &str,
+    context: TypeContext<'_>,
     resolver: &TypeResolver,
     needed: &mut HashSet<String>,
     local_types: &HashSet<String>,
 ) {
-    let Some(type_name) = resolver.resolve_type_name(
-        r#ref,
-        context_pos,
-        context_module_start,
-        current_pkg,
-        "message",
-    ) else {
+    let Some(type_name) = resolver.resolve_type_name(type_ref, context, "message") else {
         return;
     };
-    let (ref_pkg, short_name) = parse_type_name(&type_name);
-    if ref_pkg.is_empty() || ref_pkg == current_pkg || is_google_pkg(&ref_pkg) {
+    let TypeName { package, short } = parse_type_name(&type_name);
+    if package.is_empty() || package == current_package || is_google_pkg(&package) {
         return;
     }
-    if local_types.contains(&short_name) {
+    if local_types.contains(&short) {
         return;
     }
     needed.insert(type_name);

@@ -203,7 +203,9 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    let directory = path.parent().expect("rule path has a parent");
+    let directory = path
+        .parent()
+        .ok_or_else(|| Error::Config("rule path has no parent".into()))?;
     let temporary = directory.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
     let mut file = std::fs::File::create(&temporary)?;
     file.write_all(bytes)?;

@@ -11,7 +11,6 @@ use prost::Message;
 use crate::{
     Error, Result,
     backend::proxy::{self, CursorProxy},
-    model::{format_token_count, parse_token_count},
     plugins::{PluginHost, PluginModelDescriptor},
     protocol::proto::agent::v1 as agent,
 };
@@ -230,21 +229,15 @@ struct DefaultModelNudgeDataResponse {
     conversion_model_override: String,
 }
 
-fn context_options(context_window_tokens: Option<u64>) -> Vec<(String, String)> {
-    let mut contexts = CONTEXTS
+/// The context-length presets the picker offers.
+///
+/// Plugin models declare no context window, so the presets are the fixed set
+/// Cursor ships with.
+fn context_options() -> Vec<(String, String)> {
+    CONTEXTS
         .into_iter()
         .map(|(value, display_name)| (value.to_owned(), display_name.to_owned()))
-        .collect::<Vec<_>>();
-    if let Some(tokens) = context_window_tokens {
-        let value = tokens.to_string();
-        let duplicate = contexts
-            .iter()
-            .any(|(existing, _)| parse_token_count(existing) == Some(tokens));
-        if !duplicate {
-            contexts.push((value, format!("{} (Custom)", format_token_count(tokens))));
-        }
-    }
-    contexts
+        .collect()
 }
 
 pub async fn available_models(
@@ -391,7 +384,7 @@ fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
     let tooltip = TooltipData {
         markdown_content: model.description.clone(),
     };
-    let contexts = context_options(None);
+    let contexts = context_options();
     let variants = model_variants(&model.id, &model.display_name, &tooltip, &contexts);
     let legacy_slugs = variants
         .iter()

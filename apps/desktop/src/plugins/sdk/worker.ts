@@ -142,17 +142,6 @@ async function dispatch(message: { id: string; method: string; params?: JsonValu
         result = await support.refresh(params.resource as never, context);
         break;
       }
-      case "resource.action": {
-        const support = resourceSupport(params.resourceType);
-        const action = (support.actions ?? []).find((item) => item.id === params.actionId);
-        if (!action) throw new Error(`resource ${params.resourceType} has no action ${params.actionId}`);
-        result = await action.run(
-          params.resource as never,
-          params.input ?? null,
-          context,
-        );
-        break;
-      }
       case "resource.remove": {
         const support = resourceSupport(params.resourceType);
         await support.remove?.(params.resource as never, context);
@@ -193,13 +182,6 @@ async function dispatch(message: { id: string; method: string; params?: JsonValu
           ? Object.fromEntries(Object.entries(params.values as Record<string, JsonValue>).map(([key, value]) => [key, String(value ?? "")]))
           : {};
         result = await method.submit(values, context);
-        break;
-      }
-      case "import.parse": {
-        const support = resourceSupport(params.resourceType);
-        if (!support.import) throw new Error(`resource ${params.resourceType} has no import`);
-        const files = Array.isArray(params.files) ? params.files : [];
-        result = await support.import.parse(files as never, context);
         break;
       }
       default:

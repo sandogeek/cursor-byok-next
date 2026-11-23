@@ -1,5 +1,6 @@
 //! Compact protobuf `$()` schema and `enumType` / `QT` value parsing.
 
+use crate::error::Error;
 use crate::types::{
     Diagnostics, Enum, EnumValue, Field, Message, TypeToken, google_well_known, is_field_name,
     is_scalar_id, looks_like_full_type_name, looks_like_package_name,
@@ -190,18 +191,23 @@ pub fn parse_compact_type_refs(rest: &str) -> Vec<String> {
     refs
 }
 
-pub fn parse_compact_field(spec: &str) -> Result<Field, String> {
+/// Parses one `no name type` entry of a compact schema string.
+///
+/// # Errors
+///
+/// Returns [`Error::Field`] when the entry is not `no name type`, when `no` is
+/// not an integer, or when `name` is not a valid field name.
+pub fn parse_compact_field(spec: &str) -> Result<Field, Error> {
+    let invalid = || Error::Field(format!("invalid compact field: {spec}"));
     let mut parts = spec.splitn(3, char::is_whitespace);
     let no = parts
         .next()
-        .ok_or_else(|| format!("invalid compact field: {spec}"))?
+        .ok_or_else(invalid)?
         .parse::<i32>()
-        .map_err(|_| format!("invalid compact field: {spec}"))?;
-    let name = parts
-        .next()
-        .ok_or_else(|| format!("invalid compact field: {spec}"))?;
+        .map_err(|_| invalid())?;
+    let name = parts.next().ok_or_else(invalid)?;
     if !is_field_name(name) {
-        return Err(format!("invalid compact field: {spec}"));
+        return Err(invalid());
     }
     let type_spec = parts.next().unwrap_or("").trim();
     let (type_part, oneof) = split_compact_type_and_oneof(type_spec);
@@ -213,7 +219,7 @@ pub fn parse_compact_field(spec: &str) -> Result<Field, String> {
 
     if let Some((key, value)) = raw.split_once(',') {
         field.kind = "map".into();
-        let scalar = compact_scalar(key).ok_or_else(|| format!("invalid compact field: {spec}"))?;
+        let scalar = compact_scalar(key).ok_or_else(invalid)?;
         field.map_key = scalar;
         let (kind, token) = compact_type_token(value);
         field.map_value_kind = kind;
@@ -365,19 +371,19 @@ pub fn extract_compact_enum_values(array_text: &str, short_name: &str) -> Vec<En
     let bytes = array_text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'[' {
-            if let Some((no, name, next)) = parse_enum_pair(array_text, i) {
-                if seen.insert(no) {
-                    let name = if !prefix.is_empty() && !name.starts_with(&prefix) {
-                        format!("{prefix}{name}")
-                    } else {
-                        name
-                    };
-                    values.push(EnumValue { no, name });
-                }
-                i = next;
-                continue;
+        if bytes[i] == b'['
+            && let Some((no, name, next)) = parse_enum_pair(array_text, i)
+        {
+            if seen.insert(no) {
+                let name = if !prefix.is_empty() && !name.starts_with(&prefix) {
+                    format!("{prefix}{name}")
+                } else {
+                    name
+                };
+                values.push(EnumValue { no, name });
             }
+            i = next;
+            continue;
         }
         i += 1;
     }

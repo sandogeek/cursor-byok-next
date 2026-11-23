@@ -16,21 +16,32 @@ pub fn is_sensitive_header(name: &str) -> bool {
     )
 }
 
-pub fn plugin_request_url(model_id: &str) -> (String, String, String) {
+/// Where a plugin model's calls go, for the call records screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginRequestUrl {
+    /// The provider's own model id, without the plugin prefix.
+    pub model: String,
+    /// The provider family recorded for the call.
+    pub provider: String,
+    /// The `plugin://<plugin>/<provider>` URL the provider call went to.
+    pub url: String,
+}
+
+/// Builds the call-record coordinates for a Cursor model id.
+///
+/// A model id that is not a plugin id is reported as its own model under a
+/// `plugin://` URL built from the id itself.
+pub fn plugin_request_url(model_id: &str) -> PluginRequestUrl {
     crate::plugins::parse_model_id(model_id).map_or_else(
-        || {
-            (
-                model_id.to_owned(),
-                "plugin".into(),
-                format!("plugin://{model_id}"),
-            )
+        || PluginRequestUrl {
+            model: model_id.to_owned(),
+            provider: "plugin".into(),
+            url: format!("plugin://{model_id}"),
         },
-        |(plugin_id, provider_id, stored_id)| {
-            (
-                stored_id.to_owned(),
-                "plugin".into(),
-                format!("plugin://{plugin_id}/{provider_id}"),
-            )
+        |id| PluginRequestUrl {
+            model: id.model.to_owned(),
+            provider: "plugin".into(),
+            url: format!("plugin://{}/{}", id.plugin, id.provider),
         },
     )
 }
@@ -41,11 +52,14 @@ mod tests {
 
     #[test]
     fn plugin_request_url_uses_plugin_and_provider() {
-        let (model, kind, url) = plugin_request_url(
+        let request = plugin_request_url(
             "plugin:dev.cursorbyoknext.plugins.magpie/magpie/resource-1/openai/gpt-5",
         );
-        assert_eq!(model, "resource-1/openai/gpt-5");
-        assert_eq!(kind, "plugin");
-        assert_eq!(url, "plugin://dev.cursorbyoknext.plugins.magpie/magpie");
+        assert_eq!(request.model, "resource-1/openai/gpt-5");
+        assert_eq!(request.provider, "plugin");
+        assert_eq!(
+            request.url,
+            "plugin://dev.cursorbyoknext.plugins.magpie/magpie"
+        );
     }
 }

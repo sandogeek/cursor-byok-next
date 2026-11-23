@@ -1,6 +1,6 @@
 //! Reverse-proxy Cursor API traffic while capturing a diagnostic copy.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -12,6 +12,7 @@ use chrono::Utc;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use parking_lot::Mutex;
 use url::Url;
 
 use crate::capture::CaptureBody;
@@ -36,6 +37,9 @@ type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
 pub struct Server {
     config: Config,
     upstream: Url,
+    /// `upstream` without its trailing slash, precomputed for reporting.
+    upstream_url: String,
+    database_path: String,
     store: ExchangeStore,
     client: HttpsClient,
 }
@@ -46,9 +50,13 @@ impl Server {
         let upstream = Url::parse(&config.upstream_url)
             .map_err(|err| Error::Config(format!("解析固定上游地址：{err}")))?;
         let store = ExchangeStore::persistent(&config.database_path, config.max_exchanges)?;
+        let upstream_url = upstream.as_str().trim_end_matches('/').to_string();
+        let database_path = config.database_path.display().to_string();
         Ok(Arc::new(Self {
             config,
             upstream,
+            upstream_url,
+            database_path,
             store,
             client: https_client(),
         }))
@@ -78,20 +86,16 @@ impl Server {
         )
     }
 
-    pub fn database_path(&self) -> String {
-        self.config.database_path.display().to_string()
+    pub fn database_path(&self) -> &str {
+        &self.database_path
     }
 
-    pub fn upstream_url(&self) -> String {
-        self.upstream.as_str().trim_end_matches('/').to_string()
+    pub fn upstream_url(&self) -> &str {
+        &self.upstream_url
     }
 
     pub fn store(&self) -> &ExchangeStore {
         &self.store
-    }
-
-    pub fn running(&self) -> bool {
-        true
     }
 
     pub fn clear_exchanges(&self) -> Result<()> {
@@ -184,12 +188,12 @@ impl Server {
             capture_limit(self.config.max_capture_bytes),
             move |chunk| {
                 if let Some(decoder) = &chunk_decoder {
-                    decoder.lock().expect("decoder").write(chunk);
+                    decoder.lock().write(chunk);
                 }
             },
             move |captured, size, truncated, end| {
                 if let Some(decoder) = decoder {
-                    decoder.lock().expect("decoder").close();
+                    decoder.lock().close();
                 }
                 finish_request_body(
                     &store,
@@ -247,12 +251,12 @@ impl Server {
             capture_limit(self.config.max_capture_bytes),
             move |chunk| {
                 if let Some(decoder) = &chunk_decoder {
-                    decoder.lock().expect("decoder").write(chunk);
+                    decoder.lock().write(chunk);
                 }
             },
             move |captured, size, truncated, end| {
                 if let Some(decoder) = decoder {
-                    decoder.lock().expect("decoder").close();
+                    decoder.lock().close();
                 }
                 finish_response_body(
                     &store,
@@ -461,17 +465,18 @@ fn finish_request_body(store: &ExchangeStore, body: CapturedBody) {
         truncated,
         read_err,
     } = body;
-    let mut decode_payload = captured.clone();
     let mut content_decode_err = None;
     let decode_proto = decodes_unary_request(&path) && is_unary_proto_content_type(&content_type);
+    let mut decompressed = None;
     if decode_proto && truncated {
         content_decode_err = Some("请求正文超过抓取上限，无法完整解码".into());
     } else if decode_proto && !codec.is_empty() && !codec.eq_ignore_ascii_case("identity") {
         match decompress_payload(&captured, &codec) {
-            Ok(decoded) => decode_payload = decoded,
+            Ok(decoded) => decompressed = Some(decoded),
             Err(err) => content_decode_err = Some(err),
         }
     }
+    let decode_payload: &[u8] = decompressed.as_deref().unwrap_or(&captured);
     let mut decoded_json = String::new();
     let mut decoded_lang = String::new();
     let mut kind = String::new();
@@ -479,7 +484,7 @@ fn finish_request_body(store: &ExchangeStore, body: CapturedBody) {
     let mut conversation_id = String::new();
     let mut decode_err = content_decode_err;
     if decode_proto && decode_err.is_none() {
-        let decoded = decode_unary_request(&path, &decode_payload);
+        let decoded = decode_unary_request(&path, decode_payload);
         decoded_json = decoded.json;
         kind = decoded.kind;
         request_id = decoded.request_id;
@@ -535,26 +540,27 @@ fn finish_response_body(store: &ExchangeStore, body: CapturedBody) {
         truncated,
         read_err,
     } = body;
-    let mut decode_payload = captured.clone();
     let mut content_decode_err = None;
     let decode_proto = decodes_unary_response(&path) && is_unary_proto_content_type(&content_type);
+    let mut decompressed = None;
     if decode_proto && truncated {
         content_decode_err = Some("响应正文超过抓取上限，无法完整解码".into());
     } else if decode_proto && !codec.is_empty() && !codec.eq_ignore_ascii_case("identity") {
         match decompress_payload(&captured, &codec) {
-            Ok(decoded) => decode_payload = decoded,
+            Ok(decoded) => decompressed = Some(decoded),
             Err(err) => content_decode_err = Some(err),
         }
     }
+    let decode_payload: &[u8] = decompressed.as_deref().unwrap_or(&captured);
     let mut decoded_json = String::new();
     let mut decoded_lang = String::new();
     let mut kind = String::new();
     let mut decode_err = content_decode_err;
     if decode_proto && decode_err.is_none() {
-        match decode_unary_response(&path, &decode_payload) {
-            Ok((json, response_kind)) => {
-                decoded_json = json;
-                kind = response_kind;
+        match decode_unary_response(&path, decode_payload) {
+            Ok(decoded) => {
+                decoded_json = decoded.json;
+                kind = decoded.kind;
             }
             Err(err) => decode_err = Some(err),
         }

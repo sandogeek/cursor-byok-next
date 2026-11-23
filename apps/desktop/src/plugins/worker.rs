@@ -24,6 +24,7 @@ use std::sync::atomic::AtomicUsize;
 
 use super::{
     Error, Result,
+    builtin::MAGPIE_PLUGIN_ID,
     catalog::PluginEntry,
     definition::{PluginDefinitionLoader, file_url},
     origin,
@@ -323,7 +324,7 @@ impl PluginWorker {
             mut active,
         } = pending.register(InvocationState {
             allowed_origins,
-            magpie_catalog_status: (self.inner.plugin_id == "dev.cursorbyoknext.plugins.magpie"
+            magpie_catalog_status: (self.inner.plugin_id == MAGPIE_PLUGIN_ID
                 && method == "models.list")
                 .then(AtomicU16::default),
             cancellation: request_cancellation.clone(),
@@ -394,7 +395,9 @@ impl PluginWorker {
         {
             *process = Some(self.spawn()?);
         }
-        let process = process.as_ref().expect("plugin worker was started");
+        let Some(process) = process.as_ref() else {
+            return Err(Error::Provider("plugin worker was not started".into()));
+        };
         Ok((process.writer.clone(), Arc::clone(&process.pending)))
     }
 
@@ -844,7 +847,7 @@ impl HostContext {
                 if let Some(recorder) = &recorder
                     && let Err(error) = recorder.response_chunk(&chunk).await
                 {
-                    let _ = sender.send(Err(error.into())).await;
+                    let _ = sender.send(Err(error)).await;
                     return;
                 }
                 buffered.extend_from_slice(&chunk);

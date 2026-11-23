@@ -3,16 +3,15 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Failures that stop the debug service or its storage.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The listen address is not a valid loopback address.
     #[error("{0}")]
     Config(String),
+    /// SQLite could not create, read or write the capture database.
     #[error("{0}")]
     Database(String),
-    #[error("{0}")]
-    Io(String),
-    #[error("{0}")]
-    Upstream(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -124,11 +123,4 @@ pub struct StoreEvent {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-}
-
-impl Exchange {
-    #[must_use]
-    pub fn clone_exchange(&self) -> Self {
-        self.clone()
-    }
 }

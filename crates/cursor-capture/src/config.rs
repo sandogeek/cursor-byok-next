@@ -38,6 +38,12 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Fills in defaults for empty fields and asserts the listener is loopback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when `service_addr` is not a loopback address
+    /// with an explicit port.
     pub fn normalized(mut self) -> Result<Self, Error> {
         if self.service_addr.trim().is_empty() {
             self.service_addr = DEFAULT_SERVICE_ADDR.into();

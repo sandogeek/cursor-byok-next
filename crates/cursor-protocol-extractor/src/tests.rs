@@ -3,9 +3,10 @@
 use std::collections::HashMap;
 
 use super::{
-    BundleScan, Enum, Field, Message, Service, Strictness, TypeToken, declaration_coverage,
-    extract_from_sources, has_placeholder, merge_messages_by_type_name, parse_field_object_source,
-    reclassify_enum_fields, resolver_from_scan, scan_source, validate_required_agent_shapes,
+    BundleScan, Enum, Field, Message, Service, Strictness, TypeContext, TypeToken,
+    declaration_coverage, extract_from_sources, has_placeholder, merge_messages_by_type_name,
+    parse_field_object_source, reclassify_enum_fields, resolver_from_scan, scan_source,
+    validate_required_agent_shapes,
 };
 
 fn field_by_name<'a>(fields: &'a [Field], name: &str) -> Option<&'a Field> {
@@ -84,17 +85,13 @@ fn webpack_export_alias_resolves_service_message_type() {
     let type_name = resolver
         .resolve_type_name(
             "r.KS",
-            scan.source_end(),
-            service.module_start,
-            "agent.v1",
+            TypeContext::new("agent.v1", scan.source_end(), service.module_start),
             "message",
         )
         .or_else(|| {
             resolver.resolve_type_name(
                 "r.KS",
-                u32::MAX,
-                service.module_start,
-                "agent.v1",
+                TypeContext::new("agent.v1", u32::MAX, service.module_start),
                 "message",
             )
         });
@@ -127,7 +124,7 @@ fn resolver_prefers_expected_kind_over_current_package() {
         &HashMap::default(),
     );
     let type_name = resolver
-        .resolve_type_name("nt", 30, 1, "origin.v1", "message")
+        .resolve_type_name("nt", TypeContext::new("origin.v1", 30, 1), "message")
         .expect("cross-package message");
     assert_eq!(type_name, "git_forge.v1.GetTagResponse");
 }
@@ -160,23 +157,13 @@ fn modern_factory_syntax_extracts_in_app_ad_service_types() {
     assert_eq!(scan.services[0].methods.len(), 2);
     let resolver = resolver_from_scan(&scan);
     let method = &scan.services[0].methods[0];
+    let service = &scan.services[0];
+    let context = TypeContext::new(&service.package, service.pos, service.module_start);
     let input = resolver
-        .resolve_type_name(
-            &method.input_type,
-            scan.services[0].pos,
-            scan.services[0].module_start,
-            &scan.services[0].package,
-            "message",
-        )
+        .resolve_type_name(&method.input_type, context, "message")
         .expect("input");
     let output = resolver
-        .resolve_type_name(
-            &method.output_type,
-            scan.services[0].pos,
-            scan.services[0].module_start,
-            &scan.services[0].package,
-            "message",
-        )
+        .resolve_type_name(&method.output_type, context, "message")
         .expect("output");
     assert_eq!(input, "aiserver.v1.HasSeenAdRequest");
     assert_eq!(output, "aiserver.v1.HasSeenAdResponse");
@@ -187,13 +174,13 @@ fn resolver_maps_dotted_google_well_known_types() {
     let resolver = super::TypeResolver::new(&[], &[], &HashMap::default(), &HashMap::default());
     assert_eq!(
         resolver
-            .resolve_type_name("r.Empty", 0, 0, "aiserver.v1", "message")
+            .resolve_type_name("r.Empty", TypeContext::new("aiserver.v1", 0, 0), "message")
             .as_deref(),
         Some("google.protobuf.Empty")
     );
     assert_eq!(
         resolver
-            .resolve_type_name("r.Value", 0, 0, "aiserver.v1", "message")
+            .resolve_type_name("r.Value", TypeContext::new("aiserver.v1", 0, 0), "message")
             .as_deref(),
         Some("google.protobuf.Value")
     );
@@ -213,9 +200,11 @@ fn assignment_alias_resolves_standard_protobuf_type() {
     let type_name = resolver
         .resolve_type_name(
             "ua",
-            u32::MAX,
-            scan.messages.last().map_or(0, |m| m.module_start),
-            "aiserver.v1",
+            TypeContext::new(
+                "aiserver.v1",
+                u32::MAX,
+                scan.messages.last().map_or(0, |m| m.module_start),
+            ),
             "message",
         )
         .expect("alias");
@@ -250,10 +239,9 @@ var Service={typeName:"aiserver.v1.TestService",methods:{}};
         pos: 0,
         module_start: 0,
     }];
-    let (declared, extracted, missing) =
-        declaration_coverage(&scan.declared, &messages, &[], &services);
-    assert_eq!((declared, extracted), (3, 2));
-    assert_eq!(missing, vec!["aiserver.v1.Missing".to_string()]);
+    let coverage = declaration_coverage(&scan.declared, &messages, &[], &services);
+    assert_eq!((coverage.declared, coverage.extracted), (3, 2));
+    assert_eq!(coverage.missing, vec!["aiserver.v1.Missing".to_string()]);
 }
 
 #[test]
@@ -524,7 +512,7 @@ message Other {
 ";
     let err =
         validate_required_agent_shapes("aiserver_v1.proto", BODY).expect_err("cross-message leak");
-    assert!(err.contains("agent_mode_configs"));
+    assert!(err.to_string().contains("agent_mode_configs"), "got {err}");
 }
 
 #[test]
@@ -549,8 +537,11 @@ fn no_strict_extract_keeps_files_when_required_shapes_are_missing() {
 var Keep=n.makeMessageType("aiserver.v1.Keep",()=>[{no:1,name:"id",kind:"scalar",T:9}]);
 var Ads={typeName:"aiserver.v1.InAppAdService",methods:{ping:{name:"Ping",I:Keep,O:Keep,kind:n.MethodKind.Unary}}};
 "#;
-    let result = extract_from_sources(&[("bundle.js", BUNDLE.to_string())], Strictness::Lenient)
-        .expect("extract");
+    let result = extract_from_sources(
+        &[("bundle.js".to_string(), BUNDLE.to_string())],
+        Strictness::Lenient,
+    )
+    .expect("extract");
     assert!(result.files.contains_key("aiserver_v1.proto"));
     assert_eq!(result.diagnostics.shape_errors, Vec::<String>::new());
 }
@@ -575,8 +566,11 @@ var Keep=n.makeMessageType("agent.v1.Keep",()=>[{no:1,name:"id",kind:"scalar",T:
 var Drop=n.makeMessageType("origin.v1.Drop",()=>[{no:1,name:"id",kind:"scalar",T:9}]);
 var Ads={typeName:"aiserver.v1.InAppAdService",methods:{ping:{name:"Ping",I:Keep,O:Keep,kind:n.MethodKind.Unary}}};
 "#;
-    let result = extract_from_sources(&[("bundle.js", BUNDLE.to_string())], Strictness::Lenient)
-        .expect("extract");
+    let result = extract_from_sources(
+        &[("bundle.js".to_string(), BUNDLE.to_string())],
+        Strictness::Lenient,
+    )
+    .expect("extract");
     assert!(
         result
             .messages

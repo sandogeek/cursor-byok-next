@@ -1,14 +1,8 @@
 //! Extract Cursor local-loop protobuf schemas from installed JS bundles.
 
-#![expect(
-    clippy::collapsible_if,
-    clippy::get_first,
-    clippy::too_many_arguments,
-    reason = "the extractor mirrors the shape of the Cursor bundle it parses"
-)]
-
 mod ast_util;
 mod compact;
+mod error;
 mod extract;
 mod merge;
 mod renderer;
@@ -18,6 +12,7 @@ mod types;
 mod validate;
 
 pub use compact::parse_compact_field;
+pub use error::Error;
 pub use extract::{
     ExtractError, ExtractResult, Strictness, extract_from_files, extract_from_sources, write_protos,
 };
@@ -25,7 +20,7 @@ pub use merge::{
     declaration_coverage, merge_enums_by_type_name, merge_messages_by_type_name,
     merge_services_by_type_name, normalize_type_references, reclassify_enum_fields,
 };
-pub use resolver::{TypeResolver, build_alias_index, build_module_imports};
+pub use resolver::{TypeContext, TypeResolver, build_alias_index, build_module_imports};
 pub use scan::{BundleScan, parse_field_object, scan_source};
 
 pub fn resolver_from_scan(scan: &BundleScan) -> TypeResolver {
@@ -40,11 +35,17 @@ pub use types::{
 };
 pub use validate::{has_placeholder, validate_required_agent_shapes};
 
-pub fn parse_field_object_source(source: &str) -> Result<Field, String> {
+/// Parses a single JS field-object literal into a [`Field`].
+///
+/// # Errors
+///
+/// Returns [`Error::Parse`] when the source is not valid JavaScript and
+/// [`Error::Field`] when the literal is not a field object.
+pub fn parse_field_object_source(source: &str) -> Result<Field, Error> {
     let allocator = oxc::allocator::Allocator::new();
     let expr = oxc::parser::Parser::new(&allocator, source, oxc::span::SourceType::unambiguous())
         .parse_expression()
-        .map_err(|err| format!("{err:?}"))?;
+        .map_err(|error| Error::Parse(format!("{error:?}")))?;
     parse_field_object(&expr)
 }
 

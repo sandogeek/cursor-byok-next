@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use cursor_capture::{Config, DEFAULT_SERVICE_ADDR, Server};
+use cursor_capture::{Config, Server};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -24,8 +24,16 @@ async fn main() -> ExitCode {
                 }
             }
             "-max-exchanges" | "--max-exchanges" => {
-                if let Some(value) = args.next() {
-                    config.max_exchanges = value.parse().unwrap_or(config.max_exchanges);
+                let Some(value) = args.next() else {
+                    eprintln!("--max-exchanges needs a value");
+                    return ExitCode::from(2);
+                };
+                match value.parse() {
+                    Ok(max) => config.max_exchanges = max,
+                    Err(err) => {
+                        eprintln!("--max-exchanges must be a positive integer: {err}");
+                        return ExitCode::from(2);
+                    }
                 }
             }
             "-db" | "--db" => {
@@ -46,10 +54,6 @@ async fn main() -> ExitCode {
             }
         }
     }
-    if config.service_addr.is_empty() {
-        config.service_addr = DEFAULT_SERVICE_ADDR.into();
-    }
-
     let server = match Server::new(config) {
         Ok(server) => server,
         Err(err) => {

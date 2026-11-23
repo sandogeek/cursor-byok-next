@@ -17,7 +17,7 @@ use sqlx::{
 };
 use tokio::sync::{Mutex, OnceCell};
 
-use crate::{Result, model::Usage};
+use crate::{Result, model::Usage, time::now_ms};
 
 const MAX_RETAINED_CALLS: i64 = 1000;
 const MAX_STORED_REQUEST_BYTES: usize = 1024 * 1024;
@@ -731,14 +731,6 @@ async fn apply_schema(pool: &SqlitePool) -> Result<()> {
     }
     transaction.commit().await?;
     Ok(())
-}
-
-fn now_ms() -> i64 {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
 fn as_i64(value: Option<u64>) -> Option<i64> {

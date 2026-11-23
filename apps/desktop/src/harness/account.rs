@@ -122,12 +122,13 @@ impl AccountStore {
 }
 
 /// Whether an `Authorization` header carries this app's local token.
-pub fn is_local_cursor_authorization(authorization: &str) -> bool {
+fn is_local_cursor_authorization(authorization: &str) -> bool {
     authorization
         .strip_prefix("Bearer ")
         .is_some_and(is_local_cursor_token)
 }
 
+/// Whether `headers` carry this app's local Cursor token.
 pub fn request_uses_local_cursor_token(headers: &axum::http::HeaderMap) -> bool {
     headers
         .get(axum::http::header::AUTHORIZATION)
@@ -172,7 +173,7 @@ fn is_local_cursor_token(token: &str) -> bool {
 
 /// The unsigned JWT Cursor stores for the local account. Recognition validates
 /// its header, subject and marker segment, not JSON serialization order.
-pub fn local_token() -> Result<String> {
+fn local_token() -> Result<String> {
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
     let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({
         "sub": SUBJECT,

@@ -312,13 +312,9 @@ fn json(value: &Value) -> Result<Response<Body>> {
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
-    response.headers_mut().insert(
-        header::CONTENT_LENGTH,
-        length
-            .to_string()
-            .parse()
-            .expect("body length is always a valid header value"),
-    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
     Ok(response)
 }
 

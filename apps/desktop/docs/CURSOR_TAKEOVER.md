@@ -63,6 +63,7 @@ pub use self::proxy::{is_cursor_host, Routing as ProxyRouting, UPSTREAM_URL_HEAD
 | 22 | 停用 / 残留清理 | 完整通用签名 + 任意 loopback 地址即可删除 | 只清理完整匹配本 harness 代理 URL 的 5 个键 | 不删除用户后来改回的代理，也不清理其他本地工具 |
 | 23 | 路由改写失败 | URI 构造失败则静默发往上游 | 返回 502，不向上游旁路 | 命中本地白名单后必须失败关闭 |
 | 24 | `AgentService/Run*` | `RunSSE` 在白名单，且有本地 handler（配 `RunEngine`） | 白名单不含 `Run` / `RunSSE` / `RunPoll`，一律直通官方 | 这三条只服务 backend loop；本仓库不做 engine，而白名单命中后没有 handler 就是 502。local loop 会拒绝一部分 turn（模式、action、harness 覆盖、tool restriction），这些 turn 必须还能打到官方。见 [`docs/protocol/cursor-agent-loop-routing.md`](../../../docs/protocol/cursor-agent-loop-routing.md) |
+| 26 | 代理启动返回值 | 上游返回 `{ url, port }` 对象 | `ProxyRuntime::start` 返回 `StartedProxy { url, port }` | 具名结构让调用方读字段而不是解构元组；端口只存一份，`url`/`port` 不再各自缓存 |
 | 25 | native 实例所有权 | 服务端拥有长生命周期 harness | `App.tsx` 模块级单例持有 `Harness` / `Plugins` / `Calls`，不在 `mount` 回调内临时构造 | NSH 的 JS 对象被 GC 时会 drop 其 Rust 实例。临时 `new Harness()` 在 `status()` 返回后触发 `ProxyRuntime::drop`，代理被 abort，但 TSX 镜像仍显示已接管，Cursor 对已配置端口反复 `ECONNREFUSED`。应用级所有者必须与 socket 生命周期一致 |
 
 ### 顺带修掉的上游隐患

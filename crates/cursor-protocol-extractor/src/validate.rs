@@ -3,54 +3,55 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-pub fn validate_required_agent_shapes(file: &str, body: &str) -> Result<(), String> {
-    if let Some(block) = proto_block(body, "message", "ExecClientControlMessage") {
-        if !block.contains("ExecClientStreamClose stream_close = 1;") {
-            return Err(format!(
-                "{file}: ExecClientControlMessage.stream_close must be ExecClientStreamClose"
-            ));
-        }
+use crate::error::Error;
+
+pub fn validate_required_agent_shapes(file: &str, body: &str) -> Result<(), Error> {
+    if let Some(block) = proto_block(body, "message", "ExecClientControlMessage")
+        && !block.contains("ExecClientStreamClose stream_close = 1;")
+    {
+        return Err(Error::Shape(format!(
+            "{file}: ExecClientControlMessage.stream_close must be ExecClientStreamClose"
+        )));
     }
-    if let Some(block) = proto_block(body, "message", "ShellStream") {
-        if !block.contains("ShellStreamStdout stdout = 1;") {
-            return Err(format!(
-                "{file}: ShellStream.stdout must be ShellStreamStdout"
-            ));
-        }
+    if let Some(block) = proto_block(body, "message", "ShellStream")
+        && !block.contains("ShellStreamStdout stdout = 1;")
+    {
+        return Err(Error::Shape(format!(
+            "{file}: ShellStream.stdout must be ShellStreamStdout"
+        )));
     }
     if let Some(block) = proto_block(body, "message", "RunInferencePromptModelMetadata") {
         if !block.contains("repeated RunInferenceAgentModeConfig agent_mode_configs = 46;") {
-            return Err(format!(
+            return Err(Error::Shape(format!(
                 "{file}: RunInferencePromptModelMetadata.agent_mode_configs must be repeated RunInferenceAgentModeConfig = 46"
-            ));
+            )));
         }
         if !block.contains("optional RunInferenceAskQuestionConfig ask_question_config = 48;") {
-            return Err(format!(
+            return Err(Error::Shape(format!(
                 "{file}: RunInferencePromptModelMetadata.ask_question_config must be optional RunInferenceAskQuestionConfig = 48"
-            ));
+            )));
         }
     }
-    if let Some(block) = proto_block(body, "message", "RunInferenceAgentModeConfig") {
-        if !(block.contains("string mode_id = 1;")
+    if let Some(block) = proto_block(body, "message", "RunInferenceAgentModeConfig")
+        && !(block.contains("string mode_id = 1;")
             && block.contains("bool enable_ask_question_tool = 2;")
             && block
                 .contains("optional RunInferenceSwitchModeToolConfig switch_mode_tool_config = 3;"))
-        {
-            return Err(format!(
-                "{file}: RunInferenceAgentModeConfig must include mode_id, enable_ask_question_tool, and switch_mode_tool_config"
-            ));
-        }
+    {
+        return Err(Error::Shape(format!(
+            "{file}: RunInferenceAgentModeConfig must include mode_id, enable_ask_question_tool, and switch_mode_tool_config"
+        )));
     }
     if let Some(block) = proto_block(body, "service", "InferenceService") {
         if !run_inference().is_match(block) {
-            return Err(format!(
+            return Err(Error::Shape(format!(
                 "{file}: InferenceService must expose bidi RunInference"
-            ));
+            )));
         }
         if !run_inference_sse().is_match(block) {
-            return Err(format!(
+            return Err(Error::Shape(format!(
                 "{file}: InferenceService must expose RunInferenceSSE"
-            ));
+            )));
         }
     }
     Ok(())

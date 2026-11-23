@@ -4,7 +4,7 @@
   "name": "Magpie",
   "version": "0.1.0",
   "author": "@leookun",
-  "minAppVersion": "1.0.1",
+  "minAppVersion": "0.0.1",
   "icon": "assets/magpie.svg",
   "entry": "main.ts",
   "permissions": {

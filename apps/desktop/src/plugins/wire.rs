@@ -254,7 +254,6 @@ mod tests {
                             name: "read".into(),
                             content: "data".into(),
                             is_error: false,
-                            image: None,
                             provider_parts: Vec::new(),
                         }),
                     },

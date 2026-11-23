@@ -600,10 +600,10 @@ fn update_tool(
         ToolArguments::None | ToolArguments::Snapshot(_) => {}
     }
     let mut events = Vec::new();
-    if !tool.started && tool.call_id.is_some() && tool.name.is_some() {
+    if !tool.started
+        && let (Some(call_id), Some(name)) = (tool.call_id.as_deref(), tool.name.as_deref())
+    {
         tool.started = true;
-        let call_id = tool.call_id.as_deref().expect("checked is_some just above");
-        let name = tool.name.as_deref().expect("checked is_some just above");
         events.push(ModelEvent::ToolCallStart {
             index,
             call_id: super::truncated_call_id(call_id).to_owned(),

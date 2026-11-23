@@ -15,10 +15,12 @@ use crate::renderer::generate_proto_file;
 use crate::resolver::{TypeResolver, build_alias_index, build_module_imports};
 use crate::scan::{BundleScan, scan_source};
 use crate::types::{
-    Diagnostics, Enum, Message, Service, is_google_pkg, is_local_loop_pkg, parse_type_name,
+    Diagnostics, Enum, Message, Service, TypeName, is_google_pkg, is_local_loop_pkg,
+    parse_type_name,
 };
 use crate::validate::{has_placeholder, validate_required_agent_shapes};
 
+/// Failures that stop an extraction run.
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractError {
     #[error("failed to read {path}: {source}")]
@@ -56,8 +58,15 @@ pub enum Strictness {
     Lenient,
 }
 
+/// Scans each `(file name, source)` pair and renders the local-loop protos.
+///
+/// # Errors
+///
+/// With [`Strictness::Strict`], returns [`ExtractError::Validation`] when any
+/// diagnostic reports a skipped field, unresolved type, placeholder, missing
+/// declaration or shape mismatch.
 pub fn extract_from_sources(
-    sources: &[(&str, String)],
+    sources: &[(String, String)],
     strictness: Strictness,
 ) -> Result<ExtractResult, ExtractError> {
     let mut all_messages = Vec::new();
@@ -91,11 +100,10 @@ pub fn extract_from_sources(
     let resolver = TypeResolver::new(&messages, &enums, &no_aliases, &no_aliases);
 
     record_empty_messages(&mut diag, &messages);
-    let (declared_count, extracted_count, missing) =
-        declaration_coverage(&declared, &messages, &enums, &services);
-    diag.declared_types = declared_count;
-    diag.extracted_types = extracted_count;
-    diag.missing_declarations = compact_strings(missing);
+    let coverage = declaration_coverage(&declared, &messages, &enums, &services);
+    diag.declared_types = coverage.declared;
+    diag.extracted_types = coverage.extracted;
+    diag.missing_declarations = compact_strings(coverage.missing);
 
     let files = generate_local_loop_protos(&messages, &enums, &services, &resolver, &mut diag);
     if strictness == Strictness::Strict && diag.has_failure() {
@@ -110,6 +118,17 @@ pub fn extract_from_sources(
     })
 }
 
+/// Reads every bundle, extracts the local-loop protos, and writes them to
+/// `output_dir`.
+///
+/// `output_dir` is replaced atomically: files are written to a sibling temp
+/// directory that is renamed over the previous contents.
+///
+/// # Errors
+///
+/// Returns [`ExtractError::Read`] when a bundle cannot be read,
+/// [`ExtractError::Write`] when the output cannot be replaced, and
+/// [`ExtractError::Validation`] under [`Strictness::Strict`].
 pub fn extract_from_files(
     input_files: &[impl AsRef<Path>],
     output_dir: impl AsRef<Path>,
@@ -124,15 +143,17 @@ pub fn extract_from_files(
         })?;
         sources.push((path.to_string_lossy().into_owned(), text));
     }
-    let named: Vec<(&str, String)> = sources
-        .iter()
-        .map(|(name, text)| (name.as_str(), text.clone()))
-        .collect();
-    let result = extract_from_sources(&named, strictness)?;
+    let result = extract_from_sources(&sources, strictness)?;
     write_protos(output_dir, &result.files)?;
     Ok(result)
 }
 
+/// Replaces `output_dir` with `files`, writing through a temp directory.
+///
+/// # Errors
+///
+/// Returns [`ExtractError::Write`] when the temp directory cannot be created,
+/// a file cannot be written, or the directory cannot be swapped in.
 pub fn write_protos(
     output_dir: impl AsRef<Path>,
     files: &HashMap<String, String, impl std::hash::BuildHasher>,
@@ -337,27 +358,27 @@ fn copy_external_types(
         );
         let mut copied_this_round = 0;
         for type_name in needed {
-            let (ref_pkg, short_name) = parse_type_name(&type_name);
-            if ref_pkg == pkg_name || is_google_pkg(&ref_pkg) || local_types.contains(&short_name) {
+            let TypeName { package, short } = parse_type_name(&type_name);
+            if package == pkg_name || is_google_pkg(&package) || local_types.contains(&short) {
                 continue;
             }
             if let Some(message) = all_messages.get(&type_name) {
                 let mut copy = message.clone();
                 copy.package = pkg_name.to_string();
                 result.messages.push(copy);
-                copied.insert(short_name.clone(), type_name);
-                local_types.insert(short_name);
+                copied.insert(short.clone(), type_name);
+                local_types.insert(short);
                 copied_this_round += 1;
             } else if let Some(item) = all_enums.get(&type_name) {
                 let mut copy = item.clone();
                 copy.package = pkg_name.to_string();
                 result.enums.push(copy);
-                copied.insert(short_name.clone(), type_name);
-                local_types.insert(short_name);
+                copied.insert(short.clone(), type_name);
+                local_types.insert(short);
                 copied_this_round += 1;
-            } else if is_local_loop_pkg(&ref_pkg) {
-                copied.insert(short_name.clone(), type_name);
-                local_types.insert(short_name);
+            } else if is_local_loop_pkg(&package) {
+                copied.insert(short.clone(), type_name);
+                local_types.insert(short);
             }
         }
         if copied_this_round == 0 {

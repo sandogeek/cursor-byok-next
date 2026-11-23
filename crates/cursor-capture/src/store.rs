@@ -283,7 +283,9 @@ impl ExchangeStore {
                 .collect());
         }
         let rows = {
-            let db = inner.db.as_mut().expect("db present");
+            let Some(db) = inner.db.as_mut() else {
+                return Ok(Vec::new());
+            };
             let mut collected = Vec::new();
             if conversation_id.is_empty() {
                 let mut stmt = db
@@ -333,15 +335,13 @@ impl ExchangeStore {
     }
 
     pub fn get(&self, id: &str) -> Result<Option<Exchange>> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         if let Some(exchange) = inner.exchanges.get(id) {
             return Ok(Some(exchange.clone()));
         }
         if inner.db.is_none() {
             return Ok(None);
         }
-        drop(inner);
-        let mut inner = self.inner.lock();
         load_persisted_locked(&mut inner, id)
     }
 
@@ -371,7 +371,9 @@ impl ExchangeStore {
         let mut inner = self.inner.lock();
         if inner.db.is_some() {
             let rows = {
-                let db = inner.db.as_mut().expect("db present");
+                let Some(db) = inner.db.as_mut() else {
+                    return Ok(Vec::new());
+                };
                 let mut stmt = db
                     .prepare(
                         "SELECT conversation_id, COUNT(*), MAX(started_at_ms),
@@ -434,9 +436,12 @@ impl ExchangeStore {
         Ok(result)
     }
 
-    pub fn status(&self) -> (String, String) {
+    pub fn status(&self) -> StoreStatus {
         let inner = self.inner.lock();
-        (inner.database_path.clone(), inner.last_error.clone())
+        StoreStatus {
+            database_path: inner.database_path.clone(),
+            last_error: inner.last_error.clone(),
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<StoreEvent> {
@@ -450,6 +455,15 @@ impl ExchangeStore {
     pub fn database_path(&self) -> PathBuf {
         PathBuf::from(self.inner.lock().database_path.clone())
     }
+}
+
+/// Where the store keeps its database and the last write failure, if any.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoreStatus {
+    /// Absolute path of the SQLite file; empty for the in-memory store.
+    pub database_path: String,
+    /// Last persistence error, cleared by the next successful write.
+    pub last_error: String,
 }
 
 fn cache_exchange(inner: &mut Inner, exchange: Exchange) {

@@ -122,21 +122,6 @@ export function __descriptor(definition: ProviderPluginDefinition) {
           }))
           : [],
       })),
-      import: resource.import
-        ? {
-          displayName: resource.import.displayName,
-          description: resource.import.description ?? null,
-          accept: resource.import.accept,
-          multiple: resource.import.multiple ?? false,
-        }
-        : null,
-      actions: (resource.actions ?? []).map((action) => ({
-        id: action.id,
-        displayName: action.displayName,
-        description: action.description ?? null,
-        target: action.target ?? "resource",
-        destructive: action.destructive ?? false,
-      })),
       canRefresh: resource.refresh !== undefined,
       canRemove: resource.remove !== undefined,
     })),

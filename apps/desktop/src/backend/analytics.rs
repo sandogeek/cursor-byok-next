@@ -104,13 +104,9 @@ fn local_response() -> Result<Response<Body>> {
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/proto"),
     );
-    response.headers_mut().insert(
-        header::CONTENT_LENGTH,
-        length
-            .to_string()
-            .parse()
-            .expect("body length is a valid header value"),
-    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
     Ok(response)
 }
 

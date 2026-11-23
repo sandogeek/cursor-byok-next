@@ -319,12 +319,22 @@ fn conversation_id_from_unary_request(message: &DynamicMessage) -> String {
     }
 }
 
-pub fn decode_unary_response(path: &str, payload: &[u8]) -> Result<(String, String), String> {
+/// A decoded unary response: its JSON form and the message kind that produced it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DecodedResponse {
+    pub json: String,
+    pub kind: String,
+}
+
+pub fn decode_unary_response(path: &str, payload: &[u8]) -> Result<DecodedResponse, String> {
     let Some((descriptor, kind)) = unary_response_message(path) else {
-        return Ok(Default::default());
+        return Ok(DecodedResponse::default());
     };
     let message = DynamicMessage::decode(descriptor, payload).map_err(|err| err.to_string())?;
-    Ok((marshal_proto_json(&message), kind))
+    Ok(DecodedResponse {
+        json: marshal_proto_json(&message),
+        kind,
+    })
 }
 
 pub fn hydrate_stored_exchange(exchange: &mut Exchange) -> bool {
@@ -447,10 +457,10 @@ fn hydrate_stored_unary_response(exchange: &mut Exchange) -> bool {
     }
     match decode_stored_raw_payload(&exchange.response.raw_hex, &exchange.response.content_codec) {
         Ok(payload) => match decode_unary_response(&exchange.summary.path, &payload) {
-            Ok((decoded, kind)) if !decoded.is_empty() => {
-                exchange.response.decoded_json = decoded;
+            Ok(decoded) if !decoded.json.is_empty() => {
+                exchange.response.decoded_json = decoded.json;
                 exchange.response.decoded_lang = "json".into();
-                exchange.summary.response_kind = kind;
+                exchange.summary.response_kind = decoded.kind;
             }
             Ok(_) => {}
             Err(err) => exchange.response.decode_error = err,

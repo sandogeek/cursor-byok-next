@@ -20,6 +20,12 @@ pub enum Error {
     Cancelled,
     #[error("{0}")]
     NotFound(String),
+    /// A plugin runtime (the Bun worker or its executable) is unavailable.
+    #[error("{0}")]
+    Runtime(String),
+    /// A provider answered with a non-2xx status.
+    #[error("HTTP {status}: {body}")]
+    HttpStatus { status: u16, body: String },
     #[error(transparent)]
     Decode(#[from] prost::DecodeError),
     #[error(transparent)]
@@ -40,26 +46,6 @@ impl From<sqlx::Error> for Error {
     }
 }
 
-impl From<crate::plugins::Error> for Error {
-    fn from(error: crate::plugins::Error) -> Self {
-        match error {
-            crate::plugins::Error::Config(message) => Self::Config(message),
-            crate::plugins::Error::Protocol(message) => Self::Protocol(message),
-            crate::plugins::Error::Provider(message) => Self::Provider(message),
-            crate::plugins::Error::NotFound(message) => Self::NotFound(message),
-            crate::plugins::Error::HttpStatus { status, body } => {
-                Self::Provider(format!("HTTP {status}: {body}"))
-            }
-            crate::plugins::Error::Cancelled => Self::Cancelled,
-            crate::plugins::Error::Json(error) => Self::Json(error),
-            crate::plugins::Error::Io(error) => Self::Io(error),
-            crate::plugins::Error::Runtime(message) | crate::plugins::Error::Storage(message) => {
-                Self::Storage(message)
-            }
-        }
-    }
-}
-
 impl From<crate::harness::Error> for Error {
     fn from(error: crate::harness::Error) -> Self {
         Self::Config(error.to_string())
@@ -73,9 +59,11 @@ impl IntoResponse for Error {
                 StatusCode::BAD_REQUEST
             }
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::Provider(_) | Self::Http(_) => StatusCode::BAD_GATEWAY,
+            Self::Provider(_) | Self::Http(_) | Self::HttpStatus { .. } => StatusCode::BAD_GATEWAY,
             Self::Cancelled => StatusCode::CONFLICT,
-            Self::Encode(_) | Self::Io(_) | Self::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Encode(_) | Self::Io(_) | Self::Storage(_) | Self::Runtime(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         tracing::warn!(%status, error = %self, "local loop request failed");
         let code = match status {

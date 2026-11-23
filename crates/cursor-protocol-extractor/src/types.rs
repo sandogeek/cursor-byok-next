@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::error::Error;
+
 pub const SCALAR_TYPES: [(i32, &str); 15] = [
     (1, "double"),
     (2, "float"),
@@ -60,20 +62,13 @@ pub fn google_well_known(short: &str) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeToken {
     Scalar(i32),
     Named(String),
 }
 
 impl TypeToken {
-    pub fn as_named(&self) -> Option<&str> {
-        match self {
-            Self::Named(name) => Some(name),
-            Self::Scalar(_) => None,
-        }
-    }
-
     pub fn completeness(&self) -> i32 {
         match self {
             Self::Named(name)
@@ -87,7 +82,7 @@ impl TypeToken {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
     pub no: i32,
     pub name: String,
@@ -191,7 +186,7 @@ pub struct Diagnostics {
 }
 
 impl Diagnostics {
-    pub fn add_skipped_field(&mut self, field_object: &str, reason: &str) {
+    pub fn add_skipped_field(&mut self, field_object: &str, reason: &Error) {
         self.total_field_objects += 1;
         self.skipped_field_objects += 1;
         if self.skipped_field_samples.len() < 20 {
@@ -219,17 +214,17 @@ impl Diagnostics {
         *self.unresolved_type_refs.entry(key).or_insert(0) += 1;
     }
 
-    pub fn add_parse_error(&mut self, message: &str) {
+    pub fn add_parse_error(&mut self, reason: &str) {
         if self.parse_errors.len() < 20 {
-            self.parse_errors.push(message.to_string());
+            self.parse_errors.push(reason.to_string());
         } else if self.parse_errors.len() == 20 {
             self.parse_errors
-                .push(format!("... and more parse errors after {message}"));
+                .push(format!("... and more parse errors after {reason}"));
         }
     }
 
-    pub fn add_shape_error(&mut self, message: &str) {
-        self.shape_errors.push(message.to_string());
+    pub fn add_shape_error(&mut self, error: &Error) {
+        self.shape_errors.push(error.to_string());
     }
 
     pub fn merge_from(&mut self, other: &mut Diagnostics) {
@@ -385,19 +380,37 @@ pub fn looks_like_package_name(value: &str) -> bool {
     is_version_token(rest[rest.len() - 1]) && rest.iter().all(|part| is_ident(part))
 }
 
-pub fn parse_type_name(type_name: &str) -> (String, String) {
+/// A type reference split into its package and its name inside that package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeName {
+    /// Package part; empty when the reference is unqualified.
+    pub package: String,
+    /// Everything after the package (nested names keep their dots).
+    pub short: String,
+}
+
+impl TypeName {
+    pub fn new(package: impl Into<String>, short: impl Into<String>) -> Self {
+        Self {
+            package: package.into(),
+            short: short.into(),
+        }
+    }
+}
+
+pub fn parse_type_name(type_name: &str) -> TypeName {
     if let Some(rest) = type_name.strip_prefix("google.protobuf.") {
-        return ("google.protobuf".into(), rest.to_string());
+        return TypeName::new("google.protobuf", rest);
     }
     if let Some(rest) = type_name.strip_prefix("google.rpc.") {
-        return ("google.rpc".into(), rest.to_string());
+        return TypeName::new("google.rpc", rest);
     }
-    if let Some((pkg, short)) = split_versioned(type_name) {
-        return (pkg, short);
+    if let Some((package, short)) = split_versioned(type_name) {
+        return TypeName::new(package, short);
     }
     match type_name.rsplit_once('.') {
-        Some((pkg, short)) => (pkg.to_string(), short.to_string()),
-        None => (String::new(), type_name.to_string()),
+        Some((package, short)) => TypeName::new(package, short),
+        None => TypeName::new("", type_name),
     }
 }
 

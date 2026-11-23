@@ -10,6 +10,29 @@ use crate::types::{
 pub type AliasIndex = HashMap<u32, HashMap<String, Vec<String>>>;
 pub type ModuleImports = HashMap<u32, HashMap<String, u32>>;
 
+/// Where a type reference appears: the package it prefers, its byte offset and
+/// the byte offset where its module starts.
+#[derive(Clone, Copy, Debug)]
+pub struct TypeContext<'a> {
+    /// Package whose definitions win ties during resolution.
+    pub package: &'a str,
+    /// Byte offset of the referencing declaration.
+    pub pos: u32,
+    /// Byte offset where the referencing module starts, or `0` when unknown.
+    pub module_start: u32,
+}
+
+impl<'a> TypeContext<'a> {
+    /// Builds a context for the declaration that starts at `pos` in `package`.
+    pub fn new(package: &'a str, pos: u32, module_start: u32) -> Self {
+        Self {
+            package,
+            pos,
+            module_start,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct TypeResolver {
     by_symbol: HashMap<String, Vec<SymbolDef>>,
@@ -104,7 +127,7 @@ impl TypeResolver {
             .entry(symbol.to_string())
             .or_default()
             .push(def.clone());
-        let (_, short_name) = parse_type_name(type_name);
+        let short_name = parse_type_name(type_name).short;
         if short_name.is_empty() {
             return;
         }
@@ -154,109 +177,75 @@ impl TypeResolver {
             });
     }
 
+    /// Resolves `type_ref` from `context`, preferring definitions of `expected_kind`.
+    ///
+    /// Tries, in order: an exact symbol, a re-export alias, and a short name.
+    /// Dotted references also fall back to their imported module, then to the
+    /// well-known types.
+    ///
+    /// Returns `None` when nothing matches.
     pub fn resolve_type_name(
         &self,
-        r#ref: &str,
-        context_pos: u32,
-        context_module_start: u32,
-        preferred_pkg: &str,
+        type_ref: &str,
+        context: TypeContext<'_>,
         expected_kind: &str,
     ) -> Option<String> {
-        let trimmed = r#ref.trim();
+        let trimmed = type_ref.trim();
         if trimmed.is_empty() {
             return None;
         }
         if looks_like_full_type_name(trimmed) {
             return Some(trimmed.to_string());
         }
-        if trimmed.contains('.') {
-            if let Some(type_name) = well_known_type_name(trimmed) {
-                return Some(type_name);
-            }
+        if trimmed.contains('.')
+            && let Some(type_name) = well_known_type_name(trimmed)
+        {
+            return Some(type_name);
         }
         let scope = if trimmed.contains('.') {
             ModuleScope::AnyModule
         } else {
             ModuleScope::SameModuleFirst
         };
-        if let Some(name) = self.resolve_by_symbol(
-            trimmed,
-            context_pos,
-            context_module_start,
-            preferred_pkg,
-            expected_kind,
-            scope,
-        ) {
+        if let Some(name) = self.resolve_by_symbol(trimmed, context, expected_kind, scope) {
+            return Some(name);
+        }
+        if let Some(name) = self.resolve_by_alias(trimmed, context, 0, expected_kind) {
+            return Some(name);
+        }
+        if let Some(name) = self.resolve_by_short(trimmed, context, expected_kind, scope) {
+            return Some(name);
+        }
+        if !trimmed.contains('.') {
+            return well_known_type_name(trimmed);
+        }
+        let first = trimmed.split('.').next().unwrap_or("");
+        let last = last_segment(trimmed);
+        let target_module = self
+            .module_imports
+            .get(&context.module_start)
+            .and_then(|imports| imports.get(first))
+            .copied()
+            .unwrap_or(0);
+        if let Some(name) = self.resolve_by_alias(last, context, target_module, expected_kind) {
             return Some(name);
         }
         if let Some(name) =
-            self.resolve_by_alias(trimmed, context_pos, 0, preferred_pkg, expected_kind)
+            self.resolve_by_symbol(last, context, expected_kind, ModuleScope::AnyModule)
         {
             return Some(name);
         }
-        if let Some(name) = self.resolve_by_short(
-            trimmed,
-            context_pos,
-            context_module_start,
-            preferred_pkg,
-            expected_kind,
-            scope,
-        ) {
+        if let Some(name) =
+            self.resolve_by_short(last, context, expected_kind, ModuleScope::AnyModule)
+        {
             return Some(name);
         }
-        if trimmed.contains('.') {
-            let first = trimmed.split('.').next().unwrap_or("");
-            let last = last_segment(trimmed);
-            let target_module = self
-                .module_imports
-                .get(&context_module_start)
-                .and_then(|imports| imports.get(first))
-                .copied()
-                .unwrap_or(0);
-            if let Some(name) = self.resolve_by_alias(
-                last,
-                context_pos,
-                target_module,
-                preferred_pkg,
-                expected_kind,
-            ) {
-                return Some(name);
-            }
-            if let Some(name) = self.resolve_by_symbol(
-                last,
-                context_pos,
-                context_module_start,
-                preferred_pkg,
-                expected_kind,
-                ModuleScope::AnyModule,
-            ) {
-                return Some(name);
-            }
-            if let Some(name) = self.resolve_by_short(
-                last,
-                context_pos,
-                context_module_start,
-                preferred_pkg,
-                expected_kind,
-                ModuleScope::AnyModule,
-            ) {
-                return Some(name);
-            }
-            if let Some(name) = self.resolve_by_symbol(
-                first,
-                context_pos,
-                context_module_start,
-                preferred_pkg,
-                expected_kind,
-                ModuleScope::AnyModule,
-            ) {
-                return Some(name);
-            }
-            if let Some(name) = well_known_type_name(last) {
-                return Some(name);
-            }
+        if let Some(name) =
+            self.resolve_by_symbol(first, context, expected_kind, ModuleScope::AnyModule)
+        {
+            return Some(name);
         }
-        well_known_type_name(trimmed)
+        well_known_type_name(last).or_else(|| well_known_type_name(trimmed))
     }
 }
 
@@ -273,121 +262,85 @@ impl TypeResolver {
     fn resolve_by_symbol(
         &self,
         symbol: &str,
-        context_pos: u32,
-        context_module_start: u32,
-        preferred_pkg: &str,
+        context: TypeContext<'_>,
         expected_kind: &str,
         scope: ModuleScope,
     ) -> Option<String> {
         let candidates = self.by_symbol.get(symbol)?;
         let module_start = match scope {
-            ModuleScope::SameModuleFirst => context_module_start,
+            ModuleScope::SameModuleFirst => context.module_start,
             ModuleScope::AnyModule => 0,
         };
-        pick_best_definition(
-            candidates,
-            context_pos,
-            module_start,
-            preferred_pkg,
-            expected_kind,
-        )
-        .map(|def| def.type_name.clone())
+        pick_best_definition(candidates, context, module_start, expected_kind)
+            .map(|definition| definition.type_name.clone())
     }
 
     fn resolve_by_alias(
         &self,
         symbol: &str,
-        context_pos: u32,
+        context: TypeContext<'_>,
         target_module_start: u32,
-        preferred_pkg: &str,
         expected_kind: &str,
     ) -> Option<String> {
         let candidates = self.by_alias.get(symbol)?;
-        pick_best_definition(
-            candidates,
-            context_pos,
-            target_module_start,
-            preferred_pkg,
-            expected_kind,
-        )
-        .map(|def| def.type_name.clone())
+        pick_best_definition(candidates, context, target_module_start, expected_kind)
+            .map(|definition| definition.type_name.clone())
     }
 
     fn resolve_by_short(
         &self,
         symbol: &str,
-        context_pos: u32,
-        context_module_start: u32,
-        preferred_pkg: &str,
+        context: TypeContext<'_>,
         expected_kind: &str,
         scope: ModuleScope,
     ) -> Option<String> {
         let candidates = self.by_short.get(symbol)?;
         let module_start = match scope {
-            ModuleScope::SameModuleFirst => context_module_start,
+            ModuleScope::SameModuleFirst => context.module_start,
             ModuleScope::AnyModule => 0,
         };
-        pick_best_definition(
-            candidates,
-            context_pos,
-            module_start,
-            preferred_pkg,
-            expected_kind,
-        )
-        .map(|def| def.type_name.clone())
+        pick_best_definition(candidates, context, module_start, expected_kind)
+            .map(|definition| definition.type_name.clone())
     }
 }
 
-pub fn pick_best_definition<'a>(
+/// Narrows `candidates` by kind, package and module, then picks the definition
+/// closest to `context.pos`, preferring definitions that start after it.
+fn pick_best_definition<'a>(
     candidates: &'a [SymbolDef],
-    context_pos: u32,
-    context_module_start: u32,
-    preferred_pkg: &str,
+    context: TypeContext<'_>,
+    module_start: u32,
     expected_kind: &str,
 ) -> Option<&'a SymbolDef> {
-    if candidates.is_empty() {
-        return None;
-    }
     let mut filtered: Vec<&SymbolDef> = candidates.iter().collect();
-    if !expected_kind.trim().is_empty() {
-        let kind_matched: Vec<_> = filtered
-            .iter()
-            .copied()
-            .filter(|item| item.kind == expected_kind)
-            .collect();
-        if !kind_matched.is_empty() {
-            filtered = kind_matched;
-        }
+    let expected_kind = expected_kind.trim();
+    if !expected_kind.is_empty() {
+        narrow(&mut filtered, |item| item.kind == expected_kind);
     }
-    if !preferred_pkg.trim().is_empty() {
-        let pkg_matched: Vec<_> = filtered
-            .iter()
-            .copied()
-            .filter(|item| parse_type_name(&item.type_name).0 == preferred_pkg)
-            .collect();
-        if !pkg_matched.is_empty() {
-            filtered = pkg_matched;
-        }
+    let preferred_package = context.package.trim();
+    if !preferred_package.is_empty() {
+        narrow(&mut filtered, |item| {
+            parse_type_name(&item.type_name).package == preferred_package
+        });
     }
-    if context_module_start > 0 {
-        let module_matched: Vec<_> = filtered
-            .iter()
-            .copied()
-            .filter(|item| item.module_start == context_module_start)
-            .collect();
-        if !module_matched.is_empty() {
-            filtered = module_matched;
-        }
+    if module_start > 0 {
+        narrow(&mut filtered, |item| item.module_start == module_start);
     }
     filtered.into_iter().min_by(|a, b| {
-        let da = a.pos.abs_diff(context_pos);
-        let db = b.pos.abs_diff(context_pos);
-        da.cmp(&db).then_with(|| {
-            let a_future = a.pos > context_pos;
-            let b_future = b.pos > context_pos;
-            a_future.cmp(&b_future)
-        })
+        let distance_a = a.pos.abs_diff(context.pos);
+        let distance_b = b.pos.abs_diff(context.pos);
+        distance_a
+            .cmp(&distance_b)
+            .then_with(|| (a.pos > context.pos).cmp(&(b.pos > context.pos)))
     })
+}
+
+/// Drops non-matching items unless nothing matches, keeping the wider set as a
+/// fallback instead of widening the caller's ranking criteria.
+fn narrow(filtered: &mut Vec<&SymbolDef>, keep: impl Fn(&&SymbolDef) -> bool + Copy) {
+    if filtered.iter().any(keep) {
+        filtered.retain(keep);
+    }
 }
 
 pub fn well_known_type_name(r#ref: &str) -> Option<String> {

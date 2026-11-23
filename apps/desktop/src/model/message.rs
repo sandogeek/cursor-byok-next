@@ -26,7 +26,6 @@ pub struct ToolResultContent {
     pub name: String,
     pub content: String,
     pub is_error: bool,
-    pub image: Option<()>,
     #[serde(skip)]
     pub provider_parts: Vec<ContentPart>,
 }

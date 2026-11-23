@@ -16,7 +16,9 @@ use super::{
 
 const MANIFEST_FILE_NAME: &str = "plugin.json";
 const MAX_ICON_BYTES: u64 = 1024 * 1024;
-const APP_VERSION: &str = "1.0.1";
+/// The running app's version: the same string `nsh.json` publishes, because the
+/// crate version tracks the release.
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone)]
 pub struct PluginCatalog {
@@ -65,18 +67,27 @@ impl PluginCatalog {
         }
     }
 
-    pub(crate) fn manifests(&self) -> Vec<(PluginManifest, String)> {
+    pub(crate) fn manifests(&self) -> Vec<LoadedManifest> {
         load_manifest(&self.directory).into_iter().collect()
     }
 }
 
-fn load_manifest(directory: &Path) -> Result<(PluginManifest, String)> {
+/// A manifest that passed validation, plus the icon the UI shows before a
+/// worker is ready.
+#[derive(Clone, Debug)]
+pub(crate) struct LoadedManifest {
+    pub manifest: PluginManifest,
+    /// `data:` URL of the manifest's icon.
+    pub icon: String,
+}
+
+fn load_manifest(directory: &Path) -> Result<LoadedManifest> {
     let manifest: PluginManifest =
         serde_json::from_slice(&fs::read(directory.join(MANIFEST_FILE_NAME))?)?;
     manifest.validate(directory)?;
     require_app_version(&manifest, APP_VERSION)?;
     let icon = icon_data_url(directory, &manifest.icon)?;
-    Ok((manifest, icon))
+    Ok(LoadedManifest { manifest, icon })
 }
 
 fn require_app_version(manifest: &PluginManifest, app_version: &str) -> Result<()> {
@@ -97,7 +108,7 @@ async fn load_plugin(
     loader: &PluginDefinitionLoader,
     executable: &Path,
 ) -> Result<PluginEntry> {
-    let (manifest, icon) = load_manifest(directory)?;
+    let LoadedManifest { manifest, icon } = load_manifest(directory)?;
     let entry = directory.join(&manifest.entry).canonicalize()?;
     let definition = loader.load(executable, &entry).await?;
     validate_definition(&manifest.id, &definition)?;
@@ -321,8 +332,11 @@ mod tests {
         let catalog = PluginCatalog::for_test(root.path()).unwrap();
         let manifests = catalog.manifests();
         assert_eq!(manifests.len(), 1);
-        let (magpie, icon) = &manifests[0];
-        assert_eq!(magpie.id, "dev.cursorbyoknext.plugins.magpie");
+        let LoadedManifest {
+            manifest: magpie,
+            icon,
+        } = &manifests[0];
+        assert_eq!(magpie.id, super::super::builtin::MAGPIE_PLUGIN_ID);
         assert!(magpie.permissions.resource_origin);
         assert_eq!(magpie.permissions.network, Vec::<String>::new());
         assert!(icon.starts_with("data:image/svg+xml;base64,"));
@@ -384,8 +398,6 @@ mod tests {
                         placeholder: serde_json::json!("http://127.0.0.1:3425"),
                     }],
                 }],
-                import: None,
-                actions: Vec::new(),
                 can_refresh: false,
                 can_remove: false,
             }],

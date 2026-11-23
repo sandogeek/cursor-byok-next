@@ -41,33 +41,8 @@ pub struct ResourceDefinition {
     pub display_name: LocalizedText,
     #[serde(default)]
     pub add: Vec<AddMethodDefinition>,
-    #[serde(default)]
-    #[expect(
-        dead_code,
-        reason = "kept in the wire schema; import flow is not ported yet"
-    )]
-    pub import: Option<ImportDefinition>,
-    #[serde(default)]
-    #[expect(
-        dead_code,
-        reason = "kept in the wire schema; action flow is not ported yet"
-    )]
-    pub actions: Vec<ResourceActionDefinition>,
     pub can_refresh: bool,
     pub can_remove: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ResourceActionDefinition {
-    pub id: String,
-    pub display_name: LocalizedText,
-    #[serde(default)]
-    pub description: LocalizedText,
-    #[serde(default)]
-    pub target: String,
-    #[serde(default)]
-    pub destructive: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -105,16 +80,6 @@ pub struct OAuthCallbackDefinition {
     pub port: Option<u16>,
     #[serde(default)]
     pub path: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ImportDefinition {
-    pub display_name: LocalizedText,
-    #[serde(default)]
-    pub description: LocalizedText,
-    pub accept: Vec<String>,
-    pub multiple: bool,
 }
 
 pub const FORM_ADD_METHOD: &str = "form";
@@ -219,15 +184,28 @@ pub fn model_id(plugin_id: &str, provider_id: &str, model_id: &str) -> String {
     format!("{ADAPTER_ID_PREFIX}{plugin_id}/{provider_id}/{model_id}")
 }
 
-pub fn parse_model_id(value: &str) -> Option<(&str, &str, &str)> {
+/// A `plugin:<plugin>/<provider>/<model>` id split into its three parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelId<'a> {
+    /// The plugin that owns the provider.
+    pub plugin: &'a str,
+    /// The provider inside that plugin.
+    pub provider: &'a str,
+    /// The provider's own model id; may itself contain slashes.
+    pub model: &'a str,
+}
+
+/// Splits a plugin model id, or returns `None` when `value` is not one.
+pub fn parse_model_id(value: &str) -> Option<ModelId<'_>> {
     let rest = value.strip_prefix(ADAPTER_ID_PREFIX)?;
-    let (plugin_id, rest) = rest.split_once('/')?;
-    let (provider_id, model_id) = rest.split_once('/')?;
-    (!plugin_id.is_empty() && !provider_id.is_empty() && !model_id.is_empty()).then_some((
-        plugin_id,
-        provider_id,
-        model_id,
-    ))
+    let (plugin, rest) = rest.split_once('/')?;
+    let (provider, model) = rest.split_once('/')?;
+    let id = ModelId {
+        plugin,
+        provider,
+        model,
+    };
+    (!plugin.is_empty() && !provider.is_empty() && !model.is_empty()).then_some(id)
 }
 
 impl PluginModelDescriptor {
@@ -261,11 +239,19 @@ mod tests {
         let id = model_id("dev.example", "codex", "org/gpt-5");
         assert_eq!(
             parse_model_id(&id),
-            Some(("dev.example", "codex", "org/gpt-5"))
+            Some(ModelId {
+                plugin: "dev.example",
+                provider: "codex",
+                model: "org/gpt-5",
+            })
         );
         assert_eq!(
             parse_model_id("plugin:dev.example/gateway/resource-id/gpt-5"),
-            Some(("dev.example", "gateway", "resource-id/gpt-5"))
+            Some(ModelId {
+                plugin: "dev.example",
+                provider: "gateway",
+                model: "resource-id/gpt-5",
+            })
         );
         assert_eq!(parse_model_id("model-hash"), None);
     }

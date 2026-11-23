@@ -21,6 +21,15 @@ use super::{Error, Result, ca::LoadedCa};
 /// The header the local backend reads to know where the request was going.
 pub const UPSTREAM_URL_HEADER: &str = "x-server-upstream-url";
 
+/// Where a freshly started proxy listens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartedProxy {
+    /// The `http://host:port` value Cursor's `http.proxy` setting needs.
+    pub url: String,
+    /// The port actually bound, which may differ from the requested one.
+    pub port: u16,
+}
+
 /// The proxy's lifecycle. `url()` and `port()` report nothing once the task
 /// has ended, so a crashed proxy never looks alive.
 #[derive(Default)]
@@ -37,23 +46,36 @@ impl ProxyRuntime {
     }
 
     pub fn url(&self) -> Option<String> {
-        self.running().then(|| self.url.clone()).flatten()
+        if self.running() {
+            self.url.clone()
+        } else {
+            None
+        }
     }
 
     pub fn port(&self) -> Option<u16> {
-        self.running().then_some(self.port).flatten()
+        if self.running() { self.port } else { None }
     }
 
     /// Starts the proxy on `requested_port`, falling back to a free port when
-    /// it is taken. Returns the URL Cursor needs and the port actually bound.
+    /// it is taken. Starting an already running proxy returns its current
+    /// address untouched.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no loopback port can be bound or the proxy cannot be built
+    /// with the given CA.
     pub async fn start(
         &mut self,
         routing: Routing,
         ca: LoadedCa,
         requested_port: u16,
-    ) -> Result<(String, u16)> {
+    ) -> Result<StartedProxy> {
         if let Some(url) = self.url() {
-            return Ok((url, self.port.unwrap_or_default()));
+            return Ok(StartedProxy {
+                url,
+                port: self.port.unwrap_or_default(),
+            });
         }
         let listener = bind_listener(requested_port).await?;
         let address = listener.local_addr()?;
@@ -70,14 +92,18 @@ impl ProxyRuntime {
             .build()
             .map_err(|error| Error::Proxy(format!("build the Cursor proxy: {error}")))?;
         self.stop = Some(stop);
-        self.url = Some(format!("http://{address}"));
-        self.port = Some(address.port());
+        let started = StartedProxy {
+            url: format!("http://{address}"),
+            port: address.port(),
+        };
+        self.url = Some(started.url.clone());
+        self.port = Some(started.port);
         self.task = Some(tokio::spawn(async move {
             if let Err(error) = proxy.start().await {
                 tracing::error!(%error, "the Cursor proxy stopped unexpectedly");
             }
         }));
-        Ok((self.url.clone().expect("just set"), address.port()))
+        Ok(started)
     }
 
     /// Stops the proxy and reclaims its task, even if open connections prevent
@@ -302,25 +328,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut runtime = ProxyRuntime::default();
 
-        let (url, port) = runtime
+        let started = runtime
             .start(Routing::default(), test_ca(dir.path()), 0)
             .await
             .unwrap();
-        assert!(port != 0);
-        assert_eq!(runtime.url().as_deref(), Some(url.as_str()));
-        assert_eq!(runtime.port(), Some(port));
+        assert!(started.port != 0);
+        assert_eq!(runtime.url().as_deref(), Some(started.url.as_str()));
+        assert_eq!(runtime.port(), Some(started.port));
 
-        let (again, again_port) = runtime
+        let again = runtime
             .start(Routing::default(), test_ca(dir.path()), 0)
             .await
             .unwrap();
-        assert_eq!((again.as_str(), again_port), (url.as_str(), port));
+        assert_eq!(again, started);
 
         runtime.stop().await;
         assert_eq!(runtime.url(), None);
         assert_eq!(runtime.port(), None);
         assert!(!runtime.running());
-        let listener = bind_again(port).await;
+        let listener = bind_again(started.port).await;
         drop(listener);
     }
 
@@ -331,12 +357,12 @@ mod tests {
         let taken = occupied.local_addr().unwrap().port();
         let mut runtime = ProxyRuntime::default();
 
-        let (_, port) = runtime
+        let started = runtime
             .start(Routing::default(), test_ca(dir.path()), taken)
             .await
             .unwrap();
 
-        assert_ne!(port, taken);
+        assert_ne!(started.port, taken);
         runtime.stop().await;
     }
 
@@ -344,7 +370,7 @@ mod tests {
     async fn dropping_releases_the_listening_port() {
         let dir = tempfile::tempdir().unwrap();
         let mut runtime = ProxyRuntime::default();
-        let (_, port) = runtime
+        let started = runtime
             .start(Routing::default(), test_ca(dir.path()), 0)
             .await
             .unwrap();
@@ -352,7 +378,7 @@ mod tests {
         drop(runtime);
         tokio::task::yield_now().await;
 
-        let listener = bind_again(port).await;
+        let listener = bind_again(started.port).await;
         drop(listener);
     }
 

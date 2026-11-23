@@ -18,11 +18,13 @@ pub struct PluginDataStore {
 }
 
 impl PluginDataStore {
+    /// Opens the store rooted at `root`, creating it with private permissions.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the directory cannot be created or the permissions cannot be
+    /// tightened to owner-only.
     pub fn at(root: PathBuf) -> Result<Self> {
-        Self::new(root)
-    }
-
-    fn new(root: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&root)?;
         set_directory_permissions(&root)?;
         Ok(Self {
@@ -62,7 +64,7 @@ impl PluginDataStore {
     async fn write_locked(&self, path: &Path, key: &str, value: &serde_json::Value) -> Result<()> {
         let directory = path
             .parent()
-            .expect("plugin data path has a parent")
+            .ok_or_else(|| Error::Config("plugin data path has no parent".into()))?
             .to_owned();
         let temporary = directory.join(format!(".{key}.{}.tmp", uuid::Uuid::new_v4()));
         let target = path.to_owned();
@@ -173,7 +175,7 @@ mod tests {
     #[tokio::test]
     async fn writes_reads_and_removes_json() {
         let root = tempfile::tempdir().unwrap();
-        let store = PluginDataStore::new(root.path().join("data")).unwrap();
+        let store = PluginDataStore::at(root.path().join("data")).unwrap();
         store
             .update(
                 "com.example",

@@ -7,6 +7,10 @@ use std::{
 
 use super::Result;
 
+/// The id Magpie's `plugin.json` declares; the host compares ids against it
+/// when it reports Magpie-only catalog status.
+pub(crate) const MAGPIE_PLUGIN_ID: &str = "dev.cursorbyoknext.plugins.magpie";
+
 const MAGPIE: &[(&str, &str)] = &[
     (
         "plugin.json",

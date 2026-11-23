@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{Error, Result, data::PluginDataStore};
+use crate::time::now_ms;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -318,13 +319,6 @@ impl PluginStateStore {
             )
             .await
     }
-}
-
-pub fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or_default()
 }
 
 fn resource_key(resource_type: &str) -> String {

@@ -76,6 +76,9 @@ Local serve()
 | 12 | 文件附件 | 拒绝 `InferenceFilePart` | 保留 bytes / media type / filename；Responses 发 `input_file`，Chat 仅 PDF，Messages 仅 PDF 或 `text/*` | 按 provider 协议支持范围透传，不把未知二进制伪装成图片或文本；不支持的类型明确报错 |
 | 13 | 标准协议请求 | invoke 时构造 SDK `LlmRequest` JSON 并塞进 Bun | 标准路径不构造 SDK JSON；适配器直接读 `ModelInvocation`；自定义插件显式 `readRequest()` | 见 `LOCAL_LOOP_REQUEST_PRD.md`：长历史和附件不再为了选端点而序列化进 Bun |
 | 14 | 后端启动 | Tokio 应用启动阶段创建 | 同步构造只建共享状态；异步成员用当前 runtime 启动，`Idle → Starting → Running`；失败或 panic 回 `Idle` | nsh 引擎线程不在 Tokio 上下文中；直接 `spawn` 会 panic 并毒化锁，失败必须能被后续状态刷新重试 |
+| 15 | 后端任务所有权 | 服务端持有长生命周期 `Backend` | `BackendWatch.backend: OnceLock<Backend>` 持有；`Backend` 的 `JoinHandle` 随进程存活 | 原先用 `std::mem::forget` 泄漏句柄；放进 `OnceLock` 表达“只启动一次、活到进程结束”，也让重复启动能被记录 |
+| 16 | 状态锁 | `std::sync::Mutex`，poison 时清毒继续 | `parking_lot::Mutex`，无 poison 状态 | 状态锁中毒后继续用是未定义的状态；换成无 poison 的锁后不需要恢复分支，也不需要额外测试 |
+
 
 ## 必须保持的不变量
 

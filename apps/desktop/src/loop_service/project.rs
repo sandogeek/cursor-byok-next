@@ -186,7 +186,6 @@ fn tool_results(
                     value => value.to_string(),
                 },
                 is_error: part.is_error,
-                image: None,
                 provider_parts,
             }),
         });
@@ -323,11 +322,12 @@ fn parts_from_wire(parts: &[pb::InferenceContentPart]) -> Result<Vec<ContentPart
                 text: text.text.clone(),
             }),
             Some(pb::inference_content_part::Part::Image(image)) => {
-                let (mime_type, data) = image_data(&image.data, image.mime_type.as_deref())?;
+                let MediaData { mime_type, data } =
+                    image_data(&image.data, image.mime_type.as_deref())?;
                 Ok(ContentPart::Image { mime_type, data })
             }
             Some(pb::inference_content_part::Part::File(file)) => {
-                let (mime_type, data) = file_data(&file.data, &file.media_type)?;
+                let MediaData { mime_type, data } = file_data(&file.data, &file.media_type)?;
                 Ok(ContentPart::File {
                     mime_type,
                     filename: file.filename.clone(),
@@ -339,7 +339,13 @@ fn parts_from_wire(parts: &[pb::InferenceContentPart]) -> Result<Vec<ContentPart
         .collect()
 }
 
-fn image_data(value: &str, fallback_mime: Option<&str>) -> Result<(String, Vec<u8>)> {
+/// A decoded media payload carried by one `RunInference` content part.
+struct MediaData {
+    mime_type: String,
+    data: Vec<u8>,
+}
+
+fn image_data(value: &str, fallback_mime: Option<&str>) -> Result<MediaData> {
     let (mime_type, encoded) = if let Some((metadata, data)) = value
         .strip_prefix("data:")
         .and_then(|value| value.split_once(','))
@@ -351,10 +357,13 @@ fn image_data(value: &str, fallback_mime: Option<&str>) -> Result<(String, Vec<u
     let data = STANDARD
         .decode(encoded)
         .map_err(|error| Error::Protocol(format!("invalid RunInference image: {error}")))?;
-    Ok((mime_type.into(), data))
+    Ok(MediaData {
+        mime_type: mime_type.into(),
+        data,
+    })
 }
 
-fn file_data(value: &str, fallback_mime: &str) -> Result<(String, Vec<u8>)> {
+fn file_data(value: &str, fallback_mime: &str) -> Result<MediaData> {
     let (mime_type, encoded) = if let Some((metadata, data)) = value
         .strip_prefix("data:")
         .and_then(|value| value.split_once(','))
@@ -371,7 +380,10 @@ fn file_data(value: &str, fallback_mime: &str) -> Result<(String, Vec<u8>)> {
     let data = STANDARD
         .decode(encoded)
         .map_err(|error| Error::Protocol(format!("invalid RunInference file: {error}")))?;
-    Ok((mime_type.into(), data))
+    Ok(MediaData {
+        mime_type: mime_type.into(),
+        data,
+    })
 }
 
 fn text_parts(parts: &[ContentPart]) -> String {

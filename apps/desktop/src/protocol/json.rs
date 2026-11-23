@@ -52,8 +52,6 @@ fn is_integral(value: f64) -> bool {
 
 /// Every integral `f64` inside `u64`'s range is exactly representable as `u64`,
 /// so the guarded cast below is lossless.
-/// Every integral `f64` inside `u64`'s range is exactly representable as `u64`,
-/// so the guarded cast below is lossless.
 #[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,

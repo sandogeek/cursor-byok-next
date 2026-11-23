@@ -6,7 +6,6 @@ mod catalog;
 mod data;
 mod definition;
 mod descriptor;
-mod error;
 mod host;
 mod manifest;
 mod origin;
@@ -15,12 +14,12 @@ mod state;
 mod wire;
 mod worker;
 
+pub use crate::{Error, Result};
 pub use descriptor::{
-    ADAPTER_ID_PREFIX, AddMethodDefinition, FormFieldDefinition, PluginDescriptor,
+    ADAPTER_ID_PREFIX, AddMethodDefinition, FormFieldDefinition, ModelId, PluginDescriptor,
     PluginModelDescriptor, PluginProviderDescriptor, PluginResourceDescriptor, PluginResourceView,
     parse_model_id,
 };
-pub use error::{Error, Result};
 pub use host::{FormSubmitResponse, PluginHost, PluginSnapshot};
 pub use state::ResourceState;
 

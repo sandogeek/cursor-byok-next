@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::calls::CallRecorder;
+use crate::time::now_ms;
 use crate::{
     model::ModelInvocation,
     provider::{ModelEvent, ProviderStream},
@@ -27,11 +28,18 @@ use super::{
         ResourceDefinition, ResourcePresentation, parse_model_id,
     },
     origin,
-    state::{PluginStateStore, ResourceDraft, ResourcePatch, ResourceRecord, StoredModel, now_ms},
+    state::{PluginStateStore, ResourceDraft, ResourcePatch, ResourceRecord, StoredModel},
     worker::{PluginWorker, WorkerStreamItem},
 };
 
 const LIVE_CATALOG_TTL: Duration = Duration::from_secs(15);
+
+/// A provider's model list plus the error that left it incomplete, if any.
+#[derive(Debug, Default)]
+struct ProviderCatalog {
+    models: Vec<StoredModel>,
+    error: Option<String>,
+}
 
 /// Whether a catalog read may reuse the TTL cache or must re-ask the plugin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -289,9 +297,10 @@ impl PluginHost {
                 if !self.provider_configured(&entry, provider).await {
                     continue;
                 }
-                let (stored, _) = self
+                let stored = self
                     .provider_models(&entry, &executable, provider, CatalogRefresh::Cached, None)
-                    .await;
+                    .await
+                    .models;
                 models.extend(stored.into_iter().map(|model| {
                     PluginModelDescriptor::new(
                         &entry.manifest.id,
@@ -306,23 +315,24 @@ impl PluginHost {
     }
 
     pub async fn model(&self, model_id: &str) -> Result<Option<PluginModelDescriptor>> {
-        let Some((plugin_id, provider_id, stored_id)) = parse_model_id(model_id) else {
+        let Some(id) = parse_model_id(model_id) else {
             return Ok(None);
         };
         let executable = self.executable().await?;
-        let entry = self.find_entry(&executable, plugin_id).await?;
-        let provider = find_provider(&entry, provider_id)?;
+        let entry = self.find_entry(&executable, id.plugin).await?;
+        let provider = find_provider(&entry, id.provider)?;
         if !self.provider_configured(&entry, provider).await {
             return Ok(None);
         }
-        let (stored, _) = self
+        let stored = self
             .provider_models(&entry, &executable, provider, CatalogRefresh::Cached, None)
-            .await;
+            .await
+            .models;
         Ok(stored
             .into_iter()
-            .find(|model| model.id == stored_id)
+            .find(|model| model.id == id.model)
             .map(|model| {
-                PluginModelDescriptor::new(plugin_id, &entry.manifest.name, provider, &model)
+                PluginModelDescriptor::new(id.plugin, &entry.manifest.name, provider, &model)
             }))
     }
 
@@ -335,15 +345,18 @@ impl PluginHost {
         let host = self.clone();
         Box::pin(async_stream::try_stream! {
             let model_id = invocation.request.model.model_id.clone();
-            let (plugin_id, provider_id, upstream_id) = parse_model_id(&model_id)
-                .map(|(plugin, provider, model)| (plugin.to_owned(), provider.to_owned(), model.to_owned()))
+            let parsed = parse_model_id(&model_id)
                 .ok_or_else(|| Error::Provider(format!("invalid plugin model ID: {model_id}")))?;
+            let plugin_id = parsed.plugin.to_owned();
+            let provider_id = parsed.provider.to_owned();
+            let upstream_id = parsed.model.to_owned();
             let executable = host.executable().await?;
             let entry = host.find_entry(&executable, &plugin_id).await?;
             let provider = find_provider(&entry, &provider_id)?.clone();
-            let (stored, _) = host
+            let stored = host
                 .provider_models(&entry, &executable, &provider, CatalogRefresh::Cached, None)
-                .await;
+                .await
+                .models;
             let stored = stored
                 .into_iter()
                 .find(|model| model.id == upstream_id)
@@ -477,12 +490,12 @@ impl PluginHost {
             .catalog
             .manifests()
             .into_iter()
-            .map(|(manifest, icon)| PluginDescriptor {
-                id: manifest.id,
-                name: manifest.name,
-                version: manifest.version,
-                author: manifest.author,
-                icon,
+            .map(|loaded| PluginDescriptor {
+                id: loaded.manifest.id,
+                name: loaded.manifest.name,
+                version: loaded.manifest.version,
+                author: loaded.manifest.author,
+                icon: loaded.icon,
                 runtime_ready: false,
                 runtime_error: Some(super::text("plugin.error.bun_missing")),
                 providers: Vec::new(),
@@ -495,7 +508,10 @@ impl PluginHost {
         let plugin_id = &entry.manifest.id;
         let mut providers = Vec::new();
         for provider in &entry.definition.providers {
-            let (stored, catalog_error) = self
+            let ProviderCatalog {
+                models: stored,
+                error: catalog_error,
+            } = self
                 .provider_models(entry, executable, provider, CatalogRefresh::Cached, None)
                 .await;
             let configured = self.provider_configured(entry, provider).await;
@@ -640,7 +656,7 @@ impl PluginHost {
             if provider.resource_type.as_deref() != Some(resource_type) {
                 continue;
             }
-            let (_, error) = self
+            let catalog = self
                 .provider_models(
                     entry,
                     executable,
@@ -649,7 +665,7 @@ impl PluginHost {
                     Some(changed),
                 )
                 .await;
-            errors.extend(error);
+            errors.extend(catalog.error);
         }
         (!errors.is_empty()).then(|| errors.join("; "))
     }
@@ -661,12 +677,12 @@ impl PluginHost {
         provider: &ProviderDefinition,
         refresh: CatalogRefresh,
         only: Option<&HashSet<String>>,
-    ) -> (Vec<StoredModel>, Option<String>) {
+    ) -> ProviderCatalog {
         if !provider.has_models || provider.catalog != LIVE_CATALOG {
-            return (Vec::new(), None);
+            return ProviderCatalog::default();
         }
         let Some(resource_type) = provider.resource_type.as_deref() else {
-            return (Vec::new(), None);
+            return ProviderCatalog::default();
         };
         let records = self
             .inner
@@ -674,7 +690,8 @@ impl PluginHost {
             .resources(&entry.manifest.id, resource_type)
             .await;
         let Ok(records) = records else {
-            return (Vec::new(), None); // Reported on the resource descriptor.
+            // Reported on the resource descriptor instead.
+            return ProviderCatalog::default();
         };
         let mut models = Vec::new();
         let mut errors = Vec::new();
@@ -690,7 +707,10 @@ impl PluginHost {
                 errors.push(format!("{}：{error}", record.key));
             }
         }
-        (models, (!errors.is_empty()).then(|| errors.join("; ")))
+        ProviderCatalog {
+            models,
+            error: (!errors.is_empty()).then(|| errors.join("; ")),
+        }
     }
 
     async fn live_models_for_resource(
@@ -963,7 +983,7 @@ mod tests {
         sync::Notify,
     };
 
-    const MAGPIE: &str = "dev.cursorbyoknext.plugins.magpie";
+    const MAGPIE: &str = super::super::builtin::MAGPIE_PLUGIN_ID;
     const FAKE_KEY: &str = "integration-test-placeholder-key";
 
     async fn fake_gateway() -> (
@@ -1628,11 +1648,11 @@ mod tests {
                 "plugin:dev.cursorbyoknext.plugins.magpie/magpie/{}",
                 model.id
             )),
-            Some((
-                "dev.cursorbyoknext.plugins.magpie",
-                "magpie",
-                "resource-1/gpt-5"
-            ))
+            Some(crate::plugins::ModelId {
+                plugin: "dev.cursorbyoknext.plugins.magpie",
+                provider: "magpie",
+                model: "resource-1/gpt-5",
+            })
         );
     }
 }

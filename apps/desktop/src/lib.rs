@@ -15,12 +15,12 @@ pub mod model;
 pub mod plugins;
 pub mod protocol;
 pub mod provider;
+mod time;
 
 pub use error::{Error, Result};
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
-use nsh_base::theme;
 #[expect(
     unused_imports,
     reason = "re-exported to the TSX boundary and macro output"
@@ -31,6 +31,7 @@ use nsh_core::{
     i18n::Translations,
     prelude::*,
 };
+use parking_lot::Mutex;
 use tokio::sync::watch;
 
 use self::backend::Backend;
@@ -50,9 +51,6 @@ use self::plugins::{
 #[native_module("cursor-byok-next/native")]
 fn native(registry: &mut Registry) {
     registry
-        .register::<Badge>()
-        .module::<Format>()
-        .class::<Counter>()
         .class::<Harness>()
         .class::<Plugins>()
         .class::<Calls>();
@@ -979,35 +977,6 @@ impl Default for Calls {
     }
 }
 
-// A component: `<Badge label="…" onPress={…} />`. The function's doc comment
-// is the component's in TS, the fields' its props'.
-/// The props of [`Badge`].
-#[derive(Debug, Clone, PartialEq, Props)]
-pub struct BadgeProps {
-    /// The text.
-    pub label: Prop<SharedString>,
-}
-
-/// The events of a [`Badge`].
-#[derive(Debug, Clone, PartialEq, Event)]
-pub enum BadgeEvent {
-    /// The badge was pressed.
-    Press,
-}
-
-/// A pill with a label; pressing it reports `onPress`.
-#[component]
-pub fn Badge(props: BadgeProps, cx: Scope<BadgeEvent>) -> impl IntoElement {
-    view()
-        .px_4()
-        .py_2()
-        .rounded_full()
-        .bg(move || theme().primary)
-        .active(|s| s.bg(move || theme().primary.opacity(0.9)))
-        .on_press(move || cx.emit(BadgeEvent::Press))
-        .child(text(props.label).text_color(move || theme().primary_foreground))
-}
-
 fn shared_plugin_host() -> std::result::Result<PluginHost, plugins::Error> {
     if let Some(host) = PLUGIN_HOST.get() {
         return Ok(host.clone());
@@ -1019,6 +988,9 @@ fn shared_plugin_host() -> std::result::Result<PluginHost, plugins::Error> {
 struct BackendWatch {
     sender: watch::Sender<Option<String>>,
     state: Mutex<BackendState>,
+    /// Kept alive for as long as the process runs: the backend owns the axum
+    /// task Cursor talks to, so dropping it would close the port.
+    backend: OnceLock<Backend>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1034,20 +1006,13 @@ fn backend_watch() -> &'static Arc<BackendWatch> {
         Arc::new(BackendWatch {
             sender,
             state: Mutex::new(BackendState::Idle),
+            backend: OnceLock::new(),
         })
     })
 }
 
-fn backend_state(watch: &BackendWatch) -> std::sync::MutexGuard<'_, BackendState> {
-    match watch.state.lock() {
-        Ok(state) => state,
-        Err(poisoned) => {
-            let state = poisoned.into_inner();
-            watch.state.clear_poison();
-            tracing::warn!("recovered a poisoned local loop backend state lock");
-            state
-        }
-    }
+fn backend_state(watch: &BackendWatch) -> parking_lot::MutexGuard<'_, BackendState> {
+    watch.state.lock()
 }
 
 fn backend_addr() -> watch::Receiver<Option<String>> {
@@ -1084,7 +1049,9 @@ fn start_backend_on(
                 let addr = backend.addr().to_string();
                 *backend_state(&watch) = BackendState::Running;
                 watch.sender.send_replace(Some(addr));
-                std::mem::forget(backend);
+                if watch.backend.set(backend).is_err() {
+                    tracing::error!("the local loop backend started twice");
+                }
             }
             Ok(Err(error)) => {
                 *backend_state(&watch) = BackendState::Idle;
@@ -1140,60 +1107,14 @@ fn shared_call_store() -> CallStore {
     CALL_STORE.get_or_init(|| store.clone()).clone()
 }
 
-/// Text helpers.
-#[derive(Debug)]
-#[module]
-pub struct Format;
-
-// A module: `Format.times(3)`. The struct's doc comment is the module's in
-// TS (`#[module]` on it and on this block).
-#[module]
-impl Format {
-    /// "once", "twice", "3 times".
-    pub fn times(count: u32) -> String {
-        match count {
-            1 => "once".to_owned(),
-            2 => "twice".to_owned(),
-            n => format!("{n} times"),
-        }
-    }
-}
-
-/// A count kept in Rust.
-#[derive(Debug, Default)]
-#[class]
-pub struct Counter {
-    count: u32,
-}
-
-// A class: `new Counter()`, `counter.increment()`, `counter.count`.
-#[class]
-impl Counter {
-    /// A counter at 0.
-    pub fn new() -> Self {
-        Counter { count: 0 }
-    }
-
-    /// Adds one; the new count.
-    pub fn increment(&mut self) -> u32 {
-        self.count += 1;
-        self.count
-    }
-
-    /// The count.
-    #[getter]
-    pub fn count(&self) -> u32 {
-        self.count
-    }
-}
-
 #[cfg(test)]
 mod backend_lifecycle_tests {
     use std::sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     };
 
+    use parking_lot::Mutex;
     use tokio::sync::{Notify, watch};
 
     use super::{BackendState, backend_state, start_backend_on};
@@ -1204,6 +1125,7 @@ mod backend_lifecycle_tests {
         Arc::new(super::BackendWatch {
             sender,
             state: Mutex::new(BackendState::Idle),
+            backend: std::sync::OnceLock::new(),
         })
     }
 
@@ -1300,20 +1222,5 @@ mod backend_lifecycle_tests {
             std::future::pending::<Result<Backend>>(),
         );
         wait_for_state(&watch, BackendState::Starting).await;
-    }
-
-    #[test]
-    fn a_poisoned_state_lock_is_recovered() {
-        let watch = isolated_watch();
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
-            let watch = Arc::clone(&watch);
-            move || {
-                let _state = watch.state.lock().unwrap();
-                panic!("injected state lock poison");
-            }
-        }));
-        assert!(watch.state.is_poisoned());
-        assert_eq!(*backend_state(&watch), BackendState::Idle);
-        assert!(!watch.state.is_poisoned());
     }
 }

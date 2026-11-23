@@ -56,6 +56,9 @@ InvokeModel
 | 10 | 详情不存在 | HTTP 404 | `detail()` 返回 `null` | 已清理调用与数据库读取失败是不同界面状态 |
 | 11 | 观测写入 | 网络流内批量等待 SQLite | 有界队列 + 独立 writer，终态前关闭并排空 | 数据库批量写入不占用模型事件处理；终态后响应计数不再变化 |
 | 12 | 指标名称 | TTFB / stream event | 响应头耗时 / 原始网络分块数 | 名称与实现一致；首块时间取到达偏移，而非 flush 时刻 |
+| 13 | 调用记录的模型坐标 | 解构 `plugin_request_url` 的三元组 | `PluginRequestUrl { model, provider, url }` | 具名字段让“模型 id / provider 族 / 请求 URL”在写入 `NewLlmCall` 时不会错位 |
+| 14 | 记录暂停时钟 | 各自 `SystemTime` 调用 | 统一 `crate::time::now_ms()`，饱和到 `i64::MAX` | 三处（calls/plugins/knowledge）曾各有一份 `now_ms`，行为已一致，合并后只留一份 |
+
 
 ## 必须保持的不变量
 

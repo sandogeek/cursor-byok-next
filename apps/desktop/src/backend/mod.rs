@@ -210,7 +210,7 @@ fn misc_routes() -> Router {
         )
         .route(
             "/aiserver.v1.AiService/WriteGitCommitMessage",
-            post(forward_commit_message),
+            post(proxy::forward),
         )
         .route(
             "/aiserver.v1.NetworkService/IsConnected",
@@ -231,13 +231,6 @@ async fn is_connected() -> Result<Response<Body>> {
         HeaderValue::from_static("application/proto"),
     );
     Ok(response)
-}
-
-async fn forward_commit_message(
-    Extension(proxy): Extension<proxy::CursorProxy>,
-    request: Request<Body>,
-) -> Result<Response<Body>> {
-    proxy::forward(Extension(proxy), request).await
 }
 
 async fn run_inference_sse(
@@ -376,10 +369,9 @@ pub(crate) fn proto_response(message: impl prost::Message) -> Response<Body> {
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/proto"),
     );
-    response.headers_mut().insert(
-        header::CONTENT_LENGTH,
-        HeaderValue::from_str(&length.to_string()).expect("body length is valid"),
-    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
     response
 }
 
@@ -454,13 +446,14 @@ pub(crate) fn router_for_test(
     knowledge: KnowledgeService,
     proxy: proxy::CursorProxy,
 ) -> Router {
-    let directory = tempfile::tempdir().expect("temporary call store");
+    // The store owns the file for the test's lifetime, so the directory has to
+    // outlive this function.
+    let directory = tempfile::tempdir().expect("temporary call store").keep();
     let inference = InferenceService::new(
         plugins.clone(),
         knowledge.clone(),
-        CallStore::at(directory.path().join("calls.db")),
+        CallStore::at(directory.join("calls.db")),
     );
-    std::mem::forget(directory);
     router(plugins, inference, proxy, knowledge)
 }
 

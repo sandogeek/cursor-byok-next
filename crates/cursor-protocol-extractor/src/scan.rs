@@ -24,9 +24,10 @@ use crate::compact::{
     extract_compact_enum_values, finish_compact_messages, package_for_compact_pos,
     parse_compact_schema_array, resolve_compact_package_expr,
 };
+use crate::error::Error;
 use crate::types::{
-    Diagnostics, Enum, EnumValue, Field, Message, Method, Service, TypeToken, google_well_known,
-    is_field_name, is_google_pkg, is_ident, is_local_loop_pkg, parse_type_name,
+    Diagnostics, Enum, EnumValue, Field, Message, Method, Service, TypeName, TypeToken,
+    google_well_known, is_field_name, is_google_pkg, is_ident, is_local_loop_pkg, parse_type_name,
 };
 
 #[derive(Debug, Default)]
@@ -159,15 +160,15 @@ impl Scanner<'_> {
     }
 
     fn push_declared(&mut self, type_name: &str) {
-        let (pkg, _) = parse_type_name(type_name);
-        if !type_name.is_empty() && !is_google_pkg(&pkg) {
+        let package = parse_type_name(type_name).package;
+        if !type_name.is_empty() && !is_google_pkg(&package) {
             self.scan.declared.push(type_name.to_string());
         }
     }
 
     fn keep_type(type_name: &str) -> bool {
-        let (pkg, _) = parse_type_name(type_name);
-        is_local_loop_pkg(&pkg) || is_google_pkg(&pkg)
+        let package = parse_type_name(type_name).package;
+        is_local_loop_pkg(&package) || is_google_pkg(&package)
     }
 
     fn keep_package(pkg: &str) -> bool {
@@ -348,13 +349,13 @@ impl Scanner<'_> {
         };
         self.push_declared(&type_name);
         let methods = parse_methods(methods_object);
-        let (package, short_name) = parse_type_name(&type_name);
+        let TypeName { package, short } = parse_type_name(&type_name);
         self.push_service(Service {
             type_name,
             var_name: var_name.to_string(),
             methods,
             package,
-            short_name,
+            short_name: short,
             pos,
             module_start: self.module_start_for(pos),
         });
@@ -369,14 +370,14 @@ impl Scanner<'_> {
         pos: u32,
     ) {
         self.push_declared(type_name);
-        let (package, short_name) = parse_type_name(type_name);
+        let TypeName { package, short } = parse_type_name(type_name);
         self.push_message(Message {
             type_name: type_name.to_string(),
             var_name: var_name.to_string(),
             internal_name: internal_name.to_string(),
             fields,
             package,
-            short_name,
+            short_name: short,
             pos,
             module_start: self.module_start_for(pos),
         });
@@ -384,13 +385,13 @@ impl Scanner<'_> {
 
     fn record_enum(&mut self, type_name: &str, var_name: &str, values: Vec<EnumValue>, pos: u32) {
         self.push_declared(type_name);
-        let (package, short_name) = parse_type_name(type_name);
+        let TypeName { package, short } = parse_type_name(type_name);
         self.push_enum(Enum {
             type_name: type_name.to_string(),
             var_name: var_name.to_string(),
             values,
             package,
-            short_name,
+            short_name: short,
             pos,
             module_start: self.module_start_for(pos),
         });
@@ -405,7 +406,7 @@ impl Scanner<'_> {
             "makeMessageType" => {
                 let Some(type_name) = call
                     .arguments
-                    .get(0)
+                    .first()
                     .and_then(argument_expr)
                     .and_then(string_lit)
                 else {
@@ -422,7 +423,7 @@ impl Scanner<'_> {
             "makeEnum" => {
                 let Some(type_name) = call
                     .arguments
-                    .get(0)
+                    .first()
                     .and_then(argument_expr)
                     .and_then(string_lit)
                 else {
@@ -439,7 +440,7 @@ impl Scanner<'_> {
             "setEnumType" => {
                 let var_name = call
                     .arguments
-                    .get(0)
+                    .first()
                     .and_then(argument_expr)
                     .and_then(ident_name)
                     .unwrap_or("");
@@ -468,18 +469,12 @@ impl Scanner<'_> {
                         class.start,
                     )
                 });
-                if let Some((var_name, internal_name, start)) = class {
-                    if let Some(fields_expr) = call.arguments.first().and_then(argument_expr) {
-                        let fields = self.extract_fields_from_expr(fields_expr);
-                        if let Some(type_name) = self.class_type_name() {
-                            self.record_message(
-                                &type_name,
-                                &var_name,
-                                &internal_name,
-                                fields,
-                                start,
-                            );
-                        }
+                if let Some((var_name, internal_name, start)) = class
+                    && let Some(fields_expr) = call.arguments.first().and_then(argument_expr)
+                {
+                    let fields = self.extract_fields_from_expr(fields_expr);
+                    if let Some(type_name) = self.class_type_name() {
+                        self.record_message(&type_name, &var_name, &internal_name, fields, start);
                     }
                 }
             }
@@ -779,33 +774,33 @@ impl<'a> Visit<'a> for Scanner<'a> {
     }
 
     fn visit_variable_declarator(&mut self, decl: &VariableDeclarator<'a>) {
-        if let Some(name) = binding_ident(&decl.id) {
-            if let Some(init) = &decl.init {
-                self.maybe_package_prefix(name, init, decl.span.start);
-                match init.get_inner_expression() {
-                    Expression::Identifier(id) => {
-                        self.add_alias(decl.span.start, name, id.name.as_str());
-                    }
-                    Expression::ClassExpression(class) => {
-                        self.collect_class(class, Some(name));
-                    }
-                    Expression::CallExpression(call) => {
+        if let Some(name) = binding_ident(&decl.id)
+            && let Some(init) = &decl.init
+        {
+            self.maybe_package_prefix(name, init, decl.span.start);
+            match init.get_inner_expression() {
+                Expression::Identifier(id) => {
+                    self.add_alias(decl.span.start, name, id.name.as_str());
+                }
+                Expression::ClassExpression(class) => {
+                    self.collect_class(class, Some(name));
+                }
+                Expression::CallExpression(call) => {
+                    self.handle_factory_call(Some(name), call);
+                    self.handle_require_call(Some(name), call);
+                }
+                Expression::SequenceExpression(seq) => {
+                    if let Some(last) = seq.expressions.last()
+                        && let Expression::CallExpression(call) = last.get_inner_expression()
+                    {
                         self.handle_factory_call(Some(name), call);
                         self.handle_require_call(Some(name), call);
                     }
-                    Expression::SequenceExpression(seq) => {
-                        if let Some(last) = seq.expressions.last() {
-                            if let Expression::CallExpression(call) = last.get_inner_expression() {
-                                self.handle_factory_call(Some(name), call);
-                                self.handle_require_call(Some(name), call);
-                            }
-                        }
-                    }
-                    Expression::ObjectExpression(object) => {
-                        self.parse_service_from_object(object, name, decl.span.start);
-                    }
-                    _ => {}
                 }
+                Expression::ObjectExpression(object) => {
+                    self.parse_service_from_object(object, name, decl.span.start);
+                }
+                _ => {}
             }
         }
         walk::walk_variable_declarator(self, decl);
@@ -852,34 +847,29 @@ impl<'a> Visit<'a> for Scanner<'a> {
                 } else {
                     ident_name(object).map(str::to_string)
                 };
-            if prop == "typeName" {
-                if let (Some(type_name), Some(var_name)) =
+            if prop == "typeName"
+                && let (Some(type_name), Some(var_name)) =
                     (string_lit(&expr.right), assigned_var.clone())
-                {
-                    let internal = self
-                        .current_class
-                        .as_ref()
-                        .map(|class| class.internal_name.clone())
-                        .unwrap_or_default();
-                    self.record_message(
-                        type_name,
-                        &var_name,
-                        &internal,
-                        Vec::new(),
-                        expr.span.start,
-                    );
-                }
+            {
+                let internal = self
+                    .current_class
+                    .as_ref()
+                    .map(|class| class.internal_name.clone())
+                    .unwrap_or_default();
+                self.record_message(type_name, &var_name, &internal, Vec::new(), expr.span.start);
             }
-            if prop == "fields" {
-                if let Some(var_name) = assigned_var {
-                    let fields = self.extract_fields_from_expr(&expr.right);
-                    if let Some(message) =
-                        self.scan.messages.iter_mut().rev().find(|message| {
-                            message.var_name == var_name && message.fields.is_empty()
-                        })
-                    {
-                        message.fields = fields;
-                    }
+            if prop == "fields"
+                && let Some(var_name) = assigned_var
+            {
+                let fields = self.extract_fields_from_expr(&expr.right);
+                if let Some(message) = self
+                    .scan
+                    .messages
+                    .iter_mut()
+                    .rev()
+                    .find(|message| message.var_name == var_name && message.fields.is_empty())
+                {
+                    message.fields = fields;
                 }
             }
         }
@@ -926,23 +916,29 @@ impl<'a> Visit<'a> for Scanner<'a> {
     }
 }
 
-pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, String> {
+/// Parses one `{no, name, kind, …}` field object out of the bundle AST.
+///
+/// # Errors
+///
+/// Returns [`Error::Field`] when the expression is not an object, or when it
+/// lacks a numeric `no`, a valid `name`, or a string `kind`.
+pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, Error> {
     let Expression::ObjectExpression(_) = expr.get_inner_expression() else {
-        return Err("missing field object".into());
+        return Err(Error::Field("missing field object".into()));
     };
     let no = object_prop(expr, "no")
         .and_then(number_lit)
         .and_then(f64_to_i32)
-        .ok_or_else(|| "missing field no".to_string())?;
+        .ok_or_else(|| Error::Field("missing field no".into()))?;
     let name = object_prop(expr, "name")
         .and_then(string_lit)
-        .ok_or_else(|| "missing field name".to_string())?;
+        .ok_or_else(|| Error::Field("missing field name".into()))?;
     if !is_field_name(name) {
-        return Err(format!("invalid field name: {name}"));
+        return Err(Error::Field(format!("invalid field name: {name}")));
     }
     let kind = object_prop(expr, "kind")
         .and_then(string_lit)
-        .ok_or_else(|| "missing field kind".to_string())?;
+        .ok_or_else(|| Error::Field("missing field kind".into()))?;
     let mut field = Field::new(no, name, kind);
     if let Some(enum_call) =
         object_prop(expr, "T").and_then(|value| match value.get_inner_expression() {
@@ -965,10 +961,11 @@ pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, String> {
     } else if object_prop_shorthand(expr, "T") {
         field.t = Some(TypeToken::Named("T".into()));
     }
-    if let Some(oneof) = object_prop(expr, "oneof").and_then(string_lit) {
-        if is_ident(oneof) && !oneof.contains('$') {
-            field.oneof = oneof.to_string();
-        }
+    if let Some(oneof) = object_prop(expr, "oneof").and_then(string_lit)
+        && is_ident(oneof)
+        && !oneof.contains('$')
+    {
+        field.oneof = oneof.to_string();
     }
     if object_prop(expr, "repeated").is_some_and(is_js_true) {
         field.repeated = true;

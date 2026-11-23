@@ -1001,13 +1001,13 @@ async fn start_recorder(
     request: &crate::model::ModelRequest,
     model: Option<&LocalModel>,
 ) -> CallRecorder {
-    let (stored_id, provider_type, request_url) = plugin_request_url(&request.model.model_id);
+    let request_url = plugin_request_url(&request.model.model_id);
     let display_name = request
         .model
         .display_name
         .clone()
         .or_else(|| model.map(|model| model.display_name.clone()))
-        .unwrap_or_else(|| stored_id.clone());
+        .unwrap_or_else(|| request_url.model.clone());
     CallRecorder::start(
         store.clone(),
         NewLlmCall {
@@ -1016,11 +1016,11 @@ async fn start_recorder(
             conversation_id: conversation_id.into(),
             provider_call_index: i64::try_from(provider_call_index).unwrap_or(i64::MAX),
             model_hash: request.model.model_id.clone(),
-            provider_type: provider_type.clone(),
-            provider_url: request_url.clone(),
-            request_type: provider_type,
-            request_url,
-            model_id: stored_id,
+            provider_type: request_url.provider.clone(),
+            provider_url: request_url.url.clone(),
+            request_type: request_url.provider.clone(),
+            request_url: request_url.url,
+            model_id: request_url.model,
             display_name,
             reasoning_effort: request.model.reasoning.effort.clone(),
             fast: request.model.latency == ModelLatency::Fast,
