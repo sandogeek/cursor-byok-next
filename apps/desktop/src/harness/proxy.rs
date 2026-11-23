@@ -282,6 +282,21 @@ mod tests {
         ca.load().unwrap()
     }
 
+    /// Binds `port` again, retrying while the kernel finishes releasing it.
+    ///
+    /// `stop` returns when the listener is gone from this process, but another
+    /// test binding loopback ports concurrently can still win the race for it,
+    /// and a just-released port can stay reserved for a moment.
+    async fn bind_again(port: u16) -> TcpListener {
+        for _ in 0..50 {
+            match TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(listener) => return listener,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        panic!("port {port} was never released");
+    }
+
     #[tokio::test]
     async fn starting_twice_returns_the_same_port_and_stopping_clears_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -305,7 +320,7 @@ mod tests {
         assert_eq!(runtime.url(), None);
         assert_eq!(runtime.port(), None);
         assert!(!runtime.running());
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = bind_again(port).await;
         drop(listener);
     }
 
@@ -337,7 +352,7 @@ mod tests {
         drop(runtime);
         tokio::task::yield_now().await;
 
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = bind_again(port).await;
         drop(listener);
     }
 

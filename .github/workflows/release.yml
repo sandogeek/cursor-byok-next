@@ -170,6 +170,9 @@ jobs:
       # `<name>-<version>-<platform>.<ext>`, one per architecture of the OS.
       - name: Package the app
         working-directory: apps/desktop
+        # `$RUNNER_TEMP` is a bash variable; pwsh (the Windows default) would
+        # expand it to nothing and hand iscc a `/out\...` path it reads as a flag.
+        shell: bash
         run: nsh package --target ${{ matrix.target }} -o "$RUNNER_TEMP/out"
 
       # The manifest needs every platform's archive at once; the assets are
