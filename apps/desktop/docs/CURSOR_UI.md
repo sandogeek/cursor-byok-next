@@ -25,7 +25,7 @@ Cursor-BYOK-Next/apps/desktop/src/            Cursor-BYOK-Next/apps/desktop/
 
 ## 本步边界
 
-复刻桌面壳、导航分组、Cursor 当前项及状态标签、右侧接管开关和刷新、CA 门禁、安装命令弹窗。调用详细与插件配置已另步接入；数据概览、系统设置、使用教程仍为禁用导航占位。禁用项不假装有页面，不跳路由。
+复刻桌面壳、导航分组、Cursor 当前项及状态标签、右侧接管开关和刷新、CA 门禁、安装命令弹窗。调用详细、插件配置、系统设置已另步接入；数据概览仍为禁用导航占位。禁用项不假装有页面，不跳路由。
 
 接管开关、CA 初始化、刷新接 `cursor-byok-next/native` 的真实 `Harness`，不是演示状态。CA 未 `ready` 时不能启用；停用先弹确认。`caInstallCommand` 只能由用户点击复制，应用不打开终端、不执行命令、不申请 sudo。TSX 的 `HarnessState` 是 Rust 真实状态的镜像，写入只走 Rust 方法。
 

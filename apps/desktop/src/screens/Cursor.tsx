@@ -8,13 +8,14 @@ import { NavigationGroup, NavigationItem, StatusBadge, Surface } from "../ui/Sur
 import { Switch } from "../ui/Switch";
 import { CallDetails } from "./CallDetails";
 import { Calls, type CallLog } from "./Calls";
-import { LanguagePicker } from "./Language";
 import { Plugins, type PluginCatalog } from "./Plugins";
+import { SystemSettings } from "./SystemSettings";
 
 export interface CursorTakeover {
   status(): Promise<HarnessState>;
   initializeCa(): Promise<HarnessState>;
   setEnabled(enabled: boolean): Promise<HarnessState>;
+  setPreferredPort(port: number): Promise<HarnessState>;
 }
 
 const initialState: HarnessState = {
@@ -22,6 +23,8 @@ const initialState: HarnessState = {
   ca: "missing",
   integration: "disabled",
   settingsApplied: false,
+  preferredProxyPort: 0,
+  dataDir: "",
 };
 
 function errorText(cause: unknown) {
@@ -29,7 +32,7 @@ function errorText(cause: unknown) {
 }
 
 export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog; calls: CallLog }) {
-  const page = signal<"cursor" | "plugins" | "calls">("cursor");
+  const page = signal<"cursor" | "plugins" | "calls" | "settings">("cursor");
   const selectedCall = signal<string | null>(null);
   const state = resource(() => props.takeover.status(), { initialValue: initialState });
   const busy = signal(false);
@@ -46,6 +49,11 @@ export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog
   const takeoverLabel = () => enabled() ? t("takeover.switch.disable") : t("takeover.switch.enable");
   const caReady = () => current().ca === "ready";
   const statusTone = () => current().integration === "degraded" ? "warning" : enabled() ? "success" : "neutral";
+  const title = () =>
+    page() === "plugins" ? t("nav.plugins")
+      : page() === "calls" ? t("nav.calls")
+        : page() === "settings" ? t("nav.systemSettings")
+          : t("nav.cursor");
 
   const perform = async (operation: () => Promise<HarnessState>) => {
     if (busy()) return;
@@ -117,23 +125,19 @@ export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog
               selected={page() === "plugins"}
               onPress={() => page.set("plugins")}
             />
-            <NavigationItem label={t("nav.systemSettings")} icon="settings" disabled />
-            <NavigationItem label={t("nav.tutorial")} icon="help" disabled />
-          </View>
-          <View class="flex-1" />
-          <View class="gap-2 border-t border-sidebar-border px-2.5 pb-1 pt-3">
-            <LanguagePicker />
-            <View class="gap-1">
-              <Text class="text-xs font-medium text-sidebar-foreground">Cursor-BYOK-Next</Text>
-              <Text class="text-xs text-muted-foreground">{t("app.tagline")}</Text>
-            </View>
+            <NavigationItem
+              label={t("nav.systemSettings")}
+              icon="settings"
+              selected={page() === "settings"}
+              onPress={() => page.set("settings")}
+            />
           </View>
         </View>
       </Surface>
 
       <View class="min-w-0 flex-1 px-4 pb-4 pt-[env(safe-area-inset-top)]">
         <View class="min-h-16 flex-row items-center justify-between gap-4 pb-3 pl-1" desktop={{ windowDrag: true }}>
-          <Text role="header" class="text-2xl font-semibold text-foreground">{page() === "plugins" ? t("nav.plugins") : page() === "calls" ? t("nav.calls") : t("nav.cursor")}</Text>
+          <Text role="header" class="text-2xl font-semibold text-foreground">{title()}</Text>
           <If when={page() === "cursor"}>
           <Surface class="flex-row items-center gap-2 p-1.5">
             <Text class="pl-1 text-xs text-muted-foreground">{statusLabel()}</Text>
@@ -150,6 +154,9 @@ export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog
 
         <If when={page() === "plugins"}>
           <Plugins catalog={props.plugins} />
+        </If>
+        <If when={page() === "settings"}>
+          <SystemSettings takeover={props.takeover} calls={props.calls} />
         </If>
         <If when={page() === "calls" && selectedCall() === null}>
           <Calls log={props.calls} onOpen={(callId) => selectedCall.set(callId)} />

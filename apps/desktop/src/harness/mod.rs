@@ -97,6 +97,10 @@ pub struct HarnessStatus {
     pub settings_applied: bool,
     pub proxy_url: Option<String>,
     pub proxy_port: Option<u16>,
+    /// The port the user chose in system settings; `0` lets the OS pick.
+    pub preferred_proxy_port: u16,
+    /// Where this app keeps `harness.json`, the CA and its plugins.
+    pub data_dir: String,
     pub ca_install_command: Option<String>,
 }
 
@@ -110,17 +114,21 @@ pub struct HarnessPaths {
     pub state: HarnessStateStore,
     /// The port Cursor is told to use, when a backend is set.
     pub proxy_port: u16,
+    /// The app's own directory, shown in system settings.
+    pub data_dir: PathBuf,
 }
 
 impl HarnessPaths {
     /// Cursor's real files, and this app's own data directory.
     pub fn managed(proxy_port: u16) -> Result<Self> {
+        let data_dir = data_dir()?;
         Ok(Self {
             settings: SettingsStore::managed()?,
             account: AccountStore::managed()?,
             ca: CaManager::managed()?,
             state: HarnessStateStore::managed()?,
             proxy_port,
+            data_dir,
         })
     }
 }
@@ -267,8 +275,20 @@ impl CursorHarness {
             settings_applied,
             proxy_port: proxy.port(),
             proxy_url,
+            preferred_proxy_port: self.intent.read().preferred_port,
+            data_dir: self.paths.data_dir.display().to_string(),
             ca_install_command: self.paths.ca.install_command(),
         }
+    }
+
+    /// Remembers the port the user asked for; `0` lets the OS pick. Takes
+    /// effect the next time the proxy starts.
+    pub fn set_preferred_port(&self, port: u16) -> Result<()> {
+        let mut intent = *self.intent.read();
+        intent.preferred_port = port;
+        self.paths.state.save(intent)?;
+        *self.intent.write() = intent;
+        Ok(())
     }
 
     fn ca_state(&self) -> CaState {
@@ -313,11 +333,13 @@ impl CursorHarness {
             }
             return Ok(());
         }
-        // Reuse the port Cursor's settings were already pointed at, so a
-        // restart never invalidates them.
+        // Reuse the port the user chose, else the one Cursor's settings were
+        // already pointed at, so a restart never invalidates them.
         let preferred = {
             let intent = self.intent.read();
-            if intent.proxy_port != 0 {
+            if intent.preferred_port != 0 {
+                intent.preferred_port
+            } else if intent.proxy_port != 0 {
                 intent.proxy_port
             } else {
                 self.paths.proxy_port
@@ -406,6 +428,7 @@ mod tests {
             ca: CaManager::at(dir.path().join("ca")),
             state: HarnessStateStore::at(dir.path().join("harness.json")),
             proxy_port: 0,
+            data_dir: dir.path().to_path_buf(),
         })
     }
 
@@ -443,6 +466,7 @@ mod tests {
         *harness.intent.write() = HarnessState {
             enabled: true,
             proxy_port: 41000,
+            preferred_port: 0,
         };
 
         harness.disable().await.unwrap();
@@ -474,6 +498,7 @@ mod tests {
             .save(HarnessState {
                 enabled: false,
                 proxy_port: 41000,
+                preferred_port: 0,
             })
             .unwrap();
         *harness.intent.write() = harness.paths.state.load();
@@ -492,11 +517,24 @@ mod tests {
         *harness.intent.write() = HarnessState {
             enabled: false,
             proxy_port: 41000,
+            preferred_port: 0,
         };
 
         let status = harness.status().await;
         assert_eq!(status.integration, IntegrationState::Degraded);
         assert!(status.settings_applied);
+    }
+
+    #[tokio::test]
+    async fn a_chosen_port_is_remembered_for_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let harness = harness(&dir);
+
+        harness.set_preferred_port(41000).unwrap();
+
+        assert_eq!(harness.status().await.preferred_proxy_port, 41000);
+        assert_eq!(harness.paths.state.load().preferred_port, 41000);
+        assert_eq!(harness.paths.state.load().proxy_port, 0);
     }
 
     #[tokio::test]

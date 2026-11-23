@@ -111,6 +111,8 @@ impl From<HarnessStatus> for HarnessState {
             settings_applied: value.settings_applied,
             proxy_url: value.proxy_url,
             proxy_port: value.proxy_port,
+            preferred_proxy_port: value.preferred_proxy_port,
+            data_dir: value.data_dir,
             ca_install_command: value.ca_install_command,
         }
     }
@@ -131,6 +133,10 @@ pub struct HarnessState {
     pub proxy_url: Option<String>,
     /// The port the proxy bound.
     pub proxy_port: Option<u16>,
+    /// The port the user chose in system settings; `0` lets the OS pick.
+    pub preferred_proxy_port: u16,
+    /// Where this app keeps its own files (`harness.json`, `ca/`, plugins).
+    pub data_dir: String,
     /// The command that trusts the CA; the app cannot run it (it needs sudo).
     pub ca_install_command: Option<String>,
 }
@@ -198,6 +204,19 @@ impl Harness {
             .map_err(|error| {
                 HarnessError::Process(format!("CA initialization task failed: {error}"))
             })??;
+        Ok(harness.status().await.into())
+    }
+
+    /// Remembers the port takeover should bind; `0` lets the OS pick. Takes
+    /// effect the next time takeover starts.
+    pub async fn set_preferred_port(
+        this: Instance<Self>,
+        port: u16,
+    ) -> Result<HarnessState, HarnessError> {
+        let (harness, mut backend) =
+            this.with(|harness| (harness.inner.clone(), harness.backend.clone()));
+        attach_backend(&harness, &mut backend).await?;
+        harness.set_preferred_port(port)?;
         Ok(harness.status().await.into())
     }
 

@@ -27,5 +27,9 @@ visualTest("明暗主题下均可渲染，弹窗可用 Escape 关闭", async () 
     await app.press("查看 GPT-5 的详情");
     expect(app.texts()).toContain("Call ID");
     await app.screenshot(`/tmp/cursor-byok-next-${colorScheme}-call-details.png`);
+    await app.press("返回");
+    await app.press("系统设置");
+    expect(app.texts()).toContain("/Users/test/.cursor-byok-next");
+    await app.screenshot(`/tmp/cursor-byok-next-${colorScheme}-settings.png`);
   }
 });

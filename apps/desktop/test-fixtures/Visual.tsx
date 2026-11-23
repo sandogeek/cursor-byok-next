@@ -12,12 +12,15 @@ const state: HarnessState = {
   ca: "untrusted",
   integration: "disabled",
   settingsApplied: false,
+  preferredProxyPort: 0,
+  dataDir: "/Users/test/.cursor-byok-next",
   caInstallCommand: "sudo security add-trusted-cert placeholder-ca.crt",
 };
 const takeover = {
   status: async () => state,
   initializeCa: async () => state,
   setEnabled: async () => state,
+  setPreferredPort: async () => state,
 };
 const plugins = {
   snapshot: async (): Promise<PluginSnapshot> => ({
