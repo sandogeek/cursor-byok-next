@@ -72,5 +72,10 @@ runs:
         bin="$(cd "$extract/nsh/bin" && pwd)"
         # Later steps find `nsh` through this; `nsh` itself finds its
         # runtimes next to the executable, so either path form works.
+        # GITHUB_PATH is read by the runner's own shell, which on Windows
+        # does not understand Git Bash's `/d/...`, so convert it.
+        if [[ "${RUNNER_OS_NAME}" == "Windows" ]]; then
+          bin="$(cygpath -w "$bin")"
+        fi
         echo "$bin" >> "$GITHUB_PATH"
-        "$bin/nsh" --version
+        "$extract/nsh/bin/nsh" --version
