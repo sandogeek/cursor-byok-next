@@ -663,7 +663,10 @@ fn lenient_extract_keeps_files_for_a_bundle_with_no_declarations() {
     const BUNDLE: &str = "// a valid JS file without any protobuf declarations\nvar unused = 1;\n";
     let result = extract_from_sources(&[BUNDLE.to_string()], Strictness::Lenient).expect("lenient");
     assert!(result.files.contains_key("agent_v1.proto"));
-    assert!(!result.diagnostics.shape_errors.is_empty());
+    assert!(
+        !result.diagnostics.shape_errors.is_empty(),
+        "a bundle with no declarations must report the shapes it could not find"
+    );
 }
 
 #[test]

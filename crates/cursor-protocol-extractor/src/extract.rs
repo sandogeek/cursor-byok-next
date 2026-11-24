@@ -31,28 +31,50 @@ pub enum ExtractError {
         source: std::io::Error,
     },
     /// The generated directory could not be put in place.
-    ///
-    /// `backup` names where the previous contents still are when a rollback was
-    /// attempted; `rollback` keeps the rollback failure while `source` keeps the
-    /// original publish failure, so neither cause is lost.
-    #[error(
-        "failed to publish {}: {source}{}{}",
-        output_dir.display(),
-        describe_recovery(backup.as_deref(), rollback.as_ref()),
-        cleanup_note(cleanup_warning.as_deref())
-    )]
-    Publish {
-        output_dir: PathBuf,
-        backup: Option<PathBuf>,
-        #[source]
-        source: std::io::Error,
-        rollback: Option<RollbackFailure>,
-        /// A cleanup failure that happened after the publish failure above; it
-        /// is never reported instead of the cause.
-        cleanup_warning: Option<String>,
-    },
+    #[error("{0}")]
+    Publish(#[source] Box<PublishError>),
     #[error("extracted protos failed the local-loop shape checks:\n{diagnostics}")]
     Validation { diagnostics: Box<Diagnostics> },
+}
+
+/// A failed publish, with where the previous contents are and how the rollback
+/// went.
+///
+/// Boxed inside [`ExtractError::Publish`]: this is the payload that made every
+/// extractor result large, and `io::Error` plus a path is worth keeping off the
+/// stack of every call that can fail.
+#[derive(Debug)]
+pub struct PublishError {
+    /// The directory the generated files were heading for.
+    pub output_dir: PathBuf,
+    /// Where the previous contents still are when a rollback was attempted.
+    pub backup: Option<PathBuf>,
+    /// The original publish failure.
+    pub source: std::io::Error,
+    /// The rollback failure, kept next to the cause above so neither is lost.
+    pub rollback: Option<RollbackFailure>,
+    /// A cleanup failure that happened after the publish failure above; it is
+    /// never reported instead of the cause.
+    pub cleanup_warning: Option<String>,
+}
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to publish {}: {}{}{}",
+            self.output_dir.display(),
+            self.source,
+            describe_recovery(self.backup.as_deref(), self.rollback.as_ref()),
+            cleanup_note(self.cleanup_warning.as_deref())
+        )
+    }
+}
+
+impl std::error::Error for PublishError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// The second failure of a publish: restoring the previous contents.
@@ -81,14 +103,22 @@ impl std::error::Error for RollbackFailure {
 }
 
 impl ExtractError {
+    /// A publish failure with no rollback attempted yet.
+    fn publish(output_dir: &Path, source: std::io::Error) -> Self {
+        Self::Publish(Box::new(PublishError {
+            output_dir: output_dir.to_path_buf(),
+            backup: None,
+            source,
+            rollback: None,
+            cleanup_warning: None,
+        }))
+    }
+}
+
+impl PublishError {
     /// Attaches a cleanup failure that must not replace the original cause.
     fn note(&mut self, warning: String) {
-        if let Self::Publish {
-            cleanup_warning, ..
-        } = self
-        {
-            *cleanup_warning = Some(warning);
-        }
+        self.cleanup_warning = Some(warning);
     }
 }
 
@@ -264,37 +294,26 @@ pub fn write_protos(
     files: &HashMap<String, String>,
 ) -> Result<Vec<String>, ExtractError> {
     let parent = parent_or_cwd(output_dir);
-    fs::create_dir_all(parent).map_err(|source| ExtractError::Publish {
-        output_dir: output_dir.to_path_buf(),
-        backup: None,
-        source,
-        rollback: None,
-        cleanup_warning: None,
-    })?;
+    fs::create_dir_all(parent).map_err(|source| ExtractError::publish(output_dir, source))?;
     let temp_dir = unique_temp_dir(parent, output_dir)?;
     let write_result = (|| {
         for (name, body) in files {
             let path = temp_dir.join(name);
-            fs::write(&path, body).map_err(|source| ExtractError::Publish {
-                output_dir: output_dir.to_path_buf(),
-                backup: None,
-                source,
-                rollback: None,
-                cleanup_warning: None,
-            })?;
+            fs::write(&path, body).map_err(|source| ExtractError::publish(output_dir, source))?;
         }
         replace_dir(output_dir, &temp_dir)
     })();
     match write_result {
         Ok(warnings) => Ok(warnings),
-        Err(mut error) => {
+        Err(ExtractError::Publish(mut error)) => {
             // Best effort: the publish failure stays the cause, and a cleanup
             // that also failed is attached to it rather than swallowing it.
             if let Some(warning) = remove_staged_directory(&temp_dir) {
                 error.note(warning);
             }
-            Err(error)
+            Err(ExtractError::Publish(error))
         }
+        Err(other) => Err(other),
     }
 }
 
@@ -331,26 +350,17 @@ fn unique_temp_dir(parent: &Path, output_dir: &Path) -> Result<PathBuf, ExtractE
             Ok(()) => return Ok(candidate),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(source) => {
-                return Err(ExtractError::Publish {
-                    output_dir: output_dir.to_path_buf(),
-                    backup: None,
-                    source,
-                    rollback: None,
-                    cleanup_warning: None,
-                });
+                return Err(ExtractError::publish(output_dir, source));
             }
         }
     }
-    Err(ExtractError::Publish {
-        output_dir: output_dir.to_path_buf(),
-        backup: None,
-        source: std::io::Error::new(
+    Err(ExtractError::publish(
+        output_dir,
+        std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!("could not allocate a temp directory after {TEMP_DIR_ATTEMPTS} attempts"),
         ),
-        rollback: None,
-        cleanup_warning: None,
-    })
+    ))
 }
 
 /// Swaps the staged directory in, restoring the previous contents on failure.
@@ -364,20 +374,9 @@ fn replace_dir(output_dir: &Path, temp_dir: &Path) -> Result<Vec<String>, Extrac
     let backup = if output_dir.exists() {
         let backup = unique_temp_dir(parent, output_dir)?;
         // `unique_temp_dir` created it only to prove the name was free.
-        fs::remove_dir(&backup).map_err(|source| ExtractError::Publish {
-            output_dir: output_dir.to_path_buf(),
-            backup: None,
-            source,
-            rollback: None,
-            cleanup_warning: None,
-        })?;
-        fs::rename(output_dir, &backup).map_err(|source| ExtractError::Publish {
-            output_dir: output_dir.to_path_buf(),
-            backup: None,
-            source,
-            rollback: None,
-            cleanup_warning: None,
-        })?;
+        fs::remove_dir(&backup).map_err(|source| ExtractError::publish(output_dir, source))?;
+        fs::rename(output_dir, &backup)
+            .map_err(|source| ExtractError::publish(output_dir, source))?;
         Some(backup)
     } else {
         None
@@ -409,13 +408,13 @@ fn replace_dir(output_dir: &Path, temp_dir: &Path) -> Result<Vec<String>, Extrac
                     })
             });
             let leftover = restore_failed.as_ref().and(backup);
-            Err(ExtractError::Publish {
+            Err(ExtractError::Publish(Box::new(PublishError {
                 output_dir: output_dir.to_path_buf(),
                 backup: leftover,
                 source,
                 rollback: restore_failed,
                 cleanup_warning: None,
-            })
+            })))
         }
     }
 }
