@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  NSH_VERSION: "0.6.0"
+  NSH_VERSION: "0.6.1"
   # `macos` and `linux` package both architectures and write one archive per
   # architecture, so one job per OS covers every platform the manifest lists.
   # The key is `nsh_updater::platform()`'s at run time (`macos-aarch64`, …):

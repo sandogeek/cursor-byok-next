@@ -19,11 +19,11 @@ futures-util = "0.3"
 hex = "0.4"
 hudsucker = { version = "0.25", features = ["http2"] }
 json5 = "0.4"
-nsh-core = "0.6.0"
+nsh-core = "0.6.1"
 # `nsh-base` has no hand-written caller in this crate, but every generated
 # platform entry under `.nsh/rust/` calls `nsh_base::registry()`, so removing it
 # breaks `nsh run`/`nsh package` on every target.
-nsh-base = "0.6.0"
+nsh-base = "0.6.1"
 parking_lot = "0.12"
 pem = "3"
 prost = "0.14"

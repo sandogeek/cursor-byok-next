@@ -27,7 +27,7 @@ env:
   # One pin for CI: Cargo.toml's `nsh-*` versions, `.nsh/rust`'s crates
   # and the app's `.nsh/types` all come from this CLI, and check-release.mjs
   # refuses a mismatch with the Cargo dependencies.
-  NSH_VERSION: "0.6.0"
+  NSH_VERSION: "0.6.1"
 
 jobs:
   repository:
