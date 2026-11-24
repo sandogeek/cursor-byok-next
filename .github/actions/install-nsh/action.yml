@@ -13,7 +13,7 @@ inputs:
   version:
     description: nsh release version, without the leading `v`
     required: false
-    default: 0.6.0
+    default: 0.6.1
 
 runs:
   using: composite
