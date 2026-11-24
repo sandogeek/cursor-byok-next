@@ -64,20 +64,29 @@ impl Error {
     /// Wraps a foreign failure with the operation that produced it, keeping the
     /// cause reachable through [`std::error::Error::source`].
     pub(crate) fn context(
-        context: impl Into<String>,
+        context: String,
         source: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
         Self::Context {
-            context: context.into(),
+            context,
             source: Box::new(source),
         }
+    }
+
+    /// Wraps a SQLite failure with the statement or transaction it came from,
+    /// so the log line names the operation instead of "a call-record query".
+    pub(crate) fn database(context: &'static str, source: sqlx::Error) -> Self {
+        Self::Database { context, source }
     }
 }
 
 impl From<sqlx::Error> for Error {
+    /// Fallback for the `?` sites that map rows or run schema statements, where
+    /// the enclosing function already names the operation. Statement sites in
+    /// the call store go through `CallStore::fail` and carry a precise context.
     fn from(source: sqlx::Error) -> Self {
         Self::Database {
-            context: "running a call-record query",
+            context: "accessing the call-record database",
             source,
         }
     }

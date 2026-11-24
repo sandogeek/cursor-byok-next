@@ -94,10 +94,8 @@ pub fn compact_class_by_name<'a>(
         .min_by_key(|class| (class.start.abs_diff(pos), class.start))
 }
 
-pub fn compact_class_name_at(pos: u32, classes: &[CompactClass]) -> String {
-    innermost_compact_class(pos, classes)
-        .map(|class| class.name.clone())
-        .unwrap_or_default()
+pub fn compact_class_name_at(pos: u32, classes: &[CompactClass]) -> Option<String> {
+    innermost_compact_class(pos, classes).map(|class| class.name.clone())
 }
 
 /// Resolves a compact package expression to a dotted package name, or `None`
@@ -276,12 +274,8 @@ fn split_compact_type_and_oneof(spec: &str) -> (&str, Option<String>) {
 }
 
 fn split_compact_flag(spec: &str) -> (&str, Option<char>) {
-    let bytes = spec.as_bytes();
-    match bytes.last() {
-        Some(b'*' | b'?') => {
-            let flag = spec.chars().next_back();
-            (&spec[..spec.len() - 1], flag)
-        }
+    match spec.chars().next_back() {
+        Some(flag @ ('*' | '?')) => (&spec[..spec.len() - flag.len_utf8()], Some(flag)),
         _ => (spec, None),
     }
 }

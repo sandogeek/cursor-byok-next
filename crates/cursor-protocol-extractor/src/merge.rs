@@ -140,15 +140,11 @@ impl NamedDeclaration for Service {
     fn completeness(&self) -> i32 {
         let mut score = length_score(self.methods.len()) * FIELD_COUNT_WEIGHT;
         for method in &self.methods {
-            score += name_completeness(&method.input_type);
-            score += name_completeness(&method.output_type);
+            score += named_completeness(&method.input_type);
+            score += named_completeness(&method.output_type);
         }
         score
     }
-}
-
-fn name_completeness(type_ref: &str) -> i32 {
-    named_completeness(type_ref)
 }
 
 /// Rewrites field and method type references to fully-qualified names.

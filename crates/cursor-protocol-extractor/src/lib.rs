@@ -24,13 +24,19 @@ pub use merge::{
     merge_messages_by_type_name, merge_services_by_type_name, normalize_type_references,
     reclassify_enum_fields, sorted_dedup,
 };
-pub use renderer::collect_imports;
-pub use renderer::{CopiedType, ProtoFile, generate_proto_file};
+pub use renderer::{CopiedType, ProtoFile, collect_imports, generate_proto_file};
 pub use resolver::{
     AliasIndex, ModuleImports, ModuleStart, TypeContext, TypeResolver, build_alias_index,
     build_module_imports,
 };
 pub use scan::{BundleScan, parse_field_object, scan_source};
+pub use types::{
+    Diagnostics, Enum, EnumValue, Field, FieldKind, Message, Method, MethodKind, Service,
+    SymbolKind, TypeName, TypeToken, ValueKind, google_well_known, is_field_name, is_google_pkg,
+    is_ident, is_local_loop_pkg, is_scalar_id, looks_like_full_type_name, looks_like_package_name,
+    looks_like_versioned_type, parse_type_name, scalar_name,
+};
+pub use validate::{has_placeholder, validate_required_agent_shapes};
 
 /// Indexes a scan's declarations, aliases and module imports into a resolver.
 #[must_use]
@@ -45,13 +51,6 @@ pub fn resolver_from_scan(scan: &BundleScan) -> TypeResolver {
         build_module_imports(&scan.module_imports, &scan.module_starts),
     )
 }
-pub use types::{
-    Diagnostics, Enum, EnumValue, Field, FieldKind, Message, Method, MethodKind, Service,
-    SymbolKind, TypeName, TypeToken, ValueKind, google_well_known, is_field_name, is_google_pkg,
-    is_ident, is_local_loop_pkg, is_scalar_id, looks_like_full_type_name, looks_like_package_name,
-    looks_like_versioned_type, parse_type_name, scalar_name,
-};
-pub use validate::{has_placeholder, validate_required_agent_shapes};
 
 /// Parses a single JS field-object literal into a [`Field`].
 ///

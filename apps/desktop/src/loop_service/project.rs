@@ -1,5 +1,7 @@
 //! Projects client-owned model calls into the provider-independent request.
 
+use std::fmt::Write as _;
+
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value};
 
@@ -17,7 +19,10 @@ use crate::{
     },
 };
 
-/// `InferenceCoreMessage.role` values, as Cursor sends them.
+/// `InferenceCoreMessage.role` values, matching `InferenceMessageRole` in
+/// `protocols/cursor/run_inference.proto`. The generated bindings expose the
+/// field as a bare `i32` (no `enum_type` mapping), so the numbers are repeated
+/// here; keep them in step with the enum.
 const ROLE_USER: i32 = 1;
 const ROLE_ASSISTANT: i32 = 2;
 const ROLE_TOOL: i32 = 3;
@@ -281,21 +286,23 @@ fn subagent_models_task_description(
             .then_with(|| left.id.cmp(&right.id))
     });
     let mut description = description.to_owned();
-    description.push_str(
+    write!(
+        description,
         "\n\nAdditional available subagent models (BYOK)\n\n\
          These configured models are also available for explicit model requests. \
          Pass the exact hash or the display name shown below as model; \
-         the server resolves both to the same model.\n",
-    );
+         the server resolves both to the same model.\n"
+    )
+    .expect("formatting into a String cannot fail");
     for model in models {
         // Quoted and escaped the way the prompt format wants, since the name
         // can contain quotes or newlines.
-        let display_name = format!("{:?}", model.display_name);
-        description.push_str("\n- ");
-        description.push_str(&display_name);
-        description.push_str(": model=\"");
-        description.push_str(&model.id);
-        description.push('"');
+        write!(
+            description,
+            "\n- {:?}: model=\"{}\"",
+            model.display_name, model.id
+        )
+        .expect("formatting into a String cannot fail");
     }
     description
 }

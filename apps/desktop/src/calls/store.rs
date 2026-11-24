@@ -369,7 +369,7 @@ impl CallStore {
         )
         .fetch_one(&connected.pool)
         .await
-        .map_err(|error| self.fail(error))?;
+        .map_err(|error| self.fail("reading the detailed-logging setting", error))?;
         serde_json::from_str(&value).map_err(Into::into)
     }
 
@@ -395,7 +395,7 @@ impl CallStore {
         .bind(now_ms())
         .execute(&connected.pool)
         .await
-        .map_err(|error| self.fail(error))?;
+        .map_err(|error| self.fail("saving the detailed-logging setting", error))?;
         Ok(())
     }
 
@@ -432,7 +432,7 @@ impl CallStore {
         .bind(call.detailed)
         .execute(&connected.pool)
         .await
-        .map_err(|error| self.fail(error))?;
+        .map_err(|error| self.fail("inserting a running call", error))?;
         sqlx::query(
             "DELETE FROM llm_calls WHERE call_id IN (
                 SELECT call_id FROM llm_calls
@@ -442,7 +442,7 @@ impl CallStore {
         .bind(MAX_RETAINED_CALLS)
         .execute(&connected.pool)
         .await
-        .map_err(|error| self.fail(error))?;
+        .map_err(|error| self.fail("trimming old calls", error))?;
         Ok(())
     }
 
@@ -478,7 +478,7 @@ impl CallStore {
             .pool
             .begin()
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("starting the request transaction", error))?;
         if detailed {
             sqlx::query("INSERT INTO llm_call_requests(call_id, headers_json, body_json, byte_count) SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM llm_calls WHERE call_id = ? AND status = 'running')")
                 .bind(call_id)
@@ -488,7 +488,7 @@ impl CallStore {
                 .bind(call_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|error| self.fail(error))?;
+                .map_err(|error| self.fail("storing the request headers and body", error))?;
         }
         sqlx::query("UPDATE llm_calls SET request_bytes = ?, request_truncated = ? WHERE call_id = ? AND status = 'running'")
             .bind(saturating::i64_from_usize(body_len))
@@ -496,11 +496,11 @@ impl CallStore {
             .bind(call_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("stamping the request byte count", error))?;
         transaction
             .commit()
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("committing the request transaction", error))?;
         Ok(())
     }
 
@@ -520,7 +520,7 @@ impl CallStore {
             .bind(call_id)
             .execute(&connected.pool)
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("stamping the response headers", error))?;
         Ok(())
     }
 
@@ -546,7 +546,7 @@ impl CallStore {
             .pool
             .begin()
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("starting the chunks transaction", error))?;
         if detailed {
             let mut stored_bytes = sqlx::query_scalar::<_, i64>(
                 "SELECT COALESCE(SUM(byte_count), 0) FROM llm_call_response_chunks WHERE call_id = ?",
@@ -554,7 +554,7 @@ impl CallStore {
             .bind(call_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("summing the stored chunk bytes", error))?;
             let mut truncated = false;
             for chunk in chunks {
                 let data = chunk.data.as_deref().ok_or_else(|| {
@@ -578,7 +578,7 @@ impl CallStore {
                     .bind(call_id)
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|error| self.fail(error))?;
+                    .map_err(|error| self.fail("storing a response chunk", error))?;
                 stored_bytes += saturating::i64_from_usize(chunk.byte_count);
             }
             if truncated || stored_bytes >= MAX_STORED_RESPONSE_BYTES {
@@ -586,7 +586,7 @@ impl CallStore {
                     .bind(call_id)
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|error| self.fail(error))?;
+                    .map_err(|error| self.fail("flagging a truncated response", error))?;
             }
         }
         sqlx::query("UPDATE llm_calls SET first_event_at_ms = COALESCE(first_event_at_ms, ?), response_bytes = response_bytes + ?, response_chunk_count = response_chunk_count + ? WHERE call_id = ? AND status = 'running'")
@@ -596,11 +596,11 @@ impl CallStore {
             .bind(call_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("updating the response totals", error))?;
         transaction
             .commit()
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("committing the chunks transaction", error))?;
         Ok(())
     }
 
@@ -618,7 +618,7 @@ impl CallStore {
             .bind(call_id)
             .execute(&connected.pool)
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("stamping the first valid response", error))?;
         Ok(())
     }
 
@@ -632,7 +632,7 @@ impl CallStore {
             .bind(call_id)
             .execute(&connected.pool)
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("stamping the first text delta", error))?;
         Ok(())
     }
 
@@ -652,7 +652,7 @@ impl CallStore {
             .bind(call_id)
             .execute(&connected.pool)
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("storing the token usage", error))?;
         Ok(())
     }
 
@@ -678,7 +678,7 @@ impl CallStore {
             .bind(call_id)
             .execute(&connected.pool)
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("finishing the call", error))?;
         Ok(())
     }
 
@@ -691,7 +691,7 @@ impl CallStore {
         .bind(list_limit(limit))
         .fetch_all(&connected.pool)
         .await
-        .map_err(|error| self.fail(error))?;
+        .map_err(|error| self.fail("listing the calls", error))?;
         rows.iter().map(summary_from_row).collect()
     }
 
@@ -704,7 +704,7 @@ impl CallStore {
         .bind(call_id)
         .fetch_optional(&connected.pool)
         .await
-        .map_err(|error| self.fail(error))?
+        .map_err(|error| self.fail("reading one call", error))?
         .as_ref()
         .map(summary_from_row)
         .transpose()
@@ -719,7 +719,7 @@ impl CallStore {
         .bind(call_id)
         .fetch_optional(&connected.pool)
         .await
-        .map_err(|error| self.fail(error))?;
+        .map_err(|error| self.fail("reading the stored request", error))?;
         row.map(|row| {
             Ok(LlmCallRequest {
                 headers: serde_json::from_str(row.try_get("headers_json")?)?,
@@ -737,7 +737,7 @@ impl CallStore {
             .bind(call_id)
             .fetch_all(&connected.pool)
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("reading the stored response chunks", error))?;
         rows.into_iter()
             .map(|row| {
                 Ok(LlmCallResponseChunk {
@@ -761,7 +761,7 @@ impl CallStore {
         )
         .fetch_one(&connected.pool)
         .await
-        .map_err(|error| self.fail(error))?;
+        .map_err(|error| self.fail("counting the stored rows", error))?;
         Ok(CallStorage {
             call_count,
             request_count,
@@ -777,23 +777,23 @@ impl CallStore {
             .pool
             .begin()
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("starting the clear-details transaction", error))?;
         sqlx::query("DELETE FROM llm_call_requests")
             .execute(&mut *transaction)
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("deleting stored requests", error))?;
         sqlx::query("DELETE FROM llm_call_response_chunks")
             .execute(&mut *transaction)
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("deleting stored response chunks", error))?;
         sqlx::query("UPDATE llm_calls SET request_truncated = 0, response_truncated = 0")
             .execute(&mut *transaction)
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("resetting the truncation flags", error))?;
         transaction
             .commit()
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("committing the clear-details transaction", error))?;
         drop(write_guard);
         self.try_snapshot(DEFAULT_LIST_LIMIT).await
     }
@@ -806,15 +806,15 @@ impl CallStore {
             .pool
             .begin()
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("starting the clear-all transaction", error))?;
         sqlx::query("DELETE FROM llm_calls")
             .execute(&mut *transaction)
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("deleting every call", error))?;
         transaction
             .commit()
             .await
-            .map_err(|error| self.fail(error))?;
+            .map_err(|error| self.fail("committing the clear-all transaction", error))?;
         drop(write_guard);
         self.try_snapshot(DEFAULT_LIST_LIMIT).await
     }
@@ -823,15 +823,15 @@ impl CallStore {
         self.connected.get_or_try_init(|| connect(&self.path)).await
     }
 
-    fn fail(&self, error: sqlx::Error) -> crate::Error {
+    fn fail(&self, context: &'static str, error: sqlx::Error) -> crate::Error {
         self.mark_degraded();
-        crate::Error::from(error)
+        crate::Error::database(context, error)
     }
 }
 
 async fn connect(path: &Path) -> Result<Connected> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
     let options = SqliteConnectOptions::new()
         .filename(path)

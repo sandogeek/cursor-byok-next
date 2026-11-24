@@ -59,7 +59,7 @@ pub(super) struct NetworkRequest {
 /// Wraps a failed plugin network request, keeping reqwest's own error (and
 /// therefore its whole source chain) instead of flattening it into a string.
 fn provider_error(error: reqwest::Error) -> Error {
-    Error::context("plugin network request failed", error)
+    Error::context("plugin network request failed".to_owned(), error)
 }
 
 /// What one plugin may reach from inside its worker. Cheap to clone: the worker
@@ -162,7 +162,7 @@ impl HostContext {
         body: Option<&str>,
     ) -> Result<(reqwest::RequestBuilder, Option<CallRecorder>)> {
         let url = url::Url::parse(raw_url)
-            .map_err(|error| Error::context("invalid plugin network URL", error))?;
+            .map_err(|error| Error::context("invalid plugin network URL".to_owned(), error))?;
         if !url.username().is_empty() || url.password().is_some() {
             return Err(Error::Config(
                 "plugin network URL must not contain credentials".into(),
@@ -212,7 +212,7 @@ impl HostContext {
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .pool_idle_timeout(HTTP_POOL_IDLE_TIMEOUT)
             .build()
-            .map_err(|error| Error::context("cannot build plugin HTTP client", error))?;
+            .map_err(|error| Error::context("cannot build plugin HTTP client".to_owned(), error))?;
         Ok(self.http.get_or_init(|| client))
     }
 
@@ -223,13 +223,13 @@ impl HostContext {
     ) -> Result<NetworkRequest> {
         let raw_url = wire::required_str(params, "url", HOST_CALL)?;
         let url = url::Url::parse(raw_url)
-            .map_err(|error| Error::context("invalid plugin network URL", error))?;
+            .map_err(|error| Error::context("invalid plugin network URL".to_owned(), error))?;
         let method = params
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or("GET")
             .parse::<reqwest::Method>()
-            .map_err(|error| Error::context("invalid plugin HTTP method", error))?;
+            .map_err(|error| Error::context("invalid plugin HTTP method".to_owned(), error))?;
         let mut headers = HashMap::new();
         if let Some(map) = params.get("headers").and_then(Value::as_object) {
             for (name, value) in map {

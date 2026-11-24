@@ -294,7 +294,7 @@ pub fn is_cursor_host(host: &str) -> bool {
 /// mode or action, harness override, tool restriction) to that loop, so
 /// claiming them locally would turn working turns into a 404.
 fn is_local_path(path: &str) -> bool {
-    crate::backend::PROVIDED_PATHS.contains(&path)
+    crate::backend::provides(path)
 }
 
 #[cfg(test)]

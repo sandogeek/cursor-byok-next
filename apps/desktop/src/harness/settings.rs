@@ -98,7 +98,10 @@ impl SettingsStore {
         let url = Value::String(proxy_url.to_owned());
         settings.insert(PROXY_KEY.to_owned(), url.clone());
         settings.insert(KERBEROS_KEY.to_owned(), url);
-        settings.insert(SUPPORT_KEY.to_owned(), Value::String("on".to_owned()));
+        settings.insert(
+            SUPPORT_KEY.to_owned(),
+            Value::String(PROXY_SUPPORT_ON.to_owned()),
+        );
         settings.insert(DISABLE_HTTP2_KEY.to_owned(), Value::Bool(true));
         settings.insert(SYSTEM_CERTS_KEY.to_owned(), Value::Bool(true));
         self.write(&settings)
@@ -177,20 +180,20 @@ fn matches_managed_proxy(settings: &BTreeMap<String, Value>, proxy_url: &str) ->
         && settings.get(SYSTEM_CERTS_KEY).and_then(Value::as_bool) == Some(true)
 }
 
-/// The host of a proxy URL such as `http://127.0.0.1:41000`.
+/// The host of a proxy URL such as `http://127.0.0.1:41000`, lowercased.
 fn loopback_host(value: &str) -> Option<String> {
-    let authority = value.split_once("://").map_or(value, |(_, rest)| rest);
-    let authority = authority.split('/').next().unwrap_or_default();
-    let host = match authority.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => host,
-        _ => authority,
+    let value = value.trim();
+    // Accept a bare `host:port` too; the scheme is irrelevant to the host check.
+    let candidate = if value.contains("://") {
+        value.to_owned()
+    } else {
+        format!("http://{value}")
     };
-    let host = host
-        .rsplit('@')
-        .next()
-        .unwrap_or(host)
-        .trim_matches(['[', ']']);
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    match url::Url::parse(&candidate).ok()?.host()? {
+        url::Host::Domain(domain) => Some(domain.to_ascii_lowercase()),
+        url::Host::Ipv4(address) => Some(address.to_string()),
+        url::Host::Ipv6(address) => Some(address.to_string()),
+    }
 }
 
 #[cfg(test)]

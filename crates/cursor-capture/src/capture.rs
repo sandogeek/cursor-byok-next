@@ -77,7 +77,9 @@ impl CaptureBuffer {
     }
 
     fn push(&mut self, chunk: &[u8]) {
-        self.size += i64::try_from(chunk.len()).unwrap_or(i64::MAX);
+        self.size = self
+            .size
+            .saturating_add(i64::try_from(chunk.len()).unwrap_or(i64::MAX));
         let captured = self.limit.saturating_sub(self.bytes.len()).min(chunk.len());
         self.bytes.extend_from_slice(&chunk[..captured]);
         if captured < chunk.len() {

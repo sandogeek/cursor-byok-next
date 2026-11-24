@@ -29,7 +29,7 @@ use crate::resolver::{ModuleStart, module_start_by_id};
 use crate::types::{
     Diagnostics, Enum, EnumValue, Field, FieldKind, Message, Method, MethodKind, Service, TypeName,
     TypeToken, ValueKind, google_well_known, is_field_name, is_google_pkg, is_ident,
-    is_local_loop_pkg, parse_type_name,
+    is_local_loop_pkg, looks_like_package_name, parse_type_name,
 };
 
 #[derive(Debug, Default)]
@@ -245,7 +245,7 @@ impl Scanner<'_> {
             return;
         };
         let package = raw.trim_end_matches('.').to_string();
-        if crate::types::looks_like_package_name(&package) {
+        if looks_like_package_name(&package) {
             self.compact_prefixes.push(CompactPrefix {
                 name: name.to_string(),
                 package,
@@ -761,7 +761,7 @@ impl Scanner<'_> {
         self.pending_compact.push(CompactPendingMessage {
             msg: Message {
                 type_name,
-                var_name: compact_class_name_at(pos, &self.compact_classes),
+                var_name: compact_class_name_at(pos, &self.compact_classes).unwrap_or_default(),
                 internal_name: String::new(),
                 fields,
                 package: pkg,

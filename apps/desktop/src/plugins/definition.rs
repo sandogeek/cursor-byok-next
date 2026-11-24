@@ -183,8 +183,9 @@ async fn read_limited(reader: impl tokio::io::AsyncRead + Unpin, limit: usize) -
 }
 
 fn parse_definition_output(output: Vec<u8>) -> Result<PluginModuleDefinition> {
-    let output = String::from_utf8(output)
-        .map_err(|error| Error::context("plugin definition output is not UTF-8", error))?;
+    let output = String::from_utf8(output).map_err(|error| {
+        Error::context("plugin definition output is not UTF-8".to_owned(), error)
+    })?;
     let json = output
         .lines()
         .rev()

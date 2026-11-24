@@ -163,52 +163,41 @@ impl Server {
         let id = self.store.create(exchange);
 
         let (parts, body) = request.into_parts();
-        let captured = self.wrap_body(
-            body,
-            Side::Request,
-            id.clone(),
+        let target = BodyTarget {
+            id: id.clone(),
             path,
-            request_content_type,
-            request_codec,
-        );
+            content_type: request_content_type,
+            codec: request_codec,
+            side: Side::Request,
+        };
+        let captured = self.wrap_body(body, target);
         (id, Request::from_parts(parts, Body::new(captured)))
     }
 
-    fn wrap_body<B>(
-        &self,
-        body: B,
-        side: Side,
-        id: CaptureId,
-        path: String,
-        content_type: String,
-        codec: String,
-    ) -> CaptureBody<B>
+    fn wrap_body<B>(&self, body: B, target: BodyTarget) -> CaptureBody<B>
     where
         B: http_body::Body,
     {
         let max_frames = self.config.max_frames;
-        let decoder = side.streaming_message_type(&path).map(|message_type| {
-            let store = self.store.clone();
-            let frame_id = id.clone();
-            Arc::new(Mutex::new(ConnectFrameDecoder::new(
-                &message_type,
-                &codec,
-                max_frames,
-                move |frame| {
-                    store.update_transient(&frame_id, |exchange| {
-                        side.record_frame(exchange, frame);
-                    });
-                },
-            )))
-        });
+        let decoder = target
+            .side
+            .streaming_message_type(&target.path)
+            .map(|message_type| {
+                let store = self.store.clone();
+                let frame_id = target.id.clone();
+                let side = target.side;
+                Arc::new(Mutex::new(ConnectFrameDecoder::new(
+                    &message_type,
+                    &target.codec,
+                    max_frames,
+                    move |frame| {
+                        store.update_transient(&frame_id, |exchange| {
+                            side.record_frame(exchange, frame);
+                        });
+                    },
+                )))
+            });
         let chunk_decoder = decoder.clone();
-        let target = BodyTarget {
-            id,
-            path,
-            content_type,
-            codec,
-            side,
-        };
         let store = self.store.clone();
         CaptureBody::new(
             body,
@@ -289,11 +278,13 @@ async fn proxy(State(server): State<Arc<Server>>, request: Request<Body>) -> Res
             });
             let captured = server.wrap_body(
                 upstream.into_body(),
-                Side::Response,
-                id,
-                path,
-                content_type,
-                codec,
+                BodyTarget {
+                    id,
+                    path,
+                    content_type,
+                    codec,
+                    side: Side::Response,
+                },
             );
             let mut response = Response::new(Body::new(captured));
             *response.status_mut() = status;

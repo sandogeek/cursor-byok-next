@@ -1,7 +1,7 @@
 //! Connect frames, compressed payloads, and Cursor protobuf views.
 
 use std::io::{self, Read};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::LazyLock;
 
 use brotli::Decompressor;
 use flate2::read::{GzDecoder, ZlibDecoder};
@@ -868,21 +868,19 @@ pub fn decode_stored_connect_frames(
         context: "a stored Connect body",
         source,
     })?;
-    // The callback runs synchronously inside `write`/`close`; the `Arc<Mutex>`
-    // only exists because `ConnectFrameDecoder` keeps its callback until drop.
-    let frames = Arc::new(Mutex::new(Vec::new()));
-    let collected = Arc::clone(&frames);
+    // The callback runs synchronously inside `write`/`close`; a channel keeps the
+    // frames reachable after the decoder (which owns the callback) is dropped,
+    // without sharing a mutex that could be left poisoned.
+    let (sender, receiver) = std::sync::mpsc::channel();
     let mut decoder =
         ConnectFrameDecoder::new(message_type, codec, DEFAULT_MAX_FRAMES, move |frame| {
-            if let Ok(mut frames) = collected.lock() {
-                frames.push(frame);
-            }
+            // The receiver outlives the decoder, so this never fails.
+            let _ = sender.send(frame);
         });
     decoder.write(&payload);
     decoder.close();
     drop(decoder);
-    let frames = Arc::into_inner(frames).unwrap_or_default();
-    Ok(frames.into_inner().unwrap_or_default())
+    Ok(receiver.try_iter().collect())
 }
 
 #[must_use]

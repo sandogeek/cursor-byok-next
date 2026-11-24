@@ -15,14 +15,17 @@ use std::{fs, io, path::PathBuf, sync::OnceLock};
 const DIRECTORY_NAME: &str = ".cursor-byok-next";
 
 /// The app's directory, created on first use, then reused for the process
-/// lifetime so every store lands on the same path.
+/// lifetime so every store lands on the same path. A resolution failure is
+/// cached too, so a broken environment keeps reporting the same error instead
+/// of retrying the filesystem on every call.
 pub(crate) fn data_dir() -> io::Result<PathBuf> {
-    static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
-    if let Some(dir) = DATA_DIR.get() {
-        return Ok(dir.clone());
-    }
-    let dir = resolve()?;
-    Ok(DATA_DIR.get_or_init(|| dir).clone())
+    // `io::Error` is not `Clone`, so the cached failure keeps its kind and
+    // message and is rebuilt on each call.
+    static DATA_DIR: OnceLock<Result<PathBuf, (io::ErrorKind, String)>> = OnceLock::new();
+    DATA_DIR
+        .get_or_init(|| resolve().map_err(|error| (error.kind(), error.to_string())))
+        .clone()
+        .map_err(|(kind, message)| io::Error::new(kind, message))
 }
 
 /// A subdirectory of [`data_dir`], created on demand.

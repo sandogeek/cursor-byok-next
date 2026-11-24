@@ -527,28 +527,24 @@ pub fn looks_like_versioned_type(value: &str) -> bool {
 
 #[must_use]
 pub fn looks_like_package_name(value: &str) -> bool {
-    let trimmed = value
-        .trim()
-        .trim_matches(|c| c == '"' || c == '\'')
-        .trim_end_matches('.');
+    let trimmed = value.trim().trim_matches(['"', '\'']).trim_end_matches('.');
     let mut parts = trimmed.split('.');
     let Some(first) = parts.next() else {
         return false;
     };
-    if first.is_empty()
-        || !first
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic())
-        || !is_ident(first)
-    {
+    if !first.starts_with(|c: char| c.is_ascii_alphabetic()) || !is_ident(first) {
         return false;
     }
-    let rest: Vec<_> = parts.collect();
-    let Some(last) = rest.last() else {
-        return false;
-    };
-    is_version_token(last) && rest.iter().all(|part| is_ident(part))
+    // Every segment must be an identifier and the last one must name a version;
+    // anything else is a type reference, not a package.
+    let mut last = "";
+    for part in parts {
+        if !is_ident(part) {
+            return false;
+        }
+        last = part;
+    }
+    is_version_token(last)
 }
 
 /// A type reference split into its package and its name inside that package.

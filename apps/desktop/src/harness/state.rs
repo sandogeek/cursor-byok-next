@@ -37,7 +37,7 @@ impl PortChoice {
 
     /// The `null | number` the TSX boundary and `harness.json` both use.
     #[must_use]
-    pub fn to_boundary(self) -> Option<u16> {
+    pub fn as_boundary(self) -> Option<u16> {
         match self {
             Self::Unset => None,
             Self::OsAssigned => Some(0),
@@ -59,7 +59,7 @@ impl PortChoice {
 
 impl Serialize for PortChoice {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        self.to_boundary().serialize(serializer)
+        self.as_boundary().serialize(serializer)
     }
 }
 
@@ -200,9 +200,9 @@ mod tests {
         let fixed = PortChoice::from_boundary(Some(42000));
         let unset = PortChoice::from_boundary(None);
 
-        assert_eq!(os_pick.to_boundary(), Some(0));
-        assert_eq!(fixed.to_boundary(), Some(42000));
-        assert_eq!(unset.to_boundary(), None);
+        assert_eq!(os_pick.as_boundary(), Some(0));
+        assert_eq!(fixed.as_boundary(), Some(42000));
+        assert_eq!(unset.as_boundary(), None);
 
         assert_eq!(os_pick.request(Some(41000), 39831), 0);
         assert_eq!(fixed.request(Some(41000), 39831), 42000);

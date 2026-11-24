@@ -296,7 +296,7 @@ impl CursorHarness {
             let proxy = self.proxy.lock().await;
             proxy.running().then(|| proxy.url()).flatten()
         };
-        let healthy = match proxy_url {
+        let healthy = match proxy_url.as_deref() {
             Some(url) => self
                 .managed_settings(Some(url))
                 .await
@@ -320,7 +320,7 @@ impl CursorHarness {
         };
         let settings_url = proxy_url.clone().or_else(|| self.saved_proxy_url());
         let settings = self
-            .managed_settings(settings_url)
+            .managed_settings(settings_url.as_deref())
             .await
             .inspect_err(|error| tracing::warn!(%error, "could not read Cursor settings"));
         let settings_applied = settings.as_ref().is_ok_and(|state| state.is_applied());
@@ -338,7 +338,7 @@ impl CursorHarness {
             settings_applied,
             proxy_port,
             proxy_url,
-            preferred_proxy_port: self.intent.read().preferred_port.to_boundary(),
+            preferred_proxy_port: self.intent.read().preferred_port.as_boundary(),
             data_dir: self.paths.data_dir.display().to_string(),
             ca_install_command: self.paths.ca.install_command(),
         }
@@ -364,8 +364,9 @@ impl CursorHarness {
 
     /// Reads the managed state of Cursor's `settings.json` off the async
     /// thread; the file is a synchronous read and JSONC parse.
-    async fn managed_settings(&self, proxy_url: Option<String>) -> Result<ManagedSettings> {
+    async fn managed_settings(&self, proxy_url: Option<&str>) -> Result<ManagedSettings> {
         let paths = Arc::clone(&self.paths);
+        let proxy_url = proxy_url.map(str::to_owned);
         tokio::task::spawn_blocking(move || paths.settings.managed_state(proxy_url.as_deref()))
             .await
             .map_err(|error| {
@@ -390,7 +391,7 @@ impl CursorHarness {
         // terminating Cursor takes a full process scan and would otherwise
         // block `status()` and `proxy_port()` behind it.
         let running_url = self.proxy.lock().await.url();
-        let settings_applied = match running_url.clone() {
+        let settings_applied = match running_url.as_deref() {
             Some(url) => self.managed_settings(Some(url)).await?.is_applied(),
             None => false,
         };

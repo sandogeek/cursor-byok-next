@@ -562,13 +562,13 @@ impl LoopState {
             .lock()
             .insert(id.clone(), cancellation.clone());
         let recorder = start_recorder(setup, calls, &id, self.provider_call_index, &request).await;
-        self.tasks.spawn(serve_invocation(
-            plugins.clone(),
-            Arc::clone(&self.output),
-            Arc::clone(&self.invocations),
+        self.tasks.spawn(serve_invocation(InvocationJob {
+            plugins: plugins.clone(),
+            output: Arc::clone(&self.output),
+            invocations: Arc::clone(&self.invocations),
             cancellation,
             recorder,
-            ModelInvocation {
+            invocation: ModelInvocation {
                 call_id: id,
                 run_id: setup.run_id.to_owned(),
                 conversation_id: setup.conversation_id.to_owned(),
@@ -576,7 +576,7 @@ impl LoopState {
                 request,
             },
             context_window_tokens,
-        ));
+        }));
         self.provider_call_index += 1;
     }
 
@@ -801,7 +801,9 @@ fn resolve_subagent_models(
     }
 }
 
-async fn serve_invocation(
+/// Everything one background invocation task needs, bundled so the spawn site
+/// and the task agree on one shape instead of seven positional arguments.
+struct InvocationJob {
     plugins: PluginHost,
     output: Arc<OutputHub>,
     invocations: Arc<Mutex<HashMap<String, CancellationToken>>>,
@@ -809,11 +811,30 @@ async fn serve_invocation(
     recorder: CallRecorder,
     invocation: ModelInvocation,
     context_window_tokens: Option<u64>,
-) {
+}
+
+/// One tool call being streamed: the id and name arrive with the start event and
+/// the arguments accumulate across the following deltas until the end event.
+struct PendingToolCall {
+    call_id: String,
+    name: String,
+    arguments: String,
+}
+
+async fn serve_invocation(job: InvocationJob) {
+    let InvocationJob {
+        plugins,
+        output,
+        invocations,
+        cancellation,
+        recorder,
+        invocation,
+        context_window_tokens,
+    } = job;
     let id = invocation.call_id.clone();
     let _cancel_on_drop = recorder.cancel_on_drop();
     let mut stream = plugins.stream_model(invocation, cancellation.clone(), Some(recorder.clone()));
-    let mut tool_calls = HashMap::<usize, (String, String, String)>::new();
+    let mut tool_calls = HashMap::<usize, PendingToolCall>::new();
     let mut error = None;
     // One invocation response per provider event except usage, which sends a
     // pair; the sender is captured once so a stream of deltas allocates nothing.
@@ -878,17 +899,31 @@ async fn serve_invocation(
 /// handed to `send` instead of collected.
 fn model_responses(
     event: ModelEvent,
-    tool_calls: &mut HashMap<usize, (String, String, String)>,
+    tool_calls: &mut HashMap<usize, PendingToolCall>,
     context_window_tokens: Option<u64>,
     send: &mut impl FnMut(pb::InferenceStreamResponse),
 ) {
+    let Some(response) = single_response(event, tool_calls, context_window_tokens, send) else {
+        return;
+    };
+    send(stream_response(response));
+}
+
+/// Maps one event onto the single response it produces, or `None` when the event
+/// is a boundary marker or its usage pair was already handed to `send`.
+fn single_response(
+    event: ModelEvent,
+    tool_calls: &mut HashMap<usize, PendingToolCall>,
+    context_window_tokens: Option<u64>,
+    send: &mut impl FnMut(pb::InferenceStreamResponse),
+) -> Option<pb::inference_stream_response::Response> {
     use pb::inference_stream_response::Response;
     let response = match event {
         ModelEvent::Usage(usage) => {
             for response in usage_responses(usage, context_window_tokens) {
                 send(response);
             }
-            return;
+            return None;
         }
         ModelEvent::TextDelta(text) => Response::TextPart(pb::InferenceTextStreamPart {
             text,
@@ -930,43 +965,12 @@ fn model_responses(
             index,
             call_id,
             name,
-        } => {
-            tool_calls.insert(index, (call_id.clone(), name.clone(), String::new()));
-            Response::ToolCallPart(pb::InferenceToolCallStreamPart {
-                tool_call_id: call_id,
-                tool_name: name,
-                args: String::new(),
-                is_complete: false,
-                tool_index: saturating::option_i32_from_usize(index),
-                ..Default::default()
-            })
-        }
+        } => Response::ToolCallPart(tool_call_start(index, call_id, name, tool_calls)),
         ModelEvent::ToolCallArgumentsDelta { index, delta } => {
-            let Some((call_id, _, arguments)) = tool_calls.get_mut(&index) else {
-                return;
-            };
-            arguments.push_str(&delta);
-            Response::ToolCallPart(pb::InferenceToolCallStreamPart {
-                tool_call_id: call_id.clone(),
-                tool_name: String::new(),
-                args: delta,
-                is_complete: false,
-                tool_index: saturating::option_i32_from_usize(index),
-                ..Default::default()
-            })
+            Response::ToolCallPart(tool_call_arguments(index, delta, tool_calls)?)
         }
         ModelEvent::ToolCallEnd { index } => {
-            let Some((call_id, name, arguments)) = tool_calls.remove(&index) else {
-                return;
-            };
-            Response::ToolCallPart(pb::InferenceToolCallStreamPart {
-                tool_call_id: call_id,
-                tool_name: name,
-                args: arguments,
-                is_complete: true,
-                tool_index: saturating::option_i32_from_usize(index),
-                ..Default::default()
-            })
+            Response::ToolCallPart(tool_call_end(index, tool_calls)?)
         }
         ModelEvent::Start { model_call_id } => {
             Response::InvocationId(pb::InferenceInvocationIdInfo {
@@ -976,15 +980,71 @@ fn model_responses(
         ModelEvent::TextStart
         | ModelEvent::ThinkingStart
         | ModelEvent::ProviderReplayState(_)
-        | ModelEvent::Done(_) => return,
+        | ModelEvent::Done(_) => return None,
     };
-    send(stream_response(response));
+    Some(response)
+}
+
+fn tool_call_start(
+    index: usize,
+    call_id: String,
+    name: String,
+    tool_calls: &mut HashMap<usize, PendingToolCall>,
+) -> pb::InferenceToolCallStreamPart {
+    tool_calls.insert(
+        index,
+        PendingToolCall {
+            call_id: call_id.clone(),
+            name: name.clone(),
+            arguments: String::new(),
+        },
+    );
+    pb::InferenceToolCallStreamPart {
+        tool_call_id: call_id,
+        tool_name: name,
+        args: String::new(),
+        is_complete: false,
+        tool_index: saturating::option_i32_from_usize(index),
+        ..Default::default()
+    }
+}
+
+fn tool_call_arguments(
+    index: usize,
+    delta: String,
+    tool_calls: &mut HashMap<usize, PendingToolCall>,
+) -> Option<pb::InferenceToolCallStreamPart> {
+    let pending = tool_calls.get_mut(&index)?;
+    pending.arguments.push_str(&delta);
+    Some(pb::InferenceToolCallStreamPart {
+        tool_call_id: pending.call_id.clone(),
+        tool_name: String::new(),
+        args: delta,
+        is_complete: false,
+        tool_index: saturating::option_i32_from_usize(index),
+        ..Default::default()
+    })
+}
+
+fn tool_call_end(
+    index: usize,
+    tool_calls: &mut HashMap<usize, PendingToolCall>,
+) -> Option<pb::InferenceToolCallStreamPart> {
+    let pending = tool_calls.remove(&index)?;
+    Some(pb::InferenceToolCallStreamPart {
+        tool_call_id: pending.call_id,
+        tool_name: pending.name,
+        args: pending.arguments,
+        is_complete: true,
+        tool_index: saturating::option_i32_from_usize(index),
+        ..Default::default()
+    })
 }
 
 fn usage_responses(
     usage: Usage,
     context_window_tokens: Option<u64>,
-) -> Vec<pb::InferenceStreamResponse> {
+) -> [pb::InferenceStreamResponse; 2] {
     use pb::inference_stream_response::Response;
     let prompt_tokens = usage.context_input_tokens.or(usage.input_tokens);
     let completion_tokens = usage.output_tokens;
@@ -996,7 +1056,7 @@ fn usage_responses(
             (None, Some(completion)) => Some(completion),
             (None, None) => None,
         });
-    vec![
+    [
         stream_response(Response::Usage(pb::InferenceUsageInfo {
             prompt_tokens: saturating::i32_from_u64(prompt_tokens.unwrap_or_default()),
             completion_tokens: saturating::i32_from_u64(completion_tokens.unwrap_or_default()),

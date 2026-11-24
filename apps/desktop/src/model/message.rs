@@ -27,8 +27,9 @@ pub struct ToolResultContent {
     pub content: String,
     pub is_error: bool,
     /// The parts as the provider sent them, kept only while a tool result is in
-    /// flight. `content` is the wire form, so a deserialize rebuilds this field
-    /// from it instead of restoring it verbatim.
+    /// flight within this process. `content` is the wire form, so a tool result
+    /// that goes through serialize/deserialize comes back with this field empty
+    /// rather than restored; nothing outside the in-flight path reads it.
     #[serde(skip)]
     pub provider_parts: Vec<ContentPart>,
 }

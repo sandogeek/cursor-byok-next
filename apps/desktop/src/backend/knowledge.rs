@@ -382,7 +382,7 @@ impl KnowledgeService {
             operation(&inner.store)
         })
         .await
-        .map_err(|error| Error::context("rules task failed", error))?
+        .map_err(|error| Error::context("rules task failed".to_owned(), error))?
     }
 }
 

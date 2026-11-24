@@ -84,7 +84,7 @@ impl PluginDataStore {
         let bytes = serde_json::to_vec_pretty(value)?;
         tokio::task::spawn_blocking(move || write_once(&directory, &temporary, &target, &bytes))
             .await
-            .map_err(|error| Error::context("plugin data write task failed", error))??;
+            .map_err(|error| Error::context("plugin data write task failed".to_owned(), error))??;
         Ok(())
     }
 

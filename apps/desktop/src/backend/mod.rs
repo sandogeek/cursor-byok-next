@@ -75,12 +75,14 @@ impl Backend {
     }
 }
 
-/// Every Cursor RPC this backend answers, as the request line's path. The MITM
-/// layer rewrites exactly these paths to the local port; a route added below
-/// without an entry here would still reach Cursor's own host.
-pub(crate) const PROVIDED_PATHS: [&str; 31] = [
+/// Paths served by [`inference_routes`], in route order.
+pub(crate) const INFERENCE_PATHS: [&str; 2] = [
     "/aiserver.v1.InferenceService/RunInferenceSSE",
     "/aiserver.v1.BidiService/BidiAppend",
+];
+
+/// Paths served by [`account_routes`], in route order.
+pub(crate) const ACCOUNT_PATHS: [&str; 9] = [
     "/aiserver.v1.AuthService/GetEmail",
     "/aiserver.v1.AuthService/GetUserMeta",
     "/aiserver.v1.DashboardService/GetMe",
@@ -88,12 +90,12 @@ pub(crate) const PROVIDED_PATHS: [&str; 31] = [
     "/aiserver.v1.DashboardService/GetUserProfile",
     "/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
     "/aiserver.v1.DashboardService/GetUsageLimitStatusAndActiveGrants",
-    "/aiserver.v1.AiService/AvailableDocs",
-    "/aiserver.v1.DashboardService/GetEffectiveUserPlugins",
-    "/aiserver.v1.DashboardService/GetUserPrivacyMode",
-    "/agent.v1.AgentService/UpdateConversationMetadata",
-    "/aiserver.v1.AiService/GetServerConfig",
-    "/aiserver.v1.ServerConfigService/GetServerConfig",
+    "/auth/full_stripe_profile",
+    "/auth/stripe_profile",
+];
+
+/// Paths served by [`catalog_routes`], in route order.
+pub(crate) const CATALOG_PATHS: [&str; 7] = [
     "/aiserver.v1.AiService/AvailableModels",
     "/agent.v1.AgentService/GetUsableModels",
     "/aiserver.v1.AiService/GetUsableModels",
@@ -101,16 +103,51 @@ pub(crate) const PROVIDED_PATHS: [&str; 31] = [
     "/aiserver.v1.AiService/GetDefaultModelForCli",
     "/aiserver.v1.AiService/GetDefaultModel",
     "/aiserver.v1.AiService/GetDefaultModelNudgeData",
+];
+
+/// Paths served by [`knowledge_routes`], in route order.
+pub(crate) const KNOWLEDGE_PATHS: [&str; 4] = [
     "/aiserver.v1.AiService/KnowledgeBaseAdd",
     "/aiserver.v1.AiService/KnowledgeBaseList",
     "/aiserver.v1.AiService/KnowledgeBaseUpdate",
     "/aiserver.v1.AiService/KnowledgeBaseRemove",
+];
+
+/// Paths served by [`misc_routes`], in route order.
+pub(crate) const MISC_PATHS: [&str; 9] = [
+    "/aiserver.v1.AiService/AvailableDocs",
+    "/aiserver.v1.DashboardService/GetEffectiveUserPlugins",
+    "/aiserver.v1.DashboardService/GetUserPrivacyMode",
+    "/agent.v1.AgentService/UpdateConversationMetadata",
+    "/aiserver.v1.AiService/GetServerConfig",
+    "/aiserver.v1.ServerConfigService/GetServerConfig",
     "/aiserver.v1.AiService/WriteGitCommitMessage",
     "/aiserver.v1.NetworkService/IsConnected",
-    "/aiserver.v1.AnalyticsService/BootstrapStatsig",
-    "/auth/full_stripe_profile",
-    "/auth/stripe_profile",
+    analytics::BOOTSTRAP_STATSIG_PATH,
 ];
+
+/// Every Cursor RPC this backend answers. The MITM layer rewrites exactly these
+/// paths to the local port; a route added below without an entry here would
+/// still reach Cursor's own host.
+///
+/// Each path lives in the group constant next to the handler that serves it, so
+/// the route table and this list cannot drift apart.
+pub(crate) fn provided_paths() -> impl Iterator<Item = &'static str> {
+    const GROUPS: [&[&str]; 5] = [
+        &INFERENCE_PATHS,
+        &ACCOUNT_PATHS,
+        &CATALOG_PATHS,
+        &KNOWLEDGE_PATHS,
+        &MISC_PATHS,
+    ];
+    GROUPS.into_iter().flatten().copied()
+}
+
+/// Whether this backend owns `path`, which is exactly what the MITM layer checks
+/// before rewriting a request to the local port.
+pub(crate) fn provides(path: &str) -> bool {
+    provided_paths().any(|owned| owned == path)
+}
 
 fn router(
     plugins: PluginHost,
@@ -133,134 +170,56 @@ fn router(
 
 fn inference_routes(router: Router) -> Router {
     router
-        .route(
-            "/aiserver.v1.InferenceService/RunInferenceSSE",
-            post(run_inference_sse),
-        )
-        .route("/aiserver.v1.BidiService/BidiAppend", post(bidi_append))
+        .route(INFERENCE_PATHS[0], post(run_inference_sse))
+        .route(INFERENCE_PATHS[1], post(bidi_append))
 }
 
 fn account_routes() -> Router {
     Router::new()
-        .route(
-            "/aiserver.v1.AuthService/GetEmail",
-            post(account::get_email),
-        )
-        .route(
-            "/aiserver.v1.AuthService/GetUserMeta",
-            post(account::get_user_meta),
-        )
-        .route("/aiserver.v1.DashboardService/GetMe", post(account::get_me))
-        .route(
-            "/aiserver.v1.DashboardService/GetTeams",
-            post(account::get_teams),
-        )
-        .route(
-            "/aiserver.v1.DashboardService/GetUserProfile",
-            post(account::get_user_profile),
-        )
-        .route(
-            "/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
-            post(account::current_period_usage),
-        )
-        .route(
-            "/aiserver.v1.DashboardService/GetUsageLimitStatusAndActiveGrants",
-            post(account::usage_limit_status),
-        )
-        .route("/auth/full_stripe_profile", get(account::stripe_profile))
-        .route("/auth/stripe_profile", get(account::stripe_profile))
+        .route(ACCOUNT_PATHS[0], post(account::get_email))
+        .route(ACCOUNT_PATHS[1], post(account::get_user_meta))
+        .route(ACCOUNT_PATHS[2], post(account::get_me))
+        .route(ACCOUNT_PATHS[3], post(account::get_teams))
+        .route(ACCOUNT_PATHS[4], post(account::get_user_profile))
+        .route(ACCOUNT_PATHS[5], post(account::current_period_usage))
+        .route(ACCOUNT_PATHS[6], post(account::usage_limit_status))
+        .route(ACCOUNT_PATHS[7], get(account::stripe_profile))
+        .route(ACCOUNT_PATHS[8], get(account::stripe_profile))
 }
 
 fn catalog_routes() -> Router {
     Router::new()
-        .route(
-            "/aiserver.v1.AiService/AvailableModels",
-            post(catalog::available_models),
-        )
-        .route(
-            "/agent.v1.AgentService/GetUsableModels",
-            post(catalog::usable_models),
-        )
-        .route(
-            "/aiserver.v1.AiService/GetUsableModels",
-            post(catalog::usable_models),
-        )
-        .route(
-            "/agent.v1.AgentService/GetDefaultModelForCli",
-            post(catalog::default_model_for_cli),
-        )
-        .route(
-            "/aiserver.v1.AiService/GetDefaultModelForCli",
-            post(catalog::default_model_for_cli),
-        )
-        .route(
-            "/aiserver.v1.AiService/GetDefaultModel",
-            post(catalog::default_model),
-        )
-        .route(
-            "/aiserver.v1.AiService/GetDefaultModelNudgeData",
-            post(catalog::default_model_nudge),
-        )
+        .route(CATALOG_PATHS[0], post(catalog::available_models))
+        .route(CATALOG_PATHS[1], post(catalog::usable_models))
+        .route(CATALOG_PATHS[2], post(catalog::usable_models))
+        .route(CATALOG_PATHS[3], post(catalog::default_model_for_cli))
+        .route(CATALOG_PATHS[4], post(catalog::default_model_for_cli))
+        .route(CATALOG_PATHS[5], post(catalog::default_model))
+        .route(CATALOG_PATHS[6], post(catalog::default_model_nudge))
 }
 
 fn knowledge_routes() -> Router {
     Router::new()
-        .route(
-            "/aiserver.v1.AiService/KnowledgeBaseAdd",
-            post(knowledge::add),
-        )
-        .route(
-            "/aiserver.v1.AiService/KnowledgeBaseList",
-            post(knowledge::list),
-        )
-        .route(
-            "/aiserver.v1.AiService/KnowledgeBaseUpdate",
-            post(knowledge::update),
-        )
-        .route(
-            "/aiserver.v1.AiService/KnowledgeBaseRemove",
-            post(knowledge::remove),
-        )
+        .route(KNOWLEDGE_PATHS[0], post(knowledge::add))
+        .route(KNOWLEDGE_PATHS[1], post(knowledge::list))
+        .route(KNOWLEDGE_PATHS[2], post(knowledge::update))
+        .route(KNOWLEDGE_PATHS[3], post(knowledge::remove))
 }
 
 fn misc_routes() -> Router {
     Router::new()
+        .route(MISC_PATHS[0], post(compatibility::empty_metadata))
+        .route(MISC_PATHS[1], post(compatibility::empty_metadata))
+        .route(MISC_PATHS[2], post(compatibility::empty_metadata))
         .route(
-            "/aiserver.v1.AiService/AvailableDocs",
-            post(compatibility::empty_metadata),
-        )
-        .route(
-            "/aiserver.v1.DashboardService/GetEffectiveUserPlugins",
-            post(compatibility::empty_metadata),
-        )
-        .route(
-            "/aiserver.v1.DashboardService/GetUserPrivacyMode",
-            post(compatibility::empty_metadata),
-        )
-        .route(
-            "/agent.v1.AgentService/UpdateConversationMetadata",
+            MISC_PATHS[3],
             post(compatibility::update_conversation_metadata),
         )
-        .route(
-            "/aiserver.v1.AiService/GetServerConfig",
-            post(server_config::get),
-        )
-        .route(
-            "/aiserver.v1.ServerConfigService/GetServerConfig",
-            post(server_config::get),
-        )
-        .route(
-            "/aiserver.v1.AiService/WriteGitCommitMessage",
-            post(proxy::forward),
-        )
-        .route(
-            "/aiserver.v1.NetworkService/IsConnected",
-            post(is_connected),
-        )
-        .route(
-            analytics::BOOTSTRAP_STATSIG_PATH,
-            post(analytics::bootstrap_statsig),
-        )
+        .route(MISC_PATHS[4], post(server_config::get))
+        .route(MISC_PATHS[5], post(server_config::get))
+        .route(MISC_PATHS[6], post(proxy::forward))
+        .route(MISC_PATHS[7], post(is_connected))
+        .route(MISC_PATHS[8], post(analytics::bootstrap_statsig))
 }
 
 async fn is_connected() -> Result<Response<Body>> {
@@ -461,6 +420,44 @@ mod tests {
 
     fn plugin_id() -> String {
         "plugin:dev.cursorbyoknext.plugins.magpie/magpie/missing/model".into()
+    }
+
+    #[test]
+    fn every_provided_path_has_a_route_and_no_path_is_listed_twice() {
+        let owned: Vec<&str> = provided_paths().collect();
+        assert_eq!(owned.len(), 2 + 9 + 7 + 4 + 9, "route count changed");
+        for (index, path) in owned.iter().enumerate() {
+            assert!(
+                path.starts_with('/') && !path.contains("//"),
+                "{path} is not a request path"
+            );
+            assert!(
+                !owned[..index].contains(path),
+                "{path} is listed twice; `route` would panic on a duplicate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_provided_path_is_actually_served_locally() {
+        let root = tempfile::tempdir().unwrap();
+        let plugins = PluginHost::for_test(root.path()).unwrap();
+        let knowledge = KnowledgeService::with_root(root.path().join("rules")).unwrap();
+        let router = router_for_test(plugins, knowledge, proxy::CursorProxy::default());
+        for path in provided_paths() {
+            // `DELETE` matches no route, so axum answers 405 for a registered path
+            // and 404 for an unregistered one without running any handler.
+            let response = router
+                .clone()
+                .oneshot(Request::delete(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{path} is advertised to the MITM layer but has no local route"
+            );
+        }
     }
 
     async fn append(
