@@ -12,7 +12,11 @@ const plugins = new Plugins();
 const calls = new Calls();
 const desktop = new Desktop();
 
-void restoreAppearance().then(() => restoreLocale()).then(async () => {
+void restoreAppearance().then(async (appearance) => {
+  // A fixed appearance also reaches the title bar the platform draws; the
+  // screens took it already. Following the system is AppKit's default.
+  if (appearance) await desktop.setAppearance(appearance);
+}).then(() => restoreLocale()).then(async () => {
   mount(() => <Cursor takeover={takeover} plugins={plugins} calls={calls} desktop={desktop} trayIcon={trayIcon} />);
   if (platform.os === "macos") await desktop.restore();
   // A packaged app checks its signed manifest once at launch; a development

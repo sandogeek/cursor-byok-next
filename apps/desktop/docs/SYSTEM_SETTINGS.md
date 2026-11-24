@@ -9,7 +9,7 @@
 
 ```text
 cursor-byok/apps/desktop/src/features/settings/   apps/desktop/src/
-├── SettingsPage.tsx               319  页面编排   screens/SystemSettings.tsx  277  分区与操作
+├── SettingsPage.tsx               319  页面编排   screens/SystemSettings.tsx  394  分区与操作
 ├── AppLifecycleSettingsCard.tsx   166  开机/静默  ─                          ─
 ├── CommitSettingsCard.tsx         231  commit 模型 ─                          ─
 ├── ExternalApiSettingsCard.tsx     62  外部 API    ─                          ─
@@ -22,12 +22,16 @@ cursor-byok/server/src/                           apps/desktop/src/
 ├── control/settings.rs            188  HTTP 读写   lib.rs Harness    native 方法
 └── local_app/settings.rs          111  Cursor 配置 harness/settings.rs  不改（已有）
 
+apps/desktop/src-tauri/src/desktop.rs  窗口 / 外观   apps/desktop/src/
+├── create_main_window: Overlay 标题栏 + background_color  desktop.rs 255  Dock 设置 + 原生外观（set_app_appearance）
+└── （WebView 前端自己画顶栏）                              App.tsx    25  启动顺序：外观 → 原生 → 语言 → 挂载
+
 新增本仓库自有控件（上游用 SCSS 模块手写）：
 src/ui/SettingRow.tsx    20  设置行：标题 / 说明 / 尾部控件
 src/ui/NumberField.tsx   38  数字框（nsh/base Input 的应用层样式）
 src/ui/Select.tsx        42  下拉框（表单字段外观，系统设置页的语言 / 选项复用）
 src/ui/ChoiceGroup.tsx   35  分段选择（RadioGroup，三类外观选项）
-src/ui/appearance.ts     28  外观持久化（Storage 键）
+src/ui/appearance.ts     34  外观持久化（Storage 键）+ 启动返回值
 ```
 
 行数为 `wc -l` 实测，含测试与空行。
@@ -45,7 +49,8 @@ src/ui/appearance.ts     28  外观持久化（Storage 键）
 │   ├── resource(() => calls.snapshot())        detailed / storage 计数
 │   ├── 详细记录开关 → Calls.setDetailed → CallsSnapshot
 │   └── 清空详情 / 全部 → 确认弹窗 → Calls.clearDetails / clearAll
-├── 外观 → chooseAppearance → setColorScheme + Storage
+├── 外观 → chooseAppearance（setColorScheme + Storage）
+│              └── Desktop.setAppearance（原生标题栏，本次新增）
 ├── Dock（仅 macOS）
 │   ├── Desktop.snapshot()                 读 desktop.json，无副作用
 │   ├── Desktop.setDockIconVisible          AppKit 主线程切换 → 原子保存 → 失败回滚
@@ -85,7 +90,8 @@ src/ui/appearance.ts     28  外观持久化（Storage 键）
 | 9 | 调用观测 | 独立「调用观测」卡片 | 合并进「调用记录」，与调用详细页共享 `Calls` class | 详细模式只有一个所有者；两页各写一份会让开关抢写 |
 | 10 | 存储清理范围 | `details` / `all` 两档，清理后刷新全应用 store | 同样两档，只刷新本页 `CallsSnapshot` | 没有全局 store；调用详细页下次进入会自己读 |
 | 11 | 语言 | 自建 i18n store + 系统语言标签 | `nsh/i18n` + `nsh` Storage 键 | `I18N.md` 已定；设置页复用侧栏同一实现，不复制第二份 |
-| 12 | 主题 | `themeIds` + localStorage + `data-theme` | `setColorScheme("system"|"light"|"dark")` + Storage | NSH 原生外观：`dark:` 类、组件主题和平台控件一起跟随，不需要 DOM dataset |
+| 12 | 主题 | `themeIds` + localStorage + `data-theme` | `setColorScheme("system"|"light"|"dark")` + Storage，另经 `Desktop.setAppearance` 把同一选择交给原生标题栏 | NSH 原生外观：`dark:` 类、组件主题和平台控件一起跟随，不需要 DOM dataset；但 NSH 的 `setColorScheme` 只设置根视图与它自己开的窗口，不设置主窗口所属的 `NSApplication`，系统标题栏会停在系统外观（见 12a） |
+| 12a | 原生标题栏外观 | Tauri `titleBarStyle: Overlay` + 窗口 `background_color`，标题栏跟窗口背景走 | `src/desktop.rs` 的 `set_app_appearance`：macOS 在 `run_on_main_thread` 里设 `NSApplication.appearance`（`nil` = 跟随系统），其他平台 no-op | `NSApplication` 的外观是它各窗口的默认值，主窗口没有自己的外观，所以交通灯与顶栏直接跟着它；这是 NSH 边界之外的唯一缺口，绕不过去，只能在 Rust 侧补。失败只记日志，不撤销已应用的外观选择 |
 | 13 | 数据目录 | 无此信息 | 「关于」显示 `dataDir` 并可复制 | 用户排查接管 / 插件问题需要知道 `~/.cursor-byok-next` 在哪；该值由 Rust 提供，TSX 不拼路径 |
 | 14 | 页面标题 | `PageContent` 内部滚动 | 应用壳统一标题栏 + 唯一滚动区 | `CURSOR_UI.md`：内容区是唯一滚动所有者 |
 | 15 | 保存反馈 | toast | 卡片内行内 notice（成功）/ 页尾 alert（失败） | 本仓库没有 toast 组件；设置项的反馈贴近控件更明确 |
@@ -100,6 +106,10 @@ src/ui/appearance.ts     28  外观持久化（Storage 键）
 4. **调用记录只有一个所有者。** 详细模式与清理都走 `Calls`（`calls.db`），设置页和调用详细页共享同一份实现。
 5. **清理是不可撤销操作**，必须经确认弹窗，文案写明保留什么、删什么。
 6. **外观与语言立即生效**，写入 `Storage` 后重启仍保留；「跟随系统」是删除键值，不是写特殊值。
+6a. **外观有两个落点，一个所有者。** 选择只存在 TSX（Storage + `signal`）；`chooseAppearance` 写 NSH 的 `setColorScheme`，同一个值经 `Desktop.setAppearance` 交给原生标题栏。Rust 不存这份选择，也不从 `Storage` 读它。
+6b. **原生标题栏失败不阻断界面。** `Desktop.setAppearance` 的错误只 `console.warn`，屏幕外观与 Storage 保持已选值；`Desktop` 记住最后一次成功应用的值，重复选择不再过主线程。
+6c. **启动时只在有固定选择时调原生。** `restoreAppearance()` 返回 `null` 表示跟随系统，此时设置 `NSApplication.appearance = nil` 由 AppKit 默认值完成，不必跨线程调用。
+6d. **只有 macOS 需要这次原生同步。** Windows 的标题按钮由 NSH 按应用配色自绘，Linux 的 GTK 头部跟随环境；两者对 `set_app_appearance` 是 no-op，不引入平台分支到 TSX。
 7. **文案只放 `locales/`**，TSX 只调 `t()`；Rust 不新增用户可见文案。
 8. **设置页读取失败不抛错给界面**（`resource` 保留最后值），也不写假数据。
 9. **TSX 不拼路径、不猜端口。** `dataDir`、`preferredProxyPort`、`proxyPort` 全部来自 `HarnessState`。
@@ -125,7 +135,8 @@ Rust 覆盖：`a_file_without_a_choice_field_reads_as_no_choice`、`a_state_with
 
 TSX 覆盖：
 - `系统设置页保存端口与清理存储都走真实边界`（默认禁用保存 → 输入后启用 → 只调用一次 `setPreferredPort` → 清理确认）
-- `系统设置页的外观与语言选择立即生效并记住`（Storage 键两条 + 英文文案切换）
+- `系统设置页的外观与语言选择立即生效并记住`（Storage 键两条 + 英文文案切换；跟随系统启动不调原生，选暗色 / 亮色 / 跟随系统各外发一次 `appearance:*`）
+- `原生外观失败时仍保留外观选择`（`desktop.setAppearance` 抛错后 Storage 与分段选择仍是所选值）
 - `系统设置页在端口越界时给出错误文案`（越界不禁用保存但仍显示错误）
 - `清空端口字段表示沿用上次绑定的端口`（清空后保存发送 `null`，而不是 `0`）
 - `系统设置页的 Dock 开关立即切换并保留真实返回值`（关闭与重新开启各调用一次真实边界）
@@ -135,9 +146,11 @@ TSX 覆盖：
 
 Rust 的 `desktop.rs` 覆盖默认显示、保存并重读、不可读文件回默认，以及缺失字段读成显示；全部使用临时目录。
 
-本步新增 3 项 Dock 界面测试与 5 项 Rust 设置测试。
+本步新增 4 项 Dock 界面测试与 5 项 Rust 设置测试；外观原生同步后续补入 1 项 TSX 失败路径测试与真机双向验收。
 
-本轮验证（2026-11-24）：`nsh check` 通过；`nsh test App.test.tsx` 17/17（含 Dock 三项）；`nsh test test-fixtures/Visual.test.tsx --target macos` 通过（关闭隐藏 → `tray.open` → 同一 `WindowRef` 可见且聚焦）；`cargo test -p nsh-app-cursor-byok-next --lib -- desktop::tests` 5/5；`cargo clippy -p nsh-app-cursor-byok-next --all-targets --all-features -- -D warnings` 通过。
+本轮验证（2026-11-24）：`nsh check`、`nsh build` 通过；`nsh test` 200/201 通过、1 跳过（含 Dock 三项与外观两项）；`nsh test test-fixtures/Visual.test.tsx --target macos` 通过（关闭隐藏 → `tray.open` → 同一 `WindowRef` 可见且聚焦）；`cargo test -p nsh-app-cursor-byok-next --lib -- desktop::tests` 5/5；`cargo clippy -p nsh-app-cursor-byok-next --all-targets --all-features -- -D warnings` 通过。
+
+外观的原生标题栏在真实 `nsh run` 窗口里双向核对（2026-11-24，系统外观为浅色）：选「暗色」后交通灯与标题栏条变深，选「跟随系统」后随系统回到浅色，再选「暗色」又变深；三次切换中内容与标题栏始终同色。
 
 ### 设计完成清单
 
@@ -153,4 +166,5 @@ Rust 的 `desktop.rs` 覆盖默认显示、保存并重读、不可读文件回�
 ### 其他验证范围
 
 - `nsh test test-fixtures/Visual.test.tsx --target macos` 本轮（2026-11-24）通过；`/tmp/cursor-byok-next-{light,dark}-settings.png` 已检查 Dock 行的圆角、字体、间距、对齐、颜色与开关状态。
+- 设置页截图只画窗口内容，不含系统标题栏；原生标题栏的外观因此另用 `nsh run` 的真实窗口截图核对（见上）。
 - VoiceOver、Windows / Linux、大字号与窄窗口未在真实机器逐项核对。

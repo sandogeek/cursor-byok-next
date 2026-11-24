@@ -80,6 +80,19 @@ export function SystemSettings(props: { takeover: CursorTakeover; calls: Setting
   /** The appearance the app starts with was restored in `App.tsx`; mirror it. */
   void readAppearance().then(appearance.set);
 
+  /**
+   * Applies the choice to the screens and to the title bar the platform draws;
+   * the latter is the desktop shell's, as NSH's `setColorScheme` stops at the
+   * views. Failing to tint the bar must not undo the choice itself.
+   */
+  const applyAppearance = (value: Appearance) => {
+    appearance.set(value);
+    chooseAppearance(value);
+    props.desktop.setAppearance(value).catch((cause: unknown) => {
+      console.warn("the native window appearance did not change", cause);
+    });
+  };
+
   const perform = async (operation: () => Promise<void>) => {
     if (busy()) return;
     busy.set(true);
@@ -241,11 +254,7 @@ export function SystemSettings(props: { takeover: CursorTakeover; calls: Setting
               label={t("settings.appearance.title")}
               value={appearance()}
               options={appearanceOptions()}
-              onChange={(next) => {
-                const value = next as Appearance;
-                appearance.set(value);
-                chooseAppearance(value);
-              }}
+              onChange={(next) => applyAppearance(next as Appearance)}
             />
           </SettingRow>
           <SettingRow

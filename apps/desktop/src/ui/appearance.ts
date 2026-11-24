@@ -22,8 +22,14 @@ export async function readAppearance(): Promise<Appearance> {
   return isAppearance(saved) ? saved : "system";
 }
 
-/** Applies a saved choice at launch, before the first screen draws. */
-export async function restoreAppearance() {
-  const saved = await Storage.getItem(APPEARANCE_KEY);
-  if (isAppearance(saved)) setColorScheme(saved);
+/**
+ * The stored choice, applied at launch, before the first screen draws.
+ * `null` while the app follows the system: `setColorScheme` is left as it is,
+ * so the window chrome does not need a native call either.
+ */
+export async function restoreAppearance(): Promise<Appearance | null> {
+  const saved = await readAppearance();
+  if (saved === "system") return null;
+  setColorScheme(saved);
+  return saved;
 }

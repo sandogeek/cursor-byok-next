@@ -9,6 +9,7 @@ import { Dialog } from "../ui/Dialog";
 import { motion } from "../ui/motion";
 import { NavigationGroup, NavigationItem, StatusBadge, Surface } from "../ui/Surface";
 import { Switch } from "../ui/Switch";
+import type { Appearance } from "../ui/appearance";
 import { CallDetails } from "./CallDetails";
 import { Calls, type CallLog } from "./Calls";
 import { Plugins, type PluginCatalog } from "./Plugins";
@@ -38,6 +39,7 @@ export interface DesktopPreferences {
   snapshot(): Promise<DesktopState>;
   restore(): Promise<void>;
   setDockIconVisible(visible: boolean): Promise<DesktopState>;
+  setAppearance(appearance: Appearance): Promise<void>;
 }
 
 export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog; calls: CallLog; desktop: DesktopPreferences; trayIcon: ImageAsset | string; onWindow?: (window: WindowRef) => void }) {

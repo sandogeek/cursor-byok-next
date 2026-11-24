@@ -41,6 +41,7 @@ use tokio::sync::watch;
 
 use self::backend::Backend;
 use self::calls::{CallStatus, CallStore, PayloadStorage};
+pub use self::desktop::AppAppearance;
 use self::harness::{
     CaState as HarnessCa, CursorHarness, Error as HarnessError, HarnessPaths, HarnessStatus,
     IntegrationState as HarnessIntegration,
@@ -85,6 +86,9 @@ impl From<desktop::DockIcon> for DesktopState {
 )]
 pub struct Desktop {
     settings: parking_lot::Mutex<desktop::DesktopSettings>,
+    /// The appearance last handed to `AppKit`; `None` before any was. Asking
+    /// for the same one again then costs no trip to the main thread.
+    applied: parking_lot::Mutex<Option<AppAppearance>>,
 }
 
 #[class]
@@ -93,6 +97,7 @@ impl Desktop {
     pub fn new() -> Result<Self, Error> {
         Ok(Self {
             settings: parking_lot::Mutex::new(desktop::DesktopSettings::managed()?),
+            applied: parking_lot::Mutex::new(None),
         })
     }
 
@@ -146,6 +151,24 @@ impl Desktop {
             return Err(error);
         }
         Ok(requested.into())
+    }
+
+    /// Applies the app's appearance to the title bar the platform draws.
+    ///
+    /// The screens call `setColorScheme` themselves, which NSH applies to its
+    /// views; the title bar above them is the platform's and follows this.
+    /// The choice itself lives in TSX storage, so nothing is saved here; a
+    /// repeat of the choice already applied changes nothing.
+    pub async fn set_appearance(
+        this: Instance<Self>,
+        appearance: AppAppearance,
+    ) -> Result<(), Error> {
+        if this.with(|desktop| *desktop.applied.lock()) == Some(appearance) {
+            return Ok(());
+        }
+        desktop::set_app_appearance(appearance).await?;
+        this.with(|desktop| *desktop.applied.lock() = Some(appearance));
+        Ok(())
     }
 }
 

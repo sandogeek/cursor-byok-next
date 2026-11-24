@@ -2,6 +2,7 @@
 
 use std::{fs, path::PathBuf};
 
+use nsh_core::element::PropEnum;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
@@ -22,6 +23,22 @@ impl DockIcon {
     pub fn is_visible(self) -> bool {
         matches!(self, Self::Visible)
     }
+}
+
+/// The appearance the app shows in, the same choice `setColorScheme` applies
+/// to the screens.
+///
+/// NSH paints the app's own views in it; the title bar macOS draws above
+/// them is `AppKit`'s and follows the window's appearance, which NSH does not
+/// set. The desktop shell sets that here as well, so a forced dark app has a
+/// dark title bar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PropEnum)]
+pub enum AppAppearance {
+    /// Follow the system (default).
+    #[default]
+    System,
+    Light,
+    Dark,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -50,6 +67,10 @@ impl DesktopSettings {
     }
 
     /// A settings store over an explicit file, for tests.
+    ///
+    /// A missing or unparsable file falls back to the defaults: shell appearance
+    /// is cosmetic, so a corrupt `desktop.json` must never block the app from
+    /// opening. The next [`save`](Self::save) replaces the file whole.
     #[must_use]
     pub fn at(path: PathBuf) -> Self {
         let state = fs::read_to_string(&path)
@@ -94,13 +115,32 @@ pub async fn set_dock_icon(dock_icon: DockIcon) -> Result<()> {
     platform::set_dock_icon(dock_icon).await
 }
 
+/// Applies the app's appearance to the native window chrome.
+///
+/// The screens take `setColorScheme` from the TSX side; this covers what NSH
+/// does not: the title bar the platform draws, which follows its own
+/// appearance rather than the views'. Other platforms accept every choice:
+/// Windows paints its caption buttons from the app's scheme already, and
+/// GTK's header follows the environment.
+///
+/// # Errors
+///
+/// Fails on macOS when the main thread is unavailable. Changing the
+/// appearance itself cannot fail.
+pub async fn set_app_appearance(appearance: AppAppearance) -> Result<()> {
+    platform::set_app_appearance(appearance).await
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use nsh_core::element::run_on_main_thread;
     use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+    use objc2_app_kit::{
+        NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
+        NSApplicationActivationPolicy,
+    };
 
-    use super::DockIcon;
+    use super::{AppAppearance, DockIcon};
     use crate::error::{Error, Result};
 
     pub async fn set_dock_icon(dock_icon: DockIcon) -> Result<()> {
@@ -123,14 +163,41 @@ mod platform {
         .await
         .map_err(|error| Error::Runtime(error.to_string()))?
     }
+
+    pub async fn set_app_appearance(appearance: AppAppearance) -> Result<()> {
+        run_on_main_thread(move || {
+            let main_thread = MainThreadMarker::new()
+                .ok_or_else(|| Error::Runtime("AppKit must run on the main thread".into()))?;
+            let name = match appearance {
+                AppAppearance::System => None,
+                // SAFETY: the appearance names are AppKit's immutable
+                // constants.
+                AppAppearance::Light => Some(unsafe { NSAppearanceNameAqua }),
+                // SAFETY: as above.
+                AppAppearance::Dark => Some(unsafe { NSAppearanceNameDarkAqua }),
+            };
+            let appearance = name.and_then(NSAppearance::appearanceNamed);
+            // The application's appearance is what its windows inherit: a
+            // window without one of its own, the main window among them,
+            // draws its title bar in it.
+            NSApplication::sharedApplication(main_thread).setAppearance(appearance.as_deref());
+            Ok(())
+        })
+        .await
+        .map_err(|error| Error::Runtime(error.to_string()))?
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod platform {
-    use super::DockIcon;
+    use super::{AppAppearance, DockIcon};
     use crate::error::Result;
 
     pub async fn set_dock_icon(_dock_icon: DockIcon) -> Result<()> {
+        Ok(())
+    }
+
+    pub async fn set_app_appearance(_appearance: AppAppearance) -> Result<()> {
         Ok(())
     }
 }

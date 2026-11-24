@@ -43,8 +43,11 @@ const desktop = {
   snapshot: () => host.call<DesktopState>("desktop.snapshot"),
   restore: () => host.call<void>("desktop.restore"),
   setDockIconVisible: (visible: boolean) => host.call<DesktopState>("desktop.setDockIconVisible", { visible }),
+  setAppearance: (appearance: string) => host.call<void>("desktop.setAppearance", { appearance }),
 };
 
-void restoreAppearance().then(() => restoreLocale()).then(() => {
+void restoreAppearance().then(async (appearance) => {
+  if (appearance) await desktop.setAppearance(appearance);
+}).then(() => restoreLocale()).then(() => {
   mount(() => <Cursor takeover={takeover} plugins={plugins} calls={calls} desktop={desktop} trayIcon={trayIcon} />);
 });

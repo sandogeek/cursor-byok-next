@@ -158,6 +158,9 @@ function options(initial: HarnessState, calls: string[] = [], plugins: PluginSna
           calls.push(visible ? "dock-on" : "dock-off");
           return { showDockIcon: visible };
         },
+        "desktop.setAppearance": ({ appearance }: { appearance: string }) => {
+          calls.push(`appearance:${appearance}`);
+        },
         "plugins.snapshot": () => catalog,
         "plugins.submitForm": () => {
           calls.push("submitForm");
@@ -361,16 +364,39 @@ test("系统设置页保存端口与清理存储都走真实边界", async () =>
 });
 
 test("系统设置页的外观与语言选择立即生效并记住", async () => {
-  const app = await open("./test-fixtures/App.tsx", options(ready));
+  const calls: string[] = [];
+  const app = await open("./test-fixtures/App.tsx", options(ready, calls));
+  // Following the system needs no native call: it is the window's default.
+  expect(calls).toEqual([]);
   await app.press("系统设置");
   await app.press("暗色");
   expect(app.storage()["cursor-byok-next:appearance"]).toBe("dark");
   expect(app.texts()).toContain("跟随系统");
+  expect(calls).toEqual(["appearance:dark"]);
+  await app.press("亮色");
+  expect(calls).toEqual(["appearance:dark", "appearance:light"]);
+  await app.press("跟随系统");
+  expect(app.storage()["cursor-byok-next:appearance"]).toBeUndefined();
+  expect(calls).toEqual(["appearance:dark", "appearance:light", "appearance:system"]);
+  expect(app.texts()).toContain("外观");
   await app.press("id:settings-language");
   await app.press("English");
   expect(app.texts()).toContain("Appearance");
   expect(app.texts()).not.toContain("外观");
   expect(app.storage()["cursor-byok-next:locale"]).toBe("en-US");
+});
+
+test("原生外观失败时仍保留外观选择", async () => {
+  const setup = options(ready);
+  setup.host.handlers["desktop.setAppearance"] = () => {
+    throw new Error("AppKit 不可用");
+  };
+  const app = await open("./test-fixtures/App.tsx", setup);
+  await app.press("系统设置");
+  await app.press("暗色");
+  expect(app.storage()["cursor-byok-next:appearance"]).toBe("dark");
+  expect(app.texts()).toContain("外观");
+  expect(app.texts()).toContain("暗色");
 });
 
 test("系统设置页的 Dock 开关立即切换并保留真实返回值", async () => {
