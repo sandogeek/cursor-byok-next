@@ -204,6 +204,8 @@ calls:
       headers: 请求头
       body: 请求体
 
+tray:
+  open: 打开 Cursor-BYOK-Next
 settings:
   port:
     title: 代理端口
@@ -222,6 +224,9 @@ settings:
     retention: 只保留最近 1000 次调用。
     clearDetails: 清空详情
     clearAll: 清空全部
+  dock:
+    title: 在 Dock 栏显示
+    description: 关闭后隐藏 Dock 栏图标，可点击菜单栏图标重新打开窗口；重启后继续使用此设置。
   storage:
     clearedDetails: 详细记录已清理。
     clearedAll: 全部调用记录已清理。

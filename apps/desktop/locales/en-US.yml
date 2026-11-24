@@ -204,6 +204,8 @@ calls:
       headers: Request headers
       body: Request body
 
+tray:
+  open: Open Cursor-BYOK-Next
 settings:
   port:
     title: Proxy port
@@ -222,6 +224,9 @@ settings:
     retention: The latest 1000 calls are retained.
     clearDetails: Clear details
     clearAll: Clear all
+  dock:
+    title: Show in Dock
+    description: Turning this off hides the Dock icon. Reopen the window from the menu bar icon. The choice is restored at launch.
   storage:
     clearedDetails: Detailed records cleared.
     clearedAll: Every call record cleared.

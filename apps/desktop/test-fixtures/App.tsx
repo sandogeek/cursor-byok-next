@@ -1,8 +1,10 @@
 import { host, mount, setColorScheme } from "nsh";
-import type { CallDetail, CallsSnapshot, HarnessState, PluginFormResult, PluginSnapshot } from "cursor-byok-next/native";
+import { Window } from "nsh/desktop";
+import type { CallDetail, CallsSnapshot, DesktopState, HarnessState, PluginFormResult, PluginSnapshot } from "cursor-byok-next/native";
 import { Cursor } from "../src/screens/Cursor";
 import { restoreLocale } from "../src/screens/Language";
 import { restoreAppearance } from "../src/ui/appearance";
+import trayIcon from "./tray.svg";
 
 if (host.params.colorScheme === "light" || host.params.colorScheme === "dark") {
   setColorScheme(host.params.colorScheme);
@@ -37,6 +39,12 @@ const calls = {
   clearAll: () => host.call<CallsSnapshot>("calls.clearAll"),
 };
 
+const desktop = {
+  snapshot: () => host.call<DesktopState>("desktop.snapshot"),
+  restore: () => host.call<void>("desktop.restore"),
+  setDockIconVisible: (visible: boolean) => host.call<DesktopState>("desktop.setDockIconVisible", { visible }),
+};
+
 void restoreAppearance().then(() => restoreLocale()).then(() => {
-  mount(() => <Cursor takeover={takeover} plugins={plugins} calls={calls} />);
+  mount(() => <Cursor takeover={takeover} plugins={plugins} calls={calls} desktop={desktop} trayIcon={trayIcon} />);
 });

@@ -4,12 +4,14 @@ import { colorMotion } from "./motion";
 export function Switch(props: {
   checked: boolean;
   label: string;
+  testID?: string;
   disabled?: boolean;
   onChange: (event: { checked: boolean }) => void;
 }) {
   return (
     <BaseSwitch
       checked={props.checked}
+      testID={props.testID}
       accessibilityLabel={props.label}
       disabled={props.disabled}
       onChange={props.onChange}

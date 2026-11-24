@@ -1,6 +1,9 @@
-import { Clipboard, createMotion, resource, Scroll, signal, Text, View } from "nsh";
+import { Clipboard, createMotion, platform, resource, Scroll, signal, Text, View } from "nsh";
+import { Tray, currentWindow } from "nsh/desktop";
 import { t } from "nsh/i18n";
-import type { HarnessState } from "cursor-byok-next/native";
+import type { HarnessState, DesktopState } from "cursor-byok-next/native";
+import type { ImageAsset } from "nsh";
+import type { WindowRef } from "nsh/desktop";
 import { Button, IconButton } from "../ui/Button";
 import { Dialog } from "../ui/Dialog";
 import { motion } from "../ui/motion";
@@ -31,7 +34,30 @@ function errorText(cause: unknown) {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
-export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog; calls: CallLog }) {
+export interface DesktopPreferences {
+  snapshot(): Promise<DesktopState>;
+  restore(): Promise<void>;
+  setDockIconVisible(visible: boolean): Promise<DesktopState>;
+}
+
+export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog; calls: CallLog; desktop: DesktopPreferences; trayIcon: ImageAsset | string; onWindow?: (window: WindowRef) => void }) {
+  const window = currentWindow();
+  props.onWindow?.(window);
+  const reopen = () => window.focus();
+  Tray.set({
+    icon: props.trayIcon,
+    tooltip: "Cursor-BYOK-Next",
+    onClick: reopen,
+    menu: [
+      { label: t("tray.open"), onSelect: reopen },
+      { type: "separator" },
+      { role: "quit" },
+    ],
+  });
+  if (platform.os === "macos") {
+    window.set({ closeOnPress: false });
+    window.on("closePress", () => window.hide());
+  }
   const page = signal<"cursor" | "plugins" | "calls" | "settings">("cursor");
   const selectedCall = signal<string | null>(null);
   const state = resource(() => props.takeover.status(), { initialValue: initialState });
@@ -156,7 +182,7 @@ export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog
           <Plugins catalog={props.plugins} />
         </If>
         <If when={page() === "settings"}>
-          <SystemSettings takeover={props.takeover} calls={props.calls} />
+          <SystemSettings takeover={props.takeover} calls={props.calls} desktop={props.desktop} />
         </If>
         <If when={page() === "calls" && selectedCall() === null}>
           <Calls log={props.calls} onOpen={(callId) => selectedCall.set(callId)} />

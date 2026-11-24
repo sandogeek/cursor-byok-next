@@ -2,7 +2,7 @@ import { appInfo, Clipboard, openUrl, Scroll, createMotion, resource, signal, Te
 import { t } from "nsh/i18n";
 import { shellInfo } from "nsh/updater";
 import type { CallsSnapshot, HarnessState } from "cursor-byok-next/native";
-import type { CursorTakeover } from "./Cursor";
+import type { CursorTakeover, DesktopPreferences } from "./Cursor";
 import { chooseAppearance, readAppearance, type Appearance } from "../ui/appearance";
 import { Button } from "../ui/Button";
 import { ChoiceGroup } from "../ui/ChoiceGroup";
@@ -53,10 +53,11 @@ function parsePort(text: string): number | null | undefined {
   return port <= 65_535 ? port : undefined;
 }
 
-export function SystemSettings(props: { takeover: CursorTakeover; calls: SettingsCallLog }) {
+export function SystemSettings(props: { takeover: CursorTakeover; calls: SettingsCallLog; desktop: DesktopPreferences }) {
   /** The takeover state holds the port the user chose and the app's data dir. */
   const tracking = resource(() => props.takeover.status(), { initialValue: initialTracking });
   const calls = resource(() => props.calls.snapshot(), { initialValue: emptyCalls });
+  const desktop = resource(() => props.desktop.snapshot(), { initialValue: { showDockIcon: true } });
   const appearance = signal<Appearance>("system");
   const busy = signal(false);
   const error = signal("");
@@ -106,6 +107,12 @@ export function SystemSettings(props: { takeover: CursorTakeover; calls: Setting
   const toggleDetailed = (enabled: boolean) => {
     void perform(async () => {
       calls.mutate(await props.calls.setDetailed(enabled));
+    });
+  };
+
+  const toggleDock = (visible: boolean) => {
+    void perform(async () => {
+      desktop.mutate(await props.desktop.setDockIconVisible(visible));
     });
   };
 
@@ -218,6 +225,17 @@ export function SystemSettings(props: { takeover: CursorTakeover; calls: Setting
         </Surface>
 
         <Surface class="gap-1 p-4">
+          <If when={current().platform === "macos"}>
+            <SettingRow title={t("settings.dock.title")} description={t("settings.dock.description")}>
+              <Switch
+                checked={desktop().showDockIcon}
+                testID="settings-dock"
+                label={t("settings.dock.title")}
+                disabled={busy() || desktop.loading()}
+                onChange={({ checked }) => toggleDock(checked)}
+              />
+            </SettingRow>
+          </If>
           <SettingRow title={t("settings.appearance.title")} description={t("settings.appearance.description")}>
             <ChoiceGroup
               label={t("settings.appearance.title")}

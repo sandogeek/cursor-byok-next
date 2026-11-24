@@ -10,6 +10,7 @@ mod atomic;
 
 pub mod backend;
 pub mod calls;
+pub mod desktop;
 pub mod error;
 pub mod harness;
 pub mod loop_service;
@@ -57,7 +58,95 @@ fn native(registry: &mut Registry) {
     registry
         .class::<Harness>()
         .class::<Plugins>()
-        .class::<Calls>();
+        .class::<Calls>()
+        .class::<Desktop>();
+}
+
+/// Whether macOS shows the app's Dock icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, JsObject)]
+pub struct DesktopState {
+    /// The saved choice; this setting has no effect on other platforms.
+    pub show_dock_icon: bool,
+}
+
+impl From<desktop::DockIcon> for DesktopState {
+    fn from(value: desktop::DockIcon) -> Self {
+        Self {
+            show_dock_icon: value.is_visible(),
+        }
+    }
+}
+
+/// Desktop shell settings. macOS restores and applies the Dock choice at startup.
+#[class]
+#[expect(
+    missing_debug_implementations,
+    reason = "the class owns a settings file handle behind a lock; the TSX side never Debug-prints it"
+)]
+pub struct Desktop {
+    settings: parking_lot::Mutex<desktop::DesktopSettings>,
+}
+
+#[class]
+impl Desktop {
+    /// Restores the desktop shell's saved settings.
+    pub fn new() -> Result<Self, Error> {
+        Ok(Self {
+            settings: parking_lot::Mutex::new(desktop::DesktopSettings::managed()?),
+        })
+    }
+
+    /// Reads the saved shell settings without changing `AppKit`.
+    ///
+    /// Async because the generated TSX binding groups every member of a class
+    /// the same way; there is nothing to await.
+    #[expect(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "the #[class] binding is async-only; a sync member would change the generated TSX type"
+    )]
+    pub async fn snapshot(this: Instance<Self>) -> DesktopState {
+        this.with(|desktop| desktop.settings.lock().dock_icon())
+            .into()
+    }
+
+    /// Applies the restored Dock setting after the native window is mounted.
+    pub async fn restore(this: Instance<Self>) {
+        let dock_icon = this.with(|desktop| desktop.settings.lock().dock_icon());
+        if dock_icon == desktop::DockIcon::Hidden
+            && let Err(error) = desktop::set_dock_icon(dock_icon).await
+        {
+            tracing::warn!(%error, "could not restore the Dock icon setting");
+        }
+    }
+
+    /// Shows or hides the Dock icon and remembers the choice across launches.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "the native boundary takes the switch's boolean directly"
+    )]
+    pub async fn set_dock_icon_visible(
+        this: Instance<Self>,
+        visible: bool,
+    ) -> Result<DesktopState, Error> {
+        let requested = if visible {
+            desktop::DockIcon::Visible
+        } else {
+            desktop::DockIcon::Hidden
+        };
+        let previous = this.with(|desktop| desktop.settings.lock().dock_icon());
+        desktop::set_dock_icon(requested).await?;
+        let saved = this.with_mut(|desktop| desktop.settings.lock().save(requested));
+        if let Err(error) = saved {
+            // `AppKit` already accepted the change; put the previous state back
+            // rather than leaving the window out of sync with the file.
+            if let Err(rollback) = desktop::set_dock_icon(previous).await {
+                tracing::error!(%rollback, "could not roll back the Dock icon setting");
+            }
+            return Err(error);
+        }
+        Ok(requested.into())
+    }
 }
 
 /// Whether the system trusts the local CA.

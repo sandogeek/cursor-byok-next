@@ -152,6 +152,12 @@ function options(initial: HarnessState, calls: string[] = [], plugins: PluginSna
           current = { ...current, preferredProxyPort: port };
           return current;
         },
+        "desktop.snapshot": () => ({ showDockIcon: true }),
+        "desktop.restore": () => {},
+        "desktop.setDockIconVisible": ({ visible }: { visible: boolean }) => {
+          calls.push(visible ? "dock-on" : "dock-off");
+          return { showDockIcon: visible };
+        },
         "plugins.snapshot": () => catalog,
         "plugins.submitForm": () => {
           calls.push("submitForm");
@@ -365,6 +371,37 @@ test("系统设置页的外观与语言选择立即生效并记住", async () =>
   expect(app.texts()).toContain("Appearance");
   expect(app.texts()).not.toContain("外观");
   expect(app.storage()["cursor-byok-next:locale"]).toBe("en-US");
+});
+
+test("系统设置页的 Dock 开关立即切换并保留真实返回值", async () => {
+  const calls: string[] = [];
+  const app = await open("./test-fixtures/App.tsx", options(ready, calls));
+  await app.press("系统设置");
+  expect(app.texts()).toContain("在 Dock 栏显示");
+  await app.press("id:settings-dock");
+  expect(calls).toEqual(["dock-off"]);
+  await app.press("id:settings-dock");
+  expect(calls).toEqual(["dock-off", "dock-on"]);
+});
+
+test("Dock 设置保存失败时显示错误并保留已确认的状态", async () => {
+  const setup = options(ready);
+  setup.host.handlers["desktop.setDockIconVisible"] = () => {
+    throw new Error("Dock 设置保存失败");
+  };
+  const app = await open("./test-fixtures/App.tsx", setup);
+  await app.press("系统设置");
+  await app.press("id:settings-dock");
+  expect(app.texts()).toContain("Dock 设置保存失败");
+  await app.press("id:settings-dock");
+  expect(app.texts()).toContain("在 Dock 栏显示");
+});
+
+test("非 macOS 平台不显示 Dock 设置", async () => {
+  const setup = { ...options({ ...ready, platform: "windows" }), platform: "windows" as const };
+  const app = await open("./test-fixtures/App.tsx", setup);
+  await app.press("系统设置");
+  expect(app.texts()).not.toContain("在 Dock 栏显示");
 });
 
 test("系统设置页在端口越界时给出错误文案", async () => {

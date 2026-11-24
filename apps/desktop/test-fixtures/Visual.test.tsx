@@ -31,5 +31,10 @@ visualTest("明暗主题下均可渲染，弹窗可用 Escape 关闭", async () 
     await app.press("系统设置");
     expect(app.texts()).toContain("/Users/test/.cursor-byok-next");
     await app.screenshot(`/tmp/cursor-byok-next-${colorScheme}-settings.png`);
+    await app.window("main").pressClose();
+    expect(app.window("main").state()?.visible).toBe(false);
+    await app.host.send("tray.open", {});
+    await app.waitUntil(() => app.window("main").state()?.visible === true);
+    expect(app.window("main").state()?.focused).toBe(true);
   }
 });

@@ -1,7 +1,9 @@
 import { host, mount, setColorScheme } from "nsh";
+import type { WindowRef } from "nsh/desktop";
 import type { CallDetail, CallRecord, CallsSnapshot, HarnessState, PluginFormResult, PluginSnapshot } from "cursor-byok-next/native";
 import { Cursor } from "../src/screens/Cursor";
 import { restoreLocale } from "../src/screens/Language";
+import trayIcon from "./tray.svg";
 
 if (host.params.colorScheme === "light" || host.params.colorScheme === "dark") {
   setColorScheme(host.params.colorScheme);
@@ -91,6 +93,14 @@ const calls = {
   clearAll: async (): Promise<CallsSnapshot> => recordedCalls,
 };
 
+const desktop = {
+  snapshot: async () => ({ showDockIcon: true }),
+  restore: async () => {},
+  setDockIconVisible: async () => ({ showDockIcon: true }),
+};
+
 void restoreLocale().then(() => {
-  mount(() => <Cursor takeover={takeover} plugins={plugins} calls={calls} />);
+  let window: WindowRef | undefined;
+  mount(() => <Cursor takeover={takeover} plugins={plugins} calls={calls} desktop={desktop} trayIcon={trayIcon} onWindow={(value) => { window = value; }} />);
+  host.on("tray.open", () => window?.focus());
 });

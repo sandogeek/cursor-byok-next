@@ -1,9 +1,9 @@
 # 移植记录：系统设置
 
 上游实现：`cursor-byok/apps/desktop/src/features/settings/`（`SettingsPage.tsx` + 7 张卡片）+ `server/src/store/settings.rs` + `server/src/control/settings.rs`。
-本移植：`apps/desktop/src/screens/SystemSettings.tsx` + `src/ui/{SettingRow,NumberField,Select,ChoiceGroup,appearance}` + `src/harness/{state,mod}.rs` + `src/lib.rs` 的 `Harness`。
+本移植：`apps/desktop/src/screens/SystemSettings.tsx` + `src/ui/{SettingRow,NumberField,Select,ChoiceGroup,appearance}` + `src/harness/{state,mod}.rs` + `src/desktop.rs` + `src/lib.rs` 的 `Harness` / `Desktop`。
 
-范围只有一件事：**给本仓库真正拥有的状态提供设置界面**。端口、调用记录、外观、界面语言、数据目录位置；不做上游那些本仓库没有后端的功能。
+范围只有一件事：**给本仓库真正拥有的状态提供设置界面**。端口、调用记录、外观、界面语言、Dock 图标、数据目录位置；不做上游那些本仓库没有后端的功能。
 
 ## 目录映射
 
@@ -46,11 +46,21 @@ src/ui/appearance.ts     28  外观持久化（Storage 键）
 │   ├── 详细记录开关 → Calls.setDetailed → CallsSnapshot
 │   └── 清空详情 / 全部 → 确认弹窗 → Calls.clearDetails / clearAll
 ├── 外观 → chooseAppearance → setColorScheme + Storage
+├── Dock（仅 macOS）
+│   ├── Desktop.snapshot()                 读 desktop.json，无副作用
+│   ├── Desktop.setDockIconVisible          AppKit 主线程切换 → 原子保存 → 失败回滚
+│   └── App.tsx 启动挂载后 Desktop.restore   恢复上次的 Dock 选择
+├── 托盘（macOS 关闭窗口后仍可恢复）
+│   ├── Cursor 根组件 Tray.set             单色模板图标 / 打开 / 退出
+│   ├── 关闭按钮 → closeOnPress: false → WindowRef.hide()
+│   └── 图标点击或「打开」→ currentWindow().focus()
+│       └── 同一主窗口 / 引擎 / 接管生命周期，不重建应用
 ├── 界面语言 → chooseLocale → setLocale + Storage（`src/screens/Language.tsx` 的 `languageItems` / `localePreference`）
 └── 关于 → dataDir（只读）+ 复制 → Clipboard.writeText
 
 持久化
 ├── ~/.cursor-byok-next/harness.json   enabled / proxyPort / preferredPort
+├── ~/.cursor-byok-next/desktop.json   dockIcon（Visible / Hidden，默认 Visible）
 ├── ~/.cursor-byok-next/calls.db       service_settings.llm_detailed_logging + 调用表
 └── NSH Storage                        cursor-byok-next:appearance / :locale
 ```
@@ -68,7 +78,10 @@ src/ui/appearance.ts     28  外观持久化（Storage 键）
 | 5 | TAB / commit 模型 | 可配置公益服务地址与 commit 模型 | 不做 | `LOCAL_LOOP.md` 刻意不做清单：没有 commit settings / TAB 直连需求 |
 | 6 | 外部 API | 本地 OpenAI/Anthropic 端点开关 + 密钥 | 不做 | 本仓库不对外提供模型 API，模型只经 Cursor 的 local loop |
 | 7 | Token 定价 | 四个单价字段，前端换算首页用量 | 不做 | 没有首页用量概览（`MODEL_CALLS.md` 刻意不做） |
-| 8 | 应用生命周期 | 开机启动 / 静默启动 / Dock 图标 / 更新 | 不做 | 这些是 Tauri 插件能力，NSH 侧要另做一套宿主能力，超出本步 |
+| 8 | 应用生命周期 | 开机启动 / 静默启动 / Dock 图标 / 托盘 | 接入 Dock 图标与托盘重开；其余不做 | Dock 通过 `objc2-app-kit` 在 NSH 主线程切换 `NSApplicationActivationPolicy`；托盘复用 `nsh/desktop` 的原生实现，开机启动与静默启动仍超出本步 |
+| 8a | Dock 设置载体 | SQLite `desktop_settings.show_dock_icon` | 独立 `desktop.json` 的 `dockIcon`，由 `Desktop` 独占 | 不混进 `harness.json` 的 Cursor 接管状态机；读写与代理端口互不覆盖 |
+| 8b | Dock 窗口联动 | 无窗口时先 `app.hide()` 再切 Accessory；托盘可重开窗口 | 只切 Activation Policy；macOS 关闭按钮隐藏窗口；托盘 `onClick` 与菜单「打开」共用 `currentWindow().focus()`（NSH 的 `Window.get("main")` 不返回该窗口） | NSH 的 `WindowRef` 已负责取消最小化、显示和激活；保留同一引擎，不复制上游的窗口销毁与重建逻辑 |
+| 8c | Dock 失败语义 | AppKit 切换后保存，失败尝试回滚 | 相同；读取页只调 `snapshot`，启动仅 `restore` 一次 | 打开设置页不能重复改系统策略；保存失败时开关保留最后确认值 |
 | 9 | 调用观测 | 独立「调用观测」卡片 | 合并进「调用记录」，与调用详细页共享 `Calls` class | 详细模式只有一个所有者；两页各写一份会让开关抢写 |
 | 10 | 存储清理范围 | `details` / `all` 两档，清理后刷新全应用 store | 同样两档，只刷新本页 `CallsSnapshot` | 没有全局 store；调用详细页下次进入会自己读 |
 | 11 | 语言 | 自建 i18n store + 系统语言标签 | `nsh/i18n` + `nsh` Storage 键 | `I18N.md` 已定；设置页复用侧栏同一实现，不复制第二份 |
@@ -94,6 +107,11 @@ src/ui/appearance.ts     28  外观持久化（Storage 键）
 11. **`harness.json` 读失败一律降级为默认值**；字段缺失不做迁移（beta 不写兼容层），`preferredPort` 缺失由 serde 的 `Option` 自然读成"没选过"。
 12. **`proxyPort` 与 `preferredPort` 不互相覆盖**：绑定成功只写 `proxyPort`，用户选择只写 `preferredPort`；两者经同一个 `update_intent` 在 `operation` 锁内写入。
 13. **`data_dir()` 每进程解析一次**（`OnceLock`），所有存储共用同一个目录值。
+14. **Dock 只在 macOS 暴露并立即生效**，默认 `Visible`；`desktop.json` 用原子写，成功后才更新 Rust 的已确认状态。
+15. **AppKit 只经 NSH 的 `run_on_main_thread` 调用**。先切策略再保存；保存失败必须尝试恢复旧策略，界面不更新为新值。
+16. **Dock 隐藏不销毁或隐藏当前窗口**，也不阻止接管后台运行。托盘点击或「打开」必须恢复并聚焦同一主窗口；退出走系统 `quit`，不能仅隐藏窗口。
+17. **读取与恢复分开**：设置页 `snapshot()` 只读，启动 `restore()` 才应用保存的策略；失败记录日志而不阻断界面。
+18. **macOS 关闭按钮只隐藏窗口**，不能销毁引擎、接管代理或调用存储；其他平台保留默认关闭行为。托盘点击与菜单「打开」共用同一 `currentWindow()` 引用的 `focus()`；不经 `Window.get("main")`（该 API 不返回本应用主窗口）。
 
 ## 验证
 
@@ -110,8 +128,16 @@ TSX 覆盖：
 - `系统设置页的外观与语言选择立即生效并记住`（Storage 键两条 + 英文文案切换）
 - `系统设置页在端口越界时给出错误文案`（越界不禁用保存但仍显示错误）
 - `清空端口字段表示沿用上次绑定的端口`（清空后保存发送 `null`，而不是 `0`）
+- `系统设置页的 Dock 开关立即切换并保留真实返回值`（关闭与重新开启各调用一次真实边界）
+- `Dock 设置保存失败时显示错误并保留已确认的状态`（失败后可重试，不把开关改成未保存值）
+- `非 macOS 平台不显示 Dock 设置`
+- 真实 macOS 窗口：关闭后主窗口隐藏，测试宿主的 `tray.open` 经同一 `WindowRef.focus()` 恢复为可见且聚焦；生产侧托盘 `onClick` / 菜单「打开」走同一路径；菜单含「打开 Cursor-BYOK-Next」与系统退出。
 
-`nsh test` 当前 169 项：167 通过，1 项显式跳过（`Visual.test.tsx` 需 `--target macos`）。
+Rust 的 `desktop.rs` 覆盖默认显示、保存并重读、不可读文件回默认，以及缺失字段读成显示；全部使用临时目录。
+
+本步新增 3 项 Dock 界面测试与 5 项 Rust 设置测试。
+
+本轮验证（2026-11-24）：`nsh check` 通过；`nsh test App.test.tsx` 17/17（含 Dock 三项）；`nsh test test-fixtures/Visual.test.tsx --target macos` 通过（关闭隐藏 → `tray.open` → 同一 `WindowRef` 可见且聚焦）；`cargo test -p nsh-app-cursor-byok-next --lib -- desktop::tests` 5/5；`cargo clippy -p nsh-app-cursor-byok-next --all-targets --all-features -- -D warnings` 通过。
 
 ### 设计完成清单
 
@@ -124,9 +150,7 @@ TSX 覆盖：
 - 状态：端口（未编辑 / 已编辑 / 越界 / 未绑定 / 已保存）、调用记录（0 条时清理禁用）、读取失败（页尾 alert）、清理确认（两档文案不同）全覆盖。
 - 动效：卡片内容首次进入淡入上移 8pt（`motion.base`），开关与分段选择颜色 / 位移过渡，全部带 `motion-reduce:` 或 `createMotion` 默认策略。
 
-### 未完成验证
+### 其他验证范围
 
-- `nsh test test-fixtures/Visual.test.tsx --target macos` 已执行并通过（2026-11-23）；设置页已加进该用例（截图 `/tmp/cursor-byok-next-{light,dark}-settings.png`），明暗两态均检查过圆角、字体、间距、对齐与颜色。
+- `nsh test test-fixtures/Visual.test.tsx --target macos` 本轮（2026-11-24）通过；`/tmp/cursor-byok-next-{light,dark}-settings.png` 已检查 Dock 行的圆角、字体、间距、对齐、颜色与开关状态。
 - VoiceOver、Windows / Linux、大字号与窄窗口未在真实机器逐项核对。
-- `cargo clippy --all-targets -- -D warnings` 在 `calls/recorder.rs`、`plugins/{adapters/anthropic,worker}.rs`、`lib.rs::Calls::new`、`calls/store.rs` 有既有告警（本步未引入，属于之前步骤的存量），未在本步处理。
-- `cargo test --workspace` 中 `cursor-capture` 的 4 项 TLS 用例在未改动的工作树上同样失败（rustls 未安装进程级 CryptoProvider），与本步无关；单独 `cargo test -p cursor-capture --lib` 可通过。
