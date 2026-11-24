@@ -19,7 +19,7 @@ axum = { version = "0.8", features = ["http1", "http2"] }
 brotli = "8"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-dirs = "6"
+dirs = "7"
 flate2 = "1"
 futures-util = "0.3"
 hex = "0.4"
