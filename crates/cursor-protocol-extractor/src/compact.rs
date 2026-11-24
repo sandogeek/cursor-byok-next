@@ -84,7 +84,7 @@ pub fn compact_class_by_name<'a>(
     pos: u32,
     classes: &'a [CompactClass],
 ) -> Option<&'a CompactClass> {
-    let name = crate::ast_util::last_segment(name.trim());
+    let name = crate::ast::last_segment(name.trim());
     if name.is_empty() {
         return None;
     }
@@ -217,9 +217,9 @@ pub fn parse_compact_type_refs(rest: &str) -> Vec<String> {
                 _ => continue,
             }
         }
-        let r#ref = rest[start..i].trim();
-        if !r#ref.is_empty() {
-            refs.push(r#ref.to_string());
+        let type_ref = rest[start..i].trim();
+        if !type_ref.is_empty() {
+            refs.push(type_ref.to_string());
         }
         start = i + 1;
     }
@@ -235,11 +235,12 @@ pub fn parse_compact_type_refs(rest: &str) -> Vec<String> {
 pub fn parse_compact_field(spec: &str) -> Result<Field, Error> {
     let invalid = || Error::Field(format!("invalid compact field: {spec}"));
     let mut parts = spec.splitn(3, char::is_whitespace);
-    let no = parts
-        .next()
-        .ok_or_else(invalid)?
-        .parse::<i32>()
-        .map_err(|_| invalid())?;
+    let no = parts.next().ok_or_else(invalid)?;
+    let Ok(no) = no.parse::<i32>() else {
+        return Err(Error::Field(format!(
+            "compact field number is not an integer: {no}"
+        )));
+    };
     let name = parts.next().ok_or_else(invalid)?;
     if !is_field_name(name) {
         return Err(invalid());
@@ -249,7 +250,7 @@ pub fn parse_compact_field(spec: &str) -> Result<Field, Error> {
     let (raw, flag) = split_compact_flag(type_part);
     let mut field = Field::new(no, name, FieldKind::Scalar);
     field.repeated = flag == Some('*');
-    field.opt = flag == Some('?');
+    field.optional = flag == Some('?');
     field.oneof = oneof;
 
     if let Some((key, value)) = raw.split_once(',') {
@@ -263,7 +264,7 @@ pub fn parse_compact_field(spec: &str) -> Result<Field, Error> {
     }
     let (value_kind, token) = compact_value_token(raw);
     field.kind = FieldKind::of_value(value_kind);
-    field.t = Some(token);
+    field.type_token = Some(token);
     Ok(field)
 }
 
@@ -344,8 +345,8 @@ pub fn qualify_compact_fields(
     index: &CompactIndex,
 ) {
     let qualify = |token: Option<TypeToken>| match token {
-        Some(TypeToken::Named(r#ref)) if r#ref.starts_with('#') => {
-            let target = r#ref
+        Some(TypeToken::Named(type_ref)) if type_ref.starts_with('#') => {
+            let target = type_ref
                 .trim_start_matches('#')
                 .parse::<usize>()
                 .ok()
@@ -354,7 +355,7 @@ pub fn qualify_compact_fields(
                 Some(resolved) => Some(TypeToken::Named(qualify_compact_type_ref(
                     resolved, pkg, index,
                 ))),
-                None => Some(TypeToken::Named(r#ref)),
+                None => Some(TypeToken::Named(type_ref)),
             }
         }
         other => other,
@@ -363,29 +364,29 @@ pub fn qualify_compact_fields(
         if field.kind == FieldKind::Map {
             field.map_value_t = qualify(field.map_value_t.take());
         } else {
-            field.t = qualify(field.t.take());
+            field.type_token = qualify(field.type_token.take());
         }
     }
 }
 
 #[must_use]
-pub fn qualify_compact_type_ref(r#ref: &str, pkg: &str, index: &CompactIndex) -> String {
-    let r#ref = r#ref.trim();
-    if r#ref.is_empty() {
-        return r#ref.to_owned();
+pub fn qualify_compact_type_ref(type_ref: &str, pkg: &str, index: &CompactIndex) -> String {
+    let type_ref = type_ref.trim();
+    if type_ref.is_empty() {
+        return type_ref.to_owned();
     }
-    if let Some(type_name) = index.by_var.get(r#ref) {
+    if let Some(type_name) = index.by_var.get(type_ref) {
         return type_name.clone();
     }
-    let last = crate::ast_util::last_segment(r#ref);
+    let last = crate::ast::last_segment(type_ref);
     if let Some(type_name) = index.by_var.get(last) {
         return type_name.clone();
     }
     if let Some(type_name) = google_well_known(last) {
         return type_name.to_owned();
     }
-    if looks_like_full_type_name(r#ref) {
-        return r#ref.to_owned();
+    if looks_like_full_type_name(type_ref) {
+        return type_ref.to_owned();
     }
     if let Some(type_name) = index.by_short.get(last) {
         return type_name.clone();
@@ -413,7 +414,7 @@ pub fn extract_compact_enum_values(array_text: &str, short_name: &str) -> Vec<En
                 } else {
                     name
                 };
-                values.push(EnumValue { no, name });
+                values.push(EnumValue { number: no, name });
             }
             i = next;
             continue;
@@ -437,7 +438,7 @@ fn parse_enum_pair(text: &str, start: usize) -> Option<(i32, String, usize)> {
 }
 
 pub fn compact_enum_prefix(short_name: &str) -> String {
-    let name = crate::ast_util::last_segment(short_name);
+    let name = crate::ast::last_segment(short_name);
     if name.is_empty() {
         return String::new();
     }
@@ -457,8 +458,8 @@ pub fn finish_compact_messages(
 ) -> Vec<Message> {
     let index = compact_type_index(&pending, enums);
     for item in &mut pending {
-        let pkg = item.msg.package.clone();
-        qualify_compact_fields(&mut item.msg.fields, &item.type_refs, &pkg, &index);
+        let CompactPendingMessage { msg, type_refs } = item;
+        qualify_compact_fields(&mut msg.fields, type_refs, &msg.package, &index);
     }
     pending.into_iter().map(|item| item.msg).collect()
 }

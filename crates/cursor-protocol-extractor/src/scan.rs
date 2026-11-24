@@ -13,7 +13,7 @@ use oxc::span::{GetSpan, SourceType, Span};
 use regex::Regex;
 use std::sync::OnceLock;
 
-use crate::ast_util::{
+use crate::ast::{
     argument_expr, array_from_expr, assignment_ident, assignment_member, binding_ident,
     callee_tail, f64_to_i32, f64_to_u32, ident_name, is_js_true, last_segment, member_or_ident,
     number_lit, object_prop, object_prop_shorthand, property_name, property_numeric_key,
@@ -25,7 +25,7 @@ use crate::compact::{
     parse_compact_schema_array, resolve_compact_package_expr,
 };
 use crate::error::Error;
-use crate::resolver::ModuleStart;
+use crate::resolver::{ModuleStart, module_start_by_id};
 use crate::types::{
     Diagnostics, Enum, EnumValue, Field, FieldKind, Message, Method, MethodKind, Service, TypeName,
     TypeToken, ValueKind, google_well_known, is_field_name, is_google_pkg, is_ident,
@@ -45,6 +45,7 @@ pub struct BundleScan {
     pub diagnostics: Diagnostics,
 }
 
+#[must_use]
 pub fn scan_source(source: &str) -> BundleScan {
     let scan = scan_source_once(source);
     if looks_like_webpack_modules(source) && scan.module_starts.is_empty() {
@@ -99,7 +100,6 @@ fn scan_source_once(source: &str) -> BundleScan {
     let mut visitor = Scanner {
         source,
         scan: BundleScan::default(),
-        module_starts: Vec::new(),
         compact_classes: Vec::new(),
         compact_prefixes: Vec::new(),
         pending_compact: Vec::new(),
@@ -120,7 +120,6 @@ fn scan_source_once(source: &str) -> BundleScan {
 struct Scanner<'a> {
     source: &'a str,
     scan: BundleScan,
-    module_starts: Vec<ModuleStart>,
     compact_classes: Vec<CompactClass>,
     compact_prefixes: Vec<CompactPrefix>,
     pending_compact: Vec<CompactPendingMessage>,
@@ -151,17 +150,14 @@ impl Scanner<'_> {
         for message in compact_messages {
             self.push_message(message);
         }
-        self.scan.module_starts = self.module_starts;
         self.scan
     }
 
     fn module_start_for(&self, pos: u32) -> Option<u32> {
-        match self
-            .module_starts
-            .partition_point(|module| module.start <= pos)
-        {
+        let starts = &self.scan.module_starts;
+        match starts.partition_point(|module| module.start <= pos) {
             0 => None,
-            index => Some(self.module_starts[index - 1].start),
+            index => Some(starts[index - 1].start),
         }
     }
 
@@ -316,7 +312,7 @@ impl Scanner<'_> {
                 continue;
             };
             values.push(EnumValue {
-                no,
+                number: no,
                 name: name.to_string(),
             });
         }
@@ -486,19 +482,16 @@ impl Scanner<'_> {
             return;
         };
         let fields = self.extract_fields_from_expr(fields_expr);
-        let Some(class) = self.current_class.clone() else {
+        let Some(class) = self.current_class.as_ref() else {
             return;
         };
-        let Some(type_name) = self.class_type_name() else {
+        let Some(type_name) = self.class_type_name().map(str::to_owned) else {
             return;
         };
-        self.record_message(
-            &type_name,
-            &class.var_name,
-            &class.internal_name,
-            fields,
-            class.start,
-        );
+        let var_name = class.var_name.clone();
+        let internal_name = class.internal_name.clone();
+        let start = class.start;
+        self.record_message(&type_name, &var_name, &internal_name, fields, start);
     }
 
     fn qualify_late_prefixes(&mut self) {
@@ -516,9 +509,9 @@ impl Scanner<'_> {
             };
             let item = &mut self.scan.enums[index];
             let short = if item.short_name.is_empty() {
-                crate::ast_util::last_segment(&item.type_name).to_string()
+                crate::ast::last_segment(&item.type_name).to_string()
             } else {
-                crate::ast_util::last_segment(&item.short_name).to_string()
+                crate::ast::last_segment(&item.short_name).to_string()
             };
             item.package.clone_from(&pkg);
             item.short_name.clone_from(&short);
@@ -549,14 +542,15 @@ impl Scanner<'_> {
         self.enum_by_pos = enum_by_pos;
     }
 
-    fn class_type_name(&self) -> Option<String> {
+    /// The type name of the message this class already declared, if any.
+    fn class_type_name(&self) -> Option<&str> {
         let class = self.current_class.as_ref()?;
         self.scan
             .messages
             .iter()
             .rev()
             .find(|message| message.var_name == class.var_name)
-            .map(|message| message.type_name.clone())
+            .map(|message| message.type_name.as_str())
     }
 
     fn handle_compact_enum(&mut self, assigned: Option<&str>, call: &CallExpression<'_>) {
@@ -635,7 +629,7 @@ impl Scanner<'_> {
         // A webpack module factory takes `(module, exports, require)`; fewer
         // parameters means this numbered property is not a module.
         if params.items.len() >= 3 {
-            self.module_starts.push(ModuleStart {
+            self.scan.module_starts.push(ModuleStart {
                 start: span.start,
                 id: key,
             });
@@ -659,11 +653,7 @@ impl Scanner<'_> {
             return;
         };
         let current = self.module_start_for(call.span.start);
-        let target_start = self
-            .module_starts
-            .iter()
-            .find(|module| module.id == module_id)
-            .map_or(module_id, |module| module.start);
+        let target_start = module_start_by_id(&self.scan.module_starts, module_id);
         self.scan
             .module_imports
             .push((current, alias.to_owned(), target_start));
@@ -958,7 +948,7 @@ pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, Error> {
     let raw_kind = object_prop(expr, "kind")
         .and_then(string_lit)
         .ok_or_else(|| Error::Field("missing field kind".into()))?;
-    let mut field = Field::new(no, name, FieldKind::parse(raw_kind));
+    let mut field = Field::new(no, name, FieldKind::from_bundle_kind(raw_kind));
     if let Some(enum_call) =
         object_prop(expr, "T").and_then(|value| match value.get_inner_expression() {
             Expression::CallExpression(call) if callee_tail(call) == Some("getEnumType") => {
@@ -973,12 +963,12 @@ pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, Error> {
             .and_then(argument_expr)
             .and_then(member_or_ident)
         {
-            field.t = Some(TypeToken::Named(name));
+            field.type_token = Some(TypeToken::Named(name));
         }
     } else if let Some(token) = object_prop(expr, "T").and_then(type_token_from_expr) {
-        field.t = Some(token);
+        field.type_token = Some(token);
     } else if object_prop_shorthand(expr, "T") {
-        field.t = Some(TypeToken::Named("T".into()));
+        field.type_token = Some(TypeToken::Named("T".into()));
     }
     if let Some(oneof) = object_prop(expr, "oneof").and_then(string_lit)
         && is_ident(oneof)
@@ -990,7 +980,7 @@ pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, Error> {
         field.repeated = true;
     }
     if object_prop(expr, "opt").is_some_and(is_js_true) {
-        field.opt = true;
+        field.optional = true;
     }
     if field.kind == FieldKind::Map {
         if let Some(key) = object_prop(expr, "K")
@@ -1001,7 +991,7 @@ pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, Error> {
         }
         if let Some(value) = object_prop(expr, "V") {
             if let Some(raw) = object_prop(value, "kind").and_then(string_lit) {
-                field.map_value_kind = ValueKind::parse(raw);
+                field.map_value_kind = ValueKind::from_bundle_kind(raw);
             }
             field.map_value_t = object_prop(value, "T").and_then(type_token_from_expr);
         }
@@ -1034,7 +1024,7 @@ fn parse_methods(object: &ObjectExpression<'_>) -> Vec<Method> {
         let kind = object_prop(&prop.value, "kind")
             .and_then(member_or_ident)
             .map_or(MethodKind::Unary, |value| {
-                MethodKind::parse(last_segment(&value))
+                MethodKind::from_bundle_kind(last_segment(&value))
             });
         methods.push(Method {
             name: name.to_string(),

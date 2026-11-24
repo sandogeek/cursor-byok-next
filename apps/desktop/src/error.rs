@@ -47,9 +47,31 @@ pub enum Error {
         #[source]
         source: sqlx::Error,
     },
+    /// An operation failed for a reason the caller can only log; `context` says
+    /// which operation, and the cause keeps its source chain.
+    #[error("{context}: {source}")]
+    Context {
+        context: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// Cursor takeover failed; the cause is kept for the log line.
     #[error(transparent)]
     Harness(#[from] crate::harness::Error),
+}
+
+impl Error {
+    /// Wraps a foreign failure with the operation that produced it, keeping the
+    /// cause reachable through [`std::error::Error::source`].
+    pub(crate) fn context(
+        context: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Context {
+            context: context.into(),
+            source: Box::new(source),
+        }
+    }
 }
 
 impl From<sqlx::Error> for Error {
@@ -74,6 +96,7 @@ impl IntoResponse for Error {
             | Self::Io(_)
             | Self::Storage(_)
             | Self::Database { .. }
+            | Self::Context { .. }
             | Self::Harness(_)
             | Self::Runtime(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };

@@ -24,17 +24,19 @@ cursor-byok/support/cursor-protocol-extractor/
 
 crates/cursor-protocol-extractor/
 ├── src/
-│   ├── main.rs             67 行  CLI（无 prettier）
-│   ├── types.rs           448 行  领域类型 + 诊断
-│   ├── ast_util.rs        194 行  oxc 节点取值
-│   ├── scan.rs           1038 行  oxc Visit：消息 / 枚举 / 服务 / 模块
-│   ├── compact.rs         426 行  $() 字符串 schema（仍按文本解析）
-│   ├── resolver.rs        436 行  符号解析
+│   ├── lib.rs              81 行  模块声明与 `extract_from_files` 入口
+│   ├── main.rs             87 行  CLI（无 prettier）
+│   ├── error.rs            52 行  带 `#[source]` 的提取器错误
+│   ├── types.rs           660 行  领域类型 + 诊断
+│   ├── ast.rs             234 行  oxc 节点取值（每个辅助函数 `#[must_use]`）
+│   ├── scan.rs           1083 行  oxc Visit：消息 / 枚举 / 服务 / 模块
+│   ├── compact.rs         465 行  $() 字符串 schema（仍按文本解析）
+│   ├── resolver.rs        497 行  符号解析
 │   ├── merge.rs           381 行  合并、归一化、包裁剪
-│   ├── extract.rs         352 行  流水线 + 只生成 agent/aiserver + 原子写
-│   ├── renderer.rs        397 行  proto3 文本
-│   ├── validate.rs        109 行  Agent / Inference 形状（按块匹配）
-│   └── tests.rs           552 行  对齐上游测试 + 包裁剪 + 诊断/写入
+│   ├── extract.rs         446 行  流水线 + 只生成 agent/aiserver + 原子写
+│   ├── renderer.rs        452 行  proto3 文本
+│   ├── validate.rs        126 行  Agent / Inference 形状（按块匹配）
+│   └── tests.rs           613 行  对齐上游测试 + 包裁剪 + 诊断/写入
 └── scripts/extract.sh           扫描 Cursor.app，原子替换输出
 ```
 
@@ -59,6 +61,13 @@ crates/cursor-protocol-extractor/
 | 11 | oxc 解析错误 | 无（正则扫文本） | 记入 `diagnostics.parse_errors`；`--strict` 时失败 | 部分解析不能伪装成成功 |
 | 12 | `--no-strict` | 形状校验失败也进诊断，仅 strict 时退出 | 形状错误记诊断，不直接 abort；`--no-strict` 仍写出文件 | 对齐上游 `strictExtractionValidation` |
 | 13 | 写盘 | 直接覆盖输出目录 | `write_protos` 先写临时目录再 rename 替换，并清掉旧文件 | CLI 与 `extract.sh` 都要原子替换，避免半成品 proto |
+| 14 | 读取与写出的路径类型 | 字符串路径 + 内部 `string` 拼接 | `&[PathBuf]` 输入、`&Path` 输出、`PathBuf` 字段 | `&[impl AsRef<Path>]` 让每个调用点都可能传不同类型，函数体又立刻 `as_ref()`；单一具体类型让签名与 `write` 的归属对齐，也避免泛型单态化 |
+| 15 | 命名 | `Field::t` / `EnumValue::no` / `TypeToken::completeness` / `FieldKind::parse` | `Field::type_token` / `EnumValue::number` / `completeness`（`#[must_use]`）/ `from_bundle_kind` | 单字母缩写与“parse 但不会失败”的名字会误导调用方；`parse` 必须在失败时返回 `Result`，因此改名为 `from_*` |
+| 16 | 诊断样本截断 | `String::truncate` 直接在字节下标处截断 | `truncate(trimmed.floor_char_boundary(SAMPLE_PREVIEW_CHARS))` | 原写法在多字节 UTF-8 边界会 panic；诊断本身是错误路径，不能在那里崩 |
+| 17 | 诊断输出 | `map[key]` 索引 + 硬编码 `20` | `iter().collect()` 排序 + `take(DIAGNOSTIC_SAMPLE_LIMIT)` | 索引在缺键时 panic；魔法数字没有名字，两个输出点会漂移 |
+| 18 | 模块内重复 | `build_module_imports` 与 `scan` 各自线性查模块起点 | `resolver::module_start_by_id` 一处二分/预表 | 两份逻辑对同一 bundle 偏移量的答案可能不同，二次映射会改坏已解析的 offset |
+| 19 | 合并覆盖率 | 逐名 `clone` 后排序再比较 | `HashSet<&str>` + `difference`，`sort_unstable` | 覆盖率只是集合差，不需要一份拥有所有权的副本 |
+| 20 | 扫描状态所有权 | `Scanner` 与 `BundleScan` 各有一份 `module_starts` | 只保留 `BundleScan` 的那一份 | 同一状态两个所有者，写入路径不一致时会导致偏移量错位 |
 
 ## 必须保持的语义（两侧一致）
 

@@ -24,17 +24,35 @@ const CONNECT_FLAG_END_STREAM: u8 = 0x02;
 const CONNECT_ENVELOPE_BYTES: usize = 5;
 
 /// Why a stored or captured payload could not be decoded for display.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
     /// The payload was not valid hex.
-    #[error("payload is not valid hex: {0}")]
-    Hex(String),
+    #[error("payload is not valid hex while decoding {context}: {source}")]
+    Hex {
+        /// Which payload was being decoded.
+        context: &'static str,
+        /// The underlying hex failure.
+        #[source]
+        source: hex::FromHexError,
+    },
     /// A compressed payload could not be inflated.
-    #[error("cannot inflate payload: {0}")]
-    Inflate(String),
+    #[error("cannot inflate {label}: {source}")]
+    Inflate {
+        /// Which payload was being inflated.
+        label: &'static str,
+        /// The underlying IO failure.
+        #[source]
+        source: std::io::Error,
+    },
     /// A protobuf message did not match its descriptor.
-    #[error("cannot decode protobuf: {0}")]
-    Protobuf(String),
+    #[error("cannot decode {context} as protobuf: {source}")]
+    Protobuf {
+        /// Which payload was being decoded.
+        context: &'static str,
+        /// The underlying protobuf failure.
+        #[source]
+        source: prost::DecodeError,
+    },
     /// The message type is not in the embedded descriptor set.
     #[error("unknown protobuf message type {0}")]
     UnknownType(String),
@@ -49,9 +67,6 @@ pub enum DecodeError {
         /// The cap it crossed.
         limit: usize,
     },
-    /// The captured frames could not be inspected.
-    #[error("frame buffer is unusable: {0}")]
-    Frames(String),
 }
 
 /// One Cursor RPC this debugger knows by name.
@@ -78,7 +93,7 @@ static POOL: LazyLock<DescriptorPool> = LazyLock::new(|| {
 /// a frame past `MAX_CONNECT_FRAME_BYTES`, so anything larger is clamped
 /// instead of wrapping into a negative length.
 #[must_use]
-pub fn frame_count(len: usize) -> i32 {
+pub fn clamped_i32(len: usize) -> i32 {
     i32::try_from(len).unwrap_or(i32::MAX)
 }
 
@@ -176,7 +191,7 @@ impl ConnectFrameDecoder {
             if length > MAX_DECOMPRESSED_BYTES {
                 self.emit(FrameView {
                     flags,
-                    length: frame_count(length),
+                    length: clamped_i32(length),
                     error: Some("Connect 帧长度异常".into()),
                     ..FrameView::default()
                 });
@@ -200,7 +215,7 @@ impl ConnectFrameDecoder {
     pub fn close(&mut self) {
         if !self.buffer.is_empty() && self.frame_count < self.max_frames {
             self.emit(FrameView {
-                length: frame_count(self.buffer.len()),
+                length: clamped_i32(self.buffer.len()),
                 raw_hex: clipped_hex(&self.buffer, HEX_CLIP_BYTES),
                 error: Some("流结束时仍有不完整的 Connect 帧".into()),
                 ..FrameView::default()
@@ -218,7 +233,7 @@ impl ConnectFrameDecoder {
     fn decode(&self, flags: u8, payload: &[u8]) -> FrameView {
         let mut frame = FrameView {
             flags,
-            length: frame_count(payload.len()),
+            length: clamped_i32(payload.len()),
             compressed: flags & CONNECT_FLAG_COMPRESSED != 0,
             end_stream: flags & CONNECT_FLAG_END_STREAM != 0,
             raw_hex: clipped_hex(payload, HEX_CLIP_BYTES),
@@ -275,6 +290,7 @@ pub struct DecodedUnary {
 
 /// Decodes one unary request body against the message type its path names.
 /// A path this crate knows nothing about decodes as an empty [`DecodedUnary`].
+#[must_use]
 pub fn decode_unary_request(path: &str, payload: &[u8]) -> DecodedUnary {
     if path == BIDI_APPEND_PATH {
         return decode_bidi_append_request(payload);
@@ -371,8 +387,10 @@ fn decode_bidi_client_message(
 ) -> Result<Option<(DynamicMessage, String)>, DecodeError> {
     let data = string_field(request, "data");
     if !data.trim().is_empty() {
-        let payload = hex::decode(data.trim())
-            .map_err(|err| DecodeError::Hex(format!("agent client message: {err}")))?;
+        let payload = hex::decode(data.trim()).map_err(|source| DecodeError::Hex {
+            context: "the BidiAppendRequest agent client payload",
+            source,
+        })?;
         let message = decode_required(AGENT_CLIENT_MESSAGE, &payload)?;
         let kind = active_oneof_name(&message);
         return Ok(Some((message, kind)));
@@ -391,8 +409,10 @@ fn decode_required(message_type: &str, payload: &[u8]) -> Result<DynamicMessage,
     let descriptor = POOL
         .get_message_by_name(message_type)
         .ok_or_else(|| DecodeError::UnknownType(message_type.to_owned()))?;
-    DynamicMessage::decode(descriptor, payload)
-        .map_err(|err| DecodeError::Protobuf(err.to_string()))
+    DynamicMessage::decode(descriptor, payload).map_err(|source| DecodeError::Protobuf {
+        context: "a required message",
+        source,
+    })
 }
 
 fn conversation_id_from_client_message(message: &DynamicMessage) -> String {
@@ -431,19 +451,40 @@ pub fn decode_unary_response(path: &str, payload: &[u8]) -> Result<DecodedRespon
     let Some((descriptor, kind)) = unary_response_message(path) else {
         return Ok(DecodedResponse::default());
     };
-    let message = DynamicMessage::decode(descriptor, payload)
-        .map_err(|err| DecodeError::Protobuf(err.to_string()))?;
+    let message =
+        DynamicMessage::decode(descriptor, payload).map_err(|source| DecodeError::Protobuf {
+            context: "a unary response",
+            source,
+        })?;
     Ok(DecodedResponse {
         json: marshal_proto_json(&message),
         kind,
     })
 }
 
+/// Whether hydrating a stored exchange changed anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hydration {
+    /// At least one body was re-decoded into the stored exchange.
+    Changed,
+    /// Nothing could be filled in; the stored row is already final.
+    Unchanged,
+}
+
+impl Hydration {
+    /// Whether the exchange needs to be written back.
+    #[must_use]
+    pub fn is_changed(self) -> bool {
+        self == Self::Changed
+    }
+}
+
 /// The stored bodies the debugger can re-decode: streaming frames, unary
-/// protobuf JSON, and plain text/JSON. Returns whether anything was filled in.
-pub fn hydrate_stored_exchange(exchange: &mut Exchange) -> bool {
+/// protobuf JSON, and plain text/JSON.
+#[must_use]
+pub fn hydrate_stored_exchange(exchange: &mut Exchange) -> Hydration {
     if !exchange.summary.state.is_replayable() {
-        return false;
+        return Hydration::Unchanged;
     }
     let request_frames = hydrate_stored_request_frames(exchange);
     let response_frames = hydrate_stored_response_frames(exchange);
@@ -451,72 +492,71 @@ pub fn hydrate_stored_exchange(exchange: &mut Exchange) -> bool {
     let response_unary = hydrate_stored_unary_response(exchange);
     let request_text = hydrate_stored_request_text(exchange);
     let response_text = hydrate_stored_response_text(exchange);
-    request_frames
+    if request_frames
         || response_frames
         || request_unary
         || response_unary
         || request_text
         || response_text
+    {
+        Hydration::Changed
+    } else {
+        Hydration::Unchanged
+    }
+}
+
+/// Re-decodes one stored frame direction, reporting whether frames were
+/// actually filled in (an empty decode is not a change).
+fn hydrate_stored_frames(payload: &mut Payload, message_type: Option<String>) -> bool {
+    let Some(message_type) = message_type else {
+        return false;
+    };
+    if !payload.frames.is_empty() || payload.raw_hex.is_empty() || payload.raw_truncated {
+        return false;
+    }
+    match decode_stored_connect_frames(&payload.raw_hex, &message_type, &payload.content_codec) {
+        Ok(decoded) if !decoded.is_empty() => {
+            payload.frames = decoded;
+            true
+        }
+        Ok(_) => false,
+        Err(_) => true,
+    }
 }
 
 fn hydrate_stored_request_frames(exchange: &mut Exchange) -> bool {
-    let Some(message_type) = streaming_request_message_type(&exchange.summary.path) else {
-        return false;
-    };
-    if !exchange.request.frames.is_empty()
-        || exchange.request.raw_hex.is_empty()
-        || exchange.request.raw_truncated
-    {
+    let message_type = streaming_request_message_type(&exchange.summary.path);
+    let summary = &mut exchange.summary;
+    let payload = &mut exchange.request;
+    if !hydrate_stored_frames(payload, message_type) {
         return false;
     }
-    match decode_stored_connect_frames(
-        &exchange.request.raw_hex,
-        &message_type,
-        &exchange.request.content_codec,
-    ) {
-        Ok(frames) if !frames.is_empty() => {
-            for frame in &frames {
-                if !frame.kind.is_empty() && frame.kind != FrameView::KIND_END_STREAM {
-                    exchange.summary.request_kind.clone_from(&frame.kind);
-                }
-                if !frame.request_id.is_empty() {
-                    exchange.summary.request_id.clone_from(&frame.request_id);
-                }
-            }
-            exchange.request.frames = frames;
+    if let Some(error) = &payload.decode_error {
+        summary.error.get_or_insert_with(|| error.clone());
+    }
+    for frame in &payload.frames {
+        if !frame.kind.is_empty() && frame.kind != FrameView::KIND_END_STREAM {
+            summary.request_kind.clone_from(&frame.kind);
         }
-        Ok(_) => {}
-        Err(err) => exchange.request.decode_error = Some(err.to_string()),
+        if !frame.request_id.is_empty() {
+            summary.request_id.clone_from(&frame.request_id);
+        }
     }
     true
 }
 
 fn hydrate_stored_response_frames(exchange: &mut Exchange) -> bool {
-    let Some(message_type) = streaming_response_message_type(&exchange.summary.path) else {
-        return false;
-    };
-    if !exchange.response.frames.is_empty()
-        || exchange.response.raw_hex.is_empty()
-        || exchange.response.raw_truncated
-    {
+    let message_type = streaming_response_message_type(&exchange.summary.path);
+    let summary = &mut exchange.summary;
+    let payload = &mut exchange.response;
+    if !hydrate_stored_frames(payload, message_type) {
         return false;
     }
-    match decode_stored_connect_frames(
-        &exchange.response.raw_hex,
-        &message_type,
-        &exchange.response.content_codec,
-    ) {
-        Ok(frames) if !frames.is_empty() => {
-            exchange.summary.frame_count = frame_count(frames.len());
-            for frame in &frames {
-                if !frame.kind.is_empty() && frame.kind != FrameView::KIND_END_STREAM {
-                    exchange.summary.response_kind.clone_from(&frame.kind);
-                }
-            }
-            exchange.response.frames = frames;
+    summary.frame_count = clamped_i32(payload.frames.len());
+    for frame in &payload.frames {
+        if !frame.kind.is_empty() && frame.kind != FrameView::KIND_END_STREAM {
+            summary.response_kind.clone_from(&frame.kind);
         }
-        Ok(_) => {}
-        Err(err) => exchange.response.decode_error = Some(err.to_string()),
     }
     true
 }
@@ -528,28 +568,36 @@ fn hydrate_stored_unary_request(exchange: &mut Exchange) -> bool {
     {
         return false;
     }
-    match decode_stored_raw_payload(&exchange.request.raw_hex, &exchange.request.content_codec) {
-        Ok(payload) => {
-            let decoded = decode_unary_request(&exchange.summary.path, &payload);
-            if let Some(err) = decoded.error {
-                exchange.request.decode_error = Some(err);
+    let payload =
+        match decode_stored_raw_payload(&exchange.request.raw_hex, &exchange.request.content_codec)
+        {
+            Ok(payload) => payload,
+            Err(err) => {
+                exchange.request.decode_error = Some(err.to_string());
+                return true;
             }
-            if decoded.json.is_empty() {
-                return exchange.request.decode_error.is_some();
-            }
-            exchange.request.decoded_json = decoded.json;
-            exchange.request.decoded_lang = "json".into();
-            exchange.summary.request_kind = decoded.kind;
-            if !decoded.request_id.is_empty() {
-                exchange.summary.request_id = decoded.request_id;
-            }
-            if !decoded.conversation_id.is_empty() {
-                exchange.summary.conversation_id = decoded.conversation_id;
-            }
-        }
-        Err(err) => exchange.request.decode_error = Some(err.to_string()),
+        };
+    let decoded = decode_unary_request(&exchange.summary.path, &payload);
+    let mut changed = false;
+    if let Some(error) = decoded.error {
+        exchange.request.decode_error = Some(error);
+        changed = true;
     }
-    true
+    if !decoded.json.is_empty() {
+        exchange.request.decoded_json = decoded.json;
+        exchange.request.decoded_lang = "json".into();
+        changed = true;
+    }
+    if !decoded.kind.is_empty() {
+        exchange.summary.request_kind = decoded.kind;
+    }
+    if !decoded.request_id.is_empty() {
+        exchange.summary.request_id = decoded.request_id;
+    }
+    if !decoded.conversation_id.is_empty() {
+        exchange.summary.conversation_id = decoded.conversation_id;
+    }
+    changed
 }
 
 fn hydrate_stored_unary_response(exchange: &mut Exchange) -> bool {
@@ -559,19 +607,29 @@ fn hydrate_stored_unary_response(exchange: &mut Exchange) -> bool {
     {
         return false;
     }
-    match decode_stored_raw_payload(&exchange.response.raw_hex, &exchange.response.content_codec) {
-        Ok(payload) => match decode_unary_response(&exchange.summary.path, &payload) {
-            Ok(decoded) if !decoded.json.is_empty() => {
-                exchange.response.decoded_json = decoded.json;
-                exchange.response.decoded_lang = "json".into();
-                exchange.summary.response_kind = decoded.kind;
-            }
-            Ok(_) => {}
-            Err(err) => exchange.response.decode_error = Some(err.to_string()),
-        },
-        Err(err) => exchange.response.decode_error = Some(err.to_string()),
+    let payload = match decode_stored_raw_payload(
+        &exchange.response.raw_hex,
+        &exchange.response.content_codec,
+    ) {
+        Ok(payload) => payload,
+        Err(err) => {
+            exchange.response.decode_error = Some(err.to_string());
+            return true;
+        }
+    };
+    match decode_unary_response(&exchange.summary.path, &payload) {
+        Ok(decoded) if !decoded.json.is_empty() => {
+            exchange.response.decoded_json = decoded.json;
+            exchange.response.decoded_lang = "json".into();
+            exchange.summary.response_kind = decoded.kind;
+            true
+        }
+        Ok(_) => false,
+        Err(err) => {
+            exchange.response.decode_error = Some(err.to_string());
+            true
+        }
     }
-    true
 }
 
 fn hydrate_stored_request_text(exchange: &mut Exchange) -> bool {
@@ -624,6 +682,7 @@ pub struct DecodedContent {
 
 /// Decodes one captured body for display, honouring its content type and
 /// compression codec. JSON is re-indented; anything else is shown as text.
+#[must_use]
 pub fn decode_captured_content(payload: &[u8], content_type: &str, codec: &str) -> DecodedContent {
     let decoded = match decode_http_content(payload, codec) {
         Ok(decoded) => decoded,
@@ -706,7 +765,7 @@ fn json_valid(payload: &[u8]) -> bool {
 fn inflate_limited(mut reader: impl Read, label: &'static str) -> Result<Vec<u8>, DecodeError> {
     let mut result = Vec::new();
     io::copy(&mut reader.by_ref().take(frame_limit_bytes()), &mut result)
-        .map_err(|err| DecodeError::Inflate(format!("reading {label}: {err}")))?;
+        .map_err(|source| DecodeError::Inflate { label, source })?;
     if result.len() > MAX_DECOMPRESSED_BYTES {
         return Err(DecodeError::Oversized {
             label,
@@ -724,12 +783,11 @@ fn inflate_limited(mut reader: impl Read, label: &'static str) -> Result<Vec<u8>
 /// not implement, and [`DecodeError::Inflate`]/[`DecodeError::Oversized`] when
 /// decompression fails or exceeds the frame cap.
 pub fn decode_http_content(payload: &[u8], codec: &str) -> Result<Vec<u8>, DecodeError> {
-    let encodings: Vec<_> = codec
+    let encodings = codec
         .split(',')
-        .map(|item| item.trim().to_ascii_lowercase())
-        .collect();
+        .map(|item| item.trim().to_ascii_lowercase());
     let mut decoded = payload.to_vec();
-    for encoding in encodings.into_iter().rev() {
+    for encoding in encodings.rev() {
         match encoding.as_str() {
             "" | "identity" => {}
             "gzip" | "x-gzip" => decoded = decompress_payload(&decoded, "gzip")?,
@@ -747,6 +805,7 @@ pub fn decode_http_content(payload: &[u8], codec: &str) -> Result<Vec<u8>, Decod
     Ok(decoded)
 }
 
+#[must_use]
 pub fn normalized_media_type(content_type: &str) -> String {
     let trimmed = content_type.trim();
     trimmed.parse::<mime::Mime>().map_or_else(
@@ -762,6 +821,7 @@ pub fn normalized_media_type(content_type: &str) -> String {
     )
 }
 
+#[must_use]
 pub fn is_proto_content_type(content_type: &str) -> bool {
     normalized_media_type(content_type).contains("proto")
 }
@@ -798,33 +858,34 @@ fn text_language(media_type: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`DecodeError::Hex`] when the stored hex is malformed and
-/// [`DecodeError::Frames`] when the frame buffer is unusable.
+/// Returns [`DecodeError::Hex`] when the stored hex is malformed.
 pub fn decode_stored_connect_frames(
     raw_hex_value: &str,
     message_type: &str,
     codec: &str,
 ) -> Result<Vec<FrameView>, DecodeError> {
-    let payload = hex::decode(raw_hex_value.trim())
-        .map_err(|err| DecodeError::Hex(format!("stored Connect body: {err}")))?;
+    let payload = hex::decode(raw_hex_value.trim()).map_err(|source| DecodeError::Hex {
+        context: "a stored Connect body",
+        source,
+    })?;
+    // The callback runs synchronously inside `write`/`close`; the `Arc<Mutex>`
+    // only exists because `ConnectFrameDecoder` keeps its callback until drop.
     let frames = Arc::new(Mutex::new(Vec::new()));
     let collected = Arc::clone(&frames);
     let mut decoder =
         ConnectFrameDecoder::new(message_type, codec, DEFAULT_MAX_FRAMES, move |frame| {
-            // The UI cannot observe the frames before this call returns, so a
-            // poisoned lock only means a previous decode panicked.
             if let Ok(mut frames) = collected.lock() {
                 frames.push(frame);
             }
         });
     decoder.write(&payload);
     decoder.close();
-    let mut frames = frames
-        .lock()
-        .map_err(|err| DecodeError::Frames(err.to_string()))?;
-    Ok(std::mem::take(&mut *frames))
+    drop(decoder);
+    let frames = Arc::into_inner(frames).unwrap_or_default();
+    Ok(frames.into_inner().unwrap_or_default())
 }
 
+#[must_use]
 pub fn is_unary_proto_content_type(content_type: &str) -> bool {
     matches!(
         normalized_media_type(content_type).as_str(),
@@ -839,8 +900,10 @@ pub fn is_unary_proto_content_type(content_type: &str) -> bool {
 /// Returns [`DecodeError::Hex`] for malformed hex and the inflate errors for a
 /// codec this crate cannot apply.
 pub fn decode_stored_raw_payload(raw_hex_value: &str, codec: &str) -> Result<Vec<u8>, DecodeError> {
-    let payload = hex::decode(raw_hex_value.trim())
-        .map_err(|err| DecodeError::Hex(format!("stored body: {err}")))?;
+    let payload = hex::decode(raw_hex_value.trim()).map_err(|source| DecodeError::Hex {
+        context: "a stored body",
+        source,
+    })?;
     if codec.is_empty() || codec.eq_ignore_ascii_case("identity") {
         return Ok(payload);
     }
@@ -953,6 +1016,7 @@ fn unary_response_message(path: &str) -> Option<(prost_reflect::MessageDescripto
 
 /// The request/response protobuf type a streaming RPC carries, or `None` when
 /// `path` is not a streaming method.
+#[must_use]
 pub fn streaming_request_message_type(path: &str) -> Option<String> {
     if path == RUN_SSE_PATH {
         return Some("aiserver.v1.BidiRequestId".into());
@@ -966,6 +1030,7 @@ pub fn streaming_request_message_type(path: &str) -> Option<String> {
 
 /// The response protobuf type a streaming RPC returns, or `None` when `path` is
 /// not a streaming method.
+#[must_use]
 pub fn streaming_response_message_type(path: &str) -> Option<String> {
     if path == RUN_SSE_PATH {
         return Some("agent.v1.AgentServerMessage".into());
@@ -978,11 +1043,13 @@ pub fn streaming_response_message_type(path: &str) -> Option<String> {
 }
 
 /// Whether the debugger knows how to decode this path's request body.
+#[must_use]
 pub fn decodes_unary_request(path: &str) -> bool {
     path == BIDI_APPEND_PATH || unary_request_message(path).is_some()
 }
 
 /// Whether the debugger knows how to decode this path's response body.
+#[must_use]
 pub fn decodes_unary_response(path: &str) -> bool {
     unary_response_message(path).is_some()
 }
@@ -1014,6 +1081,7 @@ fn proto_message_kind(name: &str) -> String {
     snake_case(name)
 }
 
+#[must_use]
 pub fn snake_case(value: &str) -> String {
     let mut result = String::new();
     for (index, character) in value.chars().enumerate() {
@@ -1029,6 +1097,7 @@ pub fn snake_case(value: &str) -> String {
     result
 }
 
+#[must_use]
 pub fn marshal_proto_json(message: &DynamicMessage) -> String {
     let mut buf = Vec::new();
     let mut serializer = serde_json::Serializer::pretty(&mut buf);
@@ -1041,6 +1110,7 @@ pub fn marshal_proto_json(message: &DynamicMessage) -> String {
     String::from_utf8(buf).unwrap_or_default()
 }
 
+#[must_use]
 pub fn active_oneof_name(message: &DynamicMessage) -> String {
     for oneof in message.descriptor().oneofs() {
         for field in oneof.fields() {
@@ -1052,6 +1122,7 @@ pub fn active_oneof_name(message: &DynamicMessage) -> String {
     message.descriptor().name().to_string()
 }
 
+#[must_use]
 pub fn pretty_json(payload: &[u8]) -> String {
     match serde_json::from_slice::<serde_json::Value>(payload) {
         Ok(value) => serde_json::to_string_pretty(&value)
@@ -1060,6 +1131,7 @@ pub fn pretty_json(payload: &[u8]) -> String {
     }
 }
 
+#[must_use]
 pub fn clipped_hex(payload: &[u8], max: usize) -> String {
     if payload.len() > max {
         format!("{}...", hex::encode(&payload[..max]))
@@ -1068,6 +1140,7 @@ pub fn clipped_hex(payload: &[u8], max: usize) -> String {
     }
 }
 
+#[must_use]
 pub fn raw_hex(payload: &[u8]) -> String {
     hex::encode(payload)
 }

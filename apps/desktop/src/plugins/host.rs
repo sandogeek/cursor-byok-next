@@ -4,7 +4,6 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     sync::Arc,
-    time::{Duration, Instant},
 };
 
 use serde::{Deserialize as _, Serialize};
@@ -21,32 +20,19 @@ use crate::{
 use super::{
     Error, Result,
     catalog::{PluginCatalog, PluginEntry},
+    catalog_cache::{
+        CatalogCache, CatalogRefresh, LiveCatalogEntry, LiveCatalogKey, ProviderCatalog,
+    },
     data::PluginDataStore,
     descriptor::{
         CatalogMode, FormFieldKind, PluginDescriptor, PluginModelDescriptor,
         PluginProviderDescriptor, PluginResourceDescriptor, PluginResourceView, ProviderDefinition,
         ResourceDefinition, ResourcePresentation, parse_model_id,
     },
-    origin,
+    find_bun, origin,
     state::{PluginStateStore, ResourceDraft, ResourcePatch, ResourceRecord, StoredModel},
     worker::{PluginWorker, WorkerRequest, WorkerStreamItem},
 };
-
-const LIVE_CATALOG_TTL: Duration = Duration::from_secs(15);
-
-/// A provider's model list plus the error that left it incomplete, if any.
-#[derive(Debug, Default)]
-struct ProviderCatalog {
-    models: Vec<StoredModel>,
-    error: Option<String>,
-}
-
-/// Whether a catalog read may reuse the TTL cache or must re-ask the plugin.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CatalogRefresh {
-    Cached,
-    Forced,
-}
 
 #[derive(Clone)]
 pub struct PluginHost {
@@ -64,27 +50,13 @@ struct HostInner {
     state: PluginStateStore,
     entries: RwLock<Option<Arc<[Arc<PluginEntry>]>>>,
     workers: Mutex<HashMap<String, Arc<PluginWorker>>>,
-    live_catalogs: Mutex<HashMap<LiveCatalogKey, LiveCatalogEntry>>,
+    catalogs: CatalogCache,
     /// Serializes the mutations that read the catalog, call into the plugin and
     /// then write plugin state. The worker round-trip runs while this is held on
     /// purpose: two interleaved form submits could otherwise write resources
     /// derived from the same stale snapshot.
     operations: Mutex<()>,
     executable: RwLock<Option<std::path::PathBuf>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct LiveCatalogKey {
-    plugin: String,
-    provider: String,
-    resource: String,
-}
-
-#[derive(Clone, Debug)]
-struct LiveCatalogEntry {
-    models: Vec<StoredModel>,
-    last_attempt: Instant,
-    error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -117,7 +89,7 @@ impl PluginHost {
     /// Fails when the data directory cannot be resolved or the plugin workspace
     /// and data store cannot be created.
     pub fn managed() -> Result<Self> {
-        let data_dir = crate::harness::data_dir()?;
+        let data_dir = crate::storage::data_dir()?;
         Ok(Self::new(
             PluginCatalog::managed()?,
             PluginDataStore::at(data_dir.join("plugins/data"))?,
@@ -131,7 +103,7 @@ impl PluginHost {
                 state: PluginStateStore::new(data),
                 entries: RwLock::new(None),
                 workers: Mutex::new(HashMap::new()),
-                live_catalogs: Mutex::new(HashMap::new()),
+                catalogs: CatalogCache::default(),
                 operations: Mutex::new(()),
                 executable: RwLock::new(find_bun()),
             }),
@@ -248,7 +220,7 @@ impl PluginHost {
         if entry.manifest.permissions.resource_origin {
             for draft in &mut resources {
                 let origin = origin::origin_from_private_data(&draft.private_data)?;
-                origin::rewrite_private_origin(&mut draft.private_data, origin);
+                origin::rewrite_private_origin(&mut draft.private_data, &origin);
             }
         }
         let outcome = self
@@ -385,15 +357,18 @@ impl PluginHost {
     /// truncated turn as complete.
     pub fn stream_model(
         &self,
-        invocation: ModelInvocation,
+        mut invocation: ModelInvocation,
         cancellation: CancellationToken,
         recorder: Option<CallRecorder>,
     ) -> ProviderStream {
         let host = self.clone();
         Box::pin(async_stream::try_stream! {
-            let model_id = invocation.request.model.model_id.clone();
-            let parsed = parse_model_id(&model_id)
-                .ok_or_else(|| Error::Provider(format!("invalid plugin model ID: {model_id}")))?;
+            let parsed = parse_model_id(&invocation.request.model.model_id).ok_or_else(|| {
+                Error::Provider(format!(
+                    "invalid plugin model ID: {}",
+                    invocation.request.model.model_id
+                ))
+            })?;
             let plugin_id = parsed.plugin.to_owned();
             let provider_id = parsed.provider.to_owned();
             let upstream_id = parsed.model.to_owned();
@@ -407,7 +382,12 @@ impl PluginHost {
             let stored = stored
                 .into_iter()
                 .find(|model| model.id == upstream_id)
-                .ok_or_else(|| Error::NotFound(format!("plugin model {model_id}")))?;
+                .ok_or_else(|| {
+                    Error::NotFound(format!(
+                        "plugin model {}",
+                        invocation.request.model.model_id
+                    ))
+                })?;
             let resource = host
                 .invocation_resource(&plugin_id, provider, &upstream_id)
                 .await?;
@@ -425,7 +405,6 @@ impl PluginHost {
             });
             let worker = host.worker(&entry, &executable).await;
             let origins = Self::resource_origins(&entry, resource.as_ref().map(|(_, record)| record));
-            let mut invocation = invocation;
             if invocation.request.model.max_output_tokens.is_none() {
                 invocation.request.model.max_output_tokens = stored.max_output_tokens;
             }
@@ -810,35 +789,14 @@ impl PluginHost {
             provider: provider.id.clone(),
             resource: record.id.clone(),
         };
-        if refresh == CatalogRefresh::Cached {
-            let catalogs = self.inner.live_catalogs.lock().await;
-            if let Some(cached) = catalogs.get(&key)
-                && cached.last_attempt.elapsed() < LIVE_CATALOG_TTL
-            {
-                return cached.clone();
-            }
+        if let Some(cached) = self.inner.catalogs.get(&key, refresh).await {
+            return cached;
         }
         let result = self
             .list_models(entry, executable, provider, Some(record))
-            .await;
-        let mut catalogs = self.inner.live_catalogs.lock().await;
-        let cached = catalogs.entry(key).or_insert_with(|| LiveCatalogEntry {
-            models: Vec::new(),
-            last_attempt: Instant::now(),
-            error: None,
-        });
-        cached.last_attempt = Instant::now();
-        match result {
-            Ok(models) => {
-                cached.models = models
-                    .into_iter()
-                    .map(|model| bind_live_model(model, &record.id))
-                    .collect();
-                cached.error = None;
-            }
-            Err(error) => cached.error = Some(error.to_string()),
-        }
-        cached.clone()
+            .await
+            .map_err(|error| error.to_string());
+        self.inner.catalogs.store(key, result, &record.id).await
     }
 
     async fn list_models(
@@ -889,10 +847,9 @@ impl PluginHost {
 
     async fn invalidate_live_catalogs(&self, plugin_id: &str, resource_ids: &HashSet<String>) {
         self.inner
-            .live_catalogs
-            .lock()
-            .await
-            .retain(|key, _| key.plugin != plugin_id || !resource_ids.contains(&key.resource));
+            .catalogs
+            .invalidate(plugin_id, resource_ids)
+            .await;
     }
 
     /// Re-detects Bun while the catalog has not been loaded yet, and hands back
@@ -1046,11 +1003,6 @@ fn find_resource<'a>(
         })
 }
 
-fn bind_live_model(mut model: StoredModel, resource_id: &str) -> StoredModel {
-    model.id = format!("{resource_id}/{}", model.id);
-    model
-}
-
 fn live_resource_id(stored_id: &str) -> Option<&str> {
     stored_id
         .split_once('/')
@@ -1061,34 +1013,15 @@ fn live_upstream_id(stored_id: &str) -> Option<&str> {
     stored_id.split_once('/').map(|(_, upstream)| upstream)
 }
 
-fn find_bun() -> Option<std::path::PathBuf> {
-    which("bun")
-}
-
-fn which(name: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for directory in std::env::split_paths(&path) {
-        let candidate = directory.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        {
-            let exe = directory.join(format!("{name}.exe"));
-            if exe.is_file() {
-                return Some(exe);
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{ModelRequest, ModelSpec, PromptSpec};
     use futures_util::StreamExt;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::{
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        time::Duration,
+    };
     use tokio::{
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
         sync::Notify,
@@ -1182,8 +1115,8 @@ mod tests {
         assert_eq!(model.max_output_tokens, Some(8192));
         assert_eq!(
             host.inner
-                .live_catalogs
-                .lock()
+                .catalogs
+                .all()
                 .await
                 .values()
                 .next()
@@ -1739,24 +1672,35 @@ mod tests {
         gateway.4.abort();
     }
 
-    #[test]
-    fn binds_live_models_to_resource_ids() {
-        let model = bind_live_model(
-            StoredModel {
-                id: "gpt-5".into(),
-                display_name: "GPT".into(),
-                description: None,
-                max_output_tokens: None,
-                images: false,
-                private_data: serde_json::Value::Null,
-            },
-            "resource-1",
-        );
-        assert_eq!(model.id, "resource-1/gpt-5");
+    #[tokio::test]
+    async fn binds_live_models_to_resource_ids() {
+        // The binding happens inside the cache, so its effect is observed through
+        // the same read the picker makes.
+        let cache = super::super::catalog_cache::CatalogCache::default();
+        let key = super::super::catalog_cache::LiveCatalogKey {
+            plugin: "dev.cursorbyoknext.plugins.magpie".into(),
+            provider: "magpie".into(),
+            resource: "resource-1".into(),
+        };
+        let entry = cache
+            .store(
+                key,
+                Ok(vec![StoredModel {
+                    id: "gpt-5".into(),
+                    display_name: "GPT".into(),
+                    description: None,
+                    max_output_tokens: None,
+                    images: false,
+                    private_data: serde_json::Value::Null,
+                }]),
+                "resource-1",
+            )
+            .await;
+        assert_eq!(entry.models[0].id, "resource-1/gpt-5");
         assert_eq!(
             crate::plugins::parse_model_id(&format!(
                 "plugin:dev.cursorbyoknext.plugins.magpie/magpie/{}",
-                model.id
+                entry.models[0].id
             )),
             Some(crate::plugins::ModelId {
                 plugin: "dev.cursorbyoknext.plugins.magpie",

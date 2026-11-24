@@ -49,10 +49,10 @@ impl PluginDataStore {
         match tokio::fs::read(&path).await {
             Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(Error::Config(format!(
-                "plugin data read failed at {}: {error}",
-                path.display()
-            ))),
+            Err(source) => Err(Error::context(
+                format!("plugin data read failed at {}", path.display()),
+                source,
+            )),
         }
     }
 
@@ -84,7 +84,7 @@ impl PluginDataStore {
         let bytes = serde_json::to_vec_pretty(value)?;
         tokio::task::spawn_blocking(move || write_once(&directory, &temporary, &target, &bytes))
             .await
-            .map_err(|error| Error::Config(format!("plugin data write task failed: {error}")))??;
+            .map_err(|error| Error::context("plugin data write task failed", error))??;
         Ok(())
     }
 
@@ -97,10 +97,10 @@ impl PluginDataStore {
         match tokio::fs::remove_dir_all(&path).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(Error::Config(format!(
-                "plugin data cleanup failed at {}: {error}",
-                path.display()
-            ))),
+            Err(source) => Err(Error::context(
+                format!("plugin data cleanup failed at {}", path.display()),
+                source,
+            )),
         }
     }
 

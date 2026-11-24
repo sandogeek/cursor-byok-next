@@ -55,10 +55,13 @@ pub fn origin_from_private_data(value: &serde_json::Value) -> Result<String> {
 
 /// Rewrites the stored origin in place, so a normalized value always replaces
 /// whatever a plugin submitted.
-pub fn rewrite_private_origin(value: &mut serde_json::Value, origin: String) {
+pub fn rewrite_private_origin(value: &mut serde_json::Value, origin: &str) {
     match value.as_object_mut() {
         Some(object) => {
-            object.insert("origin".into(), serde_json::Value::String(origin));
+            object.insert(
+                "origin".into(),
+                serde_json::Value::String(origin.to_owned()),
+            );
         }
         None => {
             *value = serde_json::json!({ "origin": origin });

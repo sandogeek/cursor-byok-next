@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use crate::resolver::{TypeContext, TypeResolver};
 use crate::types::{
     Diagnostics, Enum, Field, FieldKind, Message, Service, SymbolKind, TypeName, TypeToken,
-    ValueKind, is_google_pkg, is_local_loop_pkg, parse_type_name,
+    ValueKind, is_google_pkg, is_local_loop_pkg, named_completeness, parse_type_name,
 };
 
 /// A definition's field count outweighs any per-field marker when choosing
@@ -89,7 +89,7 @@ impl NamedDeclaration for Message {
             if field.oneof.is_some() {
                 score += ONEOF_FIELD_WEIGHT;
             }
-            score += type_ref_completeness(field.t.as_ref());
+            score += type_ref_completeness(field.type_token.as_ref());
             score += type_ref_completeness(field.map_value_t.as_ref());
         }
         score
@@ -148,7 +148,7 @@ impl NamedDeclaration for Service {
 }
 
 fn name_completeness(type_ref: &str) -> i32 {
-    TypeToken::Named(type_ref.to_owned()).completeness()
+    named_completeness(type_ref)
 }
 
 /// Rewrites field and method type references to fully-qualified names.
@@ -161,7 +161,8 @@ pub fn normalize_type_references(
         let context = TypeContext::new(&message.package, message.pos, message.module_start);
         for field in &mut message.fields {
             if field.kind.is_named() {
-                field.t = resolve_token(field.t.take(), context, field.kind, resolver);
+                field.type_token =
+                    resolve_token(field.type_token.take(), context, field.kind, resolver);
             }
             if field.kind == FieldKind::Map && field.map_value_kind.is_named() {
                 field.map_value_t = resolve_token(
@@ -227,7 +228,7 @@ pub fn reclassify_enum_fields(messages: &mut [Message], enums: &[Enum]) {
                     field.map_value_kind = ValueKind::Enum;
                 }
             } else if field.kind == FieldKind::Message
-                && let Some(TypeToken::Named(name)) = &field.t
+                && let Some(TypeToken::Named(name)) = &field.type_token
                 && is_enum(name)
             {
                 field.kind = FieldKind::Enum;
@@ -255,36 +256,28 @@ pub fn declaration_coverage(
     enums: &[Enum],
     services: &[Service],
 ) -> DeclarationCoverage {
-    let mut declared_set = HashSet::new();
-    for type_name in declared {
-        let package = parse_type_name(type_name).package;
-        if !type_name.is_empty() && !is_google_pkg(&package) && is_local_loop_pkg(&package) {
-            declared_set.insert(type_name.clone());
-        }
-    }
-    let mut extracted = HashSet::new();
-    for message in messages {
-        extracted.insert(message.type_name.clone());
-    }
-    for item in enums {
-        extracted.insert(item.type_name.clone());
-    }
-    for service in services {
-        extracted.insert(service.type_name.clone());
-    }
-    let mut missing = Vec::new();
-    let mut matched = 0;
-    for type_name in &declared_set {
-        if extracted.contains(type_name) {
-            matched += 1;
-        } else {
-            missing.push(type_name.clone());
-        }
-    }
-    missing.sort();
+    let declared_set: HashSet<&str> = declared
+        .iter()
+        .filter(|type_name| {
+            let package = parse_type_name(type_name).package;
+            !type_name.is_empty() && !is_google_pkg(&package) && is_local_loop_pkg(&package)
+        })
+        .map(String::as_str)
+        .collect();
+    let extracted: HashSet<&str> = messages
+        .iter()
+        .map(|message| message.type_name.as_str())
+        .chain(enums.iter().map(|item| item.type_name.as_str()))
+        .chain(services.iter().map(|service| service.type_name.as_str()))
+        .collect();
+    let mut missing: Vec<String> = declared_set
+        .difference(&extracted)
+        .map(|type_name| (*type_name).to_owned())
+        .collect();
+    missing.sort_unstable();
     DeclarationCoverage {
         declared: declared_set.len(),
-        extracted: matched,
+        extracted: declared_set.len() - missing.len(),
         missing,
     }
 }
@@ -292,7 +285,7 @@ pub fn declaration_coverage(
 /// Sorts and removes duplicate names so diagnostics are stable.
 #[must_use]
 pub fn sorted_dedup(mut values: Vec<String>) -> Vec<String> {
-    values.sort();
+    values.sort_unstable();
     values.dedup();
     values
 }
@@ -376,7 +369,7 @@ pub fn collect_needed_types(
 
 /// The named types one field refers to: its own type and, for a map, its value.
 fn field_type_references(field: &Field) -> [Option<&str>; 2] {
-    let own = match &field.t {
+    let own = match &field.type_token {
         Some(TypeToken::Named(name)) if field.kind.is_named() => Some(name.as_str()),
         _ => None,
     };

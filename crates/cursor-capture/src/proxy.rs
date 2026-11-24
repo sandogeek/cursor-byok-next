@@ -18,9 +18,9 @@ use url::Url;
 use crate::capture::{BodyCompleteness, CaptureBody, CapturedBody};
 use crate::config::{Config, DEBUG_BASE_PATH, browser_address};
 use crate::decode::{
-    ConnectFrameDecoder, capture_limit, decode_captured_content, decode_unary_request,
+    ConnectFrameDecoder, capture_limit, clamped_i32, decode_captured_content, decode_unary_request,
     decode_unary_response, decodes_unary_request, decodes_unary_response, decompress_payload,
-    frame_count, is_unary_proto_content_type, raw_hex, streaming_request_message_type,
+    is_unary_proto_content_type, raw_hex, streaming_request_message_type,
     streaming_response_message_type,
 };
 use crate::store::{CaptureId, ExchangeStore, sorted_headers};
@@ -38,11 +38,7 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// Concurrent idle connections kept per upstream host.
 const POOL_MAX_IDLE_PER_HOST: usize = 32;
 
-#[derive(Clone)]
-#[expect(
-    missing_debug_implementations,
-    reason = "the server owns the capture store, which has no Debug impl"
-)]
+#[derive(Clone, Debug)]
 pub struct Server {
     config: Config,
     upstream: Url,
@@ -441,7 +437,7 @@ impl Side {
                     exchange.response.decode_error = Some(error.clone());
                 }
                 exchange.response.frames.push(frame);
-                exchange.summary.frame_count = frame_count(exchange.response.frames.len());
+                exchange.summary.frame_count = clamped_i32(exchange.response.frames.len());
             }
         }
     }

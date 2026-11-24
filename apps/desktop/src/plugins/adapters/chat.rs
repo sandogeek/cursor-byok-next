@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use super::{
     CoreMessage, ProtocolParser, SawTool, ToolNames, core_message, count_usize, data_url,
-    map_text_field, object, parse_object, text,
+    map_text_field, parse_object,
 };
 use crate::{
     model::{ContentPart, ModelInvocation, ModelLatency, Usage},
@@ -64,11 +64,11 @@ impl ProtocolParser for Parser {
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
-            .and_then(object)
+            .and_then(Value::as_object)
         else {
             return Ok(false);
         };
-        let delta = choice.get("delta").and_then(object);
+        let delta = choice.get("delta").and_then(Value::as_object);
         let reasoning_delta = delta.and_then(|delta| {
             delta
                 .get("reasoning_content")
@@ -99,16 +99,16 @@ impl ProtocolParser for Parser {
             delta.and_then(|delta| delta.get("tool_calls").and_then(Value::as_array))
         {
             for (position, raw_tool) in tool_calls.iter().enumerate() {
-                let Some(tool_delta) = object(raw_tool) else {
+                let Some(tool_delta) = raw_tool.as_object() else {
                     continue;
                 };
                 let index = tool_delta
                     .get("index")
                     .and_then(count_usize)
                     .unwrap_or(position);
-                let function = tool_delta.get("function").and_then(object);
+                let function = tool_delta.get("function").and_then(Value::as_object);
                 let tool = self.tools.entry(index).or_default();
-                if let Some(call_id) = tool_delta.get("id").and_then(text) {
+                if let Some(call_id) = tool_delta.get("id").and_then(Value::as_str) {
                     tool.merge_call_id(call_id);
                 }
                 if let Some(name) =
@@ -132,7 +132,7 @@ impl ProtocolParser for Parser {
                 }
             }
         }
-        if let Some(reason) = choice.get("finish_reason").and_then(text) {
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             self.finish = Some(map_finish(reason, SawTool::from_count(self.tools.len())));
         }
         Ok(false)
@@ -290,7 +290,7 @@ fn assistant_message(
 ) -> crate::plugins::Result<Option<Value>> {
     let reasoning = replay_state
         .filter(|state| state.provider_kind == REPLAY_KIND)
-        .and_then(|state| object(&state.value))
+        .and_then(|state| state.value.as_object())
         .and_then(|value| value.get("reasoning_content").and_then(Value::as_str));
     if text.is_empty() && tool_calls.is_empty() && reasoning.is_none() {
         return Ok(None);
@@ -377,13 +377,13 @@ fn event_error(value: &Value) -> Option<String> {
 }
 
 fn chat_usage(value: &Value) -> ModelEvent {
-    let usage = object(value);
+    let usage = value.as_object();
     let details = usage
         .and_then(|usage| usage.get("prompt_tokens_details"))
-        .and_then(object);
+        .and_then(Value::as_object);
     let completion = usage
         .and_then(|usage| usage.get("completion_tokens_details"))
-        .and_then(object);
+        .and_then(Value::as_object);
     ModelEvent::Usage(
         Usage::new(
             super::map_count(usage, "prompt_tokens"),

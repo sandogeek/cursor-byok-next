@@ -3,8 +3,8 @@
 use serde_json::{Value, json};
 
 use super::{
-    CoreMessage, ProtocolParser, SawTool, ToolNames, core_message, count_usize, encode_base64,
-    map_text_field, object, object_mut, parse_object, text_field,
+    CoreMessage, ProtocolParser, SawTool, ToolNames, core_message, encode_base64, map_text_field,
+    object_mut, parse_object, text_field,
 };
 use crate::{
     model::{ContentPart, ModelInvocation},
@@ -110,7 +110,7 @@ impl Parser {
     fn message_start(&mut self, value: &Value) {
         if let Some(message_usage) = value
             .get("message")
-            .and_then(object)
+            .and_then(Value::as_object)
             .and_then(|message| message.get("usage"))
         {
             self.saw_usage = true;
@@ -124,7 +124,7 @@ impl Parser {
         emit: &mut dyn FnMut(ModelEvent),
     ) -> Result<()> {
         let index = required_index(value)?;
-        let block = value.get("content_block").and_then(object);
+        let block = value.get("content_block").and_then(Value::as_object);
         let kind = required_type(block)?;
         self.block_types.insert(index, kind.clone());
         match kind.as_str() {
@@ -167,7 +167,7 @@ impl Parser {
         emit: &mut dyn FnMut(ModelEvent),
     ) -> Result<()> {
         let index = required_index(value)?;
-        let delta = value.get("delta").and_then(object);
+        let delta = value.get("delta").and_then(Value::as_object);
         let delta_kind = required_type(delta)?;
         self.open_implicit_block(&delta_kind, index, emit);
         match delta_kind.as_str() {
@@ -251,7 +251,7 @@ impl Parser {
         }
         if let Some(reason) = value
             .get("delta")
-            .and_then(object)
+            .and_then(Value::as_object)
             .and_then(|delta| map_text_field(Some(delta), "stop_reason"))
         {
             self.finish = Some(map_stop(reason, self.saw_tool));
@@ -469,7 +469,8 @@ fn anthropic_parts(parts: &[ContentPart], allow_attachments: Attachments) -> Res
 }
 
 fn replay_blocks(value: &Value) -> Vec<Value> {
-    object(value)
+    value
+        .as_object()
         .and_then(|value| value.get("blocks"))
         .and_then(Value::as_array)
         .cloned()
@@ -479,7 +480,9 @@ fn replay_blocks(value: &Value) -> Vec<Value> {
 fn push_anthropic(output: &mut Vec<Value>, role: AnthropicRole, content: Vec<Value>) {
     let name = role.as_str();
     if let Some(last) = output.last_mut()
-        && object(last).is_some_and(|last| map_text_field(Some(last), "role") == Some(name))
+        && last
+            .as_object()
+            .is_some_and(|last| map_text_field(Some(last), "role") == Some(name))
         && let Some(existing) = last
             .as_object_mut()
             .and_then(|last| last.get_mut("content"))
@@ -601,7 +604,7 @@ fn empty_usage() -> UsageState {
 }
 
 fn anthropic_usage(value: &Value) -> UsageState {
-    let usage = object(value);
+    let usage = value.as_object();
     UsageState {
         input: super::map_count(usage, "input_tokens"),
         output: super::map_count(usage, "output_tokens"),
@@ -655,9 +658,7 @@ fn final_reason(finish: Option<FinishReason>, saw_tool: SawTool) -> FinishReason
 }
 
 fn required_index(value: &Value) -> Result<usize> {
-    value
-        .get("index")
-        .and_then(count_usize)
+    super::count_field(value, "index")
         .ok_or_else(|| Error::Provider("Anthropic event is missing index".into()))
 }
 

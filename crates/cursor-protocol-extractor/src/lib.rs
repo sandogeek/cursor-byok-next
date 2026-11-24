@@ -1,6 +1,6 @@
 //! Extract Cursor local-loop protobuf schemas from installed JS bundles.
 
-mod ast_util;
+mod ast;
 mod compact;
 mod error;
 mod extract;

@@ -56,7 +56,7 @@ impl std::fmt::Debug for Backend {
 
 impl Backend {
     pub async fn start(plugins: PluginHost, calls: CallStore) -> Result<Self> {
-        let knowledge = KnowledgeService::with_root(crate::harness::data_dir()?.join("rules"))?;
+        let knowledge = KnowledgeService::with_root(crate::storage::data_subdir("rules")?)?;
         let inference = InferenceService::new(plugins.clone(), knowledge.clone(), calls);
         let proxy = proxy::CursorProxy::default();
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -74,6 +74,43 @@ impl Backend {
         self.addr
     }
 }
+
+/// Every Cursor RPC this backend answers, as the request line's path. The MITM
+/// layer rewrites exactly these paths to the local port; a route added below
+/// without an entry here would still reach Cursor's own host.
+pub(crate) const PROVIDED_PATHS: [&str; 31] = [
+    "/aiserver.v1.InferenceService/RunInferenceSSE",
+    "/aiserver.v1.BidiService/BidiAppend",
+    "/aiserver.v1.AuthService/GetEmail",
+    "/aiserver.v1.AuthService/GetUserMeta",
+    "/aiserver.v1.DashboardService/GetMe",
+    "/aiserver.v1.DashboardService/GetTeams",
+    "/aiserver.v1.DashboardService/GetUserProfile",
+    "/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+    "/aiserver.v1.DashboardService/GetUsageLimitStatusAndActiveGrants",
+    "/aiserver.v1.AiService/AvailableDocs",
+    "/aiserver.v1.DashboardService/GetEffectiveUserPlugins",
+    "/aiserver.v1.DashboardService/GetUserPrivacyMode",
+    "/agent.v1.AgentService/UpdateConversationMetadata",
+    "/aiserver.v1.AiService/GetServerConfig",
+    "/aiserver.v1.ServerConfigService/GetServerConfig",
+    "/aiserver.v1.AiService/AvailableModels",
+    "/agent.v1.AgentService/GetUsableModels",
+    "/aiserver.v1.AiService/GetUsableModels",
+    "/agent.v1.AgentService/GetDefaultModelForCli",
+    "/aiserver.v1.AiService/GetDefaultModelForCli",
+    "/aiserver.v1.AiService/GetDefaultModel",
+    "/aiserver.v1.AiService/GetDefaultModelNudgeData",
+    "/aiserver.v1.AiService/KnowledgeBaseAdd",
+    "/aiserver.v1.AiService/KnowledgeBaseList",
+    "/aiserver.v1.AiService/KnowledgeBaseUpdate",
+    "/aiserver.v1.AiService/KnowledgeBaseRemove",
+    "/aiserver.v1.AiService/WriteGitCommitMessage",
+    "/aiserver.v1.NetworkService/IsConnected",
+    "/aiserver.v1.AnalyticsService/BootstrapStatsig",
+    "/auth/full_stripe_profile",
+    "/auth/stripe_profile",
+];
 
 fn router(
     plugins: PluginHost,
@@ -190,15 +227,15 @@ fn misc_routes() -> Router {
     Router::new()
         .route(
             "/aiserver.v1.AiService/AvailableDocs",
-            post(compatibility::available_docs),
+            post(compatibility::empty_metadata),
         )
         .route(
             "/aiserver.v1.DashboardService/GetEffectiveUserPlugins",
-            post(compatibility::effective_user_plugins),
+            post(compatibility::empty_metadata),
         )
         .route(
             "/aiserver.v1.DashboardService/GetUserPrivacyMode",
-            post(compatibility::user_privacy_mode),
+            post(compatibility::empty_metadata),
         )
         .route(
             "/agent.v1.AgentService/UpdateConversationMetadata",
@@ -245,7 +282,7 @@ async fn run_inference_sse(
             proxy::forward_request(&proxy, Request::from_parts(parts, Body::from(body))).await
         }
         InferenceRoute::Local(run) => {
-            let (mut receiver, subscription) = inference_service.subscribe(request_id, &run);
+            let (mut receiver, subscription) = inference_service.subscribe(request_id, run);
             let stream = async_stream::stream! {
                 let _subscription = subscription;
                 while let Some(frame) = receiver.recv().await {
@@ -373,18 +410,6 @@ pub(crate) fn proto_bytes_response(body: impl Into<Bytes>) -> Response<Body> {
         .headers_mut()
         .insert(header::CONTENT_LENGTH, HeaderValue::from(length));
     response
-}
-
-pub(crate) use connect::Framing;
-
-/// Splits an optional Connect unary envelope off `body`.
-pub(crate) fn unary_payload<'a>(body: &'a [u8], label: &str) -> Result<(Framing, &'a [u8])> {
-    connect::split_unary(body, label)
-}
-
-/// Wraps an encoded unary payload in a Connect envelope when `framing` asks for it.
-pub(crate) fn encode_unary(payload: &[u8], framing: Framing) -> Result<Bytes> {
-    connect::wrap_unary(payload, framing)
 }
 
 /// Resolves a local-vs-forward decision for an account RPC. `local` runs only

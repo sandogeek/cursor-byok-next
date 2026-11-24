@@ -17,6 +17,8 @@ pub mod model;
 pub mod plugins;
 pub mod protocol;
 pub mod provider;
+mod saturating;
+mod storage;
 mod time;
 
 pub use error::{Error, Result};
@@ -394,17 +396,11 @@ impl From<HostResourceView> for PluginResourceView {
 impl From<HostFormSubmit> for PluginFormResult {
     fn from(value: HostFormSubmit) -> Self {
         Self {
-            added: saturating_u32(value.added),
-            updated: saturating_u32(value.updated),
+            added: saturating::u32_from_usize(value.added),
+            updated: saturating::u32_from_usize(value.updated),
             model_sync_error: value.model_sync_error,
         }
     }
-}
-
-/// A count the TSX boundary shows as `u32`; a resource count never reaches
-/// `u32::MAX`, and saturating is the honest answer if it somehow did.
-fn saturating_u32(count: usize) -> u32 {
-    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 /// A plugin runtime snapshot the settings page shows.
@@ -1132,7 +1128,7 @@ fn shared_call_store() -> CallStore {
     if let Some(store) = CALL_STORE.get() {
         return store.clone();
     }
-    let store = CallStore::at(crate::harness::data_dir().map_or_else(
+    let store = CallStore::at(crate::storage::data_dir().map_or_else(
         |error| {
             tracing::error!(%error, "cannot open LLM call records");
             std::env::temp_dir().join("cursor-byok-next-calls.db")

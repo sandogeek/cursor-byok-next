@@ -350,8 +350,7 @@ impl KnowledgeService {
     /// The rules as Cursor sends them, read under the same lock as writes so a
     /// rule file and its metadata cannot be observed half-updated.
     pub async fn local_cursor_rules(&self) -> Vec<pb::CursorRule> {
-        let _guard = self.inner.lock.lock().await;
-        let records = match self.inner.store.list() {
+        let records = match self.run(RuleStore::list).await {
             Ok(records) => records,
             Err(error) => {
                 tracing::warn!(%error, "cannot read local rules; continuing without them");
@@ -368,6 +367,23 @@ impl KnowledgeService {
             })
             .collect()
     }
+
+    /// Runs one store operation under the write lock, on the blocking pool: rule
+    /// files and the metadata index are filesystem work that must not occupy an
+    /// async worker.
+    async fn run<F, T>(&self, operation: F) -> Result<T>
+    where
+        F: FnOnce(&RuleStore) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let _guard = inner.lock.blocking_lock();
+            operation(&inner.store)
+        })
+        .await
+        .map_err(|error| Error::context("rules task failed", error))?
+    }
 }
 
 /// Stores one rule under a fresh local id and answers with it.
@@ -377,17 +393,20 @@ pub async fn add(
 ) -> Result<Response<Body>> {
     let body = super::read_body(request.into_body()).await?;
     let message: KnowledgeBaseAddRequest = connect::decode_unary(&body)?;
-    let _guard = service.inner.lock.lock().await;
     let id = format!("{LOCAL_ID_PREFIX}{}", uuid::Uuid::new_v4());
-    service.inner.store.upsert(&RuleRecord {
+    let record = RuleRecord {
         id: id.clone(),
         knowledge: message.knowledge,
         title: message.title,
         created_at: now(),
         is_generated: false,
         git_origin: message.git_origin,
-    })?;
-    Ok(proto(&KnowledgeBaseAddResponse { success: true, id }))
+    };
+    service.run(move |store| store.upsert(&record)).await?;
+    Ok(super::proto_response(&KnowledgeBaseAddResponse {
+        success: true,
+        id,
+    }))
 }
 
 /// Lists stored rules newest first, filtered by git origin and truncated to the requested limit.
@@ -397,8 +416,7 @@ pub async fn list(
 ) -> Result<Response<Body>> {
     let body = super::read_body(request.into_body()).await?;
     let message: KnowledgeBaseListRequest = connect::decode_unary(&body)?;
-    let _guard = service.inner.lock.lock().await;
-    let mut records = service.inner.store.list()?;
+    let mut records = service.run(RuleStore::list).await?;
     if let Some(git_origin) = message.git_origin.filter(|origin| !origin.is_empty()) {
         records.retain(|record| record.git_origin == git_origin);
     }
@@ -409,7 +427,7 @@ pub async fn list(
             records.truncate(limit);
         }
     }
-    Ok(proto(&KnowledgeBaseListResponse {
+    Ok(super::proto_response(&KnowledgeBaseListResponse {
         success: true,
         all_results: records
             .into_iter()
@@ -431,14 +449,20 @@ pub async fn update(
 ) -> Result<Response<Body>> {
     let body = super::read_body(request.into_body()).await?;
     let message: KnowledgeBaseUpdateRequest = connect::decode_unary(&body)?;
-    let _guard = service.inner.lock.lock().await;
-    let Some(mut record) = service.inner.store.get(&message.id)? else {
-        return Ok(proto(&KnowledgeBaseUpdateResponse { success: false }));
-    };
-    record.knowledge = message.knowledge;
-    record.title = message.title;
-    service.inner.store.upsert(&record)?;
-    Ok(proto(&KnowledgeBaseUpdateResponse { success: true }))
+    let updated = service
+        .run(move |store| {
+            let Some(mut record) = store.get(&message.id)? else {
+                return Ok(false);
+            };
+            record.knowledge = message.knowledge;
+            record.title = message.title;
+            store.upsert(&record)?;
+            Ok(true)
+        })
+        .await?;
+    Ok(super::proto_response(&KnowledgeBaseUpdateResponse {
+        success: updated,
+    }))
 }
 
 /// Deletes a rule and its metadata entry; removing an absent id still succeeds.
@@ -448,17 +472,15 @@ pub async fn remove(
 ) -> Result<Response<Body>> {
     let body = super::read_body(request.into_body()).await?;
     let message: KnowledgeBaseRemoveRequest = connect::decode_unary(&body)?;
-    let _guard = service.inner.lock.lock().await;
-    service.inner.store.remove(&message.id)?;
-    Ok(proto(&KnowledgeBaseRemoveResponse { success: true }))
+    let id = message.id;
+    service.run(move |store| store.remove(&id)).await?;
+    Ok(super::proto_response(&KnowledgeBaseRemoveResponse {
+        success: true,
+    }))
 }
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
-
-fn proto(message: &impl Message) -> Response<Body> {
-    super::proto_response(message)
 }
 
 #[cfg(test)]

@@ -12,24 +12,11 @@ use crate::{Result, backend::proxy::CursorProxy, protocol::proto::agent::v1 as a
 #[derive(Clone, Copy, PartialEq, Message)]
 struct EmptyResponse {}
 
-/// Answers `AiService/AvailableDocs` with the empty list Cursor accepts when docs are local.
-pub async fn available_docs(
-    Extension(proxy): Extension<CursorProxy>,
-    request: Request<Body>,
-) -> Result<Response<Body>> {
-    super::local_or_forward(&proxy, request, || super::proto_response(&EmptyResponse {})).await
-}
-
-/// Answers `DashboardService/GetEffectiveUserPlugins` with no plugins.
-pub async fn effective_user_plugins(
-    Extension(proxy): Extension<CursorProxy>,
-    request: Request<Body>,
-) -> Result<Response<Body>> {
-    super::local_or_forward(&proxy, request, || super::proto_response(&EmptyResponse {})).await
-}
-
-/// Answers `DashboardService/GetUserPrivacyMode`; the default empty message means no privacy mode.
-pub async fn user_privacy_mode(
+/// Answers a metadata RPC with the empty message its client reads as "nothing
+/// configured": `AvailableDocs`, `GetEffectiveUserPlugins` and
+/// `GetUserPrivacyMode` all share this reply, and each falls back to Cursor when
+/// the request carries a real Cursor token.
+pub async fn empty_metadata(
     Extension(proxy): Extension<CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {

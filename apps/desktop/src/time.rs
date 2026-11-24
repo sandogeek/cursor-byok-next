@@ -8,5 +8,5 @@ pub(crate) fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    i64::try_from(millis).unwrap_or(i64::MAX)
+    super::saturating::i64_from_u128(millis)
 }

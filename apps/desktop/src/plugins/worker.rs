@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     process::Stdio,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, AtomicU16, Ordering},
     },
     time::Duration,
@@ -19,49 +19,29 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-
 use super::{
     Error, Result,
     builtin::MAGPIE_PLUGIN_ID,
     catalog::PluginEntry,
     definition::{PluginDefinitionLoader, file_url},
-    origin,
+    host_calls::HostContext,
     protocol::{HostMessage, WorkerMessage},
     wire,
 };
 use crate::{calls::CallRecorder, model::ModelInvocation, provider::ModelEvent};
 
 const INVOCATION_TIMEOUT: Duration = Duration::from_secs(60);
-/// Per-request deadline for a plugin's own `fetch`/`stream` calls.
-const NETWORK_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_NETWORK_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_STREAM_BYTES: usize = 256 * 1024 * 1024;
 
-/// A prepared plugin network call: everything `fetch`/`stream_open` needs to
-/// run it and attribute the response.
-struct NetworkRequest {
-    request: reqwest::RequestBuilder,
-    origin: url::Url,
-    method: reqwest::Method,
-    recorder: Option<CallRecorder>,
+/// One item a plugin invocation produces: a streamed model event, or the
+/// terminal result that ends the invocation.
+#[derive(Debug)]
+pub enum WorkerStreamItem {
+    Event(ModelEvent),
+    Result(Result<serde_json::Value>),
 }
 
-/// Keeps the transport detail of a failed plugin request in the message,
-/// including the underlying cause chain reqwest only exposes through
-/// `source()`.
-fn provider_error(error: &reqwest::Error) -> Error {
-    use std::error::Error as _;
-    let mut detail = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        detail.push_str(": ");
-        detail.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    Error::Provider(format!("plugin network request failed: {detail}"))
-}
+/// Frames queued for the single stdin writer, as bytes ready to send.
+type Writer = mpsc::Sender<Vec<u8>>;
 
 #[cfg(test)]
 static LAST_INVOKE_FRAME: parking_lot::Mutex<Vec<u8>> = parking_lot::Mutex::new(Vec::new());
@@ -70,27 +50,6 @@ static LAST_INVOKE_FRAME: parking_lot::Mutex<Vec<u8>> = parking_lot::Mutex::new(
 pub(crate) fn last_invoke_frame() -> Vec<u8> {
     LAST_INVOKE_FRAME.lock().clone()
 }
-
-#[derive(Debug)]
-pub enum WorkerStreamItem {
-    Event(ModelEvent),
-    Result(Result<serde_json::Value>),
-}
-
-type Writer = mpsc::Sender<Vec<u8>>;
-/// The receiving half of one plugin stream, kept for `network.stream.read`.
-type StreamLines = Arc<Mutex<mpsc::Receiver<Result<String>>>>;
-/// How many queued lines one `network.stream.read` call returns. The worker
-/// loop asks again immediately, so a small batch keeps the reply bounded.
-const STREAM_READ_BATCH: usize = 256;
-/// Unread lines buffered between the reader task and the plugin. A stream that
-/// outruns its plugin applies backpressure here instead of growing unbounded.
-const STREAM_LINE_BUFFER: usize = 256;
-/// Frames queued for the single stdin writer. The writer drains one frame at a
-/// time, so this only absorbs bursts from concurrent invocations.
-const WRITE_QUEUE_FRAMES: usize = 32;
-const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// A registered stream: the guard that unregisters it, the stream the caller
 /// reads events from, the sender the worker impl writes them to, and the
@@ -129,6 +88,8 @@ impl Pending {
         Self(parking_lot::Mutex::new(Some(HashMap::new())))
     }
 
+    /// Registers one in-flight invocation. `self` stays an `Arc` at the call
+    /// site because the returned guard must keep the map alive.
     fn register(self: &Arc<Self>, state: InvocationState) -> Result<Registration> {
         let id = uuid::Uuid::new_v4().to_string();
         let (items, receiver) = mpsc::unbounded_channel();
@@ -241,8 +202,10 @@ impl Drop for WorkerProcess {
 }
 
 pub(super) struct InvocationState {
-    allowed_origins: HashSet<String>,
-    magpie_catalog_status: Option<AtomicU16>,
+    pub(super) allowed_origins: HashSet<String>,
+    /// Set only for Magpie's `models.list`, and only its own HTTP status is
+    /// recorded: the app reports that status as `catalogError`.
+    pub(super) magpie_catalog_status: Option<AtomicU16>,
     pub(super) cancellation: CancellationToken,
     recorder: Option<CallRecorder>,
     recorder_claimed: AtomicBool,
@@ -287,39 +250,16 @@ impl InvocationState {
     }
 }
 
-#[derive(Clone)]
-pub(super) struct HostContext {
-    plugin_id: String,
-    network_hosts: Arc<HashSet<String>>,
-    resource_origin: bool,
-    streams: Arc<Mutex<HashMap<String, StreamLines>>>,
-    http: OnceLock<reqwest::Client>,
-    #[cfg(test)]
-    sdk_projections: Arc<AtomicUsize>,
-}
+/// Frames queued for the single stdin writer. The writer drains one frame at a
+/// time, so this only absorbs bursts from concurrent invocations.
+const WRITE_QUEUE_FRAMES: usize = 32;
 
 impl PluginWorker {
     pub fn new(plugin: &PluginEntry, executable: PathBuf, loader: PluginDefinitionLoader) -> Self {
         let plugin_id = plugin.manifest.id.clone();
         Self {
             inner: Arc::new(PluginWorkerInner {
-                host: HostContext {
-                    plugin_id: plugin_id.clone(),
-                    network_hosts: Arc::new(
-                        plugin
-                            .manifest
-                            .permissions
-                            .network
-                            .iter()
-                            .map(|host| host.to_ascii_lowercase())
-                            .collect(),
-                    ),
-                    resource_origin: plugin.manifest.permissions.resource_origin,
-                    streams: Arc::new(Mutex::new(HashMap::new())),
-                    http: OnceLock::new(),
-                    #[cfg(test)]
-                    sdk_projections: Arc::new(AtomicUsize::new(0)),
-                },
+                host: HostContext::new(&plugin_id, &plugin.manifest.permissions),
                 plugin_id,
                 executable,
                 entry: plugin.entry.clone(),
@@ -496,11 +436,14 @@ impl PluginWorker {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command.spawn().map_err(|error| {
-            Error::Config(format!(
-                "cannot start plugin worker {}: {error}",
-                self.inner.executable.display()
-            ))
+        let mut child = command.spawn().map_err(|source| {
+            Error::context(
+                format!(
+                    "cannot start plugin worker {}",
+                    self.inner.executable.display()
+                ),
+                source,
+            )
         })?;
         let stdin = child
             .stdin
@@ -552,7 +495,10 @@ async fn read_stdout(
     let mut lines = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(message) = serde_json::from_str::<WorkerMessage>(&line) else {
-            tracing::warn!(plugin = %host.plugin_id, "plugin worker wrote an invalid message");
+            tracing::warn!(
+                plugin = host.plugin_id(),
+                "plugin worker wrote an invalid message"
+            );
             continue;
         };
         match message {
@@ -661,383 +607,6 @@ async fn write_stdin(
     Ok(())
 }
 
-impl HostContext {
-    async fn call(
-        &self,
-        invocation: &InvocationState,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        match method {
-            "network.fetch" => self.fetch(invocation, params).await,
-            "network.stream.open" => self.stream_open(invocation, params).await,
-            "network.stream.read" => self.stream_read(params).await,
-            "network.stream.close" => {
-                self.streams
-                    .lock()
-                    .await
-                    .remove(required_string(&params, "streamId")?);
-                Ok(serde_json::Value::Null)
-            }
-            "protocol.stream" => super::adapters::stream(self, invocation, params).await,
-            "provider.readRequest" => self.read_request(invocation),
-            _ => Err(Error::Protocol(format!(
-                "unsupported plugin host method: {method}"
-            ))),
-        }
-    }
-
-    #[cfg_attr(
-        not(test),
-        expect(
-            clippy::unused_self,
-            reason = "`self` is only read under cfg(test) to count SDK projections"
-        )
-    )]
-    fn read_request(&self, invocation: &InvocationState) -> Result<serde_json::Value> {
-        #[cfg(test)]
-        self.sdk_projections.fetch_add(1, Ordering::SeqCst);
-        wire::llm_request(invocation.model()?)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn sdk_projection_count(&self) -> usize {
-        self.sdk_projections.load(Ordering::SeqCst)
-    }
-
-    pub(super) async fn prepare_request(
-        &self,
-        invocation: &InvocationState,
-        raw_url: &str,
-        method: reqwest::Method,
-        headers: &std::collections::HashMap<String, String>,
-        body: Option<&str>,
-    ) -> Result<(reqwest::RequestBuilder, Option<CallRecorder>)> {
-        let url = url::Url::parse(raw_url)
-            .map_err(|error| Error::Config(format!("invalid plugin network URL: {error}")))?;
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(Error::Config(
-                "plugin network URL must not contain credentials".into(),
-            ));
-        }
-        let host = url
-            .host_str()
-            .ok_or_else(|| Error::Config("plugin network URL has no host".into()))?
-            .to_ascii_lowercase();
-        let origin = origin::request_origin(&url)?;
-        let allowed_origin = invocation.allowed_origins.contains(&origin);
-        let allowed_static_host = url.scheme() == "https" && self.network_hosts.contains(&host);
-        if !(allowed_static_host || (self.resource_origin && allowed_origin)) {
-            if url.scheme() != "https" && !self.resource_origin {
-                return Err(Error::Config(
-                    "plugin network URL must be HTTPS without credentials".into(),
-                ));
-            }
-            return Err(Error::Config(format!(
-                "plugin '{}' cannot access host '{host}'",
-                self.plugin_id
-            )));
-        }
-        let client = self.http_client()?;
-        let mut request = client.request(method, url);
-        for (name, value) in headers {
-            request = request.header(name, value);
-        }
-        if let Some(body) = body {
-            request = request.body(body.to_owned());
-        }
-        let recorder = invocation.claim_recorder();
-        if let Some(recorder) = &recorder {
-            let mut recorded_headers = serde_json::Map::new();
-            for (name, value) in headers {
-                if !crate::calls::is_sensitive_header(name) {
-                    recorded_headers.insert(name.clone(), value.clone().into());
-                }
-            }
-            let recorded_body = body.map_or(serde_json::Value::Null, |body| {
-                serde_json::from_str(body).unwrap_or_else(|_| body.into())
-            });
-            recorder
-                .request(serde_json::Value::Object(recorded_headers), &recorded_body)
-                .await;
-        }
-        Ok((request, recorder))
-    }
-
-    fn http_client(&self) -> Result<&reqwest::Client> {
-        if let Some(client) = self.http.get() {
-            return Ok(client);
-        }
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(HTTP_CONNECT_TIMEOUT)
-            .pool_idle_timeout(HTTP_POOL_IDLE_TIMEOUT)
-            .build()
-            .map_err(|error| Error::Config(format!("cannot build plugin HTTP client: {error}")))?;
-        Ok(self.http.get_or_init(|| client))
-    }
-
-    async fn request(
-        &self,
-        invocation: &InvocationState,
-        params: &serde_json::Value,
-    ) -> Result<NetworkRequest> {
-        let raw_url = required_string(params, "url")?;
-        let url = url::Url::parse(raw_url)
-            .map_err(|error| Error::Config(format!("invalid plugin network URL: {error}")))?;
-        let method = params
-            .get("method")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("GET")
-            .parse::<reqwest::Method>()
-            .map_err(|error| Error::Config(format!("invalid plugin HTTP method: {error}")))?;
-        let mut headers = std::collections::HashMap::new();
-        if let Some(map) = params.get("headers").and_then(serde_json::Value::as_object) {
-            for (name, value) in map {
-                let value = value.as_str().ok_or_else(|| {
-                    Error::Config(format!("plugin HTTP header '{name}' must be a string"))
-                })?;
-                headers.insert(name.clone(), value.to_owned());
-            }
-        }
-        let body = params.get("body").and_then(serde_json::Value::as_str);
-        let (request, recorder) = self
-            .prepare_request(invocation, raw_url, method.clone(), &headers, body)
-            .await?;
-        Ok(NetworkRequest {
-            request,
-            origin: url,
-            method,
-            recorder,
-        })
-    }
-
-    async fn fetch(
-        &self,
-        invocation: &InvocationState,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        let NetworkRequest {
-            request,
-            origin: url,
-            method,
-            recorder,
-        } = self.request(invocation, &params).await?;
-        let origin = origin::request_origin(&url)?;
-        let catalog_status = invocation.magpie_catalog_status.as_ref().filter(|_| {
-            invocation.allowed_origins.contains(&origin)
-                && method == reqwest::Method::GET
-                && url.path() == "/v1/models"
-        });
-        let request = request.timeout(NETWORK_REQUEST_TIMEOUT);
-        let mut response = tokio::select! {
-            () = invocation.cancellation.cancelled() => return Err(Error::Cancelled),
-            response = request.send() => {
-                response.map_err(|error| provider_error(&error))?
-            }
-        };
-        let status = response.status().as_u16();
-        if let Some(recorder) = &recorder {
-            recorder.response_headers(status).await;
-        }
-        if let Some(catalog_status) = catalog_status {
-            catalog_status.store(status, Ordering::Relaxed);
-            if !response.status().is_success() {
-                return Ok(serde_json::json!({"status": status, "headers": {}, "body": ""}));
-            }
-        }
-        if response.content_length().is_some_and(|size| {
-            usize::try_from(size).map_or(true, |size| size > MAX_NETWORK_RESPONSE_BYTES)
-        }) {
-            return Err(Error::Provider(
-                "plugin network response is larger than allowed".into(),
-            ));
-        }
-        let headers = header_map(&response);
-        let mut body = Vec::new();
-        loop {
-            let chunk = tokio::select! {
-                () = invocation.cancellation.cancelled() => return Err(Error::Cancelled),
-                chunk = response.chunk() => {
-                    chunk.map_err(|error| provider_error(&error))?
-                }
-            };
-            let Some(chunk) = chunk else { break };
-            if chunk.len() > MAX_NETWORK_RESPONSE_BYTES.saturating_sub(body.len()) {
-                return Err(Error::Provider(
-                    "plugin network response is larger than allowed".into(),
-                ));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        if let Some(recorder) = &recorder {
-            recorder.response_chunk(&body).await;
-        }
-        Ok(serde_json::json!({
-            "status": status,
-            "headers": headers,
-            "body": String::from_utf8_lossy(&body),
-        }))
-    }
-
-    async fn stream_open(
-        &self,
-        invocation: &InvocationState,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        let NetworkRequest {
-            request, recorder, ..
-        } = self.request(invocation, &params).await?;
-        let cancellation = invocation.cancellation.clone();
-        let response = tokio::select! {
-            () = cancellation.cancelled() => return Err(Error::Cancelled),
-            response = request.send() => {
-                response.map_err(|error| provider_error(&error))?
-            }
-        };
-        let status = response.status().as_u16();
-        if let Some(recorder) = &recorder {
-            recorder.response_headers(status).await;
-        }
-        let headers = header_map(&response);
-        let (sender, receiver) = mpsc::channel::<Result<String>>(STREAM_LINE_BUFFER);
-        tokio::spawn(async move {
-            use futures_util::StreamExt;
-            let mut body = response.bytes_stream();
-            let mut buffered = Vec::<u8>::new();
-            let mut total = 0_usize;
-            loop {
-                let chunk = tokio::select! {
-                    () = cancellation.cancelled() => {
-                        let _ = sender.send(Err(Error::Cancelled)).await;
-                        return;
-                    }
-                    chunk = body.next() => chunk,
-                };
-                let Some(chunk) = chunk else { break };
-                let Ok(chunk) = chunk else {
-                    let _ = sender
-                        .send(Err(Error::Provider(
-                            "cannot read plugin network stream".into(),
-                        )))
-                        .await;
-                    return;
-                };
-                total = total.saturating_add(chunk.len());
-                if total > MAX_STREAM_BYTES {
-                    let _ = sender
-                        .send(Err(Error::Provider(
-                            "plugin network stream is larger than allowed".into(),
-                        )))
-                        .await;
-                    return;
-                }
-                if let Some(recorder) = &recorder {
-                    recorder.response_chunk(&chunk).await;
-                }
-                buffered.extend_from_slice(&chunk);
-                // Drain forwards as each line is consumed, so a line that keeps
-                // arriving in pieces never re-scans the whole buffer.
-                let mut consumed = 0;
-                while let Some(relative) =
-                    buffered[consumed..].iter().position(|byte| *byte == b'\n')
-                {
-                    let end = consumed + relative;
-                    let mut line = buffered[consumed..end].to_vec();
-                    consumed = end + 1;
-                    if line.last() == Some(&b'\r') {
-                        line.pop();
-                    }
-                    if sender
-                        .send(Ok(String::from_utf8_lossy(&line).into_owned()))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                buffered.copy_within(consumed.., 0);
-                buffered.truncate(buffered.len() - consumed);
-            }
-            if !buffered.is_empty() {
-                let _ = sender
-                    .send(Ok(String::from_utf8_lossy(&buffered).into_owned()))
-                    .await;
-            }
-        });
-        let stream_id = uuid::Uuid::new_v4().to_string();
-        self.streams
-            .lock()
-            .await
-            .insert(stream_id.clone(), Arc::new(Mutex::new(receiver)));
-        Ok(serde_json::json!({
-            "streamId": stream_id,
-            "status": status,
-            "headers": headers,
-        }))
-    }
-
-    async fn stream_read(&self, params: serde_json::Value) -> Result<serde_json::Value> {
-        let stream_id = required_string(&params, "streamId")?;
-        // Clone out the handle and release both maps' guards before waiting:
-        // the lock must not be held across `recv()`.
-        let lines_handle = {
-            let streams = self.streams.lock().await;
-            streams
-                .get(stream_id)
-                .cloned()
-                .ok_or_else(|| Error::Protocol(format!("unknown plugin stream: {stream_id}")))?
-        };
-        let mut receiver = lines_handle.lock().await;
-        let mut lines = Vec::with_capacity(STREAM_READ_BATCH);
-        match receiver.recv().await {
-            Some(Ok(line)) => lines.push(line),
-            Some(Err(error)) => {
-                drop(receiver);
-                self.streams.lock().await.remove(stream_id);
-                return Err(error);
-            }
-            None => {
-                drop(receiver);
-                self.streams.lock().await.remove(stream_id);
-                return Ok(serde_json::json!({ "lines": [], "done": true }));
-            }
-        }
-        while lines.len() < STREAM_READ_BATCH {
-            match receiver.try_recv() {
-                Ok(Ok(line)) => lines.push(line),
-                Ok(Err(error)) => {
-                    drop(receiver);
-                    self.streams.lock().await.remove(stream_id);
-                    return Err(error);
-                }
-                Err(_) => break,
-            }
-        }
-        Ok(serde_json::json!({ "lines": lines, "done": false }))
-    }
-}
-
-fn header_map(response: &reqwest::Response) -> std::collections::BTreeMap<String, String> {
-    response
-        .headers()
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.to_string(), value.to_string()))
-        })
-        .collect()
-}
-
-fn required_string<'a>(params: &'a serde_json::Value, key: &str) -> Result<&'a str> {
-    params
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| Error::Protocol(format!("plugin host call requires string '{key}'")))
-}
-
 #[cfg(test)]
 fn recorded_network_request(
     params: &serde_json::Value,
@@ -1064,7 +633,7 @@ fn recorded_network_request(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{super::find_bun, *};
 
     fn invocation(allowed_origins: HashSet<String>) -> InvocationState {
         InvocationState {
@@ -1079,14 +648,13 @@ mod tests {
     }
 
     fn host() -> HostContext {
-        HostContext {
-            plugin_id: "test".into(),
-            network_hosts: Arc::new(HashSet::new()),
-            resource_origin: true,
-            streams: Arc::new(Mutex::new(HashMap::new())),
-            http: OnceLock::new(),
-            sdk_projections: Arc::new(AtomicUsize::new(0)),
-        }
+        HostContext::new(
+            "test",
+            &crate::plugins::manifest::PluginPermissions {
+                network: Vec::new(),
+                resource_origin: true,
+            },
+        )
     }
 
     #[tokio::test]
@@ -1384,14 +952,13 @@ mod tests {
     }
 
     fn recording_host() -> HostContext {
-        HostContext {
-            plugin_id: "test".into(),
-            network_hosts: Arc::new(HashSet::from(["example.com".into()])),
-            resource_origin: false,
-            streams: Arc::new(Mutex::new(HashMap::new())),
-            http: OnceLock::new(),
-            sdk_projections: Arc::new(AtomicUsize::new(0)),
-        }
+        HostContext::new(
+            "test",
+            &crate::plugins::manifest::PluginPermissions {
+                network: vec!["example.com".into()],
+                resource_origin: false,
+            },
+        )
     }
 
     #[test]
@@ -1459,7 +1026,7 @@ mod tests {
         let params = network_params();
         let (_, body) = recorded_network_request(&params).unwrap();
         let request_bytes =
-            i64::try_from(serde_json::to_string(&body).unwrap().len()).unwrap_or(i64::MAX);
+            crate::saturating::i64_from_usize(serde_json::to_string(&body).unwrap().len());
         let claimed = host.request(&invocation, &params).await.unwrap();
         assert!(claimed.recorder.is_some());
         recorder.response_headers(204).await;
@@ -1483,14 +1050,6 @@ mod tests {
         assert_eq!(summary.request_bytes, Some(request_bytes));
         assert_eq!(summary.response_bytes, 14);
         assert!(!summary.detailed);
-    }
-
-    fn find_bun() -> Option<PathBuf> {
-        let path = std::env::var_os("PATH")?;
-        std::env::split_paths(&path).find_map(|directory| {
-            let candidate = directory.join("bun");
-            candidate.is_file().then_some(candidate)
-        })
     }
 
     async fn echo_worker(

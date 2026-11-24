@@ -21,16 +21,16 @@ async fn main() -> ExitCode {
         match arg.as_str() {
             "-addr" | "--addr" => match args.next() {
                 Some(value) => config.service_addr = value,
-                None => return usage_error("--addr needs a value"),
+                None => return report_usage_error("--addr needs a value"),
             },
             "-max-exchanges" | "--max-exchanges" => {
                 let Some(value) = args.next() else {
-                    return usage_error("--max-exchanges needs a value");
+                    return report_usage_error("--max-exchanges needs a value");
                 };
                 match value.parse() {
                     Ok(max) => config.max_exchanges = max,
                     Err(err) => {
-                        return usage_error(&format!(
+                        return report_usage_error(&format!(
                             "--max-exchanges must be a positive integer: {err}"
                         ));
                     }
@@ -38,7 +38,7 @@ async fn main() -> ExitCode {
             }
             "-db" | "--db" => match args.next() {
                 Some(value) => config.database_path = PathBuf::from(value),
-                None => return usage_error("--db needs a path"),
+                None => return report_usage_error("--db needs a path"),
             },
             "-no-open" | "--no-open" => open_browser = false,
             "-h" | "--help" => {
@@ -95,7 +95,7 @@ fn report_launch_failure(server: &Server) {
     }
 }
 
-fn usage_error(message: &str) -> ExitCode {
+fn report_usage_error(message: &str) -> ExitCode {
     eprintln!("{message}");
     print_usage();
     ExitCode::from(2)

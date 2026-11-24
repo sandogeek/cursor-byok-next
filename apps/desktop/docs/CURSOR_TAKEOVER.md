@@ -31,7 +31,9 @@ pub use self::process::terminate_cursor as quit_cursor;
 pub use self::proxy::{is_cursor_host, Routing as ProxyRouting, UPSTREAM_URL_HEADER};
 ```
 
-`proxy.rs` 的本地路径白名单（`is_local_path`）与上游逐条比对后只**少一条**：上游 32 条，这里 31 条，少的正是 `/agent.v1.AgentService/RunSSE`（差异 #24）。
+本地路径白名单现在只有一个所有者：`backend::PROVIDED_PATHS`（31 条），`proxy.rs` 的 `is_local_path` 直接查它。上游 32 条，这里少一条，少的正是 `/agent.v1.AgentService/RunSSE`（差异 #24）。
+
+这个列表与 `backend/mod.rs` 的路由表原先各写一份，靠人工对齐；现在白名单就是路由表本身：加了 handler 却忘了改写，请求永远到不了本地，测试 `a_configured_backend_routes_only_allowlisted_cursor_paths` 守住边界。
 
 ## 差异清单
 
@@ -64,8 +66,9 @@ pub use self::proxy::{is_cursor_host, Routing as ProxyRouting, UPSTREAM_URL_HEAD
 | 22 | 停用 / 残留清理 | 完整通用签名 + 任意 loopback 地址即可删除 | 只清理完整匹配本 harness 代理 URL 的 5 个键 | 不删除用户后来改回的代理，也不清理其他本地工具 |
 | 23 | 路由改写失败 | URI 构造失败则静默发往上游 | 返回 502，不向上游旁路 | 命中本地白名单后必须失败关闭 |
 | 24 | `AgentService/Run*` | `RunSSE` 在白名单，且有本地 handler（配 `RunEngine`） | 白名单不含 `Run` / `RunSSE` / `RunPoll`，一律直通官方 | 这三条只服务 backend loop；本仓库不做 engine，而白名单命中后没有 handler 就是 502。local loop 会拒绝一部分 turn（模式、action、harness 覆盖、tool restriction），这些 turn 必须还能打到官方。见 [`docs/protocol/cursor-agent-loop-routing.md`](../../../docs/protocol/cursor-agent-loop-routing.md) |
-| 26 | 代理启动返回值 | 上游返回 `{ url, port }` 对象 | `ProxyRuntime::start` 返回 `StartedProxy { url, port }` | 具名结构让调用方读字段而不是解构元组；端口只存一份，`url`/`port` 不再各自缓存 |
 | 25 | native 实例所有权 | 服务端拥有长生命周期 harness | `App.tsx` 模块级单例持有 `Harness` / `Plugins` / `Calls`，不在 `mount` 回调内临时构造 | NSH 的 JS 对象被 GC 时会 drop 其 Rust 实例。临时 `new Harness()` 在 `status()` 返回后触发 `ProxyRuntime::drop`，代理被 abort，但 TSX 镜像仍显示已接管，Cursor 对已配置端口反复 `ECONNREFUSED`。应用级所有者必须与 socket 生命周期一致 |
+| 26 | 代理启动返回值 | 上游返回 `{ url, port }` 对象 | `ProxyRuntime::start` 返回 `StartedProxy { url, port }` | 具名结构让调用方读字段而不是解构元组；端口只存一份，`url`/`port` 不再各自缓存 |
+| 27 | 白名单与路由表 | 两份列表分别维护 | 共用 `backend::PROVIDED_PATHS` | 两份列表漂移时页面“能开”但请求直通官方，是无声错误；抽成一个 `const` 后编译器负责两边一致 |
 
 ### 顺带修掉的上游隐患
 

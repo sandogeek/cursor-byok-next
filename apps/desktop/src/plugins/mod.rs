@@ -3,10 +3,12 @@
 mod adapters;
 mod builtin;
 mod catalog;
+mod catalog_cache;
 mod data;
 mod definition;
 mod descriptor;
 mod host;
+mod host_calls;
 mod manifest;
 mod origin;
 mod protocol;
@@ -31,6 +33,33 @@ pub(crate) fn text(key: &str) -> String {
         return key.to_owned();
     }
     nsh_core::t!(key)
+}
+
+/// Bun on `PATH`, if the user has it installed. The app ships no runtime, so a
+/// missing Bun is a normal state the UI reports rather than an error.
+#[must_use]
+pub(crate) fn find_bun() -> Option<std::path::PathBuf> {
+    which("bun")
+}
+
+/// The first `name` found on `PATH`.
+#[must_use]
+pub(crate) fn which(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let exe = directory.join(format!("{name}.exe"));
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+    }
+    None
 }
 
 /// `CREATE_NO_WINDOW`: a spawned Bun worker must not flash a console window.

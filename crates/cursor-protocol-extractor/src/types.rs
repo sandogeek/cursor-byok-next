@@ -81,7 +81,7 @@ impl FieldKind {
     /// Reads a bundle `kind` string; unknown kinds are treated as scalars,
     /// which is what the renderer already did with them.
     #[must_use]
-    pub fn parse(value: &str) -> Self {
+    pub fn from_bundle_kind(value: &str) -> Self {
         match value.trim() {
             "message" => Self::Message,
             "enum" => Self::Enum,
@@ -117,7 +117,7 @@ pub enum ValueKind {
 
 impl ValueKind {
     #[must_use]
-    pub fn parse(value: &str) -> Self {
+    pub fn from_bundle_kind(value: &str) -> Self {
         match value.trim() {
             "message" => Self::Message,
             "enum" => Self::Enum,
@@ -143,7 +143,7 @@ pub enum MethodKind {
 
 impl MethodKind {
     #[must_use]
-    pub fn parse(value: &str) -> Self {
+    pub fn from_bundle_kind(value: &str) -> Self {
         match value.trim() {
             "ServerStreaming" => Self::ServerStreaming,
             "ClientStreaming" => Self::ClientStreaming,
@@ -189,28 +189,38 @@ impl TypeToken {
     /// well-known name, `1` for a bare name, `0` for a scalar. The scores are
     /// only compared against each other when picking between duplicate
     /// declarations, so they are tier labels, not measurements.
+    #[must_use]
     pub fn completeness(&self) -> i32 {
         match self {
-            Self::Named(name)
-                if looks_like_full_type_name(name) || google_well_known(name).is_some() =>
-            {
-                3
-            }
-            Self::Named(_) => 1,
+            Self::Named(name) => named_completeness(name),
             Self::Scalar(_) => 0,
         }
     }
 }
 
+/// The completeness tier of a bare type reference, without allocating a
+/// [`TypeToken`] just to score it.
+#[must_use]
+pub fn named_completeness(type_ref: &str) -> i32 {
+    if looks_like_full_type_name(type_ref) || google_well_known(type_ref).is_some() {
+        3
+    } else {
+        1
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
-    pub no: i32,
+    /// Proto field number, read from the bundle's `no`.
+    pub number: i32,
     pub name: String,
     pub kind: FieldKind,
-    pub t: Option<TypeToken>,
+    /// Named or scalar type, read from the bundle's `T`.
+    pub type_token: Option<TypeToken>,
     pub oneof: Option<String>,
     pub repeated: bool,
-    pub opt: bool,
+    /// proto3 `optional` label, read from the bundle's `opt`.
+    pub optional: bool,
     pub map_key: Option<i32>,
     pub map_value_kind: ValueKind,
     pub map_value_t: Option<TypeToken>,
@@ -219,15 +229,15 @@ pub struct Field {
 impl Field {
     /// Builds a field with no type token, label or map part yet.
     #[must_use]
-    pub fn new(no: i32, name: &str, kind: FieldKind) -> Self {
+    pub fn new(number: i32, name: &str, kind: FieldKind) -> Self {
         Self {
-            no,
+            number,
             name: name.to_owned(),
             kind,
-            t: None,
+            type_token: None,
             oneof: None,
             repeated: false,
-            opt: false,
+            optional: false,
             map_key: None,
             map_value_kind: ValueKind::Scalar,
             map_value_t: None,
@@ -250,7 +260,8 @@ pub struct Message {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumValue {
-    pub no: i32,
+    /// Proto enum number, read from the bundle's `no`.
+    pub number: i32,
     pub name: String,
 }
 
@@ -325,8 +336,9 @@ impl Diagnostics {
         self.skipped_field_objects += 1;
         if self.skipped_field_samples.len() < DIAGNOSTIC_SAMPLE_LIMIT {
             let mut trimmed = field_object.trim().to_string();
+            // Bundle snippets are arbitrary UTF-8, so cut on a char boundary.
             if trimmed.len() > SAMPLE_PREVIEW_CHARS {
-                trimmed.truncate(SAMPLE_PREVIEW_CHARS);
+                trimmed.truncate(trimmed.floor_char_boundary(SAMPLE_PREVIEW_CHARS));
                 trimmed.push_str("...");
             }
             self.skipped_field_samples
@@ -339,11 +351,11 @@ impl Diagnostics {
         self.parsed_field_objects += 1;
     }
 
-    pub fn add_unresolved_type(&mut self, r#ref: &str) {
-        let key = if r#ref.trim().is_empty() {
+    pub fn add_unresolved_type(&mut self, type_ref: &str) {
+        let key = if type_ref.trim().is_empty() {
             "<empty>".to_string()
         } else {
-            r#ref.trim().to_string()
+            type_ref.trim().to_string()
         };
         *self.unresolved_type_refs.entry(key).or_insert(0) += 1;
     }
@@ -389,6 +401,7 @@ impl Diagnostics {
         self.shape_errors.append(&mut other.shape_errors);
     }
 
+    #[must_use]
     pub fn has_failure(&self) -> bool {
         self.skipped_field_objects > 0
             || !self.unresolved_type_refs.is_empty()
@@ -438,35 +451,40 @@ impl fmt::Display for Diagnostics {
         }
         if !self.unresolved_type_refs.is_empty() {
             writeln!(f, "未解析类型引用:")?;
-            let mut keys: Vec<_> = self.unresolved_type_refs.keys().cloned().collect();
-            keys.sort();
-            for key in keys {
-                let count = self.unresolved_type_refs[&key];
+            let mut keys: Vec<_> = self.unresolved_type_refs.iter().collect();
+            keys.sort_by_key(|(name, _)| name.as_str());
+            for (key, count) in keys {
                 writeln!(f, "  - {key} ({count})")?;
             }
         }
         if !self.placeholder_hits.is_empty() {
             writeln!(f, "占位字段命中:")?;
-            for (i, hit) in self.placeholder_hits.iter().enumerate() {
-                if i >= 20 {
-                    writeln!(f, "  - ... and {} more", self.placeholder_hits.len() - 20)?;
-                    break;
-                }
+            for hit in self.placeholder_hits.iter().take(DIAGNOSTIC_SAMPLE_LIMIT) {
                 writeln!(f, "  - {hit}")?;
+            }
+            if self.placeholder_hits.len() > DIAGNOSTIC_SAMPLE_LIMIT {
+                writeln!(
+                    f,
+                    "  - ... and {} more",
+                    self.placeholder_hits.len() - DIAGNOSTIC_SAMPLE_LIMIT
+                )?;
             }
         }
         if !self.missing_declarations.is_empty() {
             writeln!(f, "未提取的 Proto 声明:")?;
-            for (i, name) in self.missing_declarations.iter().enumerate() {
-                if i >= 20 {
-                    writeln!(
-                        f,
-                        "  - ... and {} more",
-                        self.missing_declarations.len() - 20
-                    )?;
-                    break;
-                }
+            for name in self
+                .missing_declarations
+                .iter()
+                .take(DIAGNOSTIC_SAMPLE_LIMIT)
+            {
                 writeln!(f, "  - {name}")?;
+            }
+            if self.missing_declarations.len() > DIAGNOSTIC_SAMPLE_LIMIT {
+                writeln!(
+                    f,
+                    "  - ... and {} more",
+                    self.missing_declarations.len() - DIAGNOSTIC_SAMPLE_LIMIT
+                )?;
             }
         }
         Ok(())
@@ -474,8 +492,8 @@ impl fmt::Display for Diagnostics {
 }
 
 #[must_use]
-pub fn looks_like_full_type_name(r#ref: &str) -> bool {
-    let trimmed = r#ref.trim();
+pub fn looks_like_full_type_name(type_ref: &str) -> bool {
+    let trimmed = type_ref.trim();
     if trimmed.starts_with("google.protobuf.") || trimmed.starts_with("google.rpc.") {
         return true;
     }
@@ -566,6 +584,23 @@ pub fn parse_type_name(type_name: &str) -> TypeName {
     match type_name.rsplit_once('.') {
         Some((package, short)) => TypeName::new(package, short),
         None => TypeName::new("", type_name),
+    }
+}
+
+/// The package part of `type_name`, borrowed; empty when the name is
+/// unqualified. Lets callers compare packages without allocating a [`TypeName`].
+#[must_use]
+pub fn package_of(type_name: &str) -> &str {
+    if type_name.starts_with("google.protobuf.") {
+        "google.protobuf"
+    } else if type_name.starts_with("google.rpc.") {
+        "google.rpc"
+    } else if let Some(TypeNamePart { package, .. }) = split_versioned(type_name) {
+        package
+    } else {
+        type_name
+            .rsplit_once('.')
+            .map_or("", |(package, _)| package)
     }
 }
 

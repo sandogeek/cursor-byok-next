@@ -13,7 +13,7 @@ use crate::merge::{
 };
 use crate::renderer::{CopiedType, ProtoFile, generate_proto_file};
 use crate::resolver::{TypeResolver, build_alias_index, build_module_imports};
-use crate::scan::{BundleScan, scan_source};
+use crate::scan::scan_source;
 use crate::types::{
     Diagnostics, Enum, Message, Service, TypeName, is_google_pkg, is_local_loop_pkg,
     parse_type_name,
@@ -81,7 +81,6 @@ pub fn extract_from_sources(
         let scan_diagnostics = std::mem::take(&mut scan.diagnostics);
         diag.merge_from(scan_diagnostics);
         declared.append(&mut scan.declared);
-        remap_module_imports(&mut scan);
         let aliases = build_alias_index(&scan.aliases);
         let export_aliases = build_alias_index(&scan.export_aliases);
         let module_imports = build_module_imports(&scan.module_imports, &scan.module_starts);
@@ -117,15 +116,7 @@ pub fn extract_from_sources(
     diag.extracted_types = coverage.extracted;
     diag.missing_declarations = sorted_dedup(coverage.missing);
 
-    let files = generate_local_loop_protos(
-        &Declarations {
-            messages: &messages,
-            enums: &enums,
-            services: &services,
-        },
-        &resolver,
-        &mut diag,
-    );
+    let files = generate_local_loop_protos(&messages, &enums, &services, &resolver, &mut diag);
     if strictness == Strictness::Strict && diag.has_failure() {
         return Err(ExtractError::Validation {
             diagnostics: Box::new(diag),
@@ -152,15 +143,14 @@ pub fn extract_from_sources(
 /// [`ExtractError::Write`] when the output cannot be replaced, and
 /// [`ExtractError::Validation`] under [`Strictness::Strict`].
 pub fn extract_from_files(
-    input_files: &[impl AsRef<Path>],
-    output_dir: impl AsRef<Path>,
+    input_files: &[PathBuf],
+    output_dir: &Path,
     strictness: Strictness,
 ) -> Result<ExtractResult, ExtractError> {
     let mut sources = Vec::with_capacity(input_files.len());
     for path in input_files {
-        let path = path.as_ref();
         let text = fs::read_to_string(path).map_err(|source| ExtractError::Read {
-            path: path.to_path_buf(),
+            path: path.clone(),
             source,
         })?;
         sources.push(text);
@@ -181,10 +171,9 @@ pub fn extract_from_files(
     reason = "callers always build the default `HashMap`; the extractor is a CLI"
 )]
 pub fn write_protos(
-    output_dir: impl AsRef<Path>,
+    output_dir: &Path,
     files: &HashMap<String, String>,
 ) -> Result<(), ExtractError> {
-    let output_dir = output_dir.as_ref();
     let parent = parent_or_cwd(output_dir);
     fs::create_dir_all(parent).map_err(|source| ExtractError::Write {
         path: parent.to_path_buf(),
@@ -283,15 +272,12 @@ fn replace_dir(output_dir: &Path, temp_dir: &Path) -> Result<(), ExtractError> {
 /// returns the rendered file name per fully-qualified type name. Records the
 /// types that had to be copied from another package in `diag`.
 fn generate_local_loop_protos(
-    declarations: &Declarations<'_>,
+    messages: &[Message],
+    enums: &[Enum],
+    services: &[Service],
     resolver: &TypeResolver,
     diag: &mut Diagnostics,
 ) -> HashMap<String, String> {
-    let Declarations {
-        messages,
-        enums,
-        services,
-    } = *declarations;
     let mut packages: HashMap<&str, ProtoFile> = HashMap::new();
     for message in messages {
         packages
@@ -321,7 +307,7 @@ fn generate_local_loop_protos(
     for pkg_name in crate::types::LOCAL_LOOP_PACKAGES {
         let package = packages.remove(pkg_name).unwrap_or_default();
         let augmented = copy_external_types(pkg_name, package, resolver, &index);
-        let body = generate_proto_file(pkg_name, &augmented, resolver, diag);
+        let body = generate_proto_file(pkg_name, augmented, resolver, diag);
         let file_name = format!("{}.proto", pkg_name.replace('.', "_"));
         if let Err(err) = validate_required_agent_shapes(&file_name, &body) {
             diag.add_shape_error(&err);
@@ -335,14 +321,6 @@ fn generate_local_loop_protos(
         files.insert(file_name, body);
     }
     files
-}
-
-/// The declarations one extraction produced, by kind.
-#[derive(Clone, Copy)]
-struct Declarations<'a> {
-    messages: &'a [Message],
-    enums: &'a [Enum],
-    services: &'a [Service],
 }
 
 /// Every message and enum by fully-qualified name, so copies can be found
@@ -465,20 +443,4 @@ fn copy_one_round(
         local_types.insert(short);
     }
     copied
-}
-
-fn remap_module_imports(scan: &mut BundleScan) {
-    let id_to_start: HashMap<u32, u32> = scan
-        .module_starts
-        .iter()
-        .map(|module| (module.id, module.start))
-        .collect();
-    for (_, alias, target) in &mut scan.module_imports {
-        if alias.is_empty() {
-            continue;
-        }
-        if let Some(start) = id_to_start.get(target) {
-            *target = *start;
-        }
-    }
 }

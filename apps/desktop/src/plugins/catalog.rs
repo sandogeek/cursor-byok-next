@@ -82,7 +82,7 @@ impl PluginCatalog {
         let directory = self.directory.clone();
         let loaded = tokio::task::spawn_blocking(move || load_manifest(&directory))
             .await
-            .map_err(|error| Error::Runtime(format!("plugin manifest task failed: {error}")))
+            .map_err(|error| Error::context("plugin manifest task failed", error))
             .and_then(std::convert::identity);
         match loaded {
             Ok(manifest) => vec![manifest],
@@ -136,7 +136,7 @@ async fn load_plugin(
     let LoadedManifest { manifest, icon } =
         tokio::task::spawn_blocking(move || load_manifest(&manifest_directory))
             .await
-            .map_err(|error| Error::Runtime(format!("plugin manifest task failed: {error}")))??;
+            .map_err(|error| Error::context("plugin manifest task failed", error))??;
     let entry = directory.join(&manifest.entry).canonicalize()?;
     let definition = loader.load(executable, &entry).await?;
     validate_definition(&manifest.id, &definition)?;

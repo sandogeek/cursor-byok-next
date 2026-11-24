@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, mpsc};
 use crate::{
     Result,
     provider::{FinishReason, ModelEvent, is_valid_response_event},
+    saturating,
 };
 
 use super::{
@@ -430,7 +431,7 @@ fn started_at_ms(started: Instant, offset_ms: i64) -> i64 {
 }
 
 fn elapsed_ms(started: Instant) -> i64 {
-    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
+    saturating::i64_from_u128(started.elapsed().as_millis())
 }
 
 fn finish_reason(reason: FinishReason) -> &'static str {

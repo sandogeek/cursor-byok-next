@@ -28,6 +28,7 @@ use crate::{
         proto::{agent::v1 as agent, inference::v1 as pb},
     },
     provider::ModelEvent,
+    saturating,
 };
 
 const SUBAGENT_FORCE_POLICY_NONE: &str = "none";
@@ -35,6 +36,13 @@ const SUMMARY_UNUSED_WINDOW_PERCENT: f64 = 0.1;
 const DEFAULT_SUMMARY_PROMPT_CHARS: u64 = 2_800_000;
 const SUMMARY_PROMPT_SCALE_WINDOW: u64 = 1_000_000;
 const DISCONNECTED_RUN_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+/// Client frames a run may buffer before `BidiAppend` starts waiting on the
+/// consumer, so a slow turn applies backpressure instead of growing without end.
+const RUN_INPUT_QUEUE_FRAMES: usize = 64;
+/// The `RunInferenceInvocationError` codes Cursor reads: 13 is an internal
+/// failure, 3 is a rejected argument, matching gRPC's own numbering.
+const INVOCATION_CODE_INTERNAL: i32 = 13;
+const INVOCATION_CODE_INVALID_ARGUMENT: i32 = 3;
 
 #[derive(Clone)]
 pub(crate) struct InferenceService {
@@ -45,10 +53,28 @@ pub(crate) struct InferenceService {
     calls: CallStore,
 }
 
+impl std::fmt::Debug for InferenceService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InferenceService")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where one Cursor request is served: a run this app owns, or Cursor itself.
 #[derive(Clone)]
 pub(crate) enum InferenceRoute {
     Local(Arc<Run>),
     Upstream,
+}
+
+impl std::fmt::Debug for InferenceRoute {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(_) => formatter.write_str("Local(..)"),
+            Self::Upstream => formatter.write_str("Upstream"),
+        }
+    }
 }
 
 /// One client-loop inference run: its input channel, output hub, sequence counter, subscriptions and cancellation.
@@ -211,7 +237,7 @@ impl InferenceService {
                 model_id,
                 "routing Cursor RunInference to BYOK provider"
             );
-            let (sender, receiver) = mpsc::channel(64);
+            let (sender, receiver) = mpsc::channel(RUN_INPUT_QUEUE_FRAMES);
             let output = Arc::new(OutputHub::new());
             let run = Arc::new(Run {
                 input: sender,
@@ -253,11 +279,13 @@ impl InferenceService {
         Ok(route)
     }
 
-    /// Attaches a client stream to `run`, replaying output already emitted.
+    /// Attaches a client stream to `run`, replaying output already emitted. The
+    /// subscription takes ownership of the caller's handle, so no clone happens
+    /// on a path that runs once per Cursor turn.
     pub fn subscribe(
         &self,
         request_id: String,
-        run: &Arc<Run>,
+        run: Arc<Run>,
     ) -> (mpsc::UnboundedReceiver<Bytes>, Subscription) {
         let mut subscriptions = run.subscriptions.lock();
         subscriptions.active += 1;
@@ -268,7 +296,7 @@ impl InferenceService {
             Subscription {
                 service: self.clone(),
                 request_id,
-                run: Arc::clone(run),
+                run,
             },
         )
     }
@@ -633,7 +661,7 @@ impl RunSetup<'_> {
             is_gpt5: gpt5,
             persona: "auto".into(),
             self_identity_name: "Cursor".into(),
-            agent_token_limit: context_window_tokens.and_then(i32_tokens),
+            agent_token_limit: context_window_tokens.and_then(saturating::option_i32_from_u64),
             agent_mode_configs: agent_mode_configs(),
             ask_question_config: Some(pb::RunInferenceAskQuestionConfig {
                 tool_name: "AskQuestion".into(),
@@ -667,7 +695,7 @@ fn summary_prompt_chars(context_window_tokens: Option<u64>) -> i32 {
     let chars = window.map_or(DEFAULT_SUMMARY_PROMPT_CHARS, |window| {
         DEFAULT_SUMMARY_PROMPT_CHARS.saturating_mul(window) / SUMMARY_PROMPT_SCALE_WINDOW
     });
-    count_i32(chars)
+    saturating::i32_from_u64(chars)
 }
 
 fn overflow_response(message: &str) -> Option<pb::InferenceStreamResponse> {
@@ -682,10 +710,6 @@ fn overflow_response(message: &str) -> Option<pb::InferenceStreamResponse> {
             },
         ))
     })
-}
-
-fn i32_tokens(tokens: u64) -> Option<i32> {
-    i32::try_from(tokens).ok()
 }
 
 fn subagent_model_config(
@@ -836,7 +860,7 @@ async fn serve_invocation(
     let message = pb::RunInferenceInvocationEnd {
         invocation_id: id,
         error: error.map(|message| pb::RunInferenceInvocationError {
-            code: 13,
+            code: INVOCATION_CODE_INTERNAL,
             message,
             ..Default::default()
         }),
@@ -913,7 +937,7 @@ fn model_responses(
                 tool_name: name,
                 args: String::new(),
                 is_complete: false,
-                tool_index: i32::try_from(index).ok(),
+                tool_index: saturating::option_i32_from_usize(index),
                 ..Default::default()
             })
         }
@@ -927,7 +951,7 @@ fn model_responses(
                 tool_name: String::new(),
                 args: delta,
                 is_complete: false,
-                tool_index: i32::try_from(index).ok(),
+                tool_index: saturating::option_i32_from_usize(index),
                 ..Default::default()
             })
         }
@@ -940,7 +964,7 @@ fn model_responses(
                 tool_name: name,
                 args: arguments,
                 is_complete: true,
-                tool_index: i32::try_from(index).ok(),
+                tool_index: saturating::option_i32_from_usize(index),
                 ..Default::default()
             })
         }
@@ -974,17 +998,21 @@ fn usage_responses(
         });
     vec![
         stream_response(Response::Usage(pb::InferenceUsageInfo {
-            prompt_tokens: count_i32(prompt_tokens.unwrap_or_default()),
-            completion_tokens: count_i32(completion_tokens.unwrap_or_default()),
-            total_tokens: total_tokens.map(count_i32),
+            prompt_tokens: saturating::i32_from_u64(prompt_tokens.unwrap_or_default()),
+            completion_tokens: saturating::i32_from_u64(completion_tokens.unwrap_or_default()),
+            total_tokens: total_tokens.map(saturating::i32_from_u64),
         })),
         stream_response(Response::ExtendedUsage(pb::InferenceExtendedUsageInfo {
-            input_tokens: count_i32(usage.input_tokens.unwrap_or_default()),
-            output_tokens: count_i32(usage.output_tokens.unwrap_or_default()),
-            cache_read_tokens: count_i32(usage.cache_read_tokens.unwrap_or_default()),
-            cache_write_tokens: count_i32(usage.cache_write_tokens.unwrap_or_default()),
-            max_tokens: count_i32(context_window_tokens.unwrap_or_default()),
-            reasoning_tokens: usage.reasoning_tokens.map(count_i32),
+            input_tokens: saturating::i32_from_u64(usage.input_tokens.unwrap_or_default()),
+            output_tokens: saturating::i32_from_u64(usage.output_tokens.unwrap_or_default()),
+            cache_read_tokens: saturating::i32_from_u64(
+                usage.cache_read_tokens.unwrap_or_default(),
+            ),
+            cache_write_tokens: saturating::i32_from_u64(
+                usage.cache_write_tokens.unwrap_or_default(),
+            ),
+            max_tokens: saturating::i32_from_u64(context_window_tokens.unwrap_or_default()),
+            reasoning_tokens: usage.reasoning_tokens.map(saturating::i32_from_u64),
         })),
     ]
 }
@@ -1015,19 +1043,13 @@ fn agent_mode_configs() -> Vec<pb::RunInferenceAgentModeConfig> {
         .collect()
 }
 
-/// A count as Cursor's `i32` field. A count past `i32::MAX` saturates; no real
-/// prompt, context window or summary prompt reaches it.
-fn count_i32(value: u64) -> i32 {
-    i32::try_from(value).unwrap_or(i32::MAX)
-}
-
 fn invocation_error(output: &OutputHub, id: String, message: &str) {
     emit(
         output,
         pb::run_inference_server_message::Message::InvocationEnd(pb::RunInferenceInvocationEnd {
             invocation_id: id,
             error: Some(pb::RunInferenceInvocationError {
-                code: 3,
+                code: INVOCATION_CODE_INVALID_ARGUMENT,
                 message: message.into(),
                 ..Default::default()
             }),
@@ -1070,7 +1092,7 @@ async fn start_recorder(
             call_id: call_id.into(),
             run_id: setup.run_id.into(),
             conversation_id: setup.conversation_id.into(),
-            provider_call_index: i64::try_from(provider_call_index).unwrap_or(i64::MAX),
+            provider_call_index: saturating::i64_from_u64(provider_call_index),
             model_hash: request.model.model_id.clone(),
             provider_type: request_url.provider.clone(),
             provider_url: request_url.url.clone(),
@@ -1121,11 +1143,11 @@ mod tests {
             .state
             .lock()
             .insert("run".into(), InferenceRoute::Local(Arc::clone(&run)));
-        let (_receiver, subscription) = service.subscribe("run".into(), &run);
+        let (_receiver, subscription) = service.subscribe("run".into(), Arc::clone(&run));
         drop(subscription);
         tokio::task::yield_now().await;
         assert!(!run.cancellation.is_cancelled());
-        let (_receiver, subscription) = service.subscribe("run".into(), &run);
+        let (_receiver, subscription) = service.subscribe("run".into(), Arc::clone(&run));
         tokio::time::advance(DISCONNECTED_RUN_GRACE).await;
         tokio::task::yield_now().await;
         assert!(

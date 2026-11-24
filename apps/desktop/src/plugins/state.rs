@@ -53,6 +53,7 @@ impl ResourceRecord {
     /// The record as a plugin sees it: identity, private data, and state. The
     /// private data is included because plugins need the credentials to call
     /// upstream; nothing here is shown to the user.
+    #[must_use]
     pub fn snapshot(&self, resource_type: &str) -> serde_json::Value {
         serde_json::json!({
             "id": self.id,
@@ -167,6 +168,7 @@ impl StoredModel {
 
     /// The model as a plugin sees it, in the same shape `models.list` returns so a
     /// plugin can round-trip what it stored.
+    #[must_use]
     pub fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({
             "id": self.id,

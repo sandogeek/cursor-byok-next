@@ -23,16 +23,16 @@ cursor-byok/support/cursor-capture/
 
 crates/cursor-capture/
 ├── src/
-│   ├── main.rs          90 行  CLI（`--no-open`）
+│   ├── main.rs         114 行  CLI（`--no-open`）
 │   ├── lib.rs           16 行  模块入口
-│   ├── config.rs       121 行  回环地址与默认值
-│   ├── types.rs        129 行  JSON 契约
-│   ├── capture.rs      138 行  http_body 限长拷贝与收尾状态
-│   ├── decode.rs       937 行  Connect 帧 + prost-reflect
-│   ├── store.rs        601 行  捕获编号、内存窗口 + rusqlite
-│   ├── proxy.rs        591 行  axum 转发 + 捕获
-│   ├── web.rs          165 行  原版 API / SSE / rust-embed
-│   └── tests.rs        431 行  解码 / 存储 / 流式转发 / 调试 API
+│   ├── config.rs       152 行  回环地址与默认值
+│   ├── types.rs        242 行  JSON 契约
+│   ├── capture.rs      222 行  http_body 限长拷贝与收尾状态
+│   ├── decode.rs      1180 行  Connect 帧 + prost-reflect
+│   ├── store.rs        693 行  捕获编号、内存窗口 + rusqlite
+│   ├── proxy.rs        657 行  axum 转发 + 捕获
+│   ├── web.rs          186 行  原版 API / SSE / rust-embed
+│   └── tests.rs        453 行  解码 / 存储 / 流式转发 / 调试 API
 ├── build.rs            188 行  清洗提取 proto 再编 FileDescriptorSet
 └── web/               2179 行  原样拷贝上游页面
 ```
@@ -61,6 +61,11 @@ crates/cursor-capture/
 | 14 | 清空期间的在途流 | 清库后独立重置编号，回调只带编号 | 存储层在同一把锁内清库、切换捕获代次、重置编号；拒绝旧代次更新 | 保留公开编号从 1 重启的行为，不让旧流污染新记录，也不取消旧流的转发 |
 | 15 | 单帧更新 | Go 原地更新 | Rust 原地更新，帧所有权直接交给记录 | 避免每帧深拷贝已累计的 `Exchange`，保留实时可见和按需落盘的语义 |
 | 16 | 正文收尾 | 以 `Read` / `Close` 返回值收尾 | 区分正常结束、读取错误、未读完即丢弃；取消信息沿用 `error` 字段 | 不把中断误记为 `completed`，同时保持现有 Web 状态契约 |
+| 17 | 启动时的帧补齐 | 每次启动都重写全部行，无论是否真的补出帧 | `Hydration::{Changed, Unchanged}` 只在真写入或出错时返回 `Changed` | 原 bool 返回在“无帧可补”时也是 `true`，导致每次启动都重写整张表；枚举让“有没有写”只有一种读法 |
+| 18 | 解码错误 | `Proto` / `Inflate` / `Hex` 都把底层错误压成 `String` | 变体携带 `#[source]` 的类型化错误（`hex::FromHexError` / `io::Error` / `prost::DecodeError`） | `Error::source()` 原先在这些分支恒为 `None`，日志里追不到根因；代价是 `DecodeError` 不再能 `Clone`/`Eq` |
+| 19 | 帧数上限 | `frame_count(usize) -> i32` 名字像计数器 | `clamped_i32(usize) -> i32` | 函数做的是饱和转换，被当作计数器读会让人误以为它统计了什么 |
+| 20 | `Debug` 与锁 | `Debug for ExchangeStore` 取存储锁 | 只打印 subscriber 数量 | 持锁回调里打印 `Debug` 会自锁 |
+| 21 | 死代码 | 保留 `database_path()` | 删除 | 无调用点，保留只会漂移 |
 
 转发仍在正文被轮询时同步执行诊断回调，解码与 SQLite 写入尚未移出热路径。2 MiB 限制的是每方向原始正文副本，不是解码后帧的总内存；`max_exchanges` 也仅限制内存窗口，不限制磁盘保留量。
 

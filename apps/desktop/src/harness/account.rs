@@ -162,6 +162,10 @@ fn is_local_cursor_token(token: &str) -> bool {
             })
 }
 
+/// The local token's expiry: 2099-12-31T00:00:00Z, far past any session Cursor
+/// is expected to validate.
+const TOKEN_EXPIRY_UNIX: u64 = 4_070_908_800;
+
 /// The unsigned JWT Cursor stores for the local account. Recognition validates
 /// its header, subject and marker segment, not JSON serialization order.
 fn local_token() -> Result<String> {
@@ -172,7 +176,7 @@ fn local_token() -> Result<String> {
         "type": "session",
         "iss": "cursor-client",
         "scope": "openid profile email",
-        "exp": 4_070_908_800_u64
+        "exp": TOKEN_EXPIRY_UNIX
     }))?);
     Ok(format!("{header}.{payload}.{SUBJECT}"))
 }

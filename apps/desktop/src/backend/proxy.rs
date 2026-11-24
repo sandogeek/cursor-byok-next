@@ -100,6 +100,40 @@ pub async fn forward(
     forward_request(&proxy, request).await
 }
 
+/// The client request's parts that reach the upstream as-is: method, resolved
+/// URL, and headers with the harness field and every hop-by-hop field removed.
+struct PreparedUpstream {
+    method: axum::http::Method,
+    url: String,
+    headers: axum::http::HeaderMap,
+    path: String,
+}
+
+impl PreparedUpstream {
+    fn new(proxy: &CursorProxy, request: Request<Body>) -> Result<(Self, Body)> {
+        let (parts, body) = request.into_parts();
+        let path = parts
+            .uri
+            .path_and_query()
+            .map_or("/", |value| value.as_str())
+            .to_owned();
+        let url = upstream_url(&parts.headers, &proxy.upstream, &path)?;
+        let mut headers = parts.headers;
+        headers.remove(harness::UPSTREAM_URL_HEADER);
+        headers.remove(header::HOST);
+        remove_hop_by_hop_headers(&mut headers);
+        Ok((
+            Self {
+                method: parts.method,
+                url,
+                headers,
+                path,
+            },
+            body,
+        ))
+    }
+}
+
 /// Streams `request` to the upstream Cursor host, adding the configured timeouts
 /// and dropping hop-by-hop headers on both legs.
 pub async fn forward_request(
@@ -107,21 +141,11 @@ pub async fn forward_request(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     let started = Instant::now();
-    let (parts, body) = request.into_parts();
-    let path = parts
-        .uri
-        .path_and_query()
-        .map_or("/", |value| value.as_str())
-        .to_owned();
-    let url = upstream_url(&parts.headers, &proxy.upstream, &path)?;
-    let mut headers = parts.headers;
-    headers.remove(harness::UPSTREAM_URL_HEADER);
-    headers.remove(header::HOST);
-    remove_hop_by_hop_headers(&mut headers);
+    let (prepared, body) = PreparedUpstream::new(proxy, request)?;
     let mut upstream = match proxy
         .client
-        .request(parts.method.clone(), url)
-        .headers(headers)
+        .request(prepared.method.clone(), prepared.url)
+        .headers(prepared.headers)
         .body(reqwest::Body::wrap_stream(body.into_data_stream()))
         .send()
         .await
@@ -129,8 +153,8 @@ pub async fn forward_request(
         Ok(response) => response,
         Err(error) => {
             tracing::error!(
-                method = %parts.method,
-                path,
+                method = %prepared.method,
+                path = prepared.path,
                 elapsed_ms = started.elapsed().as_millis(),
                 %error,
                 "Cursor upstream request failed"
@@ -145,8 +169,8 @@ pub async fn forward_request(
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
     tracing::info!(
-        method = %parts.method,
-        path,
+        method = %prepared.method,
+        path = prepared.path,
         %status,
         elapsed_ms = started.elapsed().as_millis(),
         "forwarded Cursor backend request"
@@ -159,16 +183,14 @@ pub async fn forward_buffered(
     proxy: &CursorProxy,
     request: Request<Body>,
 ) -> Result<BufferedResponse> {
-    let (parts, body) = request.into_parts();
-    let path = parts
-        .uri
-        .path_and_query()
-        .map_or("/", |value| value.as_str());
-    let url = upstream_url(&parts.headers, &proxy.upstream, path)?;
-    let mut headers = parts.headers;
-    headers.remove(harness::UPSTREAM_URL_HEADER);
-    headers.remove(header::HOST);
-    remove_hop_by_hop_headers(&mut headers);
+    let (prepared, body) = PreparedUpstream::new(proxy, request)?;
+    let PreparedUpstream {
+        method,
+        url,
+        mut headers,
+        ..
+    } = prepared;
+    // A body this side rewrites must be read uncompressed.
     headers.insert(
         "connect-accept-encoding",
         axum::http::HeaderValue::from_static("identity"),
@@ -180,7 +202,7 @@ pub async fn forward_buffered(
     let body = super::read_body(body).await?;
     let mut upstream = proxy
         .client
-        .request(parts.method, url)
+        .request(method, url)
         .headers(headers)
         .body(body)
         .send()

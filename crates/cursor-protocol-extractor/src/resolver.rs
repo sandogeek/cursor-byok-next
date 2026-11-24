@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 
-use crate::ast_util::last_segment;
+use crate::ast::last_segment;
 use crate::types::{
-    Enum, Message, SymbolDef, SymbolKind, google_well_known, looks_like_full_type_name,
+    Enum, Message, SymbolDef, SymbolKind, google_well_known, looks_like_full_type_name, package_of,
     parse_type_name,
 };
 
@@ -345,7 +345,7 @@ fn pick_best_definition<'a>(
     let preferred_package = context.package.trim();
     if !preferred_package.is_empty() {
         narrow(&mut filtered, |item| {
-            parse_type_name(&item.type_name).package == preferred_package
+            package_of(&item.type_name) == preferred_package
         });
     }
     if let Some(module_start) = module_start {
@@ -372,15 +372,15 @@ fn narrow(filtered: &mut Vec<&SymbolDef>, keep: impl Fn(&&SymbolDef) -> bool + C
 
 /// Returns the `google_well_known` type a short name refers to, if any.
 #[must_use]
-pub fn well_known_type_name(r#ref: &str) -> Option<String> {
-    let last = last_segment(r#ref.trim());
+pub fn well_known_type_name(type_ref: &str) -> Option<String> {
+    let last = last_segment(type_ref.trim());
     google_well_known(last).map(str::to_owned)
 }
 
 /// The bare type name to emit when a reference cannot be resolved.
 #[must_use]
-pub fn fallback_type_token(r#ref: &str) -> String {
-    let token = r#ref.trim();
+pub fn fallback_type_token(type_ref: &str) -> String {
+    let token = type_ref.trim();
     if token.is_empty() {
         return token.to_owned();
     }
@@ -465,6 +465,16 @@ pub struct ModuleStart {
     pub id: u32,
 }
 
+/// The byte offset of the module `id`, or `id` itself when no module declares
+/// that id (the value `require` passed was already an offset).
+#[must_use]
+pub fn module_start_by_id(module_starts: &[ModuleStart], id: u32) -> u32 {
+    module_starts
+        .iter()
+        .find(|module| module.id == id)
+        .map_or(id, |module| module.start)
+}
+
 /// Maps each module's imported aliases to the byte offset of the module they
 /// came from.
 #[must_use]
@@ -472,16 +482,12 @@ pub fn build_module_imports(
     entries: &[(Option<u32>, String, u32)],
     module_starts: &[ModuleStart],
 ) -> ModuleImports {
-    let id_to_start: HashMap<u32, u32> = module_starts
-        .iter()
-        .map(|module| (module.id, module.start))
-        .collect();
     let mut imports = ModuleImports::new();
     for (module_start, alias, target) in entries {
         if alias.is_empty() {
             continue;
         }
-        let target_start = id_to_start.get(target).copied().unwrap_or(*target);
+        let target_start = module_start_by_id(module_starts, *target);
         imports
             .entry(*module_start)
             .or_default()

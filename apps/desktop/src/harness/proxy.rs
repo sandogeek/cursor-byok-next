@@ -294,40 +294,7 @@ pub fn is_cursor_host(host: &str) -> bool {
 /// mode or action, harness override, tool restriction) to that loop, so
 /// claiming them locally would turn working turns into a 404.
 fn is_local_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/aiserver.v1.InferenceService/RunInferenceSSE"
-            | "/aiserver.v1.BidiService/BidiAppend"
-            | "/aiserver.v1.AiService/AvailableDocs"
-            | "/aiserver.v1.DashboardService/GetEffectiveUserPlugins"
-            | "/aiserver.v1.DashboardService/GetUserPrivacyMode"
-            | "/agent.v1.AgentService/UpdateConversationMetadata"
-            | "/aiserver.v1.AiService/GetServerConfig"
-            | "/aiserver.v1.ServerConfigService/GetServerConfig"
-            | "/aiserver.v1.AiService/AvailableModels"
-            | "/agent.v1.AgentService/GetUsableModels"
-            | "/aiserver.v1.AiService/GetUsableModels"
-            | "/agent.v1.AgentService/GetDefaultModelForCli"
-            | "/aiserver.v1.AiService/GetDefaultModelForCli"
-            | "/aiserver.v1.AiService/GetDefaultModel"
-            | "/aiserver.v1.AiService/GetDefaultModelNudgeData"
-            | "/aiserver.v1.AuthService/GetEmail"
-            | "/aiserver.v1.AuthService/GetUserMeta"
-            | "/aiserver.v1.DashboardService/GetMe"
-            | "/aiserver.v1.DashboardService/GetTeams"
-            | "/aiserver.v1.DashboardService/GetUserProfile"
-            | "/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
-            | "/aiserver.v1.DashboardService/GetUsageLimitStatusAndActiveGrants"
-            | "/aiserver.v1.AiService/KnowledgeBaseAdd"
-            | "/aiserver.v1.AiService/KnowledgeBaseList"
-            | "/aiserver.v1.AiService/KnowledgeBaseUpdate"
-            | "/aiserver.v1.AiService/KnowledgeBaseRemove"
-            | "/aiserver.v1.AiService/WriteGitCommitMessage"
-            | "/aiserver.v1.NetworkService/IsConnected"
-            | "/aiserver.v1.AnalyticsService/BootstrapStatsig"
-            | "/auth/full_stripe_profile"
-            | "/auth/stripe_profile"
-    )
+    crate::backend::PROVIDED_PATHS.contains(&path)
 }
 
 #[cfg(test)]

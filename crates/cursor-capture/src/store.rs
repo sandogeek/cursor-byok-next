@@ -1,7 +1,7 @@
 //! In-memory capture window, SQLite persistence, and SSE notifications.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,14 +66,11 @@ pub struct ExchangeStore {
 
 impl std::fmt::Debug for ExchangeStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.lock();
+        // Never take the store lock here: `Debug` is reachable from callbacks
+        // that already hold it, and a re-entrant lock would deadlock.
         f.debug_struct("ExchangeStore")
-            .field("database_path", &inner.database_path)
-            .field("retained", &inner.exchanges.len())
-            .field("max", &inner.max)
-            .field("last_error", &inner.last_error)
             .field("subscribers", &self.events.receiver_count())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -127,7 +124,6 @@ impl ExchangeStore {
             .context("setting the busy timeout")?;
         db.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA busy_timeout = 5000;
              PRAGMA secure_delete = ON;
              CREATE TABLE IF NOT EXISTS exchanges (
                 id TEXT PRIMARY KEY,
@@ -180,7 +176,7 @@ impl ExchangeStore {
             let payload = payload.context("reading a backfill row")?;
             let mut exchange: Exchange =
                 serde_json::from_slice(&payload).context("decoding a backfill row")?;
-            if hydrate_stored_exchange(&mut exchange) {
+            if hydrate_stored_exchange(&mut exchange).is_changed() {
                 exchanges.push(exchange);
             }
         }
@@ -424,11 +420,8 @@ impl ExchangeStore {
     /// Returns [`Error::Database`] when the aggregate query fails.
     pub fn conversations(&self) -> Result<Vec<ConversationSummary>> {
         let mut inner = self.inner.lock();
-        if inner.db.is_some() {
+        if let Some(db) = inner.db.as_mut() {
             let rows = {
-                let Some(db) = inner.db.as_mut() else {
-                    return Ok(Vec::new());
-                };
                 let mut stmt = db
                     .prepare(
                         "SELECT conversation_id, COUNT(*), MAX(started_at_ms),
@@ -510,12 +503,6 @@ impl ExchangeStore {
     fn publish(&self, event: StoreEvent) {
         // No subscriber is a normal state (the debug UI is closed).
         let _ = self.events.send(event);
-    }
-
-    /// The SQLite path, or an empty path for the in-memory store.
-    #[must_use]
-    pub fn database_path(&self) -> PathBuf {
-        PathBuf::from(self.inner.lock().database_path.clone())
     }
 }
 
@@ -613,15 +600,17 @@ fn associate_conversation_locked(
     if request_id.is_empty() {
         return;
     }
-    if conversation_id.is_empty() {
-        for candidate in inner.exchanges.values() {
-            if candidate.summary.request_id == request_id
-                && !candidate.summary.conversation_id.is_empty()
-            {
-                conversation_id.clone_from(&candidate.summary.conversation_id);
-                break;
-            }
-        }
+    if conversation_id.is_empty()
+        && let Some(found) = inner
+            .exchanges
+            .values()
+            .find(|candidate| {
+                candidate.summary.request_id == request_id
+                    && !candidate.summary.conversation_id.is_empty()
+            })
+            .map(|candidate| candidate.summary.conversation_id.clone())
+    {
+        conversation_id = found;
     }
     if conversation_id.is_empty()
         && let Some(db) = inner.db.as_mut()
@@ -674,10 +663,13 @@ fn associate_conversation_locked(
 pub fn sorted_headers(headers: &http::HeaderMap) -> Vec<Header> {
     let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
     for (name, value) in headers {
+        let value = value
+            .to_str()
+            .map_or_else(|_| "<non-utf8>".to_owned(), str::to_owned);
         grouped
             .entry(name.as_str().to_owned())
             .or_default()
-            .push(value.to_str().unwrap_or_default().to_owned());
+            .push(value);
     }
     let mut result: Vec<Header> = grouped
         .into_iter()

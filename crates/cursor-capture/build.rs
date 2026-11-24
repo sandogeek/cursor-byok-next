@@ -5,12 +5,25 @@ use std::path::{Path, PathBuf};
 
 use prost::Message;
 
+/// How many undefined types the sanitizer will patch before giving up. Each
+/// round replaces one unresolvable reference with `bytes`; needing more than
+/// this means the inputs are not Cursor protos.
+const MAX_PATCH_ROUNDS: usize = 500;
+/// The prefix `protox` uses in its "name 'X' is not defined" diagnostic.
+const UNDEFINED_NAME_PREFIX: &str = "name '";
+/// The suffix that follows the type name in that diagnostic.
+const UNDEFINED_NAME_SUFFIX: &str = "' is not defined";
+
 fn main() {
-    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest directory"));
+    let manifest = PathBuf::from(
+        env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|err| panic!("CARGO_MANIFEST_DIR: {err}")),
+    );
     let proto_dir = manifest.join("../../protocols/cursor");
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap_or_else(|err| panic!("OUT_DIR: {err}")));
     let generated = out_dir.join("protos");
-    std::fs::create_dir_all(&generated).expect("create sanitized proto directory");
+    std::fs::create_dir_all(&generated).unwrap_or_else(|err| {
+        panic!("create {}: {err}", generated.display());
+    });
 
     let agent_path = generated.join("agent_v1.proto");
     let aiserver_path = generated.join("aiserver_v1.proto");
@@ -26,16 +39,14 @@ fn main() {
         proto_dir.join("aiserver_v1.proto").display()
     );
 
-    for _ in 0..500 {
+    for _ in 0..MAX_PATCH_ROUNDS {
         write_proto(&agent_path, &agent);
         write_proto(&aiserver_path, &aiserver);
         match protox::compile([&agent_path, &aiserver_path], [&generated]) {
             Ok(file_descriptor_set) => {
-                std::fs::write(
-                    out_dir.join("cursor.bin"),
-                    file_descriptor_set.encode_to_vec(),
-                )
-                .expect("write cursor descriptor set");
+                let descriptor_set = out_dir.join("cursor.bin");
+                std::fs::write(&descriptor_set, file_descriptor_set.encode_to_vec())
+                    .unwrap_or_else(|err| panic!("write {}: {err}", descriptor_set.display()));
                 return;
             }
             Err(err) => {
@@ -54,7 +65,7 @@ fn main() {
             }
         }
     }
-    panic!("too many undefined protobuf types while compiling Cursor descriptors");
+    panic!("still undefined protobuf types after {MAX_PATCH_ROUNDS} patch rounds");
 }
 
 fn read_proto(path: &Path) -> String {
@@ -70,9 +81,9 @@ fn sanitize(source: &str) -> String {
 }
 
 fn undefined_type_name(message: &str) -> Option<String> {
-    let start = message.find("name '")? + 6;
+    let start = message.find(UNDEFINED_NAME_PREFIX)? + UNDEFINED_NAME_PREFIX.len();
     let rest = &message[start..];
-    let end = rest.find("' is not defined")?;
+    let end = rest.find(UNDEFINED_NAME_SUFFIX)?;
     Some(rest[..end].to_string())
 }
 

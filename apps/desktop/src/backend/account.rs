@@ -166,7 +166,7 @@ pub async fn get_email(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     super::local_or_forward(&upstream, request, || {
-        proto(&GetEmailResponse {
+        super::proto_response(&GetEmailResponse {
             email: LOCAL_EMAIL.into(),
             sign_up_type: SIGN_UP_TYPE_EMAIL,
         })
@@ -180,7 +180,7 @@ pub async fn get_user_meta(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     super::local_or_forward(&upstream, request, || {
-        proto(&GetUserMetaResponse {
+        super::proto_response(&GetUserMetaResponse {
             email: LOCAL_EMAIL.into(),
             sign_up_type: SIGN_UP_TYPE_EMAIL,
             user_id: 1,
@@ -197,7 +197,7 @@ pub async fn get_me(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     super::local_or_forward(&upstream, request, || {
-        proto(&GetMeResponse {
+        super::proto_response(&GetMeResponse {
             auth_id: LOCAL_AUTH_ID.into(),
             user_id: 1,
             email: Some(LOCAL_EMAIL.into()),
@@ -218,7 +218,7 @@ pub async fn get_teams(
     Extension(upstream): Extension<proxy::CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    super::local_or_forward(&upstream, request, || proto(&Empty {})).await
+    super::local_or_forward(&upstream, request, || super::proto_response(&Empty {})).await
 }
 
 /// Answers `DashboardService/GetUserProfile`: public visibility allowed, `PUBLIC` maximum.
@@ -227,7 +227,7 @@ pub async fn get_user_profile(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     super::local_or_forward(&upstream, request, || {
-        proto(&GetUserProfileResponse {
+        super::proto_response(&GetUserProfileResponse {
             public_visibility_allowed: Some(true),
             max_visibility: Some("PUBLIC".into()),
         })
@@ -242,7 +242,7 @@ pub async fn current_period_usage(
 ) -> Result<Response<Body>> {
     super::local_or_forward(&upstream, request, || {
         let now = chrono::Utc::now();
-        proto(&GetCurrentPeriodUsageResponse {
+        super::proto_response(&GetCurrentPeriodUsageResponse {
             billing_cycle_start: (now - chrono::Duration::days(LOCAL_PLAN_CYCLE_STARTED_DAYS))
                 .timestamp_millis(),
             billing_cycle_end: (now + chrono::Duration::days(LOCAL_PLAN_HORIZON_DAYS))
@@ -279,7 +279,7 @@ pub async fn usage_limit_status(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     super::local_or_forward(&upstream, request, || {
-        proto(&GetUsageLimitStatusAndActiveGrantsResponse {
+        super::proto_response(&GetUsageLimitStatusAndActiveGrantsResponse {
             usage_limit_policy_status: Some(UsageLimitPolicyStatus {
                 is_in_slow_pool: false,
                 features: std::collections::HashMap::default(),
@@ -321,10 +321,6 @@ fn local_stripe_profile(origin: Option<HeaderValue>) -> Result<Response<Body>> {
             .insert(header::VARY, HeaderValue::from_static("Origin"));
     }
     Ok(response)
-}
-
-fn proto(message: &impl Message) -> Response<Body> {
-    super::proto_response(message)
 }
 
 fn json(value: &Value) -> Result<Response<Body>> {

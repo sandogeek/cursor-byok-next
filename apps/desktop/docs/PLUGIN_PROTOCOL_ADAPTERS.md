@@ -15,7 +15,7 @@ cursor-byok/server/src/plugin/sdk/protocol/     apps/desktop/src/plugins/
 └── anthropic_test.ts   Deno 对照              adapters/* 内 #[cfg(test)]
 
 cursor-byok/server/src/plugin/                  apps/desktop/src/plugins/
-├── worker.rs  network.stream + JSONL Event     worker.rs             protocol.stream、readRequest、HostError.status、事件直通
+├── worker.rs  network.stream + JSONL Event     host_calls.rs         protocol.stream、readRequest；worker.rs 负责 JSONL 事件直通与 HostError.status
 ├── registry.rs stream_model                    host.rs               invoke 时登记 Arc<ModelInvocation>
 ├── wire.rs    SDK JSON 投影                    wire.rs               按需 SDK 投影 + 事件解码；无 Rust LlmRequest 类型族
 └── sdk/plugin.ts / worker.ts / tsconfig        sdk/                  context.protocol.stream；input.readRequest()

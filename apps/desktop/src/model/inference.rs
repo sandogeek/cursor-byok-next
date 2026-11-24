@@ -72,6 +72,7 @@ pub struct ModelSpec {
 
 impl ModelSpec {
     /// A spec for `model_id` with every optional knob left at its default.
+    #[must_use]
     pub fn new(model_id: &str) -> Self {
         Self {
             model_id: model_id.to_owned(),

@@ -57,7 +57,7 @@ fn parse_field_object_supports_shorthand_type() {
         r#"{no:4,name:"file_not_found",kind:"message",T,oneof:"result"}"#,
     )
     .expect("parse shorthand T");
-    assert_eq!(field.t, Some(TypeToken::Named("T".into())));
+    assert_eq!(field.type_token, Some(TypeToken::Named("T".into())));
 }
 
 #[test]
@@ -345,7 +345,7 @@ fn merge_messages_prefers_qualified_type_references() {
         var_name: String::new(),
         internal_name: String::new(),
         fields: vec![Field {
-            t: Some(TypeToken::Named("uR".into())),
+            type_token: Some(TypeToken::Named("uR".into())),
             oneof: Some("result".into()),
             ..Field::new(5, "edit_result", FieldKind::Message)
         }],
@@ -359,7 +359,7 @@ fn merge_messages_prefers_qualified_type_references() {
         var_name: String::new(),
         internal_name: String::new(),
         fields: vec![Field {
-            t: Some(TypeToken::Named("aiserver.v1.EditResult".into())),
+            type_token: Some(TypeToken::Named("aiserver.v1.EditResult".into())),
             oneof: Some("result".into()),
             ..Field::new(5, "edit_result", FieldKind::Message)
         }],
@@ -370,7 +370,7 @@ fn merge_messages_prefers_qualified_type_references() {
     };
     let merged = merge_messages_by_type_name(vec![unresolved, qualified]);
     assert_eq!(
-        merged[0].fields[0].t,
+        merged[0].fields[0].type_token,
         Some(TypeToken::Named("aiserver.v1.EditResult".into()))
     );
 }
@@ -394,17 +394,17 @@ fn merge_messages_prefers_more_complete_definition() {
         fields: vec![
             Field::new(1, "vendor", FieldKind::Scalar),
             Field {
-                t: Some(TypeToken::Named(
+                type_token: Some(TypeToken::Named(
                     "aiserver.v1.RunInferenceAgentModeConfig".into(),
                 )),
                 repeated: true,
                 ..Field::new(46, "agent_mode_configs", FieldKind::Message)
             },
             Field {
-                t: Some(TypeToken::Named(
+                type_token: Some(TypeToken::Named(
                     "aiserver.v1.RunInferenceAskQuestionConfig".into(),
                 )),
-                opt: true,
+                optional: true,
                 ..Field::new(48, "ask_question_config", FieldKind::Message)
             },
         ],
@@ -462,15 +462,15 @@ fn assert_run_inference_metadata(by_type: &HashMap<String, Message>) {
     let field = field_by_name(&meta.fields, "agent_mode_configs").expect("agent_mode_configs");
     assert!(field.repeated);
     assert_eq!(
-        field.t,
+        field.type_token,
         Some(TypeToken::Named(
             "aiserver.v1.RunInferenceAgentModeConfig".into()
         ))
     );
     let ask = field_by_name(&meta.fields, "ask_question_config").expect("ask_question_config");
-    assert!(ask.opt);
+    assert!(ask.optional);
     assert_eq!(
-        ask.t,
+        ask.type_token,
         Some(TypeToken::Named(
             "aiserver.v1.RunInferenceAskQuestionConfig".into()
         ))
@@ -488,7 +488,7 @@ fn assert_run_inference_maps(by_type: &HashMap<String, Message>) {
         .expect("result part");
     let result = field_by_name(&result_part.fields, "result").expect("result");
     assert_eq!(
-        result.t,
+        result.type_token,
         Some(TypeToken::Named("google.protobuf.Value".into()))
     );
     let ready = by_type

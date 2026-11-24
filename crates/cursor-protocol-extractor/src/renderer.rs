@@ -44,10 +44,11 @@ struct TypeNode {
     children: BTreeMap<String, TypeNode>,
 }
 
-/// What every declaration in one file renders against: the file itself, the
-/// resolver that names its types, and the diagnostics the pass records.
+/// What every declaration in one file renders against: how its short names map
+/// back to fully-qualified types, the resolver that names those types, and the
+/// diagnostics the pass records.
 struct Renderer<'a> {
-    file: &'a ProtoFile,
+    copied: &'a HashMap<String, CopiedType>,
     resolver: &'a TypeResolver,
     diag: &'a mut Diagnostics,
 }
@@ -59,13 +60,22 @@ fn emit(out: &mut String, args: std::fmt::Arguments<'_>) {
 }
 
 /// Renders one package's declarations, recording unresolved references.
+///
+/// Takes the file by value: the declarations are moved into the render tree
+/// instead of being deep-cloned.
 pub fn generate_proto_file(
     pkg_name: &str,
-    file: &ProtoFile,
+    file: ProtoFile,
     resolver: &TypeResolver,
     diag: &mut Diagnostics,
 ) -> String {
-    let imports = collect_imports(&file.messages, &file.services, resolver);
+    let ProtoFile {
+        messages,
+        enums,
+        services,
+        copied,
+    } = file;
+    let imports = collect_imports(&messages, &services, resolver);
     let mut out = String::new();
     out.push_str("syntax = \"proto3\";\n\n");
     emit(&mut out, format_args!("package {pkg_name};\n\n"));
@@ -85,24 +95,22 @@ pub fn generate_proto_file(
     );
 
     let mut root = TypeNode::default();
-    for message in &file.messages {
-        insert_message(
-            &mut root,
-            &nested_path(&message.short_name),
-            message.clone(),
-        );
+    for message in messages {
+        let path = nested_path(&message.short_name);
+        insert_message(&mut root, &path, message);
     }
-    for item in &file.enums {
-        insert_enum(&mut root, &nested_path(&item.short_name), item.clone());
+    for item in enums {
+        let path = nested_path(&item.short_name);
+        insert_enum(&mut root, &path, item);
     }
     let mut renderer = Renderer {
-        file,
+        copied: &copied,
         resolver,
         diag,
     };
     renderer.write_type_tree(&root, &mut out, 0);
 
-    let mut services: Vec<&Service> = file.services.iter().collect();
+    let mut services: Vec<&Service> = services.iter().collect();
     services.sort_by(|a, b| a.short_name.cmp(&b.short_name));
     for service in services {
         emit(
@@ -120,25 +128,19 @@ pub fn generate_proto_file(
         for method in &service.methods {
             let input = renderer.resolve_method_type(&method.input_type, context);
             let output = renderer.resolve_method_type(&method.output_type, context);
-            let line = match method.kind {
-                MethodKind::ServerStreaming => format!(
-                    "  rpc {}({}) returns (stream {}) {{}}\n",
-                    method.name, input, output
-                ),
-                MethodKind::ClientStreaming => format!(
-                    "  rpc {}(stream {}) returns ({}) {{}}\n",
-                    method.name, input, output
-                ),
-                MethodKind::BiDiStreaming => format!(
-                    "  rpc {}(stream {}) returns (stream {}) {{}}\n",
-                    method.name, input, output
-                ),
-                MethodKind::Unary => format!(
-                    "  rpc {}({}) returns ({}) {{}}\n",
-                    method.name, input, output
-                ),
+            let (input_stream, output_stream) = match method.kind {
+                MethodKind::ServerStreaming => ("", "stream "),
+                MethodKind::ClientStreaming => ("stream ", ""),
+                MethodKind::BiDiStreaming => ("stream ", "stream "),
+                MethodKind::Unary => ("", ""),
             };
-            out.push_str(&line);
+            emit(
+                &mut out,
+                format_args!(
+                    "  rpc {}({input_stream}{input}) returns ({output_stream}{output}) {{}}\n",
+                    method.name
+                ),
+            );
         }
         out.push_str("}\n\n");
     }
@@ -174,8 +176,13 @@ fn insert_enum(node: &mut TypeNode, path: &[String], item: Enum) {
 }
 
 /// The `// Source:`/`// Copied from:` line above an enum.
-fn write_enum_comment(out: &mut String, indent: &str, item: &Enum, file: &ProtoFile) {
-    match file.copied.get(&item.short_name) {
+fn write_enum_comment(
+    out: &mut String,
+    indent: &str,
+    item: &Enum,
+    copied: &HashMap<String, CopiedType>,
+) {
+    match copied.get(&item.short_name) {
         Some(CopiedType::External(original)) => emit(
             out,
             format_args!(
@@ -194,12 +201,17 @@ fn write_enum_comment(out: &mut String, indent: &str, item: &Enum, file: &ProtoF
 }
 
 /// The `// Source:`/`// Copied from:` line above a message.
-fn write_message_comment(out: &mut String, indent: &str, message: &Message, file: &ProtoFile) {
+fn write_message_comment(
+    out: &mut String,
+    indent: &str,
+    message: &Message,
+    copied: &HashMap<String, CopiedType>,
+) {
     let mut var_info = message.var_name.clone();
     if !message.internal_name.is_empty() && message.internal_name != message.var_name {
         var_info = format!("{}, class: {}", message.var_name, message.internal_name);
     }
-    match file.copied.get(&message.short_name) {
+    match copied.get(&message.short_name) {
         Some(CopiedType::External(original)) => emit(
             out,
             format_args!("{indent}// Copied from: {original} (var: {var_info})\n"),
@@ -219,18 +231,18 @@ impl Renderer<'_> {
         let indent_str = "  ".repeat(indent);
         for (name, child) in &node.children {
             if let Some(item) = &child.enum_item {
-                write_enum_comment(out, &indent_str, item, self.file);
+                write_enum_comment(out, &indent_str, item, self.copied);
                 emit(out, format_args!("{indent_str}enum {name} {{\n"));
                 for value in &item.values {
                     emit(
                         out,
-                        format_args!("{indent_str}  {} = {};\n", value.name, value.no),
+                        format_args!("{indent_str}  {} = {};\n", value.name, value.number),
                     );
                 }
                 emit(out, format_args!("{indent_str}}}\n\n"));
             } else if child.message.is_some() || !child.children.is_empty() {
                 if let Some(message) = &child.message {
-                    write_message_comment(out, &indent_str, message, self.file);
+                    write_message_comment(out, &indent_str, message, self.copied);
                 }
                 emit(out, format_args!("{indent_str}message {name} {{\n"));
                 self.write_type_tree(child, out, indent + 1);
@@ -257,7 +269,7 @@ impl Renderer<'_> {
             let field_type = self.resolve_field_type(field, &message.short_name, context);
             let prefix = if field.repeated {
                 "repeated "
-            } else if field.opt {
+            } else if field.optional {
                 "optional "
             } else {
                 ""
@@ -266,7 +278,7 @@ impl Renderer<'_> {
                 out,
                 format_args!(
                     "{indent_str}{prefix}{field_type} {} = {};\n",
-                    field.name, field.no
+                    field.name, field.number
                 ),
             );
         }
@@ -278,7 +290,7 @@ impl Renderer<'_> {
                     out,
                     format_args!(
                         "{indent_str}  {field_type} {} = {};\n",
-                        field.name, field.no
+                        field.name, field.number
                     ),
                 );
             }
@@ -294,9 +306,15 @@ impl Renderer<'_> {
             self.diag.add_unresolved_type(&format!("method:{type_ref}"));
             return fallback_type_token(type_ref);
         };
-        let TypeName { package, short } = parse_type_name(&type_name);
-        if package == context.package || package.is_empty() || self.file.copied.contains_key(&short)
-        {
+        self.qualify(&type_name, context)
+    }
+
+    /// The name a rendered reference uses: the bare short name when the type is
+    /// local to this file (same package, well-known, or copied in), else the
+    /// package-qualified name.
+    fn qualify(&self, type_name: &str, context: TypeContext<'_>) -> String {
+        let TypeName { package, short } = parse_type_name(type_name);
+        if package == context.package || package.is_empty() || self.copied.contains_key(&short) {
             short
         } else {
             format!("{package}.{short}")
@@ -310,13 +328,13 @@ impl Renderer<'_> {
         context: TypeContext<'_>,
     ) -> String {
         match field.kind {
-            FieldKind::Scalar => match field.t {
+            FieldKind::Scalar => match field.type_token {
                 Some(TypeToken::Scalar(id)) => {
                     scalar_name(id).unwrap_or(FALLBACK_SCALAR).to_owned()
                 }
                 _ => FALLBACK_SCALAR.to_owned(),
             },
-            FieldKind::Message | FieldKind::Enum => match &field.t {
+            FieldKind::Message | FieldKind::Enum => match &field.type_token {
                 Some(TypeToken::Named(name)) => {
                     self.resolve_named(name, parent_path, context, SymbolKind::of(field.kind))
                 }
@@ -356,7 +374,7 @@ impl Renderer<'_> {
                 .add_unresolved_type(&format!("{expected:?}:{type_ref}"));
             return fallback_type_token(type_ref);
         };
-        let TypeName { package, short } = parse_type_name(&type_name);
+        let TypeName { short, .. } = parse_type_name(&type_name);
         if !parent_path.is_empty()
             && let Some(nested) = short
                 .strip_prefix(parent_path)
@@ -364,12 +382,7 @@ impl Renderer<'_> {
         {
             return nested.to_owned();
         }
-        if package == context.package || package.is_empty() || self.file.copied.contains_key(&short)
-        {
-            short
-        } else {
-            format!("{package}.{short}")
-        }
+        self.qualify(&type_name, context)
     }
 }
 
@@ -403,7 +416,7 @@ pub fn collect_imports(
         let context = TypeContext::new(&message.package, message.pos, message.module_start);
         for field in &message.fields {
             if field.kind.is_named()
-                && let Some(TypeToken::Named(name)) = &field.t
+                && let Some(TypeToken::Named(name)) = &field.type_token
             {
                 add(name, context, SymbolKind::of(field.kind));
             }

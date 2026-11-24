@@ -1,7 +1,7 @@
 # 移植记录：模型调用记录
 
 上游实现：`cursor-byok/server/src/{provider/recorder,store/llm_calls,plugin/worker}.rs` + `apps/desktop/src/features/calls/`。
-本移植：`apps/desktop/src/calls/` + `plugins/{host,worker}.rs` + `loop_service/service.rs` + `src/screens/{Calls,CallDetails}.tsx`。
+本移植：`apps/desktop/src/calls/` + `plugins/{host,host_calls,worker}.rs` + `loop_service/inference.rs` + `src/screens/{Calls,CallDetails}.tsx`。
 
 范围只有一件事：**记录 Cursor local loop 里每次 Magpie `InvokeModel` 的生命周期、用量和可选原始请求/响应**。不记录官方模型、不移植首页统计图表、不引入 HTTP 控制 API。
 
@@ -13,9 +13,9 @@ cursor-byok/server/src/                         apps/desktop/src/
 ├── store/storage.rs              111  清理计数      calls/store.rs          无官方 trace
 ├── provider/recorder.rs          463  调用生命周期  calls/recorder.rs       观测失败不阻断模型
 ├── provider/event.rs              55  TTFR 判定     provider.rs             is_valid_response_event
-├── plugin/worker.rs              首个 HTTP 认领     plugins/worker.rs       脱敏头 + 原始 chunk；protocol.stream 共用 prepare_request
+├── plugin/worker.rs              首个 HTTP 认领     plugins/host_calls.rs   脱敏头 + 原始 chunk；protocol.stream 共用 prepare_request
 ├── plugin/registry.rs            传入 recorder      plugins/host.rs         stream_model(..., recorder)
-├── cursor/inference/service.rs   InvokeModel        loop_service/service.rs 开始 / 事件 / 终态
+├── cursor/inference/service.rs   InvokeModel        loop_service/inference.rs 开始 / 事件 / 终态
 └── control/service.rs            HTTP API           lib.rs Calls class      native 查询与命令
 
 cursor-byok/apps/desktop/src/features/calls/    apps/desktop/src/screens/

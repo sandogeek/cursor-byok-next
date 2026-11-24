@@ -1,7 +1,7 @@
 //! Publishes configured Magpie models into Cursor's picker.
 
 use axum::{
-    body::{Body, Bytes},
+    body::Body,
     extract::Extension,
     http::{Request, Response},
 };
@@ -11,7 +11,7 @@ use crate::{
     Result,
     backend::proxy::{self, CursorProxy},
     plugins::{PluginHost, PluginModelDescriptor},
-    protocol::proto::agent::v1 as agent,
+    protocol::{connect, proto::agent::v1 as agent},
 };
 
 const CLI_LOCAL_MODEL_API_KEY: &str = "cursor-byok-next-local";
@@ -348,16 +348,12 @@ fn merge_response(upstream: proxy::BufferedResponse, extra: Vec<u8>) -> Result<R
         tracing::warn!(status = %upstream.status, "Cursor model catalog upstream rejected request; using local catalog");
         return Ok(super::proto_bytes_response(extra));
     }
-    let (framing, payload) = unary_payload(&upstream.body)?;
+    let (framing, payload) = connect::split_unary(&upstream.body, "model catalog")?;
     let mut merged = Vec::with_capacity(payload.len() + extra.len());
     merged.extend_from_slice(payload);
     merged.extend_from_slice(&extra);
-    let body = super::encode_unary(&merged, framing)?;
+    let body = connect::wrap_unary(&merged, framing)?;
     Ok(upstream.with_body(body))
-}
-
-fn unary_payload(body: &Bytes) -> Result<(super::Framing, &[u8])> {
-    super::unary_payload(body, "model catalog")
 }
 
 /// Whether a variant turns on the "Fast" cost tier.

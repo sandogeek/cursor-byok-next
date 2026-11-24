@@ -23,12 +23,7 @@ mod state;
 #[cfg(target_os = "windows")]
 mod windows;
 
-use std::{
-    fs,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::{Arc, OnceLock},
-};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use parking_lot::{Mutex as SyncMutex, RwLock};
 use serde::Serialize;
@@ -140,7 +135,7 @@ impl HarnessPaths {
     /// Fails when the home directory cannot be resolved or `~/.cursor-byok-next`
     /// cannot be created.
     pub fn managed() -> Result<Self> {
-        let data_dir = data_dir()?;
+        let data_dir = crate::storage::data_dir()?;
         Ok(Self {
             settings: SettingsStore::managed()?,
             account: AccountStore::managed()?,
@@ -205,14 +200,13 @@ impl CursorHarness {
         }
         let _operation = self.operation.lock().await;
         let url = self.proxy.lock().await.url();
-        if url.is_some() {
-            self.paths.account.inject_if_missing().await?;
-        }
         self.routing.set_backend_addr(addr);
-        if let Some(url) = url {
-            self.paths.settings.write_proxy_settings(&url)?;
+        // Starting local routing while takeover runs applies the account and
+        // settings a fresh enable would, so the two paths cannot drift.
+        match url {
+            Some(url) => self.apply(&url).await,
+            None => Ok(()),
         }
-        Ok(())
     }
 
     pub async fn proxy_port(&self) -> Option<u16> {
@@ -298,15 +292,16 @@ impl CursorHarness {
         if !self.intent.read().enabled || self.ca_state().await != CaState::Ready {
             return;
         }
-        let healthy = {
+        let proxy_url = {
             let proxy = self.proxy.lock().await;
-            proxy.running()
-                && proxy.url().is_some_and(|url| {
-                    self.paths
-                        .settings
-                        .managed_state(Some(&url))
-                        .is_ok_and(ManagedSettings::is_applied)
-                })
+            proxy.running().then(|| proxy.url()).flatten()
+        };
+        let healthy = match proxy_url {
+            Some(url) => self
+                .managed_settings(Some(url))
+                .await
+                .is_ok_and(ManagedSettings::is_applied),
+            None => false,
         };
         if !healthy && let Err(error) = self.enable().await {
             tracing::warn!(%error, "could not restore Cursor takeover");
@@ -317,16 +312,19 @@ impl CursorHarness {
     /// the integration state. An inconsistent or unreadable state is degraded.
     async fn report(&self) -> HarnessStatus {
         let ca = self.ca_state().await;
-        let proxy = self.proxy.lock().await;
-        let proxy_url = proxy.url();
+        // Snapshot the proxy under its lock, then drop it before touching the
+        // filesystem: `managed_state` reads and parses `settings.json`.
+        let (proxy_url, proxy_port, proxy_running) = {
+            let proxy = self.proxy.lock().await;
+            (proxy.url(), proxy.port(), proxy.running())
+        };
         let settings_url = proxy_url.clone().or_else(|| self.saved_proxy_url());
         let settings = self
-            .paths
-            .settings
-            .managed_state(settings_url.as_deref())
+            .managed_settings(settings_url)
+            .await
             .inspect_err(|error| tracing::warn!(%error, "could not read Cursor settings"));
         let settings_applied = settings.as_ref().is_ok_and(|state| state.is_applied());
-        let integration = match (proxy.running(), settings_applied, settings) {
+        let integration = match (proxy_running, settings_applied, settings) {
             (false, false, Ok(ManagedSettings::NotConfigured | ManagedSettings::Missing)) => {
                 IntegrationState::Disabled
             }
@@ -338,7 +336,7 @@ impl CursorHarness {
             ca,
             integration,
             settings_applied,
-            proxy_port: proxy.port(),
+            proxy_port,
             proxy_url,
             preferred_proxy_port: self.intent.read().preferred_port.to_boundary(),
             data_dir: self.paths.data_dir.display().to_string(),
@@ -364,6 +362,17 @@ impl CursorHarness {
         }
     }
 
+    /// Reads the managed state of Cursor's `settings.json` off the async
+    /// thread; the file is a synchronous read and JSONC parse.
+    async fn managed_settings(&self, proxy_url: Option<String>) -> Result<ManagedSettings> {
+        let paths = Arc::clone(&self.paths);
+        tokio::task::spawn_blocking(move || paths.settings.managed_state(proxy_url.as_deref()))
+            .await
+            .map_err(|error| {
+                Error::Process(format!("the settings inspection task failed: {error}"))
+            })?
+    }
+
     fn saved_proxy_url(&self) -> Option<String> {
         self.intent
             .read()
@@ -377,10 +386,12 @@ impl CursorHarness {
                 "trust the local CA before enabling Cursor takeover".into(),
             ));
         }
-        let mut proxy = self.proxy.lock().await;
-        let running_url = proxy.url();
-        let settings_applied = match running_url.as_deref() {
-            Some(url) => self.paths.settings.managed_state(Some(url))?.is_applied(),
+        // Read the running URL and release the proxy lock before any `.await`:
+        // terminating Cursor takes a full process scan and would otherwise
+        // block `status()` and `proxy_port()` behind it.
+        let running_url = self.proxy.lock().await.url();
+        let settings_applied = match running_url.clone() {
+            Some(url) => self.managed_settings(Some(url)).await?.is_applied(),
             None => false,
         };
         if !settings_applied {
@@ -394,50 +405,54 @@ impl CursorHarness {
             }
         }
         if let Some(url) = running_url {
-            // The proxy is already up; release the lock before writing files.
-            drop(proxy);
             return self.apply(&url).await;
         }
-        // Reuse the port the user chose, else the one Cursor's settings were
-        // already pointed at, so a restart never invalidates them. A saved `0`
-        // is the user asking for a fresh OS pick, so it is not a fallback.
-        let intent = *self.intent.read();
-        let preferred = intent
-            .preferred_port
-            .request(intent.proxy_port, DEFAULT_PROXY_PORT);
-        let ca = self.paths.ca.load()?;
-        let started = proxy.start(self.routing.clone(), ca, preferred).await?;
-        if started.port != preferred {
-            tracing::warn!(
-                requested = preferred,
-                actual_port = started.port,
-                "the preferred proxy port was taken"
-            );
-        }
-        // The proxy is running now; release the lock before writing files.
-        drop(proxy);
-
-        // Cursor's files and the remembered port must both name the port that
-        // is actually open, or the next start leaves Cursor on a dead port. A
-        // failure in either write undoes the proxy that is already listening.
-        let applied = self
-            .apply(&started.url)
-            .await
-            .and_then(|()| self.update_intent(|intent| intent.proxy_port = Some(started.port)));
-        if let Err(error) = applied {
-            // A rollback that also fails is worth a log line: Cursor's settings
-            // may still name the port that is about to close.
-            if let Err(cleanup) = self.paths.settings.clear_proxy_settings(&started.url) {
-                tracing::warn!(%cleanup, "could not roll back Cursor proxy settings");
+        let mut proxy = self.proxy.lock().await;
+        let Some(url) = proxy.url() else {
+            // Reuse the port the user chose, else the one Cursor's settings were
+            // already pointed at, so a restart never invalidates them. A saved `0`
+            // is the user asking for a fresh OS pick, so it is not a fallback.
+            let intent = *self.intent.read();
+            let preferred = intent
+                .preferred_port
+                .request(intent.proxy_port, DEFAULT_PROXY_PORT);
+            let ca = self.paths.ca.load()?;
+            let started = proxy.start(self.routing.clone(), ca, preferred).await?;
+            if started.port != preferred {
+                tracing::warn!(
+                    requested = preferred,
+                    actual_port = started.port,
+                    "the preferred proxy port was taken"
+                );
             }
-            self.proxy.lock().await.stop().await;
-            return Err(error);
-        }
-        Ok(())
+            let url = started.url.clone();
+            let port = started.port;
+            // The proxy is running now; release the lock before writing files.
+            drop(proxy);
+
+            // Cursor's files and the remembered port must both name the port that
+            // is actually open, or the next start leaves Cursor on a dead port. A
+            // failure in either write undoes the proxy that is already listening.
+            let applied = self
+                .apply(&url)
+                .await
+                .and_then(|()| self.update_intent(|intent| intent.proxy_port = Some(port)));
+            if let Err(error) = applied {
+                // A rollback that also fails is worth a log line: Cursor's settings
+                // may still name the port that is about to close.
+                if let Err(cleanup) = self.paths.settings.clear_proxy_settings(&url) {
+                    tracing::warn!(%cleanup, "could not roll back Cursor proxy settings");
+                }
+                self.proxy.lock().await.stop().await;
+                return Err(error);
+            }
+            return Ok(());
+        };
+        // Another task started the proxy while this one waited for the lock.
+        drop(proxy);
+        self.apply(&url).await
     }
 
-    /// Clears matching settings first: stopping the proxy while Cursor still
-    /// points at it would leave Cursor talking to a closed port.
     async fn disable(&self) -> Result<()> {
         let proxy_url = self
             .proxy
@@ -445,6 +460,12 @@ impl CursorHarness {
             .await
             .url()
             .or_else(|| self.saved_proxy_url());
+        self.clear_settings_then_stop(proxy_url).await
+    }
+
+    /// Clears Cursor's matching setting first: stopping the proxy while Cursor
+    /// still points at it would leave Cursor talking to a closed port.
+    async fn clear_settings_then_stop(&self, proxy_url: Option<String>) -> Result<()> {
         if let Some(url) = proxy_url {
             self.paths.settings.clear_proxy_settings(&url)?;
         }
@@ -452,6 +473,8 @@ impl CursorHarness {
         Ok(())
     }
 
+    /// Points Cursor at a running proxy: the local account when this app serves
+    /// the backend, then the proxy setting.
     async fn apply(&self, proxy_url: &str) -> Result<()> {
         if self.routing.has_backend() {
             self.paths.account.inject_if_missing().await?;
@@ -460,41 +483,10 @@ impl CursorHarness {
     }
 }
 
-/// The app's own directory: `~/.cursor-byok-next`, resolved once per process.
-///
-/// Every store (`harness.json`, `ca/`, `calls.db`, `plugins/`, `rules/`) lives
-/// here, so one resolution keeps them on the same path instead of each one
-/// re-creating and re-permissioning the directory.
-pub(crate) fn data_dir() -> Result<PathBuf> {
-    static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
-    if let Some(dir) = DATA_DIR.get() {
-        return Ok(dir.clone());
-    }
-    let dir = resolve_data_dir()?;
-    Ok(DATA_DIR.get_or_init(|| dir).clone())
-}
-
-fn resolve_data_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| Error::Config("cannot resolve the user home directory".into()))?;
-    let dir = home.join(".cursor-byok-next");
-    // The app may start twice at once: whoever wins the race creates it.
-    match fs::create_dir(&dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(dir)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn harness(dir: &tempfile::TempDir) -> CursorHarness {
         CursorHarness::new(HarnessPaths {

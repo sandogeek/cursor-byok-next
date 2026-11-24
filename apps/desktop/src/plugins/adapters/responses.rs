@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 
 use super::tools::{ToolCalls, ToolState};
 use super::{
-    CoreMessage, ProtocolParser, SawTool, ToolNames, core_message, count_usize, data_url,
-    map_text_field, object, object_mut, parse_object, text_field,
+    CoreMessage, ProtocolParser, SawTool, ToolNames, core_message, data_url, map_text_field,
+    object_mut, parse_object, text_field,
 };
 use crate::{
     model::{ContentPart, ModelInvocation, ModelLatency, Usage},
@@ -109,7 +109,7 @@ impl Parser {
     }
 
     fn output_item_added(&mut self, value: &Value, emit: &mut dyn FnMut(ModelEvent)) -> Result<()> {
-        let item = value.get("item").and_then(object);
+        let item = value.get("item").and_then(Value::as_object);
         if map_text_field(item, "type") != Some("function_call") {
             return Ok(());
         }
@@ -122,7 +122,7 @@ impl Parser {
     }
 
     fn output_item_done(&mut self, value: &Value, emit: &mut dyn FnMut(ModelEvent)) -> Result<()> {
-        let item = value.get("item").and_then(object);
+        let item = value.get("item").and_then(Value::as_object);
         match map_text_field(item, "type") {
             Some("reasoning") => {
                 self.close_thinking(emit);
@@ -259,7 +259,7 @@ impl ProtocolParser for Parser {
             Some("response.completed") => {
                 if let Some(usage) = value
                     .get("response")
-                    .and_then(object)
+                    .and_then(Value::as_object)
                     .and_then(|response| response.get("usage"))
                 {
                     emit(responses_usage(usage));
@@ -495,14 +495,15 @@ fn content_parts(parts: &[ContentPart]) -> Vec<Value> {
 }
 
 fn replay_items(value: &Value) -> Result<Vec<Value>> {
-    let items = object(value)
+    let items = value
+        .as_object()
         .and_then(|value| value.get("items"))
         .and_then(Value::as_array)
         .ok_or_else(|| Error::Provider("OpenAI Responses replay state is missing items".into()))?;
     items
         .iter()
         .map(|item| {
-            let source = object(item).ok_or_else(|| {
+            let source = item.as_object().ok_or_else(|| {
                 Error::Provider(
                     "OpenAI Responses replay state contains a non-reasoning item".into(),
                 )
@@ -538,7 +539,7 @@ fn item_text(item: &serde_json::Map<String, Value>) -> Option<String> {
     Some(
         content
             .iter()
-            .filter_map(object)
+            .filter_map(Value::as_object)
             .filter(|part| map_text_field(Some(part), "type") == Some("output_text"))
             .map(|part| map_text_field(Some(part), "text").unwrap_or(""))
             .collect(),
@@ -546,20 +547,18 @@ fn item_text(item: &serde_json::Map<String, Value>) -> Option<String> {
 }
 
 fn required_index(value: &Value) -> Result<usize> {
-    value
-        .get("output_index")
-        .and_then(count_usize)
+    super::count_field(value, "output_index")
         .ok_or_else(|| Error::Provider("OpenAI Responses event is missing output_index".into()))
 }
 
 fn responses_usage(value: &Value) -> ModelEvent {
-    let usage = object(value);
+    let usage = value.as_object();
     let input_details = usage
         .and_then(|usage| usage.get("input_tokens_details"))
-        .and_then(object);
+        .and_then(Value::as_object);
     let output_details = usage
         .and_then(|usage| usage.get("output_tokens_details"))
-        .and_then(object);
+        .and_then(Value::as_object);
     ModelEvent::Usage(
         Usage::new(
             super::map_count(usage, "input_tokens"),

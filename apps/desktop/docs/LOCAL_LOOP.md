@@ -9,26 +9,28 @@
 
 ```text
 cursor-byok/server/src/                         apps/desktop/src/
-├── cursor/inference/service.rs                 loop_service/service.rs     963  按 request_id 路由 Local/Upstream
-├── cursor/inference/project.rs                 loop_service/project.rs     433  InferenceStreamRequest → ModelRequest
-├── cursor/inference/output.rs                  loop_service/output.rs       63  可重放的 Connect 帧广播
-├── cursor/inference/overflow.rs                loop_service/overflow.rs     23  context overflow 分类
-├── cursor/inference/subagent_models.rs         loop_service/subagent_models.rs 77  Task 模型解析
-├── cursor/protocol/connect.rs                  protocol/connect.rs          55  Connect 5 字节帧
-├── cursor/protocol/json.rs                     protocol/json.rs             73  prost JSON
-├── cursor/protocol/proto.rs                    protocol/proto.rs            44  agent.v1 + run_inference
-├── plugin/wire.rs                              plugins/wire.rs             318  按需 SDK JSON 投影 / ModelEvent
-├── plugin/worker.rs                            plugins/worker.rs          1587  JSONL + protocol.stream + readRequest
-├── plugin/registry.rs stream_model             plugins/host.rs            1585  Magpie invoke + 登记 Arc<ModelInvocation>
-├── plugin/sdk/protocol/*.ts                    plugins/adapters/          2892  Chat / Responses / Anthropic
-├── api/cursor/handlers.rs                      backend/mod.rs              468  路由、RunInferenceSSE、BidiAppend
-├── api/cursor/proxy.rs                         backend/proxy.rs            209  只转发 *.cursor.sh HTTPS
-├── cursor/services/account.rs                  backend/account.rs          336  本地 token → Ultra stub
-├── cursor/services/analytics.rs                backend/analytics.rs        200  Statsig agent_host_local_loop
-├── cursor/services/server_config.rs            backend/server_config.rs     52  http2_config=FORCE_ALL_DISABLED
-├── cursor/services/compatibility.rs            backend/compatibility.rs     86  空 unary stub
-├── cursor/services/model_catalog.rs            backend/catalog.rs          656  Magpie 并入 picker
-└── cursor/services/knowledge/                  backend/knowledge.rs        484  本地 md CRUD，无 journal
+├── cursor/inference/service.rs                 loop_service/inference.rs   1212  按 request_id 路由 Local/Upstream
+├── cursor/inference/project.rs                 loop_service/project.rs     537  InferenceStreamRequest → ModelRequest
+├── cursor/inference/output.rs                  loop_service/output.rs       88  可重放的 Connect 帧广播
+├── cursor/inference/overflow.rs                loop_service/overflow.rs     26  context overflow 分类
+├── cursor/inference/subagent_models.rs         loop_service/subagent_models.rs 109  Task 模型解析
+├── cursor/protocol/connect.rs                  protocol/connect.rs         209  Connect 5 字节帧
+├── cursor/protocol/json.rs                     protocol/json.rs            104  prost JSON
+├── cursor/protocol/proto.rs                    protocol/proto.rs            56  agent.v1 + run_inference
+├── plugin/wire.rs                              plugins/wire.rs             320  按需 SDK JSON 投影 / ModelEvent
+├── plugin/worker.rs                            plugins/worker.rs          1319  JSONL 进程传输（能力见 host_calls.rs）
+├── plugin/registry.rs 的能力调用               plugins/host_calls.rs       486  fetch / stream / readRequest / 协议适配器
+├── plugin/registry.rs live 目录                plugins/catalog_cache.rs    196  TTL 缓存、失败保留旧目录、按资源失效
+├── plugin/registry.rs stream_model             plugins/host.rs            1712  Magpie invoke + 登记 Arc<ModelInvocation>
+├── plugin/sdk/protocol/*.ts                    plugins/adapters/          3763  Chat / Responses / Anthropic
+├── api/cursor/handlers.rs                      backend/mod.rs              548  路由、`PROVIDED_PATHS` 白名单、RunInferenceSSE、BidiAppend
+├── api/cursor/proxy.rs                         backend/proxy.rs            276  只转发 *.cursor.sh HTTPS
+├── cursor/services/account.rs                  backend/account.rs          351  本地 token → Ultra stub
+├── cursor/services/analytics.rs                backend/analytics.rs        157  Statsig agent_host_local_loop
+├── cursor/services/server_config.rs            backend/server_config.rs     40  http2_config=FORCE_ALL_DISABLED
+├── cursor/services/compatibility.rs            backend/compatibility.rs     71  空 unary stub（三个元数据 RPC 合一）
+├── cursor/services/model_catalog.rs            backend/catalog.rs          635  Magpie 并入 picker
+└── cursor/services/knowledge/                  backend/knowledge.rs        532  本地 md CRUD，无 journal（读写走 spawn_blocking）
 ```
 
 行数为 `wc -l` 实测，含测试和空行、不含生成代码。proto 由 `apps/desktop/build.rs` 从 `protocols/cursor/{agent_v1,run_inference}.proto` 编译；`aiserver_v1.proto` 不全量编译（重复消息名），Bidi / IsConnected 手写，schema 用字符串断言守住。
@@ -80,6 +82,14 @@ Local serve()
 | 16 | 状态锁 | `std::sync::Mutex`，poison 时清毒继续 | `parking_lot::Mutex`，无 poison 状态 | 状态锁中毒后继续用是未定义的状态；换成无 poison 的锁后不需要恢复分支，也不需要额外测试 |
 | 17 | 重放历史上限 | 重放缓冲不设上限，随 Run 增长 | `OutputHub` 只保留最近 `MAX_REPLAY_FRAMES`（4096）帧，更早的帧计入 `dropped_frames` | 订阅者迟到时重放整条流是常态；无上限的历史让一个没人读的 Run 一直占内存。`Cursor` 的 SSE 每帧很小，4096 帧远大于正常重连窗口 |
 | 18 | 适配器工具累积 | 每个适配器各自维护 `ToolState` 与 `update_tool`，`Chat` 用 `String`、`Responses` 用 `Option<String>` + `ended` | 统一为 `adapters/tools.rs` 的 `ToolState`：`merge_call_id`/`merge_name` 处理片段，`take_start`/`take_arguments_delta`/`take_end` 各自只在未发出时返回事件 | 两种协议对同一件事（何时发 start / 参数增量 / end）的簿记只写一次；`String` 与 `Option` 的差异由空值判定吸收，事件序列不变 |
+| 19 | local loop 白名单 | 白名单与路由表各一份 | `backend::PROVIDED_PATHS` 是唯一来源，`harness::proxy::is_local_path` 查它 | 漂移时请求直通官方且无任何报错；合成一份后，加路由就自动可被改写 |
+| 20 | 知识库读写的执行线程 | axum handler 里直接同步读目录与文件 | 每次操作一次 `spawn_blocking`，锁也在阻塞线程内获取 | `read_dir` + 逐文件 `read_to_string` 在 async worker 上会占住运行时线程；锁改 `blocking_lock` 后不再与 async 任务争用 |
+| 21 | 转发请求的公共准备 | `forward_request` 与 `forward_buffered` 各写一遍路径/头部处理 | 抽 `PreparedUpstream::new` | 两份代码一旦有一边漏删 hop-by-hop 头，同一个字段会在一条路径上泄漏到上游 |
+| 22 | 计数饱和转换 | 五处私有 `as_i64` / `i32_tokens` / `count_i32` / `saturating_u32` | 统一 `src/saturating.rs` | 同名函数五份，其中一份把超限值变成 `None`、其余饱和到上限；“超限时消失还是饱和”必须是一个决定 |
+| 23 | 数据目录 | `harness::data_dir()` 被 backend / plugins / calls 反向依赖 | 独立 `src/storage.rs` | 取一个路径不该让四个模块依赖接管层；harness 只是它的一个调用方 |
+| 24 | `subscribe` 的所有权 | `run: &Arc<Run>`，内部再 `Arc::clone` | `run: Arc<Run>`，直接移入订阅 | 调用点本来就持有 `Arc`；接受 `&Arc` 等于要求调用方保留一份所有权义务，却无法省掉克隆 |
+| 25 | 魔法数字 | `mpsc::channel(64)`、错误码 `13` / `3` | `RUN_INPUT_QUEUE_FRAMES` / `INVOCATION_CODE_*` | 同一个 `13` 在别处可能是任意常量；命名后 `code: 13` 不再需要读者去查 gRPC 文档 |
+| 26 | 模块名 | `service.rs`（与 `output` / `project` 并列时没有指向任何东西） | `inference.rs`，与主类型 `InferenceService` 同名 | AGENTS 约定“叶子模块以主条目命名”；`service` 在有多个 service 的仓库里不是名字 |
 
 ## 必须保持的不变量
 

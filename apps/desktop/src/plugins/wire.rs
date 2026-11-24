@@ -125,25 +125,27 @@ pub fn model_event(value: &serde_json::Value) -> Result<ModelEvent> {
         .ok_or_else(|| Error::Protocol("plugin model event requires type".into()))?;
     let event = match kind {
         "text-start" => ModelEvent::TextStart,
-        "text-delta" => ModelEvent::TextDelta(required_str(value, "text")?.to_owned()),
+        "text-delta" => ModelEvent::TextDelta(required_str(value, "text", MODEL_EVENT)?.to_owned()),
         "text-end" => ModelEvent::TextEnd,
         "thinking-start" => ModelEvent::ThinkingStart,
-        "thinking-delta" => ModelEvent::ThinkingDelta(required_str(value, "text")?.to_owned()),
+        "thinking-delta" => {
+            ModelEvent::ThinkingDelta(required_str(value, "text", MODEL_EVENT)?.to_owned())
+        }
         "thinking-end" => ModelEvent::ThinkingEnd,
         "tool-call-start" => ModelEvent::ToolCallStart {
             index: required_index(value)?,
-            call_id: required_str(value, "callId")?.to_owned(),
-            name: required_str(value, "name")?.to_owned(),
+            call_id: required_str(value, "callId", MODEL_EVENT)?.to_owned(),
+            name: required_str(value, "name", MODEL_EVENT)?.to_owned(),
         },
         "tool-call-arguments-delta" => ModelEvent::ToolCallArgumentsDelta {
             index: required_index(value)?,
-            delta: required_str(value, "delta")?.to_owned(),
+            delta: required_str(value, "delta", MODEL_EVENT)?.to_owned(),
         },
         "tool-call-end" => ModelEvent::ToolCallEnd {
             index: required_index(value)?,
         },
         "replay-state" => ModelEvent::ProviderReplayState(crate::model::ProviderReplayState {
-            provider_kind: required_str(value, "providerKind")?.to_owned(),
+            provider_kind: required_str(value, "providerKind", MODEL_EVENT)?.to_owned(),
             value: value.get("value").cloned().unwrap_or_default(),
         }),
         "usage" => {
@@ -162,7 +164,7 @@ pub fn model_event(value: &serde_json::Value) -> Result<ModelEvent> {
                 reasoning_tokens: tokens("reasoningTokens"),
             })
         }
-        "done" => ModelEvent::Done(match required_str(value, "reason")? {
+        "done" => ModelEvent::Done(match required_str(value, "reason", MODEL_EVENT)? {
             "stop" => FinishReason::Stop,
             "length" => FinishReason::Length,
             "tool-use" => FinishReason::ToolUse,
@@ -181,20 +183,24 @@ pub fn model_event(value: &serde_json::Value) -> Result<ModelEvent> {
     Ok(event)
 }
 
-fn required_str<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str> {
+/// A required string field of a worker payload; `context` names the payload so
+/// the error says which message was malformed.
+pub(super) fn required_str<'a>(
+    value: &'a serde_json::Value,
+    key: &str,
+    context: &str,
+) -> Result<&'a str> {
     value
         .get(key)
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| Error::Protocol(format!("plugin model event requires string '{key}'")))
+        .ok_or_else(|| Error::Protocol(format!("{context} requires string '{key}'")))
 }
 
+const MODEL_EVENT: &str = "plugin model event";
+
 fn required_index(value: &serde_json::Value) -> Result<usize> {
-    let index = value
-        .get("index")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| Error::Protocol("plugin model event requires index".into()))?;
-    usize::try_from(index)
-        .map_err(|_| Error::Protocol("plugin model event index is too large".into()))
+    super::adapters::count_field(value, "index")
+        .ok_or_else(|| Error::Protocol("plugin model event requires index".into()))
 }
 
 #[cfg(test)]

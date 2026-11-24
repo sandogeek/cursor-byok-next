@@ -5,7 +5,7 @@ mod chat;
 mod responses;
 mod tools;
 
-use std::{collections::HashMap, time::Duration};
+use std::{borrow::Cow, collections::HashMap, time::Duration};
 
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -13,10 +13,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    Error, Result,
-    worker::{HostContext, InvocationState},
-};
+use super::{Error, Result, host_calls::HostContext, worker::InvocationState};
 use crate::{
     model::{
         ContentPart, ModelInvocation, ProjectedContent, ProjectedMessage, ProviderReplayState,
@@ -327,10 +324,6 @@ fn sse_field(value: &str) -> &str {
     value.strip_prefix(' ').unwrap_or(value)
 }
 
-fn object(value: &Value) -> Option<&serde_json::Map<String, Value>> {
-    value.as_object()
-}
-
 /// Provider request bodies are JSON objects; every adapter builds one, so a
 /// miss is a bug in the adapter rather than bad external input.
 fn object_mut(value: &mut Value) -> Result<&mut serde_json::Map<String, Value>> {
@@ -357,13 +350,9 @@ impl SawTool {
     }
 }
 
-fn text(value: &Value) -> Option<&str> {
-    value.as_str()
-}
-
 /// The string under `key`, or `None` when the key is absent or not a string.
 /// Provider payloads put optional fields on objects that may not exist, so
-/// this replaces the `text(value.get(key).unwrap_or(&Value::Null))` spelling.
+/// this replaces the `value.get(key).unwrap_or(&Value::Null).as_str()` spelling.
 fn text_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
@@ -396,6 +385,12 @@ fn map_count(value: Option<&serde_json::Map<String, Value>>, key: &str) -> Optio
     value?.get(key).and_then(count_u64)
 }
 
+/// The integer index under `key`, or `None` when it is absent, not a count, or
+/// does not fit `usize`. Callers attach their own protocol-specific message.
+pub(super) fn count_field(value: &Value, key: &str) -> Option<usize> {
+    value.get(key).and_then(count_usize)
+}
+
 /// The provider's error detail for an SSE event, if the event is an error.
 ///
 /// Every provider family puts the message and an optional error kind in
@@ -411,7 +406,7 @@ fn event_error_detail(value: &Value) -> Option<(Option<String>, String)> {
     if let Some(text) = error.as_str() {
         return Some((None, text.to_owned()));
     }
-    let details = object(error);
+    let details = error.as_object();
     let kind = details
         .and_then(|details| details.get("type"))
         .and_then(Value::as_str)
@@ -454,7 +449,7 @@ enum CoreMessage<'a> {
     System(&'a [ContentPart]),
     User(&'a [ContentPart]),
     Assistant {
-        text: std::borrow::Cow<'a, str>,
+        text: Cow<'a, str>,
         replay_state: Option<&'a ProviderReplayState>,
         tool_calls: &'a [ToolCallContent],
     },
@@ -467,7 +462,7 @@ fn core_message(message: &ProjectedMessage) -> Result<CoreMessage<'_>> {
             Role::System => Ok(CoreMessage::System(parts)),
             Role::User => Ok(CoreMessage::User(parts)),
             Role::Assistant => Ok(CoreMessage::Assistant {
-                text: std::borrow::Cow::Owned(joined_text(parts)),
+                text: Cow::Owned(joined_text(parts)),
                 replay_state: None,
                 tool_calls: &[],
             }),
@@ -481,7 +476,7 @@ fn core_message(message: &ProjectedMessage) -> Result<CoreMessage<'_>> {
             calls,
             ..
         } => Ok(CoreMessage::Assistant {
-            text: std::borrow::Cow::Borrowed(text),
+            text: Cow::Borrowed(text),
             replay_state: replay_state.as_ref(),
             tool_calls: calls,
         }),
@@ -576,11 +571,13 @@ impl ToolNames {
         self.by_name.insert(name.to_owned(), alias);
     }
 
-    fn alias(&self, name: &str) -> String {
-        self.by_name
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| provider_tool_name(name))
+    /// The provider-facing name. Registered tools borrow; only a name that was
+    /// never inserted needs the sanitized fallback allocation.
+    fn alias<'a>(&'a self, name: &'a str) -> Cow<'a, str> {
+        self.by_name.get(name).map_or_else(
+            || Cow::Owned(provider_tool_name(name)),
+            |alias| Cow::Borrowed(alias.as_str()),
+        )
     }
 
     fn restore(&self, alias: &str) -> String {

@@ -303,6 +303,7 @@ pub fn parse_model_id(value: &str) -> Option<ModelId<'_>> {
 
 impl PluginModelDescriptor {
     /// Projects one stored model into the flat shape the model picker reads.
+    #[must_use]
     pub fn new(
         plugin_id: &str,
         plugin_name: &str,

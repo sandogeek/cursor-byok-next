@@ -17,7 +17,7 @@ use sqlx::{
 };
 use tokio::sync::{Mutex, OnceCell};
 
-use crate::{Result, model::Usage, time::now_ms};
+use crate::{Result, model::Usage, saturating, time::now_ms};
 
 /// Oldest calls are dropped past this count, so the table cannot grow forever.
 const MAX_RETAINED_CALLS: i64 = 1000;
@@ -33,12 +33,6 @@ pub const DEFAULT_LIST_LIMIT: usize = 200;
 
 /// Stored response payloads stop at 1 MiB; SQLite stores the total as `i64`.
 const MAX_STORED_RESPONSE_BYTES: i64 = 1024 * 1024;
-
-/// SQLite columns hold byte counts and token counts as `i64`. Values come from
-/// `usize` lengths and provider usage numbers, so clamping keeps the cast total.
-fn as_i64_len(len: usize) -> i64 {
-    i64::try_from(len).unwrap_or(i64::MAX)
-}
 
 /// The list limit SQLite is asked for, clamped to the UI's range.
 fn list_limit(limit: usize) -> i64 {
@@ -433,8 +427,8 @@ impl CallStore {
         .bind(call.fast)
         .bind(now)
         .bind(now)
-        .bind(as_i64_len(call.message_count))
-        .bind(as_i64_len(call.tool_count))
+        .bind(saturating::i64_from_usize(call.message_count))
+        .bind(saturating::i64_from_usize(call.tool_count))
         .bind(call.detailed)
         .execute(&connected.pool)
         .await
@@ -490,14 +484,14 @@ impl CallStore {
                 .bind(call_id)
                 .bind(headers_json)
                 .bind(&stored_body)
-                .bind(as_i64_len(body_len))
+                .bind(saturating::i64_from_usize(body_len))
                 .bind(call_id)
                 .execute(&mut *transaction)
                 .await
                 .map_err(|error| self.fail(error))?;
         }
         sqlx::query("UPDATE llm_calls SET request_bytes = ?, request_truncated = ? WHERE call_id = ? AND status = 'running'")
-            .bind(as_i64_len(body_len))
+            .bind(saturating::i64_from_usize(body_len))
             .bind(truncated)
             .bind(call_id)
             .execute(&mut *transaction)
@@ -543,9 +537,9 @@ impl CallStore {
         let detailed = storage.keeps_payloads();
         let byte_count = chunks
             .iter()
-            .map(|chunk| as_i64_len(chunk.byte_count))
+            .map(|chunk| saturating::i64_from_usize(chunk.byte_count))
             .sum::<i64>();
-        let chunk_count = as_i64_len(chunks.len());
+        let chunk_count = saturating::i64_from_usize(chunks.len());
         let connected = self.connected().await?;
         let _write = connected.writes.lock().await;
         let mut transaction = connected
@@ -580,12 +574,12 @@ impl CallStore {
                     .bind(chunk.seq)
                     .bind(chunk.elapsed_ms)
                     .bind(data)
-                    .bind(as_i64_len(chunk.byte_count))
+                    .bind(saturating::i64_from_usize(chunk.byte_count))
                     .bind(call_id)
                     .execute(&mut *transaction)
                     .await
                     .map_err(|error| self.fail(error))?;
-                stored_bytes += as_i64_len(chunk.byte_count);
+                stored_bytes += saturating::i64_from_usize(chunk.byte_count);
             }
             if truncated || stored_bytes >= MAX_STORED_RESPONSE_BYTES {
                 sqlx::query("UPDATE llm_calls SET response_truncated = 1 WHERE call_id = ? AND status = 'running'")
@@ -648,12 +642,12 @@ impl CallStore {
         let connected = self.connected().await?;
         let _write = connected.writes.lock().await;
         sqlx::query("UPDATE llm_calls SET input_tokens = ?, output_tokens = ?, total_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?, reasoning_tokens = ?, usage_json = ? WHERE call_id = ? AND status = 'running'")
-            .bind(as_i64(usage.input_tokens))
-            .bind(as_i64(usage.output_tokens))
-            .bind(as_i64(usage.total_tokens))
-            .bind(as_i64(usage.cache_read_tokens))
-            .bind(as_i64(usage.cache_write_tokens))
-            .bind(as_i64(usage.reasoning_tokens))
+            .bind(saturating::option_i64_from_u64(usage.input_tokens))
+            .bind(saturating::option_i64_from_u64(usage.output_tokens))
+            .bind(saturating::option_i64_from_u64(usage.total_tokens))
+            .bind(saturating::option_i64_from_u64(usage.cache_read_tokens))
+            .bind(saturating::option_i64_from_u64(usage.cache_write_tokens))
+            .bind(saturating::option_i64_from_u64(usage.reasoning_tokens))
             .bind(usage_json)
             .bind(call_id)
             .execute(&connected.pool)
@@ -868,10 +862,6 @@ async fn apply_schema(pool: &SqlitePool) -> Result<()> {
     }
     transaction.commit().await?;
     Ok(())
-}
-
-fn as_i64(value: Option<u64>) -> Option<i64> {
-    value.map(|value| i64::try_from(value).unwrap_or(i64::MAX))
 }
 
 fn summary_from_row(row: &SqliteRow) -> Result<LlmCallSummary> {
