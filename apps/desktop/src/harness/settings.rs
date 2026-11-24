@@ -1,8 +1,8 @@
 //! Points Cursor's own HTTP stack at the local proxy.
 //!
 //! Cursor reads its proxy from `settings.json`; these five keys are the whole
-//! contract, and `settings_match` is the only proof that a freshly written
-//! proxy is actually in effect.
+//! contract, and `managed_state` is the only proof that a freshly written proxy
+//! is actually in effect.
 
 use std::{collections::BTreeMap, fs, io, path::PathBuf};
 
@@ -32,6 +32,25 @@ const PROXY_SUPPORT_ON: &str = "on";
 #[derive(Debug)]
 pub struct SettingsStore {
     path: PathBuf,
+}
+
+/// Whether `settings.json` carries the exact proxy takeover writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedSettings {
+    /// No proxy URL is known, so there is nothing to compare against.
+    NotConfigured,
+    /// The managed keys are absent or were changed by someone else.
+    Missing,
+    /// Every managed key still holds what takeover wrote.
+    Applied,
+}
+
+impl ManagedSettings {
+    /// Whether the file holds the managed signature.
+    #[must_use]
+    pub fn is_applied(self) -> bool {
+        self == Self::Applied
+    }
 }
 
 impl SettingsStore {
@@ -86,7 +105,8 @@ impl SettingsStore {
     }
 
     /// Removes the managed keys, but only when all of them still match
-    /// `proxy_url`. Returns whether anything was removed.
+    /// `proxy_url`. Returns whether anything was removed. A loopback proxy
+    /// belonging to another tool is not a managed signature, so it survives.
     ///
     /// # Errors
     ///
@@ -103,34 +123,23 @@ impl SettingsStore {
         Ok(true)
     }
 
-    /// Reads settings even when no current proxy URL exists, so corruption is
-    /// still visible to the status screen rather than looking like "disabled".
+    /// Whether the file currently holds the managed signature for `proxy_url`.
+    /// Reads settings even when no proxy URL is known, so corruption is still
+    /// visible to the status screen rather than looking like "disabled".
     ///
     /// # Errors
     ///
     /// Fails when the file exists but cannot be parsed.
-    pub fn settings_state(&self, proxy_url: Option<&str>) -> Result<Option<bool>> {
+    pub fn managed_state(&self, proxy_url: Option<&str>) -> Result<ManagedSettings> {
         let settings = self.read()?;
-        Ok(proxy_url.map(|url| matches_managed_proxy(&settings, url)))
-    }
-
-    /// Whether all five managed keys hold exactly what takeover writes.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the file exists but cannot be parsed.
-    pub fn settings_match(&self, proxy_url: &str) -> Result<bool> {
-        Ok(matches_managed_proxy(&self.read()?, proxy_url))
-    }
-
-    /// Clears only the complete settings written for this harness's proxy. A
-    /// loopback proxy belonging to another tool is not a managed signature.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the file cannot be parsed or rewritten.
-    pub fn clear_stale_managed_settings(&self, proxy_url: &str) -> Result<bool> {
-        self.clear_proxy_settings(proxy_url)
+        let Some(url) = proxy_url else {
+            return Ok(ManagedSettings::NotConfigured);
+        };
+        Ok(if matches_managed_proxy(&settings, url) {
+            ManagedSettings::Applied
+        } else {
+            ManagedSettings::Missing
+        })
     }
 
     /// Cursor's file is JSONC (`json5`), and a missing file is an empty one.
@@ -209,7 +218,12 @@ mod tests {
             .write_proxy_settings("http://127.0.0.1:41000")
             .unwrap();
 
-        assert!(settings.settings_match("http://127.0.0.1:41000").unwrap());
+        assert!(
+            settings
+                .managed_state(Some("http://127.0.0.1:41000"))
+                .unwrap()
+                .is_applied()
+        );
         let written = settings.read().unwrap();
         assert_eq!(written.get("editor.fontSize"), Some(&Value::from(14)));
         assert_eq!(written.get(NO_PROXY_KEY), None);
@@ -230,7 +244,12 @@ mod tests {
 
         let after = settings.read().unwrap();
         assert_eq!(after.len(), before - MANAGED_KEYS.len());
-        assert!(!settings.settings_match("http://127.0.0.1:41000").unwrap());
+        assert!(
+            !settings
+                .managed_state(Some("http://127.0.0.1:41000"))
+                .unwrap()
+                .is_applied()
+        );
     }
 
     #[test]
@@ -248,7 +267,7 @@ mod tests {
         );
         assert!(
             settings
-                .clear_stale_managed_settings("http://127.0.0.1:41000")
+                .clear_proxy_settings("http://127.0.0.1:41000")
                 .unwrap()
         );
         assert!(settings.read().unwrap().is_empty());
@@ -261,7 +280,7 @@ mod tests {
         );
         assert!(
             !settings
-                .clear_stale_managed_settings("http://127.0.0.1:41000")
+                .clear_proxy_settings("http://127.0.0.1:41000")
                 .unwrap()
         );
         assert_eq!(settings.read().unwrap().len(), 4);
@@ -269,7 +288,7 @@ mod tests {
         write_raw(&settings, r#"{ "http.proxy": "http://127.0.0.1:41000" }"#);
         assert!(
             !settings
-                .clear_stale_managed_settings("http://127.0.0.1:41000")
+                .clear_proxy_settings("http://127.0.0.1:41000")
                 .unwrap()
         );
         settings
@@ -277,9 +296,14 @@ mod tests {
             .unwrap();
         assert!(
             !settings
-                .clear_stale_managed_settings("http://127.0.0.1:41001")
+                .clear_proxy_settings("http://127.0.0.1:41001")
                 .unwrap()
         );
-        assert!(settings.settings_match("http://127.0.0.1:41000").unwrap());
+        assert!(
+            settings
+                .managed_state(Some("http://127.0.0.1:41000"))
+                .unwrap()
+                .is_applied()
+        );
     }
 }

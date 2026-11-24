@@ -33,6 +33,16 @@ impl BodyEnd {
     }
 }
 
+/// Whether a captured copy is the whole body or the head of a larger one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BodyCompleteness {
+    /// `bytes` holds everything the body carried.
+    Complete,
+    /// `bytes` stopped at the capture limit before the body did, so a decoder
+    /// must not treat the missing tail as a parse error.
+    Truncated,
+}
+
 /// The diagnostic copy of one body, handed to the store when the stream ends.
 #[derive(Debug)]
 pub(crate) struct CapturedBody {
@@ -40,8 +50,8 @@ pub(crate) struct CapturedBody {
     pub(crate) bytes: Vec<u8>,
     /// How many bytes the body actually carried.
     pub(crate) size: i64,
-    /// Whether `bytes` stopped before the body did.
-    pub(crate) truncated: bool,
+    /// Whether `bytes` is the whole body.
+    pub(crate) completeness: BodyCompleteness,
     /// How the body ended.
     pub(crate) end: BodyEnd,
 }
@@ -52,7 +62,8 @@ struct CaptureBuffer {
     bytes: Vec<u8>,
     limit: usize,
     size: i64,
-    truncated: bool,
+    /// Whether a chunk was cut at `limit`; `bytes` then holds only a head.
+    hit_limit: bool,
 }
 
 impl CaptureBuffer {
@@ -61,20 +72,16 @@ impl CaptureBuffer {
             bytes: Vec::new(),
             limit,
             size: 0,
-            truncated: false,
+            hit_limit: false,
         }
     }
 
     fn push(&mut self, chunk: &[u8]) {
         self.size += i64::try_from(chunk.len()).unwrap_or(i64::MAX);
-        let remaining = self.limit.saturating_sub(self.bytes.len());
-        if remaining > 0 {
-            let captured = remaining.min(chunk.len());
-            self.bytes.extend_from_slice(&chunk[..captured]);
-        }
-        let buffered = i64::try_from(self.bytes.len()).unwrap_or(i64::MAX);
-        if self.bytes.len() >= self.limit && self.size > buffered {
-            self.truncated = true;
+        let captured = self.limit.saturating_sub(self.bytes.len()).min(chunk.len());
+        self.bytes.extend_from_slice(&chunk[..captured]);
+        if captured < chunk.len() {
+            self.hit_limit = true;
         }
     }
 
@@ -82,7 +89,11 @@ impl CaptureBuffer {
         CapturedBody {
             bytes: std::mem::take(&mut self.bytes),
             size: self.size,
-            truncated: self.truncated,
+            completeness: if self.hit_limit {
+                BodyCompleteness::Truncated
+            } else {
+                BodyCompleteness::Complete
+            },
             end,
         }
     }
@@ -105,10 +116,6 @@ pin_project! {
             if *this.done {
                 return;
             }
-            *this.done = true;
-            let Some(on_done) = this.on_done.take() else {
-                return;
-            };
             // An empty body can be known-complete without ever being polled, so
             // `is_end_stream` decides; a body dropped mid-stream did not finish.
             let end = if this.inner.is_end_stream() {
@@ -116,7 +123,7 @@ pin_project! {
             } else {
                 BodyEnd::Cancelled
             };
-            on_done(this.captured.take(end));
+            finish(this.captured, this.done, this.on_done, end);
         }
     }
 }

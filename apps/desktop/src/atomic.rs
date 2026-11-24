@@ -35,7 +35,9 @@ fn write_inner(path: &Path, data: &[u8], mode: Option<u32>) -> io::Result<()> {
     }
     let temporary = temporary_path(path);
     write_file(&temporary, data, mode)?;
-    replace(&temporary, path, mode)
+    // The rename carries the temporary's mode onto `path`, so the mode is
+    // applied in exactly one place.
+    replace(&temporary, path)
 }
 
 fn write_file(path: &Path, data: &[u8], mode: Option<u32>) -> io::Result<()> {
@@ -50,7 +52,7 @@ fn write_file(path: &Path, data: &[u8], mode: Option<u32>) -> io::Result<()> {
     Ok(())
 }
 
-fn replace(temporary: &Path, path: &Path, mode: Option<u32>) -> io::Result<()> {
+fn replace(temporary: &Path, path: &Path) -> io::Result<()> {
     // Windows refuses to rename over an existing file.
     #[cfg(windows)]
     if path.exists() {
@@ -63,11 +65,6 @@ fn replace(temporary: &Path, path: &Path, mode: Option<u32>) -> io::Result<()> {
             tracing::debug!(%cleanup, "could not remove an atomic-write temporary file");
         }
         return Err(error);
-    }
-    #[cfg(unix)]
-    if let Some(mode) = mode {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
     Ok(())
 }

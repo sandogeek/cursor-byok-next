@@ -102,7 +102,7 @@ pub fn generate_proto_file(
     };
     renderer.write_type_tree(&root, &mut out, 0);
 
-    let mut services = file.services.clone();
+    let mut services: Vec<&Service> = file.services.iter().collect();
     services.sort_by(|a, b| a.short_name.cmp(&b.short_name));
     for service in services {
         emit(

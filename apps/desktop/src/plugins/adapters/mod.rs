@@ -20,7 +20,7 @@ use super::{
 use crate::{
     model::{
         ContentPart, ModelInvocation, ProjectedContent, ProjectedMessage, ProviderReplayState,
-        Role, ToolCallContent, ToolResultContent,
+        Role, ToolCallContent, ToolResultContent, joined_text,
     },
     provider::ModelEvent,
 };
@@ -361,6 +361,21 @@ fn text(value: &Value) -> Option<&str> {
     value.as_str()
 }
 
+/// The string under `key`, or `None` when the key is absent or not a string.
+/// Provider payloads put optional fields on objects that may not exist, so
+/// this replaces the `text(value.get(key).unwrap_or(&Value::Null))` spelling.
+fn text_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
+/// The string under `key` of an already-extracted object.
+fn map_text_field<'a>(
+    value: Option<&'a serde_json::Map<String, Value>>,
+    key: &str,
+) -> Option<&'a str> {
+    value?.get(key)?.as_str()
+}
+
 fn count_u64(value: &Value) -> Option<u64> {
     match value {
         Value::Number(number) => number.as_u64().or_else(|| {
@@ -376,14 +391,19 @@ fn count_usize(value: &Value) -> Option<usize> {
     count_u64(value).and_then(|value| usize::try_from(value).ok())
 }
 
+/// The integer under `key` of an already-extracted object.
+fn map_count(value: Option<&serde_json::Map<String, Value>>, key: &str) -> Option<u64> {
+    value?.get(key).and_then(count_u64)
+}
+
 /// The provider's error detail for an SSE event, if the event is an error.
 ///
 /// Every provider family puts the message and an optional error kind in
 /// different places, so this reads all of the known spellings and leaves the
 /// formatting to the adapter that knows its protocol.
 fn event_error_detail(value: &Value) -> Option<(Option<String>, String)> {
-    let is_error = text(value.get("type").unwrap_or(&Value::Null)) == Some("error")
-        || value.get("error").is_some_and(|error| !error.is_null());
+    let is_error = text_field(value, "type") == Some("error")
+        || value.get("error").is_some_and(|e| !e.is_null());
     if !is_error {
         return None;
     }
@@ -393,11 +413,13 @@ fn event_error_detail(value: &Value) -> Option<(Option<String>, String)> {
     }
     let details = object(error);
     let kind = details
-        .and_then(|details| text(details.get("type").unwrap_or(&Value::Null)))
+        .and_then(|details| details.get("type"))
+        .and_then(Value::as_str)
         .map(str::to_owned);
     let message = details
-        .and_then(|details| text(details.get("message").unwrap_or(&Value::Null)))
-        .or_else(|| text(value.get("message").unwrap_or(&Value::Null)))
+        .and_then(|details| details.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| text_field(value, "message"))
         .map(str::to_owned);
     match (kind, message) {
         (None, None) if error.is_null() => None,
@@ -426,16 +448,6 @@ fn encode_base64(data: &[u8]) -> String {
 
 fn data_url(mime_type: &str, data: &[u8]) -> String {
     format!("data:{mime_type};base64,{}", encode_base64(data))
-}
-
-fn joined_text(parts: &[ContentPart]) -> String {
-    parts
-        .iter()
-        .filter_map(|part| match part {
-            ContentPart::Text { text } => Some(text.as_str()),
-            ContentPart::Image { .. } | ContentPart::File { .. } => None,
-        })
-        .collect()
 }
 
 enum CoreMessage<'a> {

@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 
 use super::tools::{ToolCalls, ToolState};
 use super::{
-    CoreMessage, ProtocolParser, SawTool, ToolNames, core_message, count_usize, data_url, object,
-    object_mut, parse_object, text,
+    CoreMessage, ProtocolParser, SawTool, ToolNames, core_message, count_usize, data_url,
+    map_text_field, object, object_mut, parse_object, text_field,
 };
 use crate::{
     model::{ContentPart, ModelInvocation, ModelLatency, Usage},
@@ -102,18 +102,15 @@ impl Parser {
             emit(ModelEvent::ProviderReplayState(
                 crate::model::ProviderReplayState {
                     provider_kind: REPLAY_KIND.into(),
-                    value: json!({ "items": self.reasoning_items.clone() }),
+                    value: json!({ "items": std::mem::take(&mut self.reasoning_items) }),
                 },
             ));
-            self.reasoning_items.clear();
         }
     }
 
     fn output_item_added(&mut self, value: &Value, emit: &mut dyn FnMut(ModelEvent)) -> Result<()> {
         let item = value.get("item").and_then(object);
-        if item.and_then(|item| text(item.get("type").unwrap_or(&Value::Null)))
-            != Some("function_call")
-        {
+        if map_text_field(item, "type") != Some("function_call") {
             return Ok(());
         }
         self.saw_tool = SawTool::Present;
@@ -126,7 +123,7 @@ impl Parser {
 
     fn output_item_done(&mut self, value: &Value, emit: &mut dyn FnMut(ModelEvent)) -> Result<()> {
         let item = value.get("item").and_then(object);
-        match item.and_then(|item| text(item.get("type").unwrap_or(&Value::Null))) {
+        match map_text_field(item, "type") {
             Some("reasoning") => {
                 self.close_thinking(emit);
                 self.reasoning_items
@@ -148,9 +145,7 @@ impl Parser {
                 let tool = self.tool(index);
                 let identity = item_identity(item);
                 tool.fill_identity(identity.0, identity.1);
-                if let Some(snapshot) =
-                    item.and_then(|item| text(item.get("arguments").unwrap_or(&Value::Null)))
-                {
+                if let Some(snapshot) = map_text_field(item, "arguments") {
                     tool.extend_to_snapshot(snapshot)?;
                 }
                 self.emit_pending_tool(index, emit);
@@ -168,7 +163,7 @@ impl Parser {
         value: &Value,
         emit: &mut dyn FnMut(ModelEvent),
     ) -> Result<()> {
-        let Some(delta) = text(value.get("delta").unwrap_or(&Value::Null)) else {
+        let Some(delta) = text_field(value, "delta") else {
             return Ok(());
         };
         self.saw_tool = SawTool::Present;
@@ -183,7 +178,7 @@ impl Parser {
         value: &Value,
         emit: &mut dyn FnMut(ModelEvent),
     ) -> Result<()> {
-        let snapshot = text(value.get("arguments").unwrap_or(&Value::Null));
+        let snapshot = text_field(value, "arguments");
         let index = required_index(value)?;
         if let Some(snapshot) = snapshot.filter(|snapshot| !snapshot.is_empty()) {
             self.tool(index).extend_to_snapshot(snapshot)?;
@@ -223,20 +218,20 @@ impl ProtocolParser for Parser {
             return Ok(true);
         }
         let value = parse_object(payload, "OpenAI Responses")?;
-        match text(value.get("type").unwrap_or(&Value::Null)) {
+        match text_field(&value, "type") {
             Some("response.output_text.delta") => {
                 self.close_thinking(emit);
                 if !self.text_open {
                     self.text_open = true;
                     emit(ModelEvent::TextStart);
                 }
-                if let Some(delta) = text(value.get("delta").unwrap_or(&Value::Null)) {
+                if let Some(delta) = text_field(&value, "delta") {
                     self.streamed_text.push_str(delta);
                     emit(ModelEvent::TextDelta(delta.to_owned()));
                 }
             }
             Some("response.output_text.done") => {
-                if let Some(final_text) = text(value.get("text").unwrap_or(&Value::Null)) {
+                if let Some(final_text) = text_field(&value, "text") {
                     self.reconcile_text(final_text, emit);
                 }
                 self.close_text(emit);
@@ -246,7 +241,7 @@ impl ProtocolParser for Parser {
                     self.thinking_open = true;
                     emit(ModelEvent::ThinkingStart);
                 }
-                if let Some(delta) = text(value.get("delta").unwrap_or(&Value::Null)) {
+                if let Some(delta) = text_field(&value, "delta") {
                     emit(ModelEvent::ThinkingDelta(delta.to_owned()));
                 }
             }
@@ -380,7 +375,7 @@ fn responses_input(
                         "type": "function_call",
                         "call_id": super::truncated_call_id(&tool_call.call_id),
                         "name": tool_names.alias(&tool_call.name),
-                        "arguments": serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".into()),
+                        "arguments": serde_json::to_string(&tool_call.arguments)?,
                     }));
                 }
             }
@@ -391,12 +386,12 @@ fn responses_input(
                     "output": if result.provider_parts.is_empty() {
                         Value::String(result.content.clone())
                     } else {
-                        content_parts(&result.provider_parts, "input_text")?.into()
+                        Value::Array(content_parts(&result.provider_parts))
                     },
                 }));
             }
             CoreMessage::System(content) => {
-                let parts = content_parts(content, "input_text")?;
+                let parts = content_parts(content);
                 if !parts.is_empty() {
                     input.push(json!({
                         "type": "message",
@@ -406,7 +401,7 @@ fn responses_input(
                 }
             }
             CoreMessage::User(content) => {
-                let parts = content_parts(content, "input_text")?;
+                let parts = content_parts(content);
                 if !parts.is_empty() {
                     input.push(json!({
                         "type": "message",
@@ -471,13 +466,13 @@ fn finish_reason(saw_tool: SawTool) -> FinishReason {
     }
 }
 
-fn content_parts(parts: &[ContentPart], text_type: &str) -> Result<Vec<Value>> {
-    let mut content = Vec::new();
+fn content_parts(parts: &[ContentPart]) -> Vec<Value> {
+    let mut content = Vec::with_capacity(parts.len());
     for part in parts {
         match part {
             ContentPart::Text { text } => {
                 if !text.is_empty() {
-                    content.push(json!({ "type": text_type, "text": text }));
+                    content.push(json!({ "type": "input_text", "text": text }));
                 }
             }
             ContentPart::Image { mime_type, data } => content.push(json!({
@@ -489,21 +484,14 @@ fn content_parts(parts: &[ContentPart], text_type: &str) -> Result<Vec<Value>> {
                 mime_type,
                 filename,
                 data,
-            } => {
-                if text_type != "input_text" {
-                    return Err(Error::Provider(
-                        "OpenAI Responses does not accept files in assistant messages".into(),
-                    ));
-                }
-                content.push(json!({
-                    "type": "input_file",
-                    "filename": filename.clone().unwrap_or_else(|| "attachment".into()),
-                    "file_data": data_url(mime_type, data),
-                }));
-            }
+            } => content.push(json!({
+                "type": "input_file",
+                "filename": filename.as_deref().unwrap_or("attachment"),
+                "file_data": data_url(mime_type, data),
+            })),
         }
     }
-    Ok(content)
+    content
 }
 
 fn replay_items(value: &Value) -> Result<Vec<Value>> {
@@ -519,7 +507,7 @@ fn replay_items(value: &Value) -> Result<Vec<Value>> {
                     "OpenAI Responses replay state contains a non-reasoning item".into(),
                 )
             })?;
-            if text(source.get("type").unwrap_or(&Value::Null)) != Some("reasoning") {
+            if map_text_field(Some(source), "type") != Some("reasoning") {
                 return Err(Error::Provider(
                     "OpenAI Responses replay state contains a non-reasoning item".into(),
                 ));
@@ -539,12 +527,9 @@ fn replay_items(value: &Value) -> Result<Vec<Value>> {
 
 /// The `call_id` and `name` a Responses output item carries.
 fn item_identity(item: Option<&serde_json::Map<String, Value>>) -> (Option<&str>, Option<&str>) {
-    let Some(item) = item else {
-        return (None, None);
-    };
     (
-        text(item.get("call_id").unwrap_or(&Value::Null)),
-        text(item.get("name").unwrap_or(&Value::Null)),
+        map_text_field(item, "call_id"),
+        map_text_field(item, "name"),
     )
 }
 
@@ -554,8 +539,8 @@ fn item_text(item: &serde_json::Map<String, Value>) -> Option<String> {
         content
             .iter()
             .filter_map(object)
-            .filter(|part| text(part.get("type").unwrap_or(&Value::Null)) == Some("output_text"))
-            .map(|part| text(part.get("text").unwrap_or(&Value::Null)).unwrap_or(""))
+            .filter(|part| map_text_field(Some(part), "type") == Some("output_text"))
+            .map(|part| map_text_field(Some(part), "text").unwrap_or(""))
             .collect(),
     )
 }
@@ -568,23 +553,21 @@ fn required_index(value: &Value) -> Result<usize> {
 }
 
 fn responses_usage(value: &Value) -> ModelEvent {
-    let usage = object(value).cloned().unwrap_or_default();
-    let input_details = usage.get("input_tokens_details").and_then(object);
-    let output_details = usage.get("output_tokens_details").and_then(object);
+    let usage = object(value);
+    let input_details = usage
+        .and_then(|usage| usage.get("input_tokens_details"))
+        .and_then(object);
+    let output_details = usage
+        .and_then(|usage| usage.get("output_tokens_details"))
+        .and_then(object);
     ModelEvent::Usage(
         Usage::new(
-            usage.get("input_tokens").and_then(super::count_u64),
-            usage.get("output_tokens").and_then(super::count_u64),
-            usage.get("total_tokens").and_then(super::count_u64),
+            super::map_count(usage, "input_tokens"),
+            super::map_count(usage, "output_tokens"),
+            super::map_count(usage, "total_tokens"),
         )
-        .with_cache_read(
-            input_details
-                .and_then(|details| details.get("cached_tokens").and_then(super::count_u64)),
-        )
-        .with_reasoning(
-            output_details
-                .and_then(|details| details.get("reasoning_tokens").and_then(super::count_u64)),
-        ),
+        .with_cache_read(super::map_count(input_details, "cached_tokens"))
+        .with_reasoning(super::map_count(output_details, "reasoning_tokens")),
     )
 }
 

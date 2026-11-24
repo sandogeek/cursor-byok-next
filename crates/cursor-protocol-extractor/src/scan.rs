@@ -132,6 +132,9 @@ struct Scanner<'a> {
     enum_by_pos: HashMap<u32, usize>,
 }
 
+/// The `newFieldList` class currently being walked, kept by value on clone so
+/// `handle_new_field_list` can detach from `self` before mutating the scan.
+#[derive(Clone)]
 struct CurrentClass {
     var_name: String,
     internal_name: String,
@@ -400,90 +403,102 @@ impl Scanner<'_> {
         });
     }
 
+    /// Dispatches one call expression to the handler for its factory name.
+    ///
+    /// The names are Cursor's minified helpers: `makeMessageType` / `makeEnum`
+    /// build a declaration, `setEnumType` rewrites an enum's values,
+    /// `enumType` and `QT` are the compact-schema enum forms, `newFieldList`
+    /// adds fields to the enclosing class, `d` is webpack's define/exports and
+    /// `n` is webpack's require.
     fn handle_factory_call(&mut self, assigned: Option<&str>, call: &CallExpression<'_>) {
         let Some(name) = callee_tail(call) else {
             return;
         };
-        let pos = call.span.start;
         match name {
-            "makeMessageType" => {
-                let Some(type_name) = call
-                    .arguments
-                    .first()
-                    .and_then(argument_expr)
-                    .and_then(string_lit)
-                else {
-                    return;
-                };
-                let fields = call
-                    .arguments
-                    .get(1)
-                    .and_then(argument_expr)
-                    .map(|expr| self.extract_fields_from_expr(expr))
-                    .unwrap_or_default();
-                self.record_message(type_name, assigned.unwrap_or(""), "", fields, pos);
-            }
-            "makeEnum" => {
-                let Some(type_name) = call
-                    .arguments
-                    .first()
-                    .and_then(argument_expr)
-                    .and_then(string_lit)
-                else {
-                    return;
-                };
-                let values = call
-                    .arguments
-                    .get(1)
-                    .and_then(argument_expr)
-                    .map(Self::parse_enum_values)
-                    .unwrap_or_default();
-                self.record_enum(type_name, assigned.unwrap_or(""), values, pos);
-            }
-            "setEnumType" => {
-                let var_name = call
-                    .arguments
-                    .first()
-                    .and_then(argument_expr)
-                    .and_then(ident_name)
-                    .unwrap_or("");
-                let Some(type_name) = call
-                    .arguments
-                    .get(1)
-                    .and_then(argument_expr)
-                    .and_then(string_lit)
-                else {
-                    return;
-                };
-                let values = call
-                    .arguments
-                    .get(2)
-                    .and_then(argument_expr)
-                    .map(Self::parse_enum_values)
-                    .unwrap_or_default();
-                self.record_enum(type_name, var_name, values, pos);
-            }
+            "makeMessageType" => self.handle_make_message(assigned, call),
+            "makeEnum" => self.handle_make_enum(assigned, call),
+            "setEnumType" => self.handle_set_enum(call),
             "enumType" | "QT" => self.handle_compact_enum(assigned, call),
-            "newFieldList" => {
-                let class = self.current_class.as_ref().map(|class| {
-                    (
-                        class.var_name.clone(),
-                        class.internal_name.clone(),
-                        class.start,
-                    )
-                });
-                if let Some((var_name, internal_name, start)) = class
-                    && let Some(fields_expr) = call.arguments.first().and_then(argument_expr)
-                {
-                    let fields = self.extract_fields_from_expr(fields_expr);
-                    if let Some(type_name) = self.class_type_name() {
-                        self.record_message(&type_name, &var_name, &internal_name, fields, start);
-                    }
-                }
-            }
+            "newFieldList" => self.handle_new_field_list(call),
             "d" => self.handle_webpack_export(call),
             _ => {}
         }
+    }
+
+    fn handle_make_message(&mut self, assigned: Option<&str>, call: &CallExpression<'_>) {
+        let Some(type_name) = first_string_argument(call) else {
+            return;
+        };
+        let fields = call
+            .arguments
+            .get(1)
+            .and_then(argument_expr)
+            .map(|expr| self.extract_fields_from_expr(expr))
+            .unwrap_or_default();
+        self.record_message(
+            type_name,
+            assigned.unwrap_or(""),
+            "",
+            fields,
+            call.span.start,
+        );
+    }
+
+    fn handle_make_enum(&mut self, assigned: Option<&str>, call: &CallExpression<'_>) {
+        let Some(type_name) = first_string_argument(call) else {
+            return;
+        };
+        let values = call
+            .arguments
+            .get(1)
+            .and_then(argument_expr)
+            .map(Self::parse_enum_values)
+            .unwrap_or_default();
+        self.record_enum(type_name, assigned.unwrap_or(""), values, call.span.start);
+    }
+
+    fn handle_set_enum(&mut self, call: &CallExpression<'_>) {
+        let var_name = call
+            .arguments
+            .first()
+            .and_then(argument_expr)
+            .and_then(ident_name)
+            .unwrap_or("");
+        let Some(type_name) = call
+            .arguments
+            .get(1)
+            .and_then(argument_expr)
+            .and_then(string_lit)
+        else {
+            return;
+        };
+        let values = call
+            .arguments
+            .get(2)
+            .and_then(argument_expr)
+            .map(Self::parse_enum_values)
+            .unwrap_or_default();
+        self.record_enum(type_name, var_name, values, call.span.start);
+    }
+
+    fn handle_new_field_list(&mut self, call: &CallExpression<'_>) {
+        let Some(fields_expr) = call.arguments.first().and_then(argument_expr) else {
+            return;
+        };
+        let fields = self.extract_fields_from_expr(fields_expr);
+        let Some(class) = self.current_class.clone() else {
+            return;
+        };
+        let Some(type_name) = self.class_type_name() else {
+            return;
+        };
+        self.record_message(
+            &type_name,
+            &class.var_name,
+            &class.internal_name,
+            fields,
+            class.start,
+        );
     }
 
     fn qualify_late_prefixes(&mut self) {
@@ -898,7 +913,9 @@ impl<'a> Visit<'a> for Scanner<'a> {
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         self.handle_factory_call(None, call);
-        if callee_tail(call) == Some("n") || ident_name(&call.callee) == Some("n") {
+        // `callee_tail` already returns the identifier name for a bare `n(…)`
+        // callee and the last member's name for `a.b.n(…)`.
+        if callee_tail(call) == Some("n") {
             self.handle_require_call(None, call);
         }
         walk::walk_call_expression(self, call);
@@ -908,6 +925,14 @@ impl<'a> Visit<'a> for Scanner<'a> {
         self.parse_service_from_object(object, "", object.span.start);
         walk::walk_object_expression(self, object);
     }
+}
+
+/// The literal string passed as a call's first argument.
+fn first_string_argument<'a>(call: &'a CallExpression<'a>) -> Option<&'a str> {
+    call.arguments
+        .first()
+        .and_then(argument_expr)
+        .and_then(string_lit)
 }
 
 /// Parses one `{no, name, kind, …}` field object out of the bundle AST.

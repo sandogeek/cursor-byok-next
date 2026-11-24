@@ -21,6 +21,11 @@ const LOCAL_PLAN_CYCLE_STARTED_DAYS: i64 = 30;
 /// The usage bar hides itself past roughly this spend; a local plan is never
 /// near it, so the number only has to be larger than any real invoice.
 const USAGE_DISPLAY_THRESHOLD: i32 = 99_999_999;
+/// Cursor's own sign-up-type number for an e-mail account.
+const SIGN_UP_TYPE_EMAIL: i32 = 3;
+/// What the local plan's tooltip and status rows say.
+const LOCAL_ULTRA_BONUS_TOOLTIP: &str = "Ultra local account mock is active.";
+const ULTRA_DISPLAY_MESSAGE: &str = "Ultra plan active";
 
 #[derive(Clone, PartialEq, Message)]
 struct GetEmailResponse {
@@ -155,41 +160,44 @@ struct UsageLimitPolicyStatus {
 #[derive(Clone, Copy, PartialEq, Message)]
 struct Empty {}
 
+/// Answers `AuthService/GetEmail` with the local account's e-mail.
 pub async fn get_email(
     Extension(upstream): Extension<proxy::CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    super::local_or_forward(upstream, request, || {
-        Ok(proto(GetEmailResponse {
+    super::local_or_forward(&upstream, request, || {
+        proto(&GetEmailResponse {
             email: LOCAL_EMAIL.into(),
-            sign_up_type: 3,
-        }))
+            sign_up_type: SIGN_UP_TYPE_EMAIL,
+        })
     })
     .await
 }
 
+/// Answers `AuthService/GetUserMeta` with the local account's identity.
 pub async fn get_user_meta(
     Extension(upstream): Extension<proxy::CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    super::local_or_forward(upstream, request, || {
-        Ok(proto(GetUserMetaResponse {
+    super::local_or_forward(&upstream, request, || {
+        proto(&GetUserMetaResponse {
             email: LOCAL_EMAIL.into(),
-            sign_up_type: 3,
+            sign_up_type: SIGN_UP_TYPE_EMAIL,
             user_id: 1,
             workos_id: None,
             profile_picture_url: None,
-        }))
+        })
     })
     .await
 }
 
+/// Answers `DashboardService/GetMe`; `created_at` is the moment of the reply, since the local account has no history.
 pub async fn get_me(
     Extension(upstream): Extension<proxy::CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    super::local_or_forward(upstream, request, || {
-        Ok(proto(GetMeResponse {
+    super::local_or_forward(&upstream, request, || {
+        proto(&GetMeResponse {
             auth_id: LOCAL_AUTH_ID.into(),
             user_id: 1,
             email: Some(LOCAL_EMAIL.into()),
@@ -200,38 +208,41 @@ pub async fn get_me(
             email_domain_type: Some("personal".into()),
             country: Some("US".into()),
             profile_picture_url: None,
-        }))
+        })
     })
     .await
 }
 
+/// Answers `DashboardService/GetTeams`: the local account belongs to no team.
 pub async fn get_teams(
     Extension(upstream): Extension<proxy::CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    super::local_or_forward(upstream, request, || Ok(proto(Empty {}))).await
+    super::local_or_forward(&upstream, request, || proto(&Empty {})).await
 }
 
+/// Answers `DashboardService/GetUserProfile`: public visibility allowed, `PUBLIC` maximum.
 pub async fn get_user_profile(
     Extension(upstream): Extension<proxy::CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    super::local_or_forward(upstream, request, || {
-        Ok(proto(GetUserProfileResponse {
+    super::local_or_forward(&upstream, request, || {
+        proto(&GetUserProfileResponse {
             public_visibility_allowed: Some(true),
             max_visibility: Some("PUBLIC".into()),
-        }))
+        })
     })
     .await
 }
 
+/// Answers `DashboardService/GetCurrentPeriodUsage` with an Ultra plan whose cycle never rolls over.
 pub async fn current_period_usage(
     Extension(upstream): Extension<proxy::CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    super::local_or_forward(upstream, request, || {
+    super::local_or_forward(&upstream, request, || {
         let now = chrono::Utc::now();
-        Ok(proto(GetCurrentPeriodUsageResponse {
+        proto(&GetCurrentPeriodUsageResponse {
             billing_cycle_start: (now - chrono::Duration::days(LOCAL_PLAN_CYCLE_STARTED_DAYS))
                 .timestamp_millis(),
             billing_cycle_end: (now + chrono::Duration::days(LOCAL_PLAN_HORIZON_DAYS))
@@ -242,7 +253,7 @@ pub async fn current_period_usage(
                 remaining: LOCAL_ULTRA_PLAN_INCLUDED_CENTS,
                 limit: LOCAL_ULTRA_PLAN_INCLUDED_CENTS,
                 remaining_bonus: Some(false),
-                bonus_tooltip: Some("Ultra local account mock is active.".into()),
+                bonus_tooltip: Some(LOCAL_ULTRA_BONUS_TOOLTIP.into()),
                 auto_spend: Some(0),
                 api_spend: Some(0),
                 auto_percent_used: Some(0.0),
@@ -254,20 +265,21 @@ pub async fn current_period_usage(
             }),
             display_threshold: Some(USAGE_DISPLAY_THRESHOLD),
             enabled: true,
-            display_message: "Ultra plan active".into(),
-            auto_model_selected_display_message: Some("Ultra plan active".into()),
-            named_model_selected_display_message: Some("Ultra plan active".into()),
-        }))
+            display_message: ULTRA_DISPLAY_MESSAGE.into(),
+            auto_model_selected_display_message: Some(ULTRA_DISPLAY_MESSAGE.into()),
+            named_model_selected_display_message: Some(ULTRA_DISPLAY_MESSAGE.into()),
+        })
     })
     .await
 }
 
+/// Answers `DashboardService/GetUsageLimitStatusAndActiveGrants`: no slow pool, no spend limit.
 pub async fn usage_limit_status(
     Extension(upstream): Extension<proxy::CursorProxy>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    super::local_or_forward(upstream, request, || {
-        Ok(proto(GetUsageLimitStatusAndActiveGrantsResponse {
+    super::local_or_forward(&upstream, request, || {
+        proto(&GetUsageLimitStatusAndActiveGrantsResponse {
             usage_limit_policy_status: Some(UsageLimitPolicyStatus {
                 is_in_slow_pool: false,
                 features: std::collections::HashMap::default(),
@@ -276,11 +288,12 @@ pub async fn usage_limit_status(
                 allowed_model_ids: Vec::new(),
                 allowed_model_tags: Vec::new(),
             }),
-        }))
+        })
     })
     .await
 }
 
+/// Answers the Stripe profile REST endpoints. Forwarded unless the request carries this app's own token.
 pub async fn stripe_profile(
     Extension(upstream): Extension<proxy::CursorProxy>,
     request: Request<Body>,
@@ -310,12 +323,12 @@ fn local_stripe_profile(origin: Option<HeaderValue>) -> Result<Response<Body>> {
     Ok(response)
 }
 
-fn proto(message: impl Message) -> Response<Body> {
+fn proto(message: &impl Message) -> Response<Body> {
     super::proto_response(message)
 }
 
 fn json(value: &Value) -> Result<Response<Body>> {
-    let body = serde_json::to_vec(&value)?;
+    let body = serde_json::to_vec(value)?;
     let length = body.len();
     let mut response = Response::new(Body::from(body));
     response.headers_mut().insert(

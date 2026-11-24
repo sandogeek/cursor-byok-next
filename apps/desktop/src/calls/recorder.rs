@@ -17,7 +17,7 @@ use crate::{
 
 use super::{
     CallStore, NewLlmCall,
-    store::{BufferedLlmChunk, CallOutcome, CallStatus, PayloadStorage},
+    store::{BufferedLlmChunk, CallOutcome, PayloadStorage},
 };
 
 #[derive(Clone)]
@@ -30,18 +30,21 @@ pub struct CallRecorder {
 }
 
 pub(crate) struct CancelOnDrop {
-    recorder: CallRecorder,
+    /// Taken on drop, so cancelling a call never bumps the recorder's refcount.
+    recorder: Option<CallRecorder>,
 }
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        if self.recorder.is_finished() {
+        let Some(recorder) = self.recorder.take() else {
+            return;
+        };
+        if recorder.is_finished() {
             return;
         }
-        let recorder = self.recorder.clone();
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             tracing::warn!(
-                call_id = %self.recorder.inner.call_id,
+                call_id = %recorder.inner.call_id,
                 "unfinished LLM call dropped outside Tokio runtime"
             );
             return;
@@ -178,6 +181,7 @@ impl ObservationWriter {
 }
 
 impl CallRecorder {
+    /// Starts recording `call`, snapshotting the store's current storage mode.
     pub async fn start(store: CallStore, mut call: NewLlmCall) -> Self {
         let storage = store.payload_storage().await.unwrap_or_else(|error| {
             tracing::warn!(%error, "cannot read LLM detailed logging");
@@ -215,13 +219,14 @@ impl CallRecorder {
         }
     }
 
+    /// Whether the call reached a terminal state already.
     pub fn is_finished(&self) -> bool {
         self.inner.finished.load(Ordering::Acquire)
     }
 
     pub(crate) fn cancel_on_drop(&self) -> CancelOnDrop {
         CancelOnDrop {
-            recorder: self.clone(),
+            recorder: Some(self.clone()),
         }
     }
 
@@ -273,8 +278,7 @@ impl CallRecorder {
         if self.is_finished() {
             return;
         }
-        let sender = self.inner.observations.lock().await.clone();
-        let Some(sender) = sender else {
+        let Some(sender) = self.inner.observations.lock().await.clone() else {
             return;
         };
         if sender
@@ -365,26 +369,20 @@ impl CallRecorder {
 
     /// Marks the call completed. Finishing twice is a no-op.
     pub async fn completed(&self, reason: FinishReason) {
-        self.finish(CallOutcome::completed(finish_reason(reason), 0))
+        self.finish(CallOutcome::completed(finish_reason(reason)))
             .await;
     }
 
     /// Marks the call failed, recording why.
     pub async fn failed(&self, error: &crate::Error) {
         let message = error.to_string();
-        self.finish(CallOutcome {
-            status: CallStatus::Error,
-            finish_reason: None,
-            elapsed_ms: 0,
-            error_kind: Some(error_kind(error)),
-            error_message: Some(&message),
-        })
-        .await;
+        self.finish(CallOutcome::failed(error_kind(error), &message))
+            .await;
     }
 
     /// Marks the call cancelled.
     pub async fn cancelled(&self) {
-        self.finish(CallOutcome::cancelled(0)).await;
+        self.finish(CallOutcome::cancelled()).await;
     }
 
     async fn finish(&self, mut outcome: CallOutcome<'_>) {
@@ -454,7 +452,7 @@ fn error_kind(error: &crate::Error) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::calls::{CallStore, NewLlmCall};
+    use crate::calls::{CallStatus, CallStore, NewLlmCall};
 
     use super::*;
 

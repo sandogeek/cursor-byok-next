@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use super::{
     CoreMessage, ProtocolParser, SawTool, ToolNames, core_message, count_usize, encode_base64,
-    object, object_mut, parse_object, text,
+    map_text_field, object, object_mut, parse_object, text_field,
 };
 use crate::{
     model::{ContentPart, ModelInvocation},
@@ -21,6 +21,24 @@ const DEFAULT_MAX_TOKENS: u64 = 65_000;
 enum Attachments {
     Allowed,
     Forbidden,
+}
+
+/// The Anthropic turn a block is appended to. Anthropic merges consecutive
+/// blocks of the same role, so the role decides whether to append or start a
+/// new message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnthropicRole {
+    Assistant,
+    User,
+}
+
+impl AnthropicRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Assistant => "assistant",
+            Self::User => "user",
+        }
+    }
 }
 
 struct UsageState {
@@ -83,12 +101,7 @@ impl Parser {
     }
 
     fn close_remaining(&mut self, emit: &mut dyn FnMut(ModelEvent)) {
-        let remaining: Vec<_> = self
-            .block_types
-            .iter()
-            .map(|(index, kind)| (*index, kind.clone()))
-            .collect();
-        self.block_types.clear();
+        let remaining = std::mem::take(&mut self.block_types);
         for (index, kind) in remaining {
             self.close_block(index, &kind, emit);
         }
@@ -111,12 +124,8 @@ impl Parser {
         emit: &mut dyn FnMut(ModelEvent),
     ) -> Result<()> {
         let index = required_index(value)?;
-        let block = value
-            .get("content_block")
-            .and_then(object)
-            .cloned()
-            .unwrap_or_default();
-        let kind = required_type(&block)?;
+        let block = value.get("content_block").and_then(object);
+        let kind = required_type(block)?;
         self.block_types.insert(index, kind.clone());
         match kind.as_str() {
             "text" => emit(ModelEvent::TextStart),
@@ -126,16 +135,16 @@ impl Parser {
                 emit(ModelEvent::ThinkingStart);
             }
             "redacted_thinking" => {
-                let data = text(block.get("data").unwrap_or(&Value::Null))
+                let data = map_text_field(block, "data")
                     .ok_or_else(|| Error::Provider("Anthropic event is missing data".into()))?;
                 self.thinking_blocks
                     .push(json!({ "type": "redacted_thinking", "data": data }));
                 emit(ModelEvent::RedactedThinking(data.to_owned()));
             }
             "tool_use" => {
-                let call_id = text(block.get("id").unwrap_or(&Value::Null));
-                let name = text(block.get("name").unwrap_or(&Value::Null));
-                let (Some(call_id), Some(name)) = (call_id, name) else {
+                let (Some(call_id), Some(name)) =
+                    (map_text_field(block, "id"), map_text_field(block, "name"))
+                else {
                     return Err(Error::Provider(
                         "Anthropic event is missing id or name".into(),
                     ));
@@ -158,21 +167,17 @@ impl Parser {
         emit: &mut dyn FnMut(ModelEvent),
     ) -> Result<()> {
         let index = required_index(value)?;
-        let delta = value
-            .get("delta")
-            .and_then(object)
-            .cloned()
-            .unwrap_or_default();
-        let delta_kind = required_type(&delta)?;
+        let delta = value.get("delta").and_then(object);
+        let delta_kind = required_type(delta)?;
         self.open_implicit_block(&delta_kind, index, emit);
         match delta_kind.as_str() {
             "text_delta" => {
-                if let Some(delta_text) = text(delta.get("text").unwrap_or(&Value::Null)) {
+                if let Some(delta_text) = map_text_field(delta, "text") {
                     emit(ModelEvent::TextDelta(delta_text.to_owned()));
                 }
             }
             "thinking_delta" => {
-                if let Some(delta_text) = text(delta.get("thinking").unwrap_or(&Value::Null)) {
+                if let Some(delta_text) = map_text_field(delta, "thinking") {
                     self.thinking_text
                         .entry(index)
                         .or_default()
@@ -181,7 +186,7 @@ impl Parser {
                 }
             }
             "signature_delta" => {
-                if let Some(signature) = text(delta.get("signature").unwrap_or(&Value::Null)) {
+                if let Some(signature) = map_text_field(delta, "signature") {
                     self.thinking_signatures
                         .entry(index)
                         .or_default()
@@ -189,7 +194,7 @@ impl Parser {
                 }
             }
             "input_json_delta" => {
-                if let Some(partial) = text(delta.get("partial_json").unwrap_or(&Value::Null)) {
+                if let Some(partial) = map_text_field(delta, "partial_json") {
                     self.saw_tool = SawTool::Present;
                     emit(ModelEvent::ToolCallArgumentsDelta {
                         index,
@@ -247,7 +252,7 @@ impl Parser {
         if let Some(reason) = value
             .get("delta")
             .and_then(object)
-            .and_then(|delta| text(delta.get("stop_reason").unwrap_or(&Value::Null)))
+            .and_then(|delta| map_text_field(Some(delta), "stop_reason"))
         {
             self.finish = Some(map_stop(reason, self.saw_tool));
         }
@@ -259,10 +264,9 @@ impl Parser {
             emit(ModelEvent::ProviderReplayState(
                 crate::model::ProviderReplayState {
                     provider_kind: REPLAY_KIND.into(),
-                    value: json!({ "blocks": self.thinking_blocks.clone() }),
+                    value: json!({ "blocks": std::mem::take(&mut self.thinking_blocks) }),
                 },
             ));
-            self.thinking_blocks.clear();
         }
         if self.saw_usage {
             let context_input_tokens = self.usage.input.map(|input| {
@@ -302,7 +306,7 @@ impl ProtocolParser for Parser {
             return Err(Error::Provider(format!("Anthropic error: {error}")));
         }
         let kind = match event {
-            "" | "message" => text(value.get("type").unwrap_or(&Value::Null)).unwrap_or(event),
+            "" | "message" => text_field(&value, "type").unwrap_or(event),
             kind => kind,
         };
         match kind {
@@ -472,10 +476,10 @@ fn replay_blocks(value: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn push_anthropic(output: &mut Vec<Value>, role: &str, content: Vec<Value>) {
+fn push_anthropic(output: &mut Vec<Value>, role: AnthropicRole, content: Vec<Value>) {
+    let name = role.as_str();
     if let Some(last) = output.last_mut()
-        && object(last)
-            .is_some_and(|last| text(last.get("role").unwrap_or(&Value::Null)) == Some(role))
+        && object(last).is_some_and(|last| map_text_field(Some(last), "role") == Some(name))
         && let Some(existing) = last
             .as_object_mut()
             .and_then(|last| last.get_mut("content"))
@@ -484,7 +488,7 @@ fn push_anthropic(output: &mut Vec<Value>, role: &str, content: Vec<Value>) {
         existing.extend(content);
         return;
     }
-    output.push(json!({ "role": role, "content": content }));
+    output.push(json!({ "role": name, "content": content }));
 }
 
 fn anthropic_messages(
@@ -517,13 +521,13 @@ fn anthropic_messages(
                     }));
                 }
                 if !content.is_empty() {
-                    push_anthropic(&mut output, "assistant", content);
+                    push_anthropic(&mut output, AnthropicRole::Assistant, content);
                 }
             }
             CoreMessage::Tool(result) => {
                 push_anthropic(
                     &mut output,
-                    "user",
+                    AnthropicRole::User,
                     vec![json!({
                         "type": "tool_result",
                         "tool_use_id": super::truncated_call_id(&result.call_id),
@@ -538,13 +542,13 @@ fn anthropic_messages(
             CoreMessage::System(content) => {
                 let parts = anthropic_parts(content, Attachments::Forbidden)?;
                 if !parts.is_empty() {
-                    push_anthropic(&mut output, "user", parts);
+                    push_anthropic(&mut output, AnthropicRole::User, parts);
                 }
             }
             CoreMessage::User(content) => {
                 let parts = anthropic_parts(content, Attachments::Allowed)?;
                 if !parts.is_empty() {
-                    push_anthropic(&mut output, "user", parts);
+                    push_anthropic(&mut output, AnthropicRole::User, parts);
                 }
             }
         }
@@ -557,7 +561,7 @@ fn mark_cache_breakpoint(messages: &mut [Value]) {
         let Some(object) = message.as_object_mut() else {
             continue;
         };
-        if text(object.get("role").unwrap_or(&Value::Null)) != Some("user") {
+        if map_text_field(Some(object), "role") != Some("user") {
             continue;
         }
         let Some(content) = object.get_mut("content").and_then(Value::as_array_mut) else {
@@ -568,7 +572,7 @@ fn mark_cache_breakpoint(messages: &mut [Value]) {
                 continue;
             };
             if let Some("text" | "image" | "document" | "tool_result") =
-                text(block.get("type").unwrap_or(&Value::Null))
+                map_text_field(Some(block), "type")
             {
                 block.insert("cache_control".into(), json!({ "type": "ephemeral" }));
                 return;
@@ -597,17 +601,13 @@ fn empty_usage() -> UsageState {
 }
 
 fn anthropic_usage(value: &Value) -> UsageState {
-    let usage = object(value).cloned().unwrap_or_default();
+    let usage = object(value);
     UsageState {
-        input: usage.get("input_tokens").and_then(super::count_u64),
-        output: usage.get("output_tokens").and_then(super::count_u64),
-        total: usage.get("total_tokens").and_then(super::count_u64),
-        cache_read: usage
-            .get("cache_read_input_tokens")
-            .and_then(super::count_u64),
-        cache_write: usage
-            .get("cache_creation_input_tokens")
-            .and_then(super::count_u64),
+        input: super::map_count(usage, "input_tokens"),
+        output: super::map_count(usage, "output_tokens"),
+        total: super::map_count(usage, "total_tokens"),
+        cache_read: super::map_count(usage, "cache_read_input_tokens"),
+        cache_write: super::map_count(usage, "cache_creation_input_tokens"),
         reasoning: None,
     }
 }
@@ -661,8 +661,8 @@ fn required_index(value: &Value) -> Result<usize> {
         .ok_or_else(|| Error::Provider("Anthropic event is missing index".into()))
 }
 
-fn required_type(value: &serde_json::Map<String, Value>) -> Result<String> {
-    text(value.get("type").unwrap_or(&Value::Null))
+fn required_type(value: Option<&serde_json::Map<String, Value>>) -> Result<String> {
+    map_text_field(value, "type")
         .map(str::to_owned)
         .ok_or_else(|| Error::Provider("Anthropic event is missing type".into()))
 }

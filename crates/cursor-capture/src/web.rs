@@ -65,8 +65,8 @@ async fn handle_exchange_list(
     State(server): State<Arc<Server>>,
     Query(query): Query<ExchangeQuery>,
 ) -> Response {
-    let conversation_id = query.conversation_id.unwrap_or_default().trim().to_string();
-    match server.store().summaries(&conversation_id) {
+    let conversation_id = query.conversation_id.unwrap_or_default();
+    match server.store().summaries(conversation_id.trim()) {
         Ok(summaries) => axum::Json(summaries).into_response(),
         Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }

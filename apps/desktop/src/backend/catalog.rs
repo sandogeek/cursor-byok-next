@@ -3,13 +3,12 @@
 use axum::{
     body::{Body, Bytes},
     extract::Extension,
-    http::{HeaderValue, Request, Response, StatusCode, header},
+    http::{Request, Response},
 };
-use bytes::{BufMut, BytesMut};
 use prost::Message;
 
 use crate::{
-    Error, Result,
+    Result,
     backend::proxy::{self, CursorProxy},
     plugins::{PluginHost, PluginModelDescriptor},
     protocol::proto::agent::v1 as agent,
@@ -241,13 +240,11 @@ struct DefaultModelNudgeDataResponse {
 ///
 /// Plugin models declare no context window, so the presets are the fixed set
 /// Cursor ships with.
-fn context_options() -> Vec<(String, String)> {
-    CONTEXTS
-        .into_iter()
-        .map(|(value, display_name)| (value.to_owned(), display_name.to_owned()))
-        .collect()
+fn context_options() -> &'static [(&'static str, &'static str)] {
+    &CONTEXTS
 }
 
+/// Merges the configured plugin models into Cursor's `AvailableModels`, falling back to the local catalog when upstream fails.
 pub async fn available_models(
     Extension(plugins): Extension<PluginHost>,
     Extension(proxy): Extension<CursorProxy>,
@@ -267,11 +264,12 @@ pub async fn available_models(
         Ok(upstream) => merge_response(upstream, local),
         Err(error) => {
             tracing::warn!(%error, "Cursor AvailableModels upstream unavailable; using local catalog");
-            Ok(local_response(local))
+            Ok(super::proto_bytes_response(local))
         }
     }
 }
 
+/// Merges the configured plugin models into `GetUsableModels`, which is what the CLI reads.
 pub async fn usable_models(
     Extension(plugins): Extension<PluginHost>,
     Extension(proxy): Extension<CursorProxy>,
@@ -290,16 +288,17 @@ pub async fn usable_models(
         Ok(upstream) => merge_response(upstream, local),
         Err(error) => {
             tracing::warn!(%error, "Cursor GetUsableModels upstream unavailable; using local catalog");
-            Ok(local_response(local))
+            Ok(super::proto_bytes_response(local))
         }
     }
 }
 
+/// Answers `GetDefaultModelForCli` with the first configured plugin model.
 pub async fn default_model_for_cli(
     Extension(plugins): Extension<PluginHost>,
 ) -> Result<Response<Body>> {
     let plugin_models = plugins.configured_models().await;
-    Ok(local_response(
+    Ok(super::proto_bytes_response(
         agent::GetDefaultModelForCliResponse {
             model: plugin_models.first().map(usable_plugin_model),
         }
@@ -307,13 +306,14 @@ pub async fn default_model_for_cli(
     ))
 }
 
+/// Answers `GetDefaultModel` with the first configured plugin model, as its own thinking model.
 pub async fn default_model(Extension(plugins): Extension<PluginHost>) -> Result<Response<Body>> {
     let plugin_models = plugins.configured_models().await;
     let model = plugin_models
         .first()
         .map(|model| model.id.clone())
         .unwrap_or_default();
-    Ok(local_response(
+    Ok(super::proto_bytes_response(
         DefaultModelResponse {
             thinking_model: model.clone(),
             model,
@@ -324,11 +324,12 @@ pub async fn default_model(Extension(plugins): Extension<PluginHost>) -> Result<
     ))
 }
 
+/// Answers `GetDefaultModelNudgeData`: no nudge, and every plugin model exempt from a default switch.
 pub async fn default_model_nudge(
     Extension(plugins): Extension<PluginHost>,
 ) -> Result<Response<Body>> {
     let plugin_models = plugins.configured_models().await;
-    Ok(local_response(
+    Ok(super::proto_bytes_response(
         DefaultModelNudgeDataResponse {
             nudge_date: "0".into(),
             should_default_switch_on_new_chat: false,
@@ -345,36 +346,14 @@ pub async fn default_model_nudge(
 fn merge_response(upstream: proxy::BufferedResponse, extra: Vec<u8>) -> Result<Response<Body>> {
     if !upstream.status.is_success() {
         tracing::warn!(status = %upstream.status, "Cursor model catalog upstream rejected request; using local catalog");
-        return Ok(local_response(extra));
+        return Ok(super::proto_bytes_response(extra));
     }
     let (framing, payload) = unary_payload(&upstream.body)?;
-    let body = if framing.is_enveloped() {
-        let total = payload.len() + extra.len();
-        let length = u32::try_from(total)
-            .map_err(|_| Error::Protocol("model catalog frame exceeds 4 GiB".into()))?;
-        let mut merged = BytesMut::with_capacity(5 + total);
-        merged.put_u8(0);
-        merged.put_u32(length);
-        merged.extend_from_slice(payload);
-        merged.extend_from_slice(&extra);
-        merged.freeze()
-    } else {
-        let mut merged = BytesMut::with_capacity(payload.len() + extra.len());
-        merged.extend_from_slice(payload);
-        merged.extend_from_slice(&extra);
-        merged.freeze()
-    };
+    let mut merged = Vec::with_capacity(payload.len() + extra.len());
+    merged.extend_from_slice(payload);
+    merged.extend_from_slice(&extra);
+    let body = super::encode_unary(&merged, framing)?;
     Ok(upstream.with_body(body))
-}
-
-fn local_response(body: Vec<u8>) -> Response<Body> {
-    let mut response = Response::new(Body::from(body));
-    *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/proto"),
-    );
-    response
 }
 
 fn unary_payload(body: &Bytes) -> Result<(super::Framing, &[u8])> {
@@ -401,7 +380,7 @@ fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
         markdown_content: model.description.clone(),
     };
     let contexts = context_options();
-    let variants = model_variants(&model.id, &model.display_name, &tooltip, &contexts);
+    let variants = model_variants(&model.id, &model.display_name, &tooltip, contexts);
     let legacy_slugs = variants
         .iter()
         .filter_map(|variant| variant.legacy_slug.clone())
@@ -424,7 +403,7 @@ fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
         inputbox_short_model_name: Some(model.display_name.clone()),
         supports_sandboxing: Some(true),
         supports_cmd_k: Some(false),
-        parameter_definitions: model_parameters(&contexts),
+        parameter_definitions: model_parameters(contexts),
         variants,
         legacy_slugs,
         named_model_section_index: Some(NAMED_MODEL_SECTION),
@@ -441,7 +420,7 @@ fn available_plugin_model(model: &PluginModelDescriptor) -> AvailableModel {
     }
 }
 
-fn model_parameters(contexts: &[(String, String)]) -> Vec<ModelParameterDefinition> {
+fn model_parameters(contexts: &[(&str, &str)]) -> Vec<ModelParameterDefinition> {
     let mut parameters = vec![ModelParameterDefinition {
         id: "context".into(),
         name: "Context".into(),
@@ -452,15 +431,16 @@ fn model_parameters(contexts: &[(String, String)]) -> Vec<ModelParameterDefiniti
                 values: contexts
                     .iter()
                     .map(|(value, display_name)| EnumParameterValue {
-                        value: value.clone(),
-                        display_name: Some(display_name.clone()),
+                        value: (*value).into(),
+                        display_name: Some((*display_name).into()),
                     })
                     .collect(),
             }),
         }),
         is_cycleable_by_hotkey: Some(false),
     }];
-    // Reasoning effort is advertised for every plugin model.
+    // Cursor only shows the effort picker when the model declares the parameter,
+    // so every plugin model advertises it even when the provider ignores it.
     parameters.push(ModelParameterDefinition {
         id: "reasoning".into(),
         name: "Effort".into(),
@@ -524,7 +504,7 @@ fn model_variants(
     name: &str,
     display_name: &str,
     tooltip: &TooltipData,
-    contexts: &[(String, String)],
+    contexts: &[(&str, &str)],
 ) -> Vec<ModelVariant> {
     let mut variants = Vec::with_capacity(contexts.len() * EFFORTS.len() * FastMode::ALL.len());
     for (context, context_name) in contexts {

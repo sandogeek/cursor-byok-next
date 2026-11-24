@@ -59,14 +59,17 @@ pub struct CaManager {
 }
 
 impl CaManager {
+    /// A manager over an explicit `ca` directory, for tests and for the real data dir.
     pub fn at(dir: PathBuf) -> Self {
         Self { dir }
     }
 
+    /// The PEM certificate the system trust store holds.
     pub fn cert_path(&self) -> PathBuf {
         self.dir.join("ca.crt")
     }
 
+    /// The PEM private key that signs leaf certificates.
     pub fn key_path(&self) -> PathBuf {
         self.dir.join("ca.key")
     }
@@ -97,6 +100,7 @@ impl CaManager {
         }
     }
 
+    /// Parses the stored pair into an issuer the proxy can sign leaves with.
     pub fn load(&self) -> Result<LoadedCa> {
         let cert = fs::read_to_string(self.cert_path())?;
         let key = fs::read_to_string(self.key_path())?;

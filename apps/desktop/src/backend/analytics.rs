@@ -13,25 +13,9 @@ use sha2::{Digest, Sha256};
 use crate::{Error, Result, backend::proxy};
 
 pub const BOOTSTRAP_STATSIG_PATH: &str = "/aiserver.v1.AnalyticsService/BootstrapStatsig";
-const AGENT_GATES: [(&str, bool); 2] =
-    [("nal_agent_retries", true), ("agent_host_local_loop", true)];
-
-/// Whether a Statsig feature gate is on for the local user.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Enabled {
-    Enabled,
-    Disabled,
-}
-
-impl From<bool> for Enabled {
-    fn from(enabled: bool) -> Self {
-        if enabled {
-            Self::Enabled
-        } else {
-            Self::Disabled
-        }
-    }
-}
+/// The gates agent-host reads to route a turn to the local loop. Every gate
+/// here is forced on; a gate that must stay off does not belong in the list.
+const AGENT_GATES: [&str; 2] = ["nal_agent_retries", "agent_host_local_loop"];
 
 #[derive(Clone, PartialEq, Message)]
 struct BootstrapStatsigResponse {
@@ -41,6 +25,7 @@ struct BootstrapStatsigResponse {
     generated_at_ms: u64,
 }
 
+/// Patches Cursor's Statsig bootstrap so the agent-host gates choose the local loop, falling back to a local bootstrap.
 pub async fn bootstrap_statsig(
     Extension(upstream): Extension<proxy::CursorProxy>,
     request: Request<Body>,
@@ -97,11 +82,14 @@ fn local_response() -> Result<Response<Body>> {
         config: serde_json::to_string(&config)?,
         generated_at_ms,
     };
-    Ok(super::proto_response(message))
+    Ok(super::proto_response(&message))
 }
 
 fn configure_agent_gates(config: &mut Value) -> Result<()> {
-    let overrides = AGENT_GATES.map(|(name, enabled)| (statsig_key(config, name), enabled));
+    let keys: Vec<String> = AGENT_GATES
+        .iter()
+        .map(|name| statsig_key(config, name))
+        .collect();
     let root = config
         .as_object_mut()
         .ok_or_else(|| Error::Protocol("Statsig bootstrap config must be an object".into()))?;
@@ -110,9 +98,8 @@ fn configure_agent_gates(config: &mut Value) -> Result<()> {
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
         .ok_or_else(|| Error::Protocol("Statsig feature_gates must be an object".into()))?;
-    for (key, enabled) in overrides {
-        let gate = feature_gate(&key, Enabled::from(enabled));
-        gates.insert(key, gate);
+    for key in keys {
+        gates.insert(key.clone(), enabled_gate(&key));
     }
     Ok(())
 }
@@ -134,18 +121,15 @@ fn djb2(value: &str) -> String {
         .to_string()
 }
 
-fn feature_gate(name: &str, enabled: Enabled) -> Value {
-    let (rule, enabled) = match enabled {
-        Enabled::Enabled => ("local_enabled", true),
-        Enabled::Disabled => ("local_disabled", false),
-    };
+fn enabled_gate(name: &str) -> Value {
+    const RULE: &str = "local_enabled";
     json!({
         "name": name,
-        "value": enabled,
-        "rule_id": rule,
-        "ruleID": rule,
-        "group_name": rule,
-        "groupName": rule,
+        "value": true,
+        "rule_id": RULE,
+        "ruleID": RULE,
+        "group_name": RULE,
+        "groupName": RULE,
         "secondary_exposures": [],
         "secondaryExposures": [],
         "undelegated_secondary_exposures": [],

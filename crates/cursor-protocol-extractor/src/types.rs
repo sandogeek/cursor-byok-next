@@ -185,6 +185,10 @@ pub enum TypeToken {
 }
 
 impl TypeToken {
+    /// How completely this token names its type: `3` for a fully-qualified or
+    /// well-known name, `1` for a bare name, `0` for a scalar. The scores are
+    /// only compared against each other when picking between duplicate
+    /// declarations, so they are tier labels, not measurements.
     pub fn completeness(&self) -> i32 {
         match self {
             Self::Named(name)
@@ -291,6 +295,12 @@ pub struct SymbolDef {
     pub module_start: Option<u32>,
 }
 
+/// How many sample strings each diagnostic list keeps before it summarises the
+/// remainder, so one pathological bundle cannot fill the report.
+const DIAGNOSTIC_SAMPLE_LIMIT: usize = 20;
+/// How many characters of a skipped field object the diagnostics quote.
+const SAMPLE_PREVIEW_CHARS: usize = 140;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Diagnostics {
     pub total_field_objects: usize,
@@ -304,6 +314,8 @@ pub struct Diagnostics {
     pub extracted_types: usize,
     pub missing_declarations: Vec<String>,
     pub parse_errors: Vec<String>,
+    /// Parse errors dropped after [`DIAGNOSTIC_SAMPLE_LIMIT`] were kept.
+    pub overflowed_parse_errors: usize,
     pub shape_errors: Vec<String>,
 }
 
@@ -311,10 +323,10 @@ impl Diagnostics {
     pub fn add_skipped_field(&mut self, field_object: &str, reason: &Error) {
         self.total_field_objects += 1;
         self.skipped_field_objects += 1;
-        if self.skipped_field_samples.len() < 20 {
+        if self.skipped_field_samples.len() < DIAGNOSTIC_SAMPLE_LIMIT {
             let mut trimmed = field_object.trim().to_string();
-            if trimmed.len() > 140 {
-                trimmed.truncate(140);
+            if trimmed.len() > SAMPLE_PREVIEW_CHARS {
+                trimmed.truncate(SAMPLE_PREVIEW_CHARS);
                 trimmed.push_str("...");
             }
             self.skipped_field_samples
@@ -337,11 +349,10 @@ impl Diagnostics {
     }
 
     pub fn add_parse_error(&mut self, reason: &str) {
-        if self.parse_errors.len() < 20 {
+        if self.parse_errors.len() < DIAGNOSTIC_SAMPLE_LIMIT {
             self.parse_errors.push(reason.to_string());
-        } else if self.parse_errors.len() == 20 {
-            self.parse_errors
-                .push(format!("... and more parse errors after {reason}"));
+        } else {
+            self.overflowed_parse_errors += 1;
         }
     }
 
@@ -356,8 +367,8 @@ impl Diagnostics {
         self.skipped_field_objects += other.skipped_field_objects;
         self.skipped_field_samples
             .append(&mut other.skipped_field_samples);
-        if self.skipped_field_samples.len() > 20 {
-            self.skipped_field_samples.truncate(20);
+        if self.skipped_field_samples.len() > DIAGNOSTIC_SAMPLE_LIMIT {
+            self.skipped_field_samples.truncate(DIAGNOSTIC_SAMPLE_LIMIT);
         }
         for (key, count) in other.unresolved_type_refs {
             *self.unresolved_type_refs.entry(key).or_insert(0) += count;
@@ -369,8 +380,11 @@ impl Diagnostics {
         self.declared_types += other.declared_types;
         self.extracted_types += other.extracted_types;
         self.parse_errors.append(&mut other.parse_errors);
-        if self.parse_errors.len() > 20 {
-            self.parse_errors.truncate(20);
+        self.overflowed_parse_errors += other.overflowed_parse_errors;
+        if self.parse_errors.len() > DIAGNOSTIC_SAMPLE_LIMIT {
+            let dropped = self.parse_errors.len() - DIAGNOSTIC_SAMPLE_LIMIT;
+            self.parse_errors.truncate(DIAGNOSTIC_SAMPLE_LIMIT);
+            self.overflowed_parse_errors += dropped;
         }
         self.shape_errors.append(&mut other.shape_errors);
     }
@@ -411,6 +425,9 @@ impl fmt::Display for Diagnostics {
             writeln!(f, "JS bundle 解析错误:")?;
             for error in &self.parse_errors {
                 writeln!(f, "  - {error}")?;
+            }
+            if self.overflowed_parse_errors > 0 {
+                writeln!(f, "  - ... and {} more", self.overflowed_parse_errors)?;
             }
         }
         if !self.shape_errors.is_empty() {

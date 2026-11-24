@@ -26,6 +26,7 @@ pub struct AccountStore {
 }
 
 impl AccountStore {
+    /// Cursor's real `state.vscdb` for this platform.
     pub fn managed() -> Result<Self> {
         let home = dirs::home_dir()
             .ok_or_else(|| Error::Config("cannot resolve the user home directory".into()))?;
@@ -48,6 +49,7 @@ impl AccountStore {
         Ok(Self { state_db: path })
     }
 
+    /// A store over an explicit database file, for tests.
     pub fn at(state_db: PathBuf) -> Self {
         Self { state_db }
     }
@@ -178,15 +180,16 @@ fn local_token() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
-    async fn connect(state_db: &PathBuf) -> SqliteConnection {
+    async fn connect(state_db: &Path) -> SqliteConnection {
         let options = SqliteConnectOptions::new()
             .filename(state_db)
             .create_if_missing(true);
         SqliteConnection::connect_with(&options).await.unwrap()
     }
 
-    async fn value(state_db: &PathBuf, key: &str) -> Option<String> {
+    async fn value(state_db: &Path, key: &str) -> Option<String> {
         let mut connection = connect(state_db).await;
         sqlx::query("SELECT CAST(value AS TEXT) AS value FROM ItemTable WHERE key = ?")
             .bind(key)

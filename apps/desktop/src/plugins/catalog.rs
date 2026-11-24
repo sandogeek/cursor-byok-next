@@ -35,6 +35,12 @@ pub(crate) struct PluginEntry {
 }
 
 impl PluginCatalog {
+    /// The app's own plugin catalog: a private workspace under the temp dir
+    /// that holds the embedded Magpie.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the workspace or its SDK files cannot be created.
     pub fn managed() -> Result<Self> {
         Self::in_temporary_workspace(&std::env::temp_dir())
     }
@@ -57,8 +63,10 @@ impl PluginCatalog {
         &self.definition_loader
     }
 
+    /// Loads the bundled plugin's entry module. A load failure is logged and
+    /// reported as an empty list, because the UI shows manifests instead.
     pub(crate) async fn entries(&self, executable: &Path) -> Vec<PluginEntry> {
-        match load_plugin(&self.directory, &self.definition_loader, executable).await {
+        match load_plugin(self.directory.clone(), &self.definition_loader, executable).await {
             Ok(entry) => vec![entry],
             Err(error) => {
                 tracing::warn!(%error, "failed to load bundled Magpie");
@@ -67,8 +75,22 @@ impl PluginCatalog {
         }
     }
 
-    pub(crate) fn manifests(&self) -> Vec<LoadedManifest> {
-        load_manifest(&self.directory).into_iter().collect()
+    /// Reads the embedded manifest and icon without a worker, for the UI's
+    /// state before Bun is available. Both reads are filesystem work, so they
+    /// run off the async runtime.
+    pub(crate) async fn manifests(&self) -> Vec<LoadedManifest> {
+        let directory = self.directory.clone();
+        let loaded = tokio::task::spawn_blocking(move || load_manifest(&directory))
+            .await
+            .map_err(|error| Error::Runtime(format!("plugin manifest task failed: {error}")))
+            .and_then(std::convert::identity);
+        match loaded {
+            Ok(manifest) => vec![manifest],
+            Err(error) => {
+                tracing::warn!(%error, "failed to load the bundled Magpie manifest");
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -104,15 +126,15 @@ fn require_app_version(manifest: &PluginManifest, app_version: &str) -> Result<(
 }
 
 async fn load_plugin(
-    directory: &Path,
+    directory: PathBuf,
     loader: &PluginDefinitionLoader,
     executable: &Path,
 ) -> Result<PluginEntry> {
     // Reading the manifest and the icon touches the filesystem; keep it off the
     // async runtime.
-    let directory_owned = directory.to_path_buf();
+    let manifest_directory = directory.clone();
     let LoadedManifest { manifest, icon } =
-        tokio::task::spawn_blocking(move || load_manifest(&directory_owned))
+        tokio::task::spawn_blocking(move || load_manifest(&manifest_directory))
             .await
             .map_err(|error| Error::Runtime(format!("plugin manifest task failed: {error}")))??;
     let entry = directory.join(&manifest.entry).canonicalize()?;
@@ -126,7 +148,12 @@ async fn load_plugin(
     })
 }
 
-fn validate_localized_text(value: &serde_json::Value, label: &str) -> Result<()> {
+/// Accepts a bare string or a locale map. `label` only runs on failure, so
+/// the success path allocates nothing for diagnostics.
+fn validate_localized_text(
+    value: &serde_json::Value,
+    label: impl FnOnce() -> String,
+) -> Result<()> {
     match value {
         serde_json::Value::String(text) if !text.trim().is_empty() => Ok(()),
         serde_json::Value::Object(map)
@@ -138,7 +165,8 @@ fn validate_localized_text(value: &serde_json::Value, label: &str) -> Result<()>
             Ok(())
         }
         _ => Err(Error::Config(format!(
-            "{label} must be a non-empty string or a locale map of non-empty strings"
+            "{} must be a non-empty string or a locale map of non-empty strings",
+            label()
         ))),
     }
 }
@@ -152,13 +180,12 @@ fn validate_definition(plugin_id: &str, definition: &PluginModuleDefinition) -> 
     let mut provider_ids = std::collections::HashSet::new();
     for provider in &definition.providers {
         validate_id(&provider.id, "plugin provider id")?;
-        validate_localized_text(
-            &provider.display_name,
-            &format!(
+        validate_localized_text(&provider.display_name, || {
+            format!(
                 "plugin '{plugin_id}' provider '{}' displayName",
                 provider.id
-            ),
-        )?;
+            )
+        })?;
         if provider.provider_type.trim().is_empty() {
             return Err(Error::Config(format!(
                 "plugin '{plugin_id}' provider '{}' requires providerType",
@@ -200,13 +227,12 @@ fn validate_definition(plugin_id: &str, definition: &PluginModuleDefinition) -> 
     let mut resource_types = std::collections::HashSet::new();
     for resource in &definition.resources {
         validate_id(&resource.resource_type, "plugin resource type")?;
-        validate_localized_text(
-            &resource.display_name,
-            &format!(
+        validate_localized_text(&resource.display_name, || {
+            format!(
                 "plugin '{plugin_id}' resource '{}' displayName",
                 resource.resource_type
-            ),
-        )?;
+            )
+        })?;
         if !resource_types.insert(resource.resource_type.clone()) {
             return Err(Error::Config(format!(
                 "plugin '{plugin_id}' contains duplicate resource type '{}'",
@@ -240,13 +266,12 @@ fn validate_form_fields(
                 field.id
             )));
         }
-        validate_localized_text(
-            &field.label,
-            &format!(
+        validate_localized_text(&field.label, || {
+            format!(
                 "plugin '{plugin_id}' form method '{method_id}' field '{}' label",
                 field.id
-            ),
-        )?;
+            )
+        })?;
     }
     Ok(())
 }
@@ -293,8 +318,8 @@ mod tests {
     };
     use crate::plugins::descriptor::{AddMethodKind, FormFieldKind};
 
-    #[test]
-    fn embedded_magpie_ignores_installed_manifests_and_source() {
+    #[tokio::test]
+    async fn embedded_magpie_ignores_installed_manifests_and_source() {
         let root = tempfile::tempdir().unwrap();
         let installed = root.path().join("plugins/installed");
         fs::create_dir_all(&installed).unwrap();
@@ -311,7 +336,7 @@ mod tests {
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 
         let catalog = PluginCatalog::for_test(root.path()).unwrap();
-        let manifests = catalog.manifests();
+        let manifests = catalog.manifests().await;
         assert_eq!(manifests.len(), 1);
         let LoadedManifest {
             manifest: magpie,
@@ -343,9 +368,13 @@ mod tests {
             .tempdir()
             .unwrap();
         let catalog = PluginCatalog::for_test(root.path()).unwrap();
-        let entry = load_plugin(&catalog.directory, catalog.loader(), Path::new("bun"))
-            .await
-            .unwrap();
+        let entry = load_plugin(
+            catalog.directory.clone(),
+            catalog.loader(),
+            Path::new("bun"),
+        )
+        .await
+        .unwrap();
         assert_eq!(entry.definition.providers[0].id, "magpie");
         assert_eq!(entry.definition.resources[0].resource_type, "gateway");
     }

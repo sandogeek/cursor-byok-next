@@ -19,23 +19,18 @@ use crate::types::{
 const EVENT_CAPACITY: usize = 256;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Attaches the failed operation to a SQLite error.
-trait SqliteContext<T> {
+/// Attaches the failed operation to a wrapped error.
+trait Context<T, E> {
     fn context(self, operation: &'static str) -> Result<T>;
 }
 
-impl<T> SqliteContext<T> for std::result::Result<T, rusqlite::Error> {
+impl<T> Context<T, rusqlite::Error> for std::result::Result<T, rusqlite::Error> {
     fn context(self, operation: &'static str) -> Result<T> {
         self.map_err(|source| Error::database(operation, source))
     }
 }
 
-/// Attaches the failed operation to a JSON error.
-trait JsonContext<T> {
-    fn context(self, operation: &'static str) -> Result<T>;
-}
-
-impl<T> JsonContext<T> for std::result::Result<T, serde_json::Error> {
+impl<T> Context<T, serde_json::Error> for std::result::Result<T, serde_json::Error> {
     fn context(self, operation: &'static str) -> Result<T> {
         self.map_err(|source| Error::json(operation, source))
     }
@@ -90,7 +85,8 @@ struct Inner {
     exchanges: HashMap<String, Exchange>,
     db: Option<Connection>,
     database_path: String,
-    last_error: String,
+    /// The most recent persistence failure, cleared by the next success.
+    last_error: Option<String>,
 }
 
 impl ExchangeStore {
@@ -107,7 +103,7 @@ impl ExchangeStore {
                 exchanges: HashMap::new(),
                 db: None,
                 database_path: String::new(),
-                last_error: String::new(),
+                last_error: None,
             })),
             events,
         }
@@ -237,10 +233,9 @@ impl ExchangeStore {
             loaded.push(exchange);
         }
         for exchange in loaded {
-            inner
-                .exchanges
-                .insert(exchange.summary.id.clone(), exchange.clone());
-            inner.order.push(exchange.summary.id);
+            let id = exchange.summary.id.clone();
+            inner.exchanges.insert(id.clone(), exchange);
+            inner.order.push(id);
         }
         Ok(())
     }
@@ -291,7 +286,7 @@ impl ExchangeStore {
                     Ok(Some(loaded)) => cache_exchange(&mut inner, loaded),
                     Ok(None) => return,
                     Err(err) => {
-                        inner.last_error = err.to_string();
+                        inner.last_error = Some(err.to_string());
                         return;
                     }
                 }
@@ -405,12 +400,12 @@ impl ExchangeStore {
                     .execute("DELETE FROM exchanges", [])
                     .context("clearing rows")
             {
-                inner.last_error = err.to_string();
+                inner.last_error = Some(err.to_string());
                 return Err(err);
             }
             inner.order.clear();
             inner.exchanges.clear();
-            inner.last_error.clear();
+            inner.last_error = None;
             inner.generation += 1;
             inner.next_number = 1;
             StoreEvent {
@@ -530,7 +525,7 @@ pub struct StoreStatus {
     /// Absolute path of the SQLite file; empty for the in-memory store.
     pub database_path: String,
     /// Last persistence error, cleared by the next successful write.
-    pub last_error: String,
+    pub last_error: Option<String>,
 }
 
 fn cache_exchange(inner: &mut Inner, exchange: Exchange) {
@@ -579,11 +574,11 @@ fn persist_locked(inner: &mut Inner, id: &str) {
                 )
                 .context("writing an exchange row")
             {
-                Ok(_) => inner.last_error.clear(),
-                Err(err) => inner.last_error = err.to_string(),
+                Ok(_) => inner.last_error = None,
+                Err(err) => inner.last_error = Some(err.to_string()),
             }
         }
-        Err(err) => inner.last_error = err.to_string(),
+        Err(err) => inner.last_error = Some(err.to_string()),
     }
 }
 
@@ -670,7 +665,7 @@ fn associate_conversation_locked(
             )
             .context("associating stored rows with a conversation")
     {
-        inner.last_error = err.to_string();
+        inner.last_error = Some(err.to_string());
     }
 }
 

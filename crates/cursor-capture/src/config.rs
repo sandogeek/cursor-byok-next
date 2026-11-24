@@ -40,12 +40,6 @@ impl Default for Config {
 }
 
 impl Config {
-    /// The default configuration.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Replaces blank fields with defaults and validates the listen address.
     ///
     /// A limit that is zero or negative falls back to its default rather than

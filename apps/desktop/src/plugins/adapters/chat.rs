@@ -3,8 +3,8 @@
 use serde_json::{Value, json};
 
 use super::{
-    CoreMessage, ProtocolParser, SawTool, ToolNames, core_message, count_usize, data_url, object,
-    parse_object, text,
+    CoreMessage, ProtocolParser, SawTool, ToolNames, core_message, count_usize, data_url,
+    map_text_field, object, parse_object, text,
 };
 use crate::{
     model::{ContentPart, ModelInvocation, ModelLatency, Usage},
@@ -70,8 +70,10 @@ impl ProtocolParser for Parser {
         };
         let delta = choice.get("delta").and_then(object);
         let reasoning_delta = delta.and_then(|delta| {
-            text(delta.get("reasoning_content").unwrap_or(&Value::Null))
-                .or_else(|| text(delta.get("reasoning").unwrap_or(&Value::Null)))
+            delta
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .or_else(|| delta.get("reasoning").and_then(Value::as_str))
         });
         if let Some(reasoning_delta) = reasoning_delta {
             if !self.thinking_open {
@@ -81,8 +83,7 @@ impl ProtocolParser for Parser {
             self.reasoning.push_str(reasoning_delta);
             emit(ModelEvent::ThinkingDelta(reasoning_delta.to_owned()));
         }
-        if let Some(content) =
-            delta.and_then(|delta| text(delta.get("content").unwrap_or(&Value::Null)))
+        if let Some(content) = delta.and_then(|delta| delta.get("content").and_then(Value::as_str))
         {
             if self.thinking_open {
                 self.thinking_open = false;
@@ -111,12 +112,12 @@ impl ProtocolParser for Parser {
                     tool.merge_call_id(call_id);
                 }
                 if let Some(name) =
-                    function.and_then(|function| text(function.get("name").unwrap_or(&Value::Null)))
+                    function.and_then(|function| map_text_field(Some(function), "name"))
                 {
                     tool.merge_name(name);
                 }
-                if let Some(delta) = function
-                    .and_then(|function| text(function.get("arguments").unwrap_or(&Value::Null)))
+                if let Some(delta) =
+                    function.and_then(|function| map_text_field(Some(function), "arguments"))
                 {
                     tool.push_arguments(delta);
                 }
@@ -208,7 +209,8 @@ pub(super) fn build_body(
                 replay_state,
                 tool_calls,
             } => {
-                if let Some(value) = assistant_message(text, replay_state, tool_calls, tool_names) {
+                if let Some(value) = assistant_message(text, replay_state, tool_calls, tool_names)?
+                {
                     messages.push(value);
                 }
             }
@@ -285,46 +287,42 @@ fn assistant_message(
     replay_state: Option<&crate::model::ProviderReplayState>,
     tool_calls: &[crate::model::ToolCallContent],
     tool_names: &ToolNames,
-) -> Option<Value> {
-    let reasoning = replay_state.and_then(|state| {
-        (state.provider_kind == REPLAY_KIND)
-            .then(|| {
-                object(&state.value).and_then(|value| super::text(value.get("reasoning_content")?))
-            })
-            .flatten()
-    });
+) -> crate::plugins::Result<Option<Value>> {
+    let reasoning = replay_state
+        .filter(|state| state.provider_kind == REPLAY_KIND)
+        .and_then(|state| object(&state.value))
+        .and_then(|value| value.get("reasoning_content").and_then(Value::as_str));
     if text.is_empty() && tool_calls.is_empty() && reasoning.is_none() {
-        return None;
+        return Ok(None);
     }
-    let mut value = json!({
-        "role": "assistant",
-        "content": if text.is_empty() { Value::Null } else { Value::String(text.into_owned()) },
-    });
-    let object = value
-        .as_object_mut()
-        .expect("the assistant message was built from an object literal");
+    let mut message = serde_json::Map::new();
+    message.insert("role".into(), Value::from("assistant"));
+    message.insert(
+        "content".into(),
+        if text.is_empty() {
+            Value::Null
+        } else {
+            Value::String(text.into_owned())
+        },
+    );
     if let Some(reasoning) = reasoning {
-        object.insert("reasoning_content".into(), reasoning.into());
+        message.insert("reasoning_content".into(), reasoning.into());
     }
     if !tool_calls.is_empty() {
-        object.insert(
-            "tool_calls".into(),
-            tool_calls
-                .iter()
-                .map(|tool_call| {
-                    json!({
-                        "id": super::truncated_call_id(&tool_call.call_id),
-                        "type": "function",
-                        "function": {
-                            "name": tool_names.alias(&tool_call.name),
-                            "arguments": serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".into()),
-                        },
-                    })
-                })
-                .collect::<Value>(),
-        );
+        let mut projected = Vec::with_capacity(tool_calls.len());
+        for tool_call in tool_calls {
+            projected.push(json!({
+                "id": super::truncated_call_id(&tool_call.call_id),
+                "type": "function",
+                "function": {
+                    "name": tool_names.alias(&tool_call.name),
+                    "arguments": serde_json::to_string(&tool_call.arguments)?,
+                },
+            }));
+        }
+        message.insert("tool_calls".into(), Value::Array(projected));
     }
-    Some(value)
+    Ok(Some(Value::Object(message)))
 }
 
 fn chat_content(parts: &[ContentPart]) -> Result<Value> {
@@ -360,10 +358,11 @@ fn chat_content(parts: &[ContentPart]) -> Result<Value> {
                         "OpenAI Chat Completions only supports PDF file attachments".into(),
                     ));
                 }
+                let filename = filename.as_deref().unwrap_or("attachment.pdf");
                 Ok(json!({
                     "type": "file",
                     "file": {
-                        "filename": filename.clone().unwrap_or_else(|| "attachment.pdf".into()),
+                        "filename": filename,
                         "file_data": data_url(mime_type, data),
                     },
                 }))
@@ -378,27 +377,22 @@ fn event_error(value: &Value) -> Option<String> {
 }
 
 fn chat_usage(value: &Value) -> ModelEvent {
-    let usage = object(value).cloned().unwrap_or_default();
-    let details = usage.get("prompt_tokens_details").and_then(object);
-    let completion = usage.get("completion_tokens_details").and_then(object);
+    let usage = object(value);
+    let details = usage
+        .and_then(|usage| usage.get("prompt_tokens_details"))
+        .and_then(object);
+    let completion = usage
+        .and_then(|usage| usage.get("completion_tokens_details"))
+        .and_then(object);
     ModelEvent::Usage(
         Usage::new(
-            usage.get("prompt_tokens").and_then(count_u64_value),
-            usage.get("completion_tokens").and_then(count_u64_value),
-            usage.get("total_tokens").and_then(count_u64_value),
+            super::map_count(usage, "prompt_tokens"),
+            super::map_count(usage, "completion_tokens"),
+            super::map_count(usage, "total_tokens"),
         )
-        .with_cache_read(
-            details.and_then(|details| details.get("cached_tokens").and_then(count_u64_value)),
-        )
-        .with_reasoning(
-            completion
-                .and_then(|details| details.get("reasoning_tokens").and_then(count_u64_value)),
-        ),
+        .with_cache_read(super::map_count(details, "cached_tokens"))
+        .with_reasoning(super::map_count(completion, "reasoning_tokens")),
     )
-}
-
-fn count_u64_value(value: &Value) -> Option<u64> {
-    super::count_u64(value)
 }
 
 fn map_finish(reason: &str, has_tools: SawTool) -> FinishReason {

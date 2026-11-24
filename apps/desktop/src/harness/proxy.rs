@@ -180,22 +180,29 @@ pub struct Routing {
 }
 
 impl Routing {
+    /// Points the relay at a freshly started local backend. Every request
+    /// reads this value, so the backend may arrive after the proxy started.
     pub fn set_backend_addr(&self, addr: SocketAddr) {
         *self.backend.write() = Some(addr);
     }
 
+    /// The backend the relay should use, or `None` when none is connected.
     fn backend(&self) -> Option<SocketAddr> {
         self.backend.read().filter(|addr| addr.ip().is_loopback())
     }
 
+    /// Whether a local backend is connected.
+    #[must_use]
     pub fn has_backend(&self) -> bool {
         self.backend().is_some()
     }
 
     fn routes(&self, host: &str, path: &str) -> Option<SocketAddr> {
-        (is_cursor_host(host) && is_local_path(path))
-            .then(|| self.backend())
-            .flatten()
+        if is_cursor_host(host) && is_local_path(path) {
+            self.backend()
+        } else {
+            None
+        }
     }
 }
 

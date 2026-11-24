@@ -279,8 +279,9 @@ fn replace_dir(output_dir: &Path, temp_dir: &Path) -> Result<(), ExtractError> {
     }
 }
 
-/// One proto file's declarations, plus how each of its short names maps back to
-/// the fully-qualified type it came from.
+/// Groups local-loop declarations per package, renders one proto file each, and
+/// returns the rendered file name per fully-qualified type name. Records the
+/// types that had to be copied from another package in `diag`.
 fn generate_local_loop_protos(
     declarations: &Declarations<'_>,
     resolver: &TypeResolver,
@@ -387,6 +388,8 @@ fn copied_enum(item: &Enum, pkg_name: &str) -> Enum {
     copy
 }
 
+/// Copies the declarations of other packages that this one refers to, in
+/// `COPY_ROUNDS` passes so copies of copies are found too.
 fn copy_external_types(
     pkg_name: &str,
     package: ProtoFile,
@@ -394,6 +397,26 @@ fn copy_external_types(
     index: &DeclarationIndex<'_>,
 ) -> ProtoFile {
     let mut result = package;
+    let mut local_types = seed_local_types(&mut result);
+    for _ in 0..COPY_ROUNDS {
+        let needed = collect_needed_types(
+            pkg_name,
+            &result.messages,
+            &result.services,
+            resolver,
+            &local_types,
+        );
+        let copied_this_round =
+            copy_one_round(pkg_name, needed, index, &mut result, &mut local_types);
+        if copied_this_round == 0 {
+            break;
+        }
+    }
+    result
+}
+
+/// Registers a file's own types so external references to them are not copied.
+fn seed_local_types(result: &mut ProtoFile) -> HashSet<String> {
     let mut local_types = HashSet::new();
     for message in &result.messages {
         local_types.insert(message.short_name.clone());
@@ -407,46 +430,41 @@ fn copy_external_types(
             .copied
             .insert(item.short_name.clone(), CopiedType::Local);
     }
-    for _ in 0..COPY_ROUNDS {
-        let needed = collect_needed_types(
-            pkg_name,
-            &result.messages,
-            &result.services,
-            resolver,
-            &local_types,
-        );
-        let mut copied_this_round = 0;
-        for type_name in needed {
-            let TypeName { package, short } = parse_type_name(&type_name);
-            if package == pkg_name || is_google_pkg(&package) || local_types.contains(&short) {
-                continue;
-            }
-            if let Some(message) = index.messages.get(type_name.as_str()) {
-                result.messages.push(copied_message(message, pkg_name));
-                result
-                    .copied
-                    .insert(short.clone(), CopiedType::External(type_name));
-                local_types.insert(short);
-                copied_this_round += 1;
-            } else if let Some(item) = index.enums.get(type_name.as_str()) {
-                result.enums.push(copied_enum(item, pkg_name));
-                result
-                    .copied
-                    .insert(short.clone(), CopiedType::External(type_name));
-                local_types.insert(short);
-                copied_this_round += 1;
-            } else if is_local_loop_pkg(&package) {
-                result
-                    .copied
-                    .insert(short.clone(), CopiedType::External(type_name));
-                local_types.insert(short);
-            }
+    local_types
+}
+
+/// Copies every needed external declaration the index knows, returning how
+/// many declarations it added.
+fn copy_one_round(
+    pkg_name: &str,
+    needed: HashSet<String>,
+    index: &DeclarationIndex<'_>,
+    result: &mut ProtoFile,
+    local_types: &mut HashSet<String>,
+) -> usize {
+    let mut copied = 0;
+    for type_name in needed {
+        let TypeName { package, short } = parse_type_name(&type_name);
+        if package == pkg_name || is_google_pkg(&package) || local_types.contains(&short) {
+            continue;
         }
-        if copied_this_round == 0 {
-            break;
+        if let Some(message) = index.messages.get(type_name.as_str()) {
+            result.messages.push(copied_message(message, pkg_name));
+            copied += 1;
+        } else if let Some(item) = index.enums.get(type_name.as_str()) {
+            result.enums.push(copied_enum(item, pkg_name));
+            copied += 1;
+        } else if !is_local_loop_pkg(&package) {
+            continue;
         }
+        // A local-loop type nobody extracted still needs a name in `copied` so
+        // the renderer reports it, but it does not count as a copy.
+        result
+            .copied
+            .insert(short.clone(), CopiedType::External(type_name));
+        local_types.insert(short);
     }
-    result
+    copied
 }
 
 fn remap_module_imports(scan: &mut BundleScan) {

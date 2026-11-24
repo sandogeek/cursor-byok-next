@@ -16,7 +16,7 @@ struct ServerConfigResponse {
 }
 
 pub async fn get() -> Response<Body> {
-    super::proto_response(server_config())
+    super::proto_response(&server_config())
 }
 
 fn server_config() -> ServerConfigResponse {

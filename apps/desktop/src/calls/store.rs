@@ -19,11 +19,17 @@ use tokio::sync::{Mutex, OnceCell};
 
 use crate::{Result, model::Usage, time::now_ms};
 
-/// SQLite has no enum type, so each [`CallStatus`] stores its wire name.
+/// Oldest calls are dropped past this count, so the table cannot grow forever.
 const MAX_RETAINED_CALLS: i64 = 1000;
 /// How many of the newest calls the UI list may request at once.
 const MAX_LIST_LIMIT: i64 = 500;
 const MAX_STORED_REQUEST_BYTES: usize = 1024 * 1024;
+/// How long a write waits for Cursor's own SQLite reader before failing.
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Small pool: every write already serializes on `Connected::writes`.
+const POOL_MAX_CONNECTIONS: u32 = 8;
+/// The call list a snapshot shows when the caller names no limit.
+pub const DEFAULT_LIST_LIMIT: usize = 200;
 
 /// Stored response payloads stop at 1 MiB; SQLite stores the total as `i64`.
 const MAX_STORED_RESPONSE_BYTES: i64 = 1024 * 1024;
@@ -32,6 +38,12 @@ const MAX_STORED_RESPONSE_BYTES: i64 = 1024 * 1024;
 /// `usize` lengths and provider usage numbers, so clamping keeps the cast total.
 fn as_i64_len(len: usize) -> i64 {
     i64::try_from(len).unwrap_or(i64::MAX)
+}
+
+/// The list limit SQLite is asked for, clamped to the UI's range.
+fn list_limit(limit: usize) -> i64 {
+    let limit = i64::try_from(limit).unwrap_or(MAX_LIST_LIMIT);
+    limit.clamp(1, MAX_LIST_LIMIT)
 }
 
 const LLM_CALL_COLUMNS: &str = "call_id, run_id, conversation_id, provider_call_index, model_hash,
@@ -122,7 +134,8 @@ pub struct LlmCallSummary {
 pub struct CallOutcome<'a> {
     pub status: CallStatus,
     pub finish_reason: Option<&'a str>,
-    /// Time from request start to the terminal state.
+    /// Time from request start to the terminal state; [`CallRecorder`] stamps
+    /// the real value when it finishes the call.
     pub elapsed_ms: i64,
     pub error_kind: Option<&'a str>,
     pub error_message: Option<&'a str>,
@@ -131,11 +144,11 @@ pub struct CallOutcome<'a> {
 impl<'a> CallOutcome<'a> {
     /// A call that finished at the provider's own end-of-stream.
     #[must_use]
-    pub fn completed(finish_reason: &'a str, elapsed_ms: i64) -> Self {
+    pub fn completed(finish_reason: &'a str) -> Self {
         Self {
             status: CallStatus::Completed,
             finish_reason: Some(finish_reason),
-            elapsed_ms,
+            elapsed_ms: 0,
             error_kind: None,
             error_message: None,
         }
@@ -143,14 +156,33 @@ impl<'a> CallOutcome<'a> {
 
     /// A call the client dropped before the stream ended.
     #[must_use]
-    pub fn cancelled(elapsed_ms: i64) -> Self {
+    pub fn cancelled() -> Self {
         Self {
             status: CallStatus::Cancelled,
             finish_reason: None,
-            elapsed_ms,
+            elapsed_ms: 0,
             error_kind: None,
             error_message: None,
         }
+    }
+
+    /// A call that failed; `kind` and `message` are what the call list shows.
+    #[must_use]
+    pub fn failed(kind: &'a str, message: &'a str) -> Self {
+        Self {
+            status: CallStatus::Error,
+            finish_reason: None,
+            elapsed_ms: 0,
+            error_kind: Some(kind),
+            error_message: Some(message),
+        }
+    }
+
+    /// Stamps the measured duration, for callers that time the call themselves.
+    #[must_use]
+    pub fn with_elapsed(mut self, elapsed_ms: i64) -> Self {
+        self.elapsed_ms = elapsed_ms;
+        self
     }
 }
 
@@ -185,8 +217,8 @@ pub struct CallSnapshot {
     pub degraded: bool,
 }
 
-/// Where a call is in its lifecycle. The persisted column holds
-/// [`CallStatus::as_str`], which matches the names the UI shows.
+/// SQLite has no enum type, so each [`CallStatus`] stores its wire name, which
+/// [`CallStatus::as_str`] returns and [`CallStatus::from_stored`] parses back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallStatus {
     /// Accepted and waiting for the provider's first byte.
@@ -249,17 +281,6 @@ impl PayloadStorage {
     }
 }
 
-/// The TS boundary and the stored setting both express the mode as a bool.
-impl From<bool> for PayloadStorage {
-    fn from(detailed: bool) -> Self {
-        if detailed {
-            Self::Detailed
-        } else {
-            Self::Metrics
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct BufferedLlmChunk {
     pub(crate) seq: i64,
@@ -305,6 +326,7 @@ struct Connected {
 }
 
 impl CallStore {
+    /// A store over an explicit `calls.db`, connected lazily on first use.
     pub fn at(path: PathBuf) -> Self {
         Self {
             path,
@@ -313,11 +335,13 @@ impl CallStore {
         }
     }
 
+    /// Records that a write failed, so the calls screen can say the log is incomplete.
     pub fn mark_degraded(&self) {
         self.degraded.store(true, Ordering::Release);
     }
 
-    pub async fn snapshot(&self, limit: i64) -> CallSnapshot {
+    /// The calls screen's whole view: recent calls, storage mode, counts and whether the log is degraded. Never fails; an unreadable store reports itself degraded.
+    pub async fn snapshot(&self, limit: usize) -> CallSnapshot {
         match self.try_snapshot(limit).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -331,7 +355,7 @@ impl CallStore {
         }
     }
 
-    async fn try_snapshot(&self, limit: i64) -> Result<CallSnapshot> {
+    async fn try_snapshot(&self, limit: usize) -> Result<CallSnapshot> {
         let calls = self.llm_calls(limit).await?;
         let detailed = self.detailed_logging().await?;
         let storage = self.storage().await?;
@@ -343,6 +367,7 @@ impl CallStore {
         })
     }
 
+    /// Whether payload bodies are being stored for new calls.
     pub async fn detailed_logging(&self) -> Result<bool> {
         let connected = self.connected().await?;
         let value: String = sqlx::query_scalar(
@@ -356,9 +381,15 @@ impl CallStore {
 
     /// The storage mode new calls will snapshot.
     pub async fn payload_storage(&self) -> Result<PayloadStorage> {
-        self.detailed_logging().await.map(PayloadStorage::from)
+        let detailed = self.detailed_logging().await?;
+        Ok(if detailed {
+            PayloadStorage::Detailed
+        } else {
+            PayloadStorage::Metrics
+        })
     }
 
+    /// Changes the storage mode for calls started from now on; running calls keep theirs.
     pub async fn set_detailed_logging(&self, storage: PayloadStorage) -> Result<()> {
         let enabled = storage.keeps_payloads();
         let connected = self.connected().await?;
@@ -374,6 +405,7 @@ impl CallStore {
         Ok(())
     }
 
+    /// Inserts the running row and trims the oldest rows past `MAX_RETAINED_CALLS`.
     pub async fn start_llm_call(&self, call: &NewLlmCall) -> Result<()> {
         let connected = self.connected().await?;
         let _write = connected.writes.lock().await;
@@ -420,6 +452,7 @@ impl CallStore {
         Ok(())
     }
 
+    /// Stores the request body (and headers, in detailed mode) and its byte count.
     pub async fn record_llm_request(
         &self,
         call_id: &str,
@@ -429,14 +462,18 @@ impl CallStore {
     ) -> Result<()> {
         let detailed = storage.keeps_payloads();
         let body_json = serde_json::to_string(body)?;
-        let stored_body = if body_json.len() > MAX_STORED_REQUEST_BYTES {
+        // `body_json` is the stored text in the short branch, so read its
+        // length once instead of cloning it to keep the original around.
+        let body_len = body_json.len();
+        let truncated = body_len > MAX_STORED_REQUEST_BYTES;
+        let stored_body = if truncated {
             serde_json::json!({
                 "truncated": true,
-                "originalBytes": body_json.len(),
+                "originalBytes": body_len,
             })
             .to_string()
         } else {
-            body_json.clone()
+            body_json
         };
         let headers_json = detailed
             .then(|| serde_json::to_string(headers))
@@ -453,15 +490,15 @@ impl CallStore {
                 .bind(call_id)
                 .bind(headers_json)
                 .bind(&stored_body)
-                .bind(as_i64_len(body_json.len()))
+                .bind(as_i64_len(body_len))
                 .bind(call_id)
                 .execute(&mut *transaction)
                 .await
                 .map_err(|error| self.fail(error))?;
         }
         sqlx::query("UPDATE llm_calls SET request_bytes = ?, request_truncated = ? WHERE call_id = ? AND status = 'running'")
-            .bind(as_i64_len(body_json.len()))
-            .bind(body_json.len() > MAX_STORED_REQUEST_BYTES)
+            .bind(as_i64_len(body_len))
+            .bind(truncated)
             .bind(call_id)
             .execute(&mut *transaction)
             .await
@@ -473,6 +510,7 @@ impl CallStore {
         Ok(())
     }
 
+    /// Stamps the upstream status and the time to response headers.
     pub async fn record_llm_response_headers(
         &self,
         call_id: &str,
@@ -526,7 +564,10 @@ impl CallStore {
             let mut truncated = false;
             for chunk in chunks {
                 let data = chunk.data.as_deref().ok_or_else(|| {
-                    crate::Error::Storage("detailed LLM chunk is missing payload data".into())
+                    crate::Error::Storage(format!(
+                        "detailed chunk {} of call {call_id} has no payload data",
+                        chunk.seq
+                    ))
                 })?;
                 let remaining = usize::try_from((MAX_STORED_RESPONSE_BYTES - stored_bytes).max(0))
                     .unwrap_or(usize::MAX);
@@ -569,6 +610,7 @@ impl CallStore {
         Ok(())
     }
 
+    /// Stamps the time to the first response event that carries content.
     pub async fn record_llm_first_valid_response(
         &self,
         call_id: &str,
@@ -586,6 +628,7 @@ impl CallStore {
         Ok(())
     }
 
+    /// Stamps the time to first non-empty text delta.
     pub async fn record_llm_first_text(&self, call_id: &str, elapsed_ms: i64) -> Result<()> {
         let connected = self.connected().await?;
         let _write = connected.writes.lock().await;
@@ -599,6 +642,7 @@ impl CallStore {
         Ok(())
     }
 
+    /// Stores the provider's token usage.
     pub async fn record_llm_usage(&self, call_id: &str, usage: Usage) -> Result<()> {
         let usage_json = serde_json::to_string(&usage)?;
         let connected = self.connected().await?;
@@ -644,18 +688,20 @@ impl CallStore {
         Ok(())
     }
 
-    pub async fn llm_calls(&self, limit: i64) -> Result<Vec<LlmCallSummary>> {
+    /// The most recent `limit` calls, newest first.
+    pub async fn llm_calls(&self, limit: usize) -> Result<Vec<LlmCallSummary>> {
         let connected = self.connected().await?;
         let rows = sqlx::query(&format!(
             "SELECT {LLM_CALL_COLUMNS} FROM llm_calls ORDER BY created_at_ms DESC, rowid DESC LIMIT ?"
         ))
-        .bind(limit.clamp(1, MAX_LIST_LIMIT))
+        .bind(list_limit(limit))
         .fetch_all(&connected.pool)
         .await
         .map_err(|error| self.fail(error))?;
         rows.iter().map(summary_from_row).collect()
     }
 
+    /// One call summary, or `None` when no row matches.
     pub async fn llm_call(&self, call_id: &str) -> Result<Option<LlmCallSummary>> {
         let connected = self.connected().await?;
         sqlx::query(&format!(
@@ -670,6 +716,7 @@ impl CallStore {
         .transpose()
     }
 
+    /// The stored request, present only for a detailed call.
     pub async fn llm_call_request(&self, call_id: &str) -> Result<Option<LlmCallRequest>> {
         let connected = self.connected().await?;
         let row = sqlx::query(
@@ -689,6 +736,7 @@ impl CallStore {
         .transpose()
     }
 
+    /// The stored response chunks, present only for a detailed call.
     pub async fn llm_call_chunks(&self, call_id: &str) -> Result<Vec<LlmCallResponseChunk>> {
         let connected = self.connected().await?;
         let rows = sqlx::query("SELECT seq, received_offset_ms, data, byte_count FROM llm_call_response_chunks WHERE call_id = ? ORDER BY seq")
@@ -708,6 +756,7 @@ impl CallStore {
             .collect()
     }
 
+    /// How many calls, requests and chunks the database holds.
     pub async fn storage(&self) -> Result<CallStorage> {
         let connected = self.connected().await?;
         let (call_count, request_count, chunk_count) = sqlx::query_as::<_, (i64, i64, i64)>(
@@ -726,6 +775,7 @@ impl CallStore {
         })
     }
 
+    /// Deletes stored payloads and keeps the summaries.
     pub async fn clear_details(&self) -> Result<CallSnapshot> {
         let connected = self.connected().await?;
         let write_guard = connected.writes.lock().await;
@@ -751,9 +801,10 @@ impl CallStore {
             .await
             .map_err(|error| self.fail(error))?;
         drop(write_guard);
-        self.try_snapshot(200).await
+        self.try_snapshot(DEFAULT_LIST_LIMIT).await
     }
 
+    /// Deletes every recorded call.
     pub async fn clear_all(&self) -> Result<CallSnapshot> {
         let connected = self.connected().await?;
         let write_guard = connected.writes.lock().await;
@@ -771,7 +822,7 @@ impl CallStore {
             .await
             .map_err(|error| self.fail(error))?;
         drop(write_guard);
-        self.try_snapshot(200).await
+        self.try_snapshot(DEFAULT_LIST_LIMIT).await
     }
 
     async fn connected(&self) -> Result<&Connected> {
@@ -794,9 +845,9 @@ async fn connect(path: &Path) -> Result<Connected> {
         .foreign_keys(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Full)
-        .busy_timeout(Duration::from_secs(5));
+        .busy_timeout(SQLITE_BUSY_TIMEOUT);
     let pool = SqlitePoolOptions::new()
-        .max_connections(8)
+        .max_connections(POOL_MAX_CONNECTIONS)
         .connect_with(options)
         .await?;
     apply_schema(&pool).await?;
@@ -910,7 +961,10 @@ mod tests {
             .await
             .unwrap();
         store
-            .finish_llm_call("plugin-call", CallOutcome::completed("stop", 10))
+            .finish_llm_call(
+                "plugin-call",
+                CallOutcome::completed("stop").with_elapsed(10),
+            )
             .await
             .unwrap();
         let call = store.llm_call("plugin-call").await.unwrap().unwrap();
@@ -988,7 +1042,7 @@ mod tests {
         store.record_llm_first_text("timing", 18).await.unwrap();
         store.record_llm_first_text("timing", 50).await.unwrap();
         store
-            .finish_llm_call("timing", CallOutcome::cancelled(20))
+            .finish_llm_call("timing", CallOutcome::cancelled().with_elapsed(20))
             .await
             .unwrap();
         store
@@ -1004,7 +1058,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .finish_llm_call("timing", CallOutcome::completed("stop", 99))
+            .finish_llm_call("timing", CallOutcome::completed("stop").with_elapsed(99))
             .await
             .unwrap();
         let call = store.llm_call("timing").await.unwrap().unwrap();
@@ -1072,7 +1126,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .finish_llm_call("finished", CallOutcome::cancelled(20))
+            .finish_llm_call("finished", CallOutcome::cancelled().with_elapsed(20))
             .await
             .unwrap();
         let before = store.llm_call("finished").await.unwrap().unwrap();

@@ -6,15 +6,20 @@ use super::{Error, Result, data::PluginDataStore};
 use crate::time::now_ms;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ResourceState {
     Ready,
+    /// Retryable failure. `retry_at_ms` is the point the resource becomes
+    /// usable again; without one the resource stays out of rotation until the
+    /// user acts on it.
     Cooling {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none", rename = "retryAtMs")]
         retry_at_ms: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    /// Needs user action (a bad key, a removed project). Never retried
+    /// automatically.
     Invalid {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
@@ -22,6 +27,9 @@ pub enum ResourceState {
 }
 
 impl ResourceState {
+    /// Whether the resource may serve a call now. A cooling resource without a
+    /// retry time stays out until something re-states it.
+    #[must_use]
     pub fn is_ready(&self, now_ms: i64) -> bool {
         match self {
             Self::Ready => true,
@@ -42,6 +50,9 @@ pub struct ResourceRecord {
 }
 
 impl ResourceRecord {
+    /// The record as a plugin sees it: identity, private data, and state. The
+    /// private data is included because plugins need the credentials to call
+    /// upstream; nothing here is shown to the user.
     pub fn snapshot(&self, resource_type: &str) -> serde_json::Value {
         serde_json::json!({
             "id": self.id,
@@ -76,49 +87,20 @@ fn state_json(state: &ResourceState) -> serde_json::Value {
 pub struct ResourceDraft {
     pub key: String,
     pub private_data: serde_json::Value,
+    /// The state the plugin reports with a new resource; ready when absent.
     #[serde(default)]
-    pub state: Option<ResourceStateInput>,
+    pub state: Option<ResourceState>,
 }
 
+/// A partial update a plugin sends after a call: only the fields it names are
+/// replaced, so an omitted `state` keeps the stored one.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourcePatch {
     #[serde(default)]
     pub private_data: Option<serde_json::Value>,
     #[serde(default)]
-    pub state: Option<ResourceStateInput>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum ResourceStateInput {
-    Ready,
-    Cooling {
-        #[serde(default, rename = "retryAtMs")]
-        retry_at_ms: Option<i64>,
-        #[serde(default)]
-        message: Option<String>,
-    },
-    Invalid {
-        #[serde(default)]
-        message: Option<String>,
-    },
-}
-
-impl From<ResourceStateInput> for ResourceState {
-    fn from(input: ResourceStateInput) -> Self {
-        match input {
-            ResourceStateInput::Ready => Self::Ready,
-            ResourceStateInput::Cooling {
-                retry_at_ms,
-                message,
-            } => Self::Cooling {
-                retry_at_ms,
-                message,
-            },
-            ResourceStateInput::Invalid { message } => Self::Invalid { message },
-        }
-    }
+    pub state: Option<ResourceState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -136,6 +118,12 @@ pub struct StoredModel {
 }
 
 impl StoredModel {
+    /// Reads one `models.list` entry.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the entry is not an object, or `id` or `displayName` is
+    /// missing or blank.
     pub fn from_definition(value: &serde_json::Value) -> Result<Self> {
         let object = value
             .as_object()
@@ -177,6 +165,8 @@ impl StoredModel {
         })
     }
 
+    /// The model as a plugin sees it, in the same shape `models.list` returns so a
+    /// plugin can round-trip what it stored.
     pub fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({
             "id": self.id,
@@ -202,25 +192,38 @@ pub struct UpsertOutcome {
 }
 
 impl PluginStateStore {
+    /// Wraps the data store this state persists through.
     pub fn new(data: PluginDataStore) -> Self {
         Self { data }
     }
 
+    /// Every stored resource of `resource_type`, in insertion order. A missing
+    /// file is an empty list, not an error.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the stored JSON cannot be read or decoded.
     pub async fn resources(
         &self,
         plugin_id: &str,
         resource_type: &str,
     ) -> Result<Vec<ResourceRecord>> {
-        let value = self
+        let Some(value) = self
             .data
             .read(plugin_id, &resource_key(resource_type))
-            .await?;
-        if value.is_null() {
+            .await?
+        else {
             return Ok(Vec::new());
-        }
+        };
         Ok(serde_json::from_value(value)?)
     }
 
+    /// Applies a plugin's drafts, matching them to stored resources by `key`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a draft has a blank key, or the stored list cannot be read or
+    /// written.
     pub async fn upsert_resources(
         &self,
         plugin_id: &str,
@@ -238,9 +241,7 @@ impl PluginStateStore {
             if draft.key.trim().is_empty() {
                 return Err(Error::Protocol("plugin resource draft requires key".into()));
             }
-            let state = draft
-                .state
-                .map_or(ResourceState::Ready, ResourceState::from);
+            let state = draft.state.unwrap_or(ResourceState::Ready);
             if let Some(existing) = records.iter_mut().find(|record| record.key == draft.key) {
                 existing.private_data = draft.private_data;
                 existing.state = state;
@@ -266,6 +267,12 @@ impl PluginStateStore {
         Ok(outcome)
     }
 
+    /// Applies a partial update to one resource.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the resource is unknown, or the stored list cannot be read or
+    /// written.
     pub async fn apply_patch(
         &self,
         plugin_id: &str,
@@ -282,13 +289,19 @@ impl PluginStateStore {
             record.private_data = private_data;
         }
         if let Some(state) = patch.state {
-            record.state = state.into();
+            record.state = state;
         }
         record.updated_at_ms = now_ms();
         self.save_resources(plugin_id, resource_type, &records)
             .await
     }
 
+    /// Deletes one resource and returns the record that was removed.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the resource is unknown, or the stored list cannot be read or
+    /// written.
     pub async fn remove_resource(
         &self,
         plugin_id: &str,

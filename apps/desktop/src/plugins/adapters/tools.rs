@@ -10,6 +10,29 @@ use crate::{Error, Result, provider::ModelEvent};
 
 use super::ToolNames;
 
+/// How much of one tool call has been emitted. A pair of `bool`s would allow
+/// the impossible `ended && !started` state to be read as two independent facts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ToolPhase {
+    /// Neither `ToolCallStart` nor `ToolCallEnd` emitted yet.
+    #[default]
+    Pending,
+    /// `ToolCallStart` emitted; `ToolCallEnd` still owed.
+    Started,
+    /// Both emitted.
+    Ended,
+}
+
+impl ToolPhase {
+    fn is_started(self) -> bool {
+        self != Self::Pending
+    }
+
+    fn is_ended(self) -> bool {
+        self == Self::Ended
+    }
+}
+
 /// The parts of a tool call that stream in separately.
 #[derive(Clone, Debug, Default)]
 pub(super) struct ToolState {
@@ -18,8 +41,7 @@ pub(super) struct ToolState {
     arguments: String,
     /// Bytes of `arguments` already sent as a delta.
     emitted: usize,
-    started: bool,
-    ended: bool,
+    phase: ToolPhase,
 }
 
 impl ToolState {
@@ -92,11 +114,11 @@ impl ToolState {
 
     /// Whether the `ToolCallStart` for this call has been emitted.
     pub(super) fn is_started(&self) -> bool {
-        self.started
+        self.phase.is_started()
     }
 
     /// The identity the `ToolCallStart` reports, if both parts arrived.
-    pub(super) fn has_identity(&self) -> bool {
+    fn has_identity(&self) -> bool {
         self.call_id_text().is_some() && self.name_text().is_some()
     }
 
@@ -111,12 +133,12 @@ impl ToolState {
         index: usize,
         tool_names: &ToolNames,
     ) -> Option<ModelEvent> {
-        if self.started || !self.has_identity() {
+        if self.phase.is_started() || !self.has_identity() {
             return None;
         }
         let call_id = super::truncated_call_id(self.call_id_text()?).to_owned();
         let name = tool_names.restore(self.name_text()?);
-        self.started = true;
+        self.phase = ToolPhase::Started;
         Some(ModelEvent::ToolCallStart {
             index,
             call_id,
@@ -126,7 +148,7 @@ impl ToolState {
 
     /// The argument delta this call still owes, once it has started.
     pub(super) fn take_arguments_delta(&mut self, index: usize) -> Option<ModelEvent> {
-        if !self.started || self.emitted >= self.arguments.len() {
+        if !self.phase.is_started() || self.emitted >= self.arguments.len() {
             return None;
         }
         let delta = self.arguments[self.emitted..].to_owned();
@@ -136,15 +158,15 @@ impl ToolState {
 
     /// Whether the `ToolCallEnd` for this call has been emitted.
     pub(super) fn is_ended(&self) -> bool {
-        self.ended
+        self.phase.is_ended()
     }
 
     /// The `ToolCallEnd` this call still owes.
     pub(super) fn take_end(&mut self, index: usize) -> Option<ModelEvent> {
-        if self.ended {
+        if self.phase.is_ended() {
             return None;
         }
-        self.ended = true;
+        self.phase = ToolPhase::Ended;
         Some(ModelEvent::ToolCallEnd { index })
     }
 

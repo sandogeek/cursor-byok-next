@@ -15,7 +15,7 @@ use hyper_util::rt::TokioExecutor;
 use parking_lot::Mutex;
 use url::Url;
 
-use crate::capture::{CaptureBody, CapturedBody};
+use crate::capture::{BodyCompleteness, CaptureBody, CapturedBody};
 use crate::config::{Config, DEBUG_BASE_PATH, browser_address};
 use crate::decode::{
     ConnectFrameDecoder, capture_limit, decode_captured_content, decode_unary_request,
@@ -154,7 +154,7 @@ impl Server {
                 request_kind: String::new(),
                 response_kind: String::new(),
                 frame_count: 0,
-                error: String::new(),
+                error: None,
             },
             request: Payload {
                 headers: sorted_headers(request.headers()),
@@ -235,7 +235,7 @@ impl Server {
         let message = error.to_string();
         self.store.update(id, |exchange| {
             exchange.summary.state = ExchangeState::Error;
-            exchange.summary.error.clone_from(&message);
+            exchange.summary.error = Some(message);
             exchange.summary.duration_ms = elapsed_ms(exchange.summary.started_at);
         });
     }
@@ -437,8 +437,8 @@ impl Side {
                 if !frame.kind.is_empty() && !is_end_stream {
                     exchange.summary.response_kind.clone_from(&frame.kind);
                 }
-                if !frame.error.is_empty() {
-                    exchange.response.decode_error.clone_from(&frame.error);
+                if let Some(error) = &frame.error {
+                    exchange.response.decode_error = Some(error.clone());
                 }
                 exchange.response.frames.push(frame);
                 exchange.summary.frame_count = frame_count(exchange.response.frames.len());
@@ -461,7 +461,7 @@ struct BodyTarget {
 struct FinishedBody<'a> {
     size: i64,
     bytes: &'a [u8],
-    truncated: bool,
+    completeness: BodyCompleteness,
     decode_error: Option<String>,
 }
 
@@ -480,57 +480,70 @@ impl BodyTarget {
         let CapturedBody {
             bytes,
             size,
-            truncated,
+            completeness,
             end,
         } = captured;
-        let proto =
-            self.side.decodes_unary(&self.path) && is_unary_proto_content_type(&self.content_type);
-        let mut decode_err = None;
-        let mut decompressed = None;
-        if proto && truncated {
-            decode_err = Some(format!(
-                "{}正文超过抓取上限，无法完整解码",
-                self.side.label()
-            ));
-        } else if proto && !self.codec.is_empty() && !self.codec.eq_ignore_ascii_case("identity") {
-            match decompress_payload(&bytes, &self.codec) {
-                Ok(decoded) => decompressed = Some(decoded),
-                Err(err) => decode_err = Some(err.to_string()),
-            }
-        }
-        let decode_payload: &[u8] = decompressed.as_deref().unwrap_or(&bytes);
-        let decoded = if proto {
-            if decode_err.is_some() {
-                DecodedSide::default()
-            } else {
-                let (decoded, err) = decode_protobuf(self.side, &self.path, decode_payload);
-                decode_err = err;
-                decoded
-            }
-        } else {
-            let content = decode_captured_content(&bytes, &self.content_type, &self.codec);
-            decode_err = content.error;
-            DecodedSide {
-                json: content.text,
-                language: content.language,
-                ..DecodedSide::default()
-            }
-        };
-
+        let (decoded, decode_error) = self.decode(&bytes, completeness);
         let read_error = end.error();
         let finished = FinishedBody {
             size,
             bytes: &bytes,
-            truncated,
-            decode_error: decode_err,
+            completeness,
+            decode_error,
         };
         store.update(&self.id, |exchange| {
             exchange.publish_body(self.side, &decoded, &finished);
             if let Some(err) = read_error {
                 exchange.summary.state = ExchangeState::Error;
-                exchange.summary.error = err;
+                exchange.summary.error = Some(err);
             }
         });
+    }
+
+    /// Decodes one body, returning the view to show plus the reason it is
+    /// incomplete when decoding failed.
+    fn decode(
+        &self,
+        bytes: &[u8],
+        completeness: BodyCompleteness,
+    ) -> (DecodedSide, Option<String>) {
+        let proto =
+            self.side.decodes_unary(&self.path) && is_unary_proto_content_type(&self.content_type);
+        if !proto {
+            let content = decode_captured_content(bytes, &self.content_type, &self.codec);
+            return (
+                DecodedSide {
+                    json: content.text,
+                    language: content.language,
+                    ..DecodedSide::default()
+                },
+                content.error,
+            );
+        }
+        // A truncated protobuf body cannot be decoded at all, so say why
+        // instead of reporting a parse failure on half a message.
+        if completeness == BodyCompleteness::Truncated {
+            return (
+                DecodedSide::default(),
+                Some(format!(
+                    "{}正文超过抓取上限，无法完整解码",
+                    self.side.label()
+                )),
+            );
+        }
+        let decompressed = if self.codec.is_empty() || self.codec.eq_ignore_ascii_case("identity") {
+            None
+        } else {
+            match decompress_payload(bytes, &self.codec) {
+                Ok(decoded) => Some(decoded),
+                Err(err) => return (DecodedSide::default(), Some(err.to_string())),
+            }
+        };
+        decode_protobuf(
+            self.side,
+            &self.path,
+            decompressed.as_deref().unwrap_or(bytes),
+        )
     }
 }
 
@@ -602,13 +615,13 @@ impl Exchange {
         let payload = side.payload(self);
         payload.size = finished.size;
         payload.raw_hex = raw_hex;
-        payload.raw_truncated = finished.truncated;
+        payload.raw_truncated = finished.completeness == BodyCompleteness::Truncated;
         if is_json {
             payload.decoded_json.clone_from(&decoded.json);
             language.clone_into(&mut payload.decoded_lang);
         }
         if let Some(err) = &finished.decode_error {
-            payload.decode_error.clone_from(err);
+            payload.decode_error = Some(err.clone());
         }
     }
 }

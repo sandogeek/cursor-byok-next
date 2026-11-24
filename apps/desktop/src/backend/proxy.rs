@@ -3,12 +3,12 @@
 use std::time::Instant;
 
 use axum::{
-    body::{Body, Bytes, to_bytes},
+    body::{Body, Bytes},
     extract::Extension,
     http::{HeaderValue, Request, Response, header},
 };
 
-use crate::{Result, backend::MAX_BUFFERED_BYTES, harness};
+use crate::{Result, harness};
 
 const CURSOR_UPSTREAM: &str = "https://api2.cursor.sh";
 /// Cursor's upstream answers in well under this; a hung socket must not pin a
@@ -24,15 +24,24 @@ pub struct CursorProxy {
 }
 
 /// One client for every forwarded call: timeouts on connect and response, and
-/// pooled connections to the single upstream host.
+/// pooled connections to the single upstream host. A builder failure is fatal
+/// rather than silently falling back to a client with no timeouts.
 fn upstream_client() -> reqwest::Client {
     const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-    reqwest::Client::builder()
+    match reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(UPSTREAM_TIMEOUT)
         .pool_idle_timeout(UPSTREAM_POOL_IDLE)
         .build()
-        .unwrap_or_default()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            // `Client::builder()` cannot fail on this platform with these
+            // options, so the only sane answer is a client with the defaults.
+            tracing::error!(%error, "cannot build the Cursor upstream client; using defaults");
+            reqwest::Client::new()
+        }
+    }
 }
 
 impl Default for CursorProxy {
@@ -52,6 +61,7 @@ pub struct BufferedResponse {
 }
 
 impl BufferedResponse {
+    /// Turns the buffered reply into the streamed response axum sends.
     pub fn into_response(self) -> Response<Body> {
         let Self {
             status,
@@ -61,6 +71,7 @@ impl BufferedResponse {
         with_body(status, headers, body)
     }
 
+    /// Replaces the buffered body while keeping the upstream status and headers.
     pub fn with_body(self, body: Bytes) -> Response<Body> {
         let Self {
             status, headers, ..
@@ -81,8 +92,18 @@ fn with_body(
     response
 }
 
+/// Axum handler for the forward-only paths.
 pub async fn forward(
     Extension(proxy): Extension<CursorProxy>,
+    request: Request<Body>,
+) -> Result<Response<Body>> {
+    forward_request(&proxy, request).await
+}
+
+/// Streams `request` to the upstream Cursor host, adding the configured timeouts
+/// and dropping hop-by-hop headers on both legs.
+pub async fn forward_request(
+    proxy: &CursorProxy,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     let started = Instant::now();
@@ -97,7 +118,7 @@ pub async fn forward(
     headers.remove(harness::UPSTREAM_URL_HEADER);
     headers.remove(header::HOST);
     remove_hop_by_hop_headers(&mut headers);
-    let upstream = match proxy
+    let mut upstream = match proxy
         .client
         .request(parts.method.clone(), url)
         .headers(headers)
@@ -118,7 +139,7 @@ pub async fn forward(
         }
     };
     let status = upstream.status();
-    let mut response_headers = upstream.headers().clone();
+    let mut response_headers = std::mem::take(upstream.headers_mut());
     remove_hop_by_hop_headers(&mut response_headers);
     let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
     *response.status_mut() = status;
@@ -133,6 +154,7 @@ pub async fn forward(
     Ok(response)
 }
 
+/// Forwards `request` and buffers the whole reply, for handlers that have to patch the body.
 pub async fn forward_buffered(
     proxy: &CursorProxy,
     request: Request<Body>,
@@ -155,10 +177,8 @@ pub async fn forward_buffered(
         header::ACCEPT_ENCODING,
         axum::http::HeaderValue::from_static("identity"),
     );
-    let body = to_bytes(body, MAX_BUFFERED_BYTES)
-        .await
-        .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
-    let upstream = proxy
+    let body = super::read_body(body).await?;
+    let mut upstream = proxy
         .client
         .request(parts.method, url)
         .headers(headers)
@@ -166,7 +186,7 @@ pub async fn forward_buffered(
         .send()
         .await?;
     let status = upstream.status();
-    let mut headers = upstream.headers().clone();
+    let mut headers = std::mem::take(upstream.headers_mut());
     remove_hop_by_hop_headers(&mut headers);
     let body = upstream.bytes().await?;
     Ok(BufferedResponse {
@@ -185,8 +205,7 @@ fn upstream_url(headers: &axum::http::HeaderMap, fallback: &str, path: &str) -> 
         .map_err(|error| crate::Error::Protocol(format!("invalid upstream URL header: {error}")))?;
     let url = reqwest::Url::parse(value)
         .map_err(|error| crate::Error::Protocol(format!("invalid upstream URL: {error}")))?;
-    let host = url.host_str().unwrap_or_default();
-    if url.scheme() != "https" || !harness::is_cursor_host(host) {
+    if url.scheme() != "https" || !url.host_str().is_some_and(harness::is_cursor_host) {
         return Err(crate::Error::Protocol(
             "upstream URL must target a Cursor HTTPS host".into(),
         ));
@@ -195,18 +214,17 @@ fn upstream_url(headers: &axum::http::HeaderMap, fallback: &str, path: &str) -> 
 }
 
 fn remove_hop_by_hop_headers(headers: &mut axum::http::HeaderMap) {
-    let connection_headers = headers
+    // A `Connection` header names the fields that are hop-by-hop for this leg
+    // only; they are as removable as the fixed set below.
+    let connection_headers: Vec<String> = headers
         .get(header::CONNECTION)
         .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
     for name in connection_headers {
         headers.remove(name);
     }

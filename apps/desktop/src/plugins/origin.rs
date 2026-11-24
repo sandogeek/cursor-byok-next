@@ -4,6 +4,12 @@ use url::Url;
 
 use super::{Error, Result};
 
+/// Trims, validates and canonicalizes a user-entered gateway origin.
+///
+/// # Errors
+///
+/// Fails for a non-HTTP(S) scheme, embedded credentials, a path, a query, or a
+/// missing host.
 pub fn normalize_origin(value: &str) -> Result<String> {
     let trimmed = value.trim().trim_end_matches('/');
     let url = Url::parse(trimmed)
@@ -34,6 +40,11 @@ pub fn normalize_origin(value: &str) -> Result<String> {
     Ok(url.origin().ascii_serialization())
 }
 
+/// Reads `privateData.origin`, which every origin-bound resource carries.
+///
+/// # Errors
+///
+/// Fails when the field is missing or is not a valid origin.
 pub fn origin_from_private_data(value: &serde_json::Value) -> Result<String> {
     let origin = value
         .get("origin")
@@ -42,6 +53,8 @@ pub fn origin_from_private_data(value: &serde_json::Value) -> Result<String> {
     normalize_origin(origin)
 }
 
+/// Rewrites the stored origin in place, so a normalized value always replaces
+/// whatever a plugin submitted.
 pub fn rewrite_private_origin(value: &mut serde_json::Value, origin: String) {
     match value.as_object_mut() {
         Some(object) => {
@@ -53,13 +66,21 @@ pub fn rewrite_private_origin(value: &mut serde_json::Value, origin: String) {
     }
 }
 
+/// The origin of a plugin-supplied URL, ignoring its path.
+///
+/// # Errors
+///
+/// Fails when the URL cannot be parsed, carries credentials, or is not HTTP(S).
 pub fn origin_from_url(value: &str) -> Result<String> {
     let url = Url::parse(value.trim())
         .map_err(|error| Error::Config(format!("invalid plugin network URL: {error}")))?;
     request_origin(&url)
 }
 
-pub fn request_origin(url: &Url) -> Result<String> {
+/// Rejects a URL that carries credentials or is not HTTP(S), so no plugin
+/// request can smuggle a `user:pass@` authority or another scheme past the
+/// origin allowlist.
+pub(super) fn request_origin(url: &Url) -> Result<String> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err(Error::Config(
             "plugin network URL must not contain credentials".into(),

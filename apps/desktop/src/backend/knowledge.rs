@@ -7,7 +7,7 @@ use std::{
 };
 
 use axum::{
-    body::{Body, Bytes, to_bytes},
+    body::Body,
     extract::Extension,
     http::{Request, Response},
 };
@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Error, Result,
-    backend::MAX_BUFFERED_BYTES,
     protocol::{connect, proto::agent::v1 as pb},
 };
 
@@ -58,11 +57,22 @@ pub struct RuleStore {
 }
 
 impl RuleStore {
+    /// Opens (and creates) the rules directory.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the directory cannot be created.
     pub fn open(root: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&root)?;
         Ok(Self { root })
     }
 
+    /// Every stored rule, newest first. Files whose name is not a valid id are
+    /// skipped rather than failing the whole read.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the directory or a rule file cannot be read.
     pub fn list(&self) -> Result<Vec<RuleRecord>> {
         let meta = self.read_meta();
         let mut records = Vec::new();
@@ -88,6 +98,11 @@ impl RuleStore {
         Ok(records)
     }
 
+    /// One stored rule, or `None` when no file exists for `id`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `id` is not a valid rule id or the file cannot be read.
     pub fn get(&self, id: &str) -> Result<Option<RuleRecord>> {
         validate_id(id)?;
         let path = self.rule_path(id);
@@ -100,14 +115,26 @@ impl RuleStore {
         Ok(Some(assemble(id, knowledge, meta.rules.get(id), &path)))
     }
 
+    /// Writes a rule and its metadata.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `record.id` is not a valid rule id, or the rule file or the
+    /// metadata index cannot be written.
     pub fn upsert(&self, record: &RuleRecord) -> Result<()> {
         validate_id(&record.id)?;
         crate::atomic::write(&self.rule_path(&record.id), record.knowledge.as_bytes())?;
         let mut meta = self.read_meta();
-        meta.rules.insert(record.id.clone(), rule_meta(record));
+        meta.rules.insert(record.id.clone(), RuleMeta::from(record));
         self.write_meta(&meta)
     }
 
+    /// Deletes one rule and its metadata entry.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `id` is not a valid rule id, or the file or metadata index
+    /// cannot be written.
     pub fn remove(&self, id: &str) -> Result<()> {
         validate_id(id)?;
         remove_file_if_exists(&self.rule_path(id))?;
@@ -127,13 +154,18 @@ impl RuleStore {
     }
 
     fn read_meta(&self) -> Meta {
-        match std::fs::read(self.meta_path()) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-                tracing::warn!(%error, "rules meta.json is corrupt; starting from empty metadata");
-                Meta::default()
-            }),
-            Err(_) => Meta::default(),
-        }
+        let bytes = match std::fs::read(self.meta_path()) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Meta::default(),
+            Err(error) => {
+                tracing::warn!(%error, "rules meta.json is unreadable; treating every rule as untitled");
+                return Meta::default();
+            }
+        };
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            tracing::warn!(%error, "rules meta.json is corrupt; starting from empty metadata");
+            Meta::default()
+        })
     }
 
     fn write_meta(&self, meta: &Meta) -> Result<()> {
@@ -142,33 +174,32 @@ impl RuleStore {
     }
 }
 
+/// A rule read from disk plus whatever the metadata index knows about it. A
+/// rule with no metadata entry falls back to its file name and mtime.
 fn assemble(id: &str, knowledge: String, meta: Option<&RuleMeta>, path: &Path) -> RuleRecord {
-    match meta {
-        Some(meta) => RuleRecord {
-            id: id.into(),
-            knowledge,
-            title: meta.title.clone(),
-            created_at: meta.created_at.clone(),
-            is_generated: meta.is_generated,
-            git_origin: meta.git_origin.clone(),
-        },
-        None => RuleRecord {
-            id: id.into(),
-            knowledge,
-            title: id.into(),
-            created_at: file_modified_at(path),
-            is_generated: false,
-            git_origin: String::new(),
-        },
+    let meta = meta.cloned().unwrap_or_else(|| RuleMeta {
+        title: id.to_owned(),
+        created_at: file_modified_at(path),
+        ..RuleMeta::default()
+    });
+    RuleRecord {
+        id: id.to_owned(),
+        knowledge,
+        title: meta.title,
+        created_at: meta.created_at,
+        is_generated: meta.is_generated,
+        git_origin: meta.git_origin,
     }
 }
 
-fn rule_meta(record: &RuleRecord) -> RuleMeta {
-    RuleMeta {
-        title: record.title.clone(),
-        created_at: record.created_at.clone(),
-        is_generated: record.is_generated,
-        git_origin: record.git_origin.clone(),
+impl From<&RuleRecord> for RuleMeta {
+    fn from(record: &RuleRecord) -> Self {
+        Self {
+            title: record.title.clone(),
+            created_at: record.created_at.clone(),
+            is_generated: record.is_generated,
+            git_origin: record.git_origin.clone(),
+        }
     }
 }
 
@@ -282,6 +313,7 @@ pub(crate) struct KnowledgeBaseRemoveResponse {
     success: bool,
 }
 
+/// The rule store behind every knowledge-base RPC.
 #[derive(Clone)]
 pub struct KnowledgeService {
     inner: Arc<Inner>,
@@ -301,6 +333,11 @@ struct Inner {
 }
 
 impl KnowledgeService {
+    /// Opens the rule store under `root`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the rules directory cannot be created.
     pub fn with_root(root: std::path::PathBuf) -> Result<Self> {
         Ok(Self {
             inner: Arc::new(Inner {
@@ -310,7 +347,10 @@ impl KnowledgeService {
         })
     }
 
-    pub fn local_cursor_rules(&self) -> Vec<pb::CursorRule> {
+    /// The rules as Cursor sends them, read under the same lock as writes so a
+    /// rule file and its metadata cannot be observed half-updated.
+    pub async fn local_cursor_rules(&self) -> Vec<pb::CursorRule> {
+        let _guard = self.inner.lock.lock().await;
         let records = match self.inner.store.list() {
             Ok(records) => records,
             Err(error) => {
@@ -330,11 +370,12 @@ impl KnowledgeService {
     }
 }
 
+/// Stores one rule under a fresh local id and answers with it.
 pub async fn add(
     Extension(service): Extension<KnowledgeService>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    let (_, body) = buffered(request).await?;
+    let body = super::read_body(request.into_body()).await?;
     let message: KnowledgeBaseAddRequest = connect::decode_unary(&body)?;
     let _guard = service.inner.lock.lock().await;
     let id = format!("{LOCAL_ID_PREFIX}{}", uuid::Uuid::new_v4());
@@ -346,19 +387,19 @@ pub async fn add(
         is_generated: false,
         git_origin: message.git_origin,
     })?;
-    Ok(proto(KnowledgeBaseAddResponse { success: true, id }))
+    Ok(proto(&KnowledgeBaseAddResponse { success: true, id }))
 }
 
+/// Lists stored rules newest first, filtered by git origin and truncated to the requested limit.
 pub async fn list(
     Extension(service): Extension<KnowledgeService>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    let (_, body) = buffered(request).await?;
+    let body = super::read_body(request.into_body()).await?;
     let message: KnowledgeBaseListRequest = connect::decode_unary(&body)?;
     let _guard = service.inner.lock.lock().await;
-    let git_origin = message.git_origin.unwrap_or_default();
     let mut records = service.inner.store.list()?;
-    if !git_origin.is_empty() {
+    if let Some(git_origin) = message.git_origin.filter(|origin| !origin.is_empty()) {
         records.retain(|record| record.git_origin == git_origin);
     }
     if let Some(limit) = message.limit.filter(|limit| *limit >= 0) {
@@ -368,7 +409,7 @@ pub async fn list(
             records.truncate(limit);
         }
     }
-    Ok(proto(KnowledgeBaseListResponse {
+    Ok(proto(&KnowledgeBaseListResponse {
         success: true,
         all_results: records
             .into_iter()
@@ -383,46 +424,40 @@ pub async fn list(
     }))
 }
 
+/// Rewrites a rule's text and title; a missing id answers `success: false` rather than failing.
 pub async fn update(
     Extension(service): Extension<KnowledgeService>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    let (_, body) = buffered(request).await?;
+    let body = super::read_body(request.into_body()).await?;
     let message: KnowledgeBaseUpdateRequest = connect::decode_unary(&body)?;
     let _guard = service.inner.lock.lock().await;
     let Some(mut record) = service.inner.store.get(&message.id)? else {
-        return Ok(proto(KnowledgeBaseUpdateResponse { success: false }));
+        return Ok(proto(&KnowledgeBaseUpdateResponse { success: false }));
     };
     record.knowledge = message.knowledge;
     record.title = message.title;
     service.inner.store.upsert(&record)?;
-    Ok(proto(KnowledgeBaseUpdateResponse { success: true }))
+    Ok(proto(&KnowledgeBaseUpdateResponse { success: true }))
 }
 
+/// Deletes a rule and its metadata entry; removing an absent id still succeeds.
 pub async fn remove(
     Extension(service): Extension<KnowledgeService>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
-    let (_, body) = buffered(request).await?;
+    let body = super::read_body(request.into_body()).await?;
     let message: KnowledgeBaseRemoveRequest = connect::decode_unary(&body)?;
     let _guard = service.inner.lock.lock().await;
     service.inner.store.remove(&message.id)?;
-    Ok(proto(KnowledgeBaseRemoveResponse { success: true }))
-}
-
-async fn buffered(request: Request<Body>) -> Result<(axum::http::request::Parts, Bytes)> {
-    let (parts, body) = request.into_parts();
-    let body = to_bytes(body, MAX_BUFFERED_BYTES)
-        .await
-        .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
-    Ok((parts, body))
+    Ok(proto(&KnowledgeBaseRemoveResponse { success: true }))
 }
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-fn proto(message: impl Message) -> Response<Body> {
+fn proto(message: &impl Message) -> Response<Body> {
     super::proto_response(message)
 }
 

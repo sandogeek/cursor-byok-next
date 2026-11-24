@@ -8,7 +8,7 @@ use crate::{
     model::{
         ContentPart, ModelRequest, ModelSpec, ProjectedContent, ProjectedMessage, PromptSpec,
         ProviderReplayState, Reasoning, Role, ToolCallContent, ToolDefinition, ToolResultContent,
-        parse_token_count,
+        joined_text, parse_token_count,
     },
     plugins::PluginModelDescriptor,
     protocol::{
@@ -23,6 +23,7 @@ const ROLE_ASSISTANT: i32 = 2;
 const ROLE_TOOL: i32 = 3;
 const ROLE_SYSTEM_MESSAGE: i32 = 4;
 
+/// Projects one Cursor `RunInference` request onto the provider-independent model request.
 pub(crate) fn project(
     input: &pb::InferenceStreamRequest,
     model_id: &str,
@@ -131,7 +132,7 @@ impl Instructions {
                     consumed,
                 });
             }
-            segments.push(text_parts(&parts(message.content.as_ref())?));
+            segments.push(joined_text(&parts(message.content.as_ref())?));
         }
         Ok(Self {
             text: segments.join("\n\n"),
@@ -258,7 +259,7 @@ fn assistant_content(
         value: serde_json::json!({"blocks": blocks}),
     });
     Ok(ProjectedContent::Assistant {
-        text: text_parts(parts),
+        text: joined_text(parts),
         thinking,
         replay_state,
         calls,
@@ -287,9 +288,11 @@ fn subagent_models_task_description(
          the server resolves both to the same model.\n",
     );
     for model in models {
-        let display_name = serde_json::json!(model.display_name);
+        // Quoted and escaped the way the prompt format wants, since the name
+        // can contain quotes or newlines.
+        let display_name = format!("{:?}", model.display_name);
         description.push_str("\n- ");
-        description.push_str(&display_name.to_string());
+        description.push_str(&display_name);
         description.push_str(": model=\"");
         description.push_str(&model.id);
         description.push('"');
@@ -301,6 +304,7 @@ fn is_task_tool(name: &str) -> bool {
     name.eq_ignore_ascii_case("Task")
 }
 
+/// The context window the client selected, if it selected one. A value that is not a token count is an error, not a silent default.
 pub(crate) fn requested_context_window(
     requested: Option<&pb::InferenceRequestedModel>,
 ) -> Result<Option<u64>> {
@@ -361,15 +365,32 @@ struct MediaData {
     data: Vec<u8>,
 }
 
-fn image_data(value: &str, fallback_mime: Option<&str>) -> Result<MediaData> {
-    let (mime_type, encoded) = if let Some((metadata, data)) = value
+/// One `data:` URI, or the bare base64 payload with its fallback media type.
+struct MediaUri<'a> {
+    mime_type: &'a str,
+    encoded: &'a str,
+}
+
+/// Splits `data:<mime>;base64,<payload>` or keeps `value` as a bare payload.
+fn split_media_uri<'a>(value: &'a str, fallback_mime: &'a str) -> MediaUri<'a> {
+    match value
         .strip_prefix("data:")
         .and_then(|value| value.split_once(','))
     {
-        (metadata.trim_end_matches(";base64"), data)
-    } else {
-        (fallback_mime.unwrap_or("image/png"), value)
-    };
+        Some((metadata, data)) => MediaUri {
+            mime_type: metadata.trim_end_matches(";base64"),
+            encoded: data,
+        },
+        None => MediaUri {
+            mime_type: fallback_mime,
+            encoded: value,
+        },
+    }
+}
+
+fn image_data(value: &str, fallback_mime: Option<&str>) -> Result<MediaData> {
+    let MediaUri { mime_type, encoded } =
+        split_media_uri(value, fallback_mime.unwrap_or("image/png"));
     let data = STANDARD
         .decode(encoded)
         .map_err(|error| Error::Protocol(format!("invalid RunInference image: {error}")))?;
@@ -380,14 +401,7 @@ fn image_data(value: &str, fallback_mime: Option<&str>) -> Result<MediaData> {
 }
 
 fn file_data(value: &str, fallback_mime: &str) -> Result<MediaData> {
-    let (mime_type, encoded) = if let Some((metadata, data)) = value
-        .strip_prefix("data:")
-        .and_then(|value| value.split_once(','))
-    {
-        (metadata.trim_end_matches(";base64"), data)
-    } else {
-        (fallback_mime, value)
-    };
+    let MediaUri { mime_type, encoded } = split_media_uri(value, fallback_mime);
     if mime_type.is_empty() {
         return Err(Error::Protocol(
             "RunInference file content requires a media type".into(),
@@ -400,16 +414,6 @@ fn file_data(value: &str, fallback_mime: &str) -> Result<MediaData> {
         mime_type: mime_type.into(),
         data,
     })
-}
-
-fn text_parts(parts: &[ContentPart]) -> String {
-    parts
-        .iter()
-        .filter_map(|part| match part {
-            ContentPart::Text { text } => Some(text.as_str()),
-            ContentPart::Image { .. } | ContentPart::File { .. } => None,
-        })
-        .collect()
 }
 
 #[cfg(test)]

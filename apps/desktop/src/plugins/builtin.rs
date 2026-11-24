@@ -58,6 +58,8 @@ const MAGPIE: &[(&str, &str)] = &[
 
 pub(super) fn materialize_magpie(workspace: &Path) -> Result<PathBuf> {
     let directory = workspace.join("magpie");
+    // The workspace is a fresh UUID directory; failing when `magpie` already
+    // exists is the guard against reusing code from a discoverable path.
     fs::create_dir(&directory)?;
     fs::create_dir(directory.join("assets"))?;
     for (relative, content) in MAGPIE {

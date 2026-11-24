@@ -48,9 +48,19 @@ struct NetworkRequest {
     recorder: Option<CallRecorder>,
 }
 
-/// Keeps the transport detail of a failed plugin request in the message.
+/// Keeps the transport detail of a failed plugin request in the message,
+/// including the underlying cause chain reqwest only exposes through
+/// `source()`.
 fn provider_error(error: &reqwest::Error) -> Error {
-    Error::Provider(format!("plugin network request failed: {error}"))
+    use std::error::Error as _;
+    let mut detail = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    Error::Provider(format!("plugin network request failed: {detail}"))
 }
 
 #[cfg(test)]
@@ -76,6 +86,11 @@ const STREAM_READ_BATCH: usize = 256;
 /// Unread lines buffered between the reader task and the plugin. A stream that
 /// outruns its plugin applies backpressure here instead of growing unbounded.
 const STREAM_LINE_BUFFER: usize = 256;
+/// Frames queued for the single stdin writer. The writer drains one frame at a
+/// time, so this only absorbs bursts from concurrent invocations.
+const WRITE_QUEUE_FRAMES: usize = 32;
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// A registered stream: the guard that unregisters it, the stream the caller
 /// reads events from, the sender the worker impl writes them to, and the
@@ -87,7 +102,10 @@ struct Registration {
     active: watch::Receiver<()>,
 }
 
-struct Pending(parking_lot::Mutex<Option<HashMap<String, PendingInvocation>>>);
+struct Pending(parking_lot::Mutex<PendingInvocationMap>);
+
+/// The invocation registry while the worker runs, or `None` once it stopped.
+type PendingInvocationMap = Option<HashMap<String, PendingInvocation>>;
 
 struct PendingInvocation {
     items: mpsc::UnboundedSender<WorkerStreamItem>,
@@ -175,6 +193,19 @@ impl Pending {
 #[derive(Clone)]
 pub struct PluginWorker {
     inner: Arc<PluginWorkerInner>,
+}
+
+/// One plugin invocation: what to call, how to reach the plugin's own
+/// endpoints, and what to record.
+pub(super) struct WorkerRequest<'a> {
+    pub method: &'a str,
+    pub params: serde_json::Value,
+    pub cancellation: CancellationToken,
+    pub recorder: Option<CallRecorder>,
+    /// Origins the invocation's resource was registered for; a plugin may
+    /// reach these even though they are not in its manifest.
+    pub allowed_origins: HashSet<String>,
+    pub model: Option<Arc<ModelInvocation>>,
 }
 
 impl std::fmt::Debug for PluginWorker {
@@ -298,6 +329,14 @@ impl PluginWorker {
         }
     }
 
+    /// Runs a non-streaming host call (`form.submit`, `models.list`,
+    /// `resource.present`) and waits for its terminal result.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the worker cannot be started or the frame cannot be encoded,
+    /// when the plugin answers with an error, or when the invocation exceeds
+    /// [`INVOCATION_TIMEOUT`].
     pub async fn invoke(
         &self,
         method: &str,
@@ -305,14 +344,14 @@ impl PluginWorker {
         allowed_origins: HashSet<String>,
     ) -> Result<serde_json::Value> {
         let mut items = self
-            .invoke_streaming_with_origins(
+            .invoke_streaming(WorkerRequest {
                 method,
                 params,
-                CancellationToken::new(),
-                None,
+                cancellation: CancellationToken::new(),
+                recorder: None,
                 allowed_origins,
-                None,
-            )
+                model: None,
+            })
             .await?;
         match tokio::time::timeout(INVOCATION_TIMEOUT, async {
             while let Some(item) = items.recv().await {
@@ -335,15 +374,28 @@ impl PluginWorker {
         }
     }
 
-    pub async fn invoke_streaming_with_origins(
+    /// Sends one request and hands back the stream of events and the terminal
+    /// result.
+    ///
+    /// The caller must drain the receiver: cancelling `request.cancellation`
+    /// or dropping the receiver withdraws the request from the worker.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the worker cannot be started, no write permit is available,
+    /// or the request frame cannot be encoded.
+    pub async fn invoke_streaming(
         &self,
-        method: &str,
-        params: serde_json::Value,
-        cancellation: CancellationToken,
-        recorder: Option<CallRecorder>,
-        allowed_origins: HashSet<String>,
-        model: Option<Arc<ModelInvocation>>,
+        request: WorkerRequest<'_>,
     ) -> Result<mpsc::UnboundedReceiver<WorkerStreamItem>> {
+        let WorkerRequest {
+            method,
+            params,
+            cancellation,
+            recorder,
+            allowed_origins,
+            model,
+        } = request;
         let (writer, pending) = self.connection().await?;
         let permit = writer
             .reserve()
@@ -468,7 +520,7 @@ impl PluginWorker {
             });
         }
         let pending = Arc::new(Pending::open());
-        let (writer, messages) = mpsc::channel(32);
+        let (writer, messages) = mpsc::channel(WRITE_QUEUE_FRAMES);
         let task = tokio::spawn({
             let plugin_id = self.inner.plugin_id.clone();
             let writer = writer.clone();
@@ -686,7 +738,7 @@ impl HostContext {
                 self.plugin_id
             )));
         }
-        let client = self.http_client()?.clone();
+        let client = self.http_client()?;
         let mut request = client.request(method, url);
         for (name, value) in headers {
             request = request.header(name, value);
@@ -718,8 +770,8 @@ impl HostContext {
         }
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(30))
-            .pool_idle_timeout(Duration::from_secs(90))
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .pool_idle_timeout(HTTP_POOL_IDLE_TIMEOUT)
             .build()
             .map_err(|error| Error::Config(format!("cannot build plugin HTTP client: {error}")))?;
         Ok(self.http.get_or_init(|| client))
@@ -884,9 +936,15 @@ impl HostContext {
                     recorder.response_chunk(&chunk).await;
                 }
                 buffered.extend_from_slice(&chunk);
-                while let Some(position) = buffered.iter().position(|byte| *byte == b'\n') {
-                    let mut line = buffered.drain(..=position).collect::<Vec<u8>>();
-                    line.pop();
+                // Drain forwards as each line is consumed, so a line that keeps
+                // arriving in pieces never re-scans the whole buffer.
+                let mut consumed = 0;
+                while let Some(relative) =
+                    buffered[consumed..].iter().position(|byte| *byte == b'\n')
+                {
+                    let end = consumed + relative;
+                    let mut line = buffered[consumed..end].to_vec();
+                    consumed = end + 1;
                     if line.last() == Some(&b'\r') {
                         line.pop();
                     }
@@ -898,6 +956,8 @@ impl HostContext {
                         return;
                     }
                 }
+                buffered.copy_within(consumed.., 0);
+                buffered.truncate(buffered.len() - consumed);
             }
             if !buffered.is_empty() {
                 let _ = sender
@@ -929,7 +989,7 @@ impl HostContext {
                 .ok_or_else(|| Error::Protocol(format!("unknown plugin stream: {stream_id}")))?
         };
         let mut receiver = lines_handle.lock().await;
-        let mut lines = Vec::new();
+        let mut lines = Vec::with_capacity(STREAM_READ_BATCH);
         match receiver.recv().await {
             Some(Ok(line)) => lines.push(line),
             Some(Err(error)) => {
@@ -1540,18 +1600,18 @@ export default defineProviderPlugin({ providers: [provider] });
         cancellation: CancellationToken,
     ) -> Vec<crate::provider::ModelEvent> {
         let mut items = worker
-            .invoke_streaming_with_origins(
-                "provider.invoke",
-                serde_json::json!({
+            .invoke_streaming(WorkerRequest {
+                method: "provider.invoke",
+                params: serde_json::json!({
                     "providerId": "echo",
                     "model": { "id": "echo", "displayName": "Echo" },
                     "resource": null
                 }),
                 cancellation,
-                None,
-                HashSet::new(),
-                Some(invocation),
-            )
+                recorder: None,
+                allowed_origins: HashSet::new(),
+                model: Some(invocation),
+            })
             .await
             .unwrap();
         let mut events = Vec::new();
@@ -1648,18 +1708,18 @@ export default defineProviderPlugin({ providers: [provider] });
         let (_loader, worker) = echo_worker(temp.path(), source).await;
         let cancellation = CancellationToken::new();
         let mut items = worker
-            .invoke_streaming_with_origins(
-                "provider.invoke",
-                serde_json::json!({
+            .invoke_streaming(WorkerRequest {
+                method: "provider.invoke",
+                params: serde_json::json!({
                     "providerId": "echo",
                     "model": { "id": "echo", "displayName": "Echo" },
                     "resource": null
                 }),
-                cancellation.clone(),
-                None,
-                HashSet::new(),
-                Some(echo_invocation("hello")),
-            )
+                cancellation: cancellation.clone(),
+                recorder: None,
+                allowed_origins: HashSet::new(),
+                model: Some(echo_invocation("hello")),
+            })
             .await
             .unwrap();
         cancellation.cancel();

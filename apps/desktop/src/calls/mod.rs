@@ -5,10 +5,13 @@ mod store;
 
 pub use recorder::CallRecorder;
 pub use store::{
-    CallOutcome, CallSnapshot, CallStatus, CallStorage, CallStore, LlmCallRequest,
-    LlmCallResponseChunk, LlmCallSummary, NewLlmCall, PayloadStorage,
+    CallOutcome, CallSnapshot, CallStatus, CallStorage, CallStore, DEFAULT_LIST_LIMIT,
+    LlmCallRequest, LlmCallResponseChunk, LlmCallSummary, NewLlmCall, PayloadStorage,
 };
 
+/// Whether a header must be kept out of the call log. These are the header
+/// names that carry credentials across the providers we serve, so the log
+/// filters them by name rather than trying to recognize key shapes.
 pub fn is_sensitive_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),

@@ -1,5 +1,7 @@
 //! Buffers, replays, broadcasts, and atomically closes downstream output.
 
+use std::collections::VecDeque;
+
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
@@ -16,11 +18,10 @@ pub struct OutputHub {
 
 #[derive(Debug, Default)]
 struct OutputState {
-    history: Vec<Bytes>,
+    /// The frames emitted so far, oldest first, capped at [`MAX_REPLAY_FRAMES`].
+    history: VecDeque<Bytes>,
     subscribers: Vec<mpsc::UnboundedSender<Bytes>>,
     closed: bool,
-    /// Frames dropped from the front of `history` once it hit the cap.
-    dropped_frames: usize,
 }
 
 impl OutputHub {
@@ -43,10 +44,9 @@ impl OutputHub {
             .subscribers
             .retain(|subscriber| subscriber.send(frame.clone()).is_ok());
         if state.history.len() == MAX_REPLAY_FRAMES {
-            state.history.remove(0);
-            state.dropped_frames += 1;
+            state.history.pop_front();
         }
-        state.history.push(frame);
+        state.history.push_back(frame);
         true
     }
 

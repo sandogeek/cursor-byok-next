@@ -40,6 +40,22 @@ pub enum CatalogMode {
     Snapshot,
 }
 
+impl ProviderDefinition {
+    /// The resource type a live catalog is read through, or `None` when this
+    /// provider has no live catalog.
+    ///
+    /// Validation rejects a live catalog without models or without a resource
+    /// type, but the compiler cannot see that pair of constraints, so it is
+    /// stated once here instead of at every call site.
+    #[must_use]
+    pub fn live_resource_type(&self) -> Option<&str> {
+        if !self.has_models || self.catalog != CatalogMode::Live {
+            return None;
+        }
+        self.resource_type.as_deref()
+    }
+}
+
 impl CatalogMode {
     /// The wire name Cursor and plugin manifests use.
     #[must_use]
@@ -69,6 +85,11 @@ pub struct ResourceDefinition {
     pub can_remove: bool,
 }
 
+/// One "add a resource" flow. `fields` belongs to [`AddMethodKind::Form`] and
+/// is empty for every other kind; `callback` is the OAuth redirect the host
+/// listens on. The two extra kinds the SDK declares (`oauth2.0` and
+/// `oauth2.authorization-code`) are rejected at load time, so only `form`
+/// reaches this struct today.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AddMethodDefinition {
@@ -224,6 +245,8 @@ pub struct PluginResourceView {
     pub created_at_ms: i64,
 }
 
+/// What a plugin's `resource.present` returns for one resource: the display
+/// name, an optional localized description, and optional usage metrics.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourcePresentation {
@@ -235,6 +258,7 @@ pub struct ResourcePresentation {
 }
 
 impl PluginResourceView {
+    /// Combines the stored record with the presentation the plugin returned.
     pub fn from_record(record: &ResourceRecord, presentation: ResourcePresentation) -> Self {
         Self {
             id: record.id.clone(),
@@ -246,8 +270,11 @@ impl PluginResourceView {
     }
 }
 
-pub fn model_id(plugin_id: &str, provider_id: &str, model_id: &str) -> String {
-    format!("{ADAPTER_ID_PREFIX}{plugin_id}/{provider_id}/{model_id}")
+/// The `plugin:<plugin>/<provider>/<model>` id for a stored model.
+///
+/// Not to be confused with [`parse_model_id`], which splits one back apart.
+pub fn model_id(plugin_id: &str, provider_id: &str, upstream_model: &str) -> String {
+    format!("{ADAPTER_ID_PREFIX}{plugin_id}/{provider_id}/{upstream_model}")
 }
 
 /// A `plugin:<plugin>/<provider>/<model>` id split into its three parts.
@@ -275,6 +302,7 @@ pub fn parse_model_id(value: &str) -> Option<ModelId<'_>> {
 }
 
 impl PluginModelDescriptor {
+    /// Projects one stored model into the flat shape the model picker reads.
     pub fn new(
         plugin_id: &str,
         plugin_name: &str,

@@ -4,12 +4,18 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 
 use crate::{
     model::{
-        ContentPart, ModelInvocation, ModelLatency, ProjectedContent, ProjectedMessage, Role, Usage,
+        ContentPart, ModelInvocation, ModelLatency, ProjectedContent, ProjectedMessage, Role,
+        Usage, joined_text,
     },
     plugins::{Error, Result},
     provider::{FinishReason, ModelEvent},
 };
 
+/// Everything a plugin SDK implementation needs to read about one invocation:
+/// instructions, projected history, tools, and sampling knobs.
+///
+/// `cacheKey` is the conversation id: a plugin that keeps its own provider
+/// session should key it on that, so two conversations never share state.
 pub fn llm_request(invocation: &ModelInvocation) -> Result<serde_json::Value> {
     let request = &invocation.request;
     let messages = request
@@ -111,16 +117,7 @@ fn wire_parts(parts: &[ContentPart]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn joined_text(parts: &[ContentPart]) -> String {
-    parts
-        .iter()
-        .filter_map(|part| match part {
-            ContentPart::Text { text } => Some(text.as_str()),
-            ContentPart::Image { .. } | ContentPart::File { .. } => None,
-        })
-        .collect()
-}
-
+/// One event a plugin streamed, translated to the loop's own event type.
 pub fn model_event(value: &serde_json::Value) -> Result<ModelEvent> {
     let kind = value
         .get("type")

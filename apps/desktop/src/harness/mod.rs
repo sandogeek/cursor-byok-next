@@ -38,7 +38,7 @@ use self::{
     account::AccountStore,
     ca::CaManager,
     proxy::{ProxyRuntime, Routing},
-    settings::SettingsStore,
+    settings::{ManagedSettings, SettingsStore},
     state::{HarnessState, HarnessStateStore, PortChoice},
 };
 
@@ -229,7 +229,7 @@ impl CursorHarness {
         let Some(url) = self.saved_proxy_url() else {
             return Ok(false);
         };
-        self.paths.settings.clear_stale_managed_settings(&url)
+        self.paths.settings.clear_proxy_settings(&url)
     }
 
     /// Generates the CA when missing. Blocking work: run it from a task.
@@ -301,9 +301,12 @@ impl CursorHarness {
         let healthy = {
             let proxy = self.proxy.lock().await;
             proxy.running()
-                && proxy
-                    .url()
-                    .is_some_and(|url| self.paths.settings.settings_match(&url).unwrap_or(false))
+                && proxy.url().is_some_and(|url| {
+                    self.paths
+                        .settings
+                        .managed_state(Some(&url))
+                        .is_ok_and(ManagedSettings::is_applied)
+                })
         };
         if !healthy && let Err(error) = self.enable().await {
             tracing::warn!(%error, "could not restore Cursor takeover");
@@ -320,11 +323,13 @@ impl CursorHarness {
         let settings = self
             .paths
             .settings
-            .settings_state(settings_url.as_deref())
+            .managed_state(settings_url.as_deref())
             .inspect_err(|error| tracing::warn!(%error, "could not read Cursor settings"));
-        let settings_applied = settings.as_ref().is_ok_and(|state| *state == Some(true));
+        let settings_applied = settings.as_ref().is_ok_and(|state| state.is_applied());
         let integration = match (proxy.running(), settings_applied, settings) {
-            (false, false, Ok(None | Some(false))) => IntegrationState::Disabled,
+            (false, false, Ok(ManagedSettings::NotConfigured | ManagedSettings::Missing)) => {
+                IntegrationState::Disabled
+            }
             (true, true, _) => IntegrationState::Enabled,
             _ => IntegrationState::Degraded,
         };
@@ -373,12 +378,11 @@ impl CursorHarness {
             ));
         }
         let mut proxy = self.proxy.lock().await;
-        let settings_applied = proxy
-            .url()
-            .as_deref()
-            .map(|url| self.paths.settings.settings_match(url))
-            .transpose()?
-            .unwrap_or(false);
+        let running_url = proxy.url();
+        let settings_applied = match running_url.as_deref() {
+            Some(url) => self.paths.settings.managed_state(Some(url))?.is_applied(),
+            None => false,
+        };
         if !settings_applied {
             // Optional: it only makes the fresh setting take effect sooner.
             match process::terminate_cursor().await {
@@ -389,12 +393,10 @@ impl CursorHarness {
                 }
             }
         }
-        if proxy.running() {
-            if let Some(url) = proxy.url() {
-                drop(proxy);
-                self.apply(&url).await?;
-            }
-            return Ok(());
+        if let Some(url) = running_url {
+            // The proxy is already up; release the lock before writing files.
+            drop(proxy);
+            return self.apply(&url).await;
         }
         // Reuse the port the user chose, else the one Cursor's settings were
         // already pointed at, so a restart never invalidates them. A saved `0`
@@ -414,19 +416,17 @@ impl CursorHarness {
         }
         // The proxy is running now; release the lock before writing files.
         drop(proxy);
-        if let Err(error) = self.apply(&started.url).await {
-            // The proxy is up but Cursor was never pointed at it, so stop it.
+
+        // Cursor's files and the remembered port must both name the port that
+        // is actually open, or the next start leaves Cursor on a dead port. A
+        // failure in either write undoes the proxy that is already listening.
+        let applied = self
+            .apply(&started.url)
+            .await
+            .and_then(|()| self.update_intent(|intent| intent.proxy_port = Some(started.port)));
+        if let Err(error) = applied {
             // A rollback that also fails is worth a log line: Cursor's settings
             // may still name the port that is about to close.
-            if let Err(cleanup) = self.paths.settings.clear_proxy_settings(&started.url) {
-                tracing::warn!(%cleanup, "could not roll back Cursor proxy settings");
-            }
-            self.proxy.lock().await.stop().await;
-            return Err(error);
-        }
-        if let Err(error) = self.update_intent(|intent| intent.proxy_port = Some(started.port)) {
-            // `harness.json` could not record the port, so the next start would
-            // reuse a stale one. Undo the settings write with the proxy.
             if let Err(cleanup) = self.paths.settings.clear_proxy_settings(&started.url) {
                 tracing::warn!(%cleanup, "could not roll back Cursor proxy settings");
             }
@@ -549,8 +549,9 @@ mod tests {
             !harness
                 .paths
                 .settings
-                .settings_match("http://127.0.0.1:41000")
+                .managed_state(Some("http://127.0.0.1:41000"))
                 .unwrap()
+                .is_applied()
         );
         assert!(!harness.paths.state.load().enabled);
     }

@@ -32,7 +32,7 @@ use crate::{
 
 const SUBAGENT_FORCE_POLICY_NONE: &str = "none";
 const SUMMARY_UNUSED_WINDOW_PERCENT: f64 = 0.1;
-const DEFAULT_SUMMARY_PROMPT_CHARS: i32 = 2_800_000;
+const DEFAULT_SUMMARY_PROMPT_CHARS: u64 = 2_800_000;
 const SUMMARY_PROMPT_SCALE_WINDOW: u64 = 1_000_000;
 const DISCONNECTED_RUN_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -51,6 +51,7 @@ pub(crate) enum InferenceRoute {
     Upstream,
 }
 
+/// One client-loop inference run: its input channel, output hub, sequence counter, subscriptions and cancellation.
 pub(crate) struct Run {
     input: mpsc::Sender<pb::RunInferenceClientMessage>,
     output: Arc<OutputHub>,
@@ -65,6 +66,7 @@ struct Subscriptions {
     generation: u64,
 }
 
+/// Keeps a run alive while a client stream is attached; dropping the last one starts the disconnect grace timer.
 pub(crate) struct Subscription {
     service: InferenceService,
     request_id: String,
@@ -81,7 +83,8 @@ impl Drop for Subscription {
         let generation = subscriptions.generation;
         let state = Arc::downgrade(&self.service.state);
         let run = Arc::downgrade(&self.run);
-        let request_id = self.request_id.clone();
+        // `Drop` hands the guard the id by move so no copy of the key is made.
+        let request_id = std::mem::take(&mut self.request_id);
         tokio::spawn(async move {
             tokio::time::sleep(DISCONNECTED_RUN_GRACE).await;
             let (Some(state), Some(run)) = (state.upgrade(), run.upgrade()) else {
@@ -124,6 +127,7 @@ struct ServeContext {
 }
 
 impl InferenceService {
+    /// The service over the plugin host, the rule store and the call log.
     pub fn new(plugins: PluginHost, knowledge: KnowledgeService, calls: CallStore) -> Self {
         Self {
             state: Arc::new(Mutex::new(HashMap::new())),
@@ -134,10 +138,12 @@ impl InferenceService {
         }
     }
 
+    /// The route recorded for `request_id`, if any.
     pub fn route(&self, request_id: &str) -> Option<InferenceRoute> {
         self.state.lock().get(request_id).cloned()
     }
 
+    /// Waits until `request_id` has a route, which is how the SSE handler learns that `BidiAppend` started a run.
     pub async fn wait_route(&self, request_id: &str) -> InferenceRoute {
         loop {
             let changed = self.changed.notified();
@@ -150,6 +156,14 @@ impl InferenceService {
         }
     }
 
+    /// Records the route for a run's first message, starting a local run when
+    /// the model is a plugin model.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `message` does not start a run, when the model id or
+    /// conversation id is missing, or when the plugin host cannot resolve the
+    /// model.
     pub async fn begin(
         &self,
         request_id: &str,
@@ -233,15 +247,13 @@ impl InferenceService {
             InferenceRoute::Upstream
         };
         let mut state = self.state.lock();
-        let route = state
-            .entry(request_id.into())
-            .or_insert_with(|| route.clone())
-            .clone();
+        let route = state.entry(request_id.to_owned()).or_insert(route).clone();
         drop(state);
         self.changed.notify_waiters();
         Ok(route)
     }
 
+    /// Attaches a client stream to `run`, replaying output already emitted.
     pub fn subscribe(
         &self,
         request_id: String,
@@ -261,6 +273,7 @@ impl InferenceService {
         )
     }
 
+    /// Forgets a request id once its client said `FinishRun`.
     pub fn finish(&self, request_id: &str) {
         self.state.lock().remove(request_id);
     }
@@ -270,19 +283,28 @@ impl InferenceService {
         requested: &str,
     ) -> Result<Option<PluginModelDescriptor>> {
         let models = self.plugins.configured_models().await;
-        let byok = models
-            .iter()
-            .map(|model| ByokModel {
-                hash: model.id.clone(),
-                model_id: model.model_id.clone(),
-                display_name: model.display_name.clone(),
-            })
-            .collect::<Vec<_>>();
-        let Ok(hash) = subagent_models::resolve(&byok, requested) else {
-            return Ok(None);
+        let hash = {
+            let byok = byok_models(&models);
+            match subagent_models::resolve(&byok, requested) {
+                Ok(hash) => hash.to_owned(),
+                Err(_) => return Ok(None),
+            }
         };
         Ok(models.into_iter().find(|model| model.id == hash))
     }
+}
+
+/// The borrowed view [`subagent_models::resolve`] needs, so resolving a Task
+/// model clones no descriptors.
+fn byok_models(models: &[PluginModelDescriptor]) -> Vec<ByokModel<'_>> {
+    models
+        .iter()
+        .map(|model| ByokModel {
+            hash: &model.id,
+            model_id: &model.model_id,
+            display_name: &model.display_name,
+        })
+        .collect()
 }
 
 impl Run {
@@ -338,8 +360,7 @@ async fn serve(
         cancellation,
         invocations: Arc::new(Mutex::new(HashMap::new())),
         tasks: JoinSet::new(),
-        finished: false,
-        disconnected: false,
+        exit: None,
         provider_call_index: 0,
         // A plugin model carries no context-window figure: the descriptor the
         // provider reports is the only source, and the run learns it from the
@@ -352,7 +373,7 @@ async fn serve(
         loop {
             let message = tokio::select! {
                 () = loop_state.cancellation.cancelled() => {
-                    loop_state.disconnected = true;
+                    loop_state.exit = Some(RunExit::Disconnected);
                     break;
                 }
                 message = input.recv() => message,
@@ -365,7 +386,7 @@ async fn serve(
                     let ready = loop_state.run_ready_message(
                         &run_setup,
                         &request,
-                        knowledge.local_cursor_rules(),
+                        knowledge.local_cursor_rules().await,
                     );
                     emit(&output, ready);
                 }
@@ -378,10 +399,11 @@ async fn serve(
                     loop_state.cancel_invocation(&cancel.invocation_id);
                 }
                 Some(Message::FinishRun(finish)) => {
-                    loop_state.finished = true;
-                    if finish.aborted {
-                        loop_state.cancel_all();
-                    }
+                    loop_state.exit = Some(if finish.aborted {
+                        RunExit::Aborted
+                    } else {
+                        RunExit::Finished
+                    });
                     break;
                 }
                 Some(Message::ResolveSubagentModels(resolve)) => {
@@ -402,11 +424,39 @@ async fn serve(
             }
         }
     }
-    if !loop_state.finished {
+    let exit = loop_state.exit.unwrap_or(RunExit::Disconnected);
+    if exit.cancels_invocations() {
         loop_state.cancel_all();
     }
-    loop_state.finish().await;
+    loop_state.finish(exit).await;
     output.close();
+}
+
+/// How a Run's client loop ended, decided inside the loop and acted on once.
+///
+/// The variants are exclusive: `Finished` keeps live invocations running,
+/// `Aborted` cancels them, and `Disconnected` closes the stream without an
+/// end-of-stream marker the client can no longer receive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunExit {
+    /// The client sent `FinishRun` and asked for a normal finish.
+    Finished,
+    /// The client sent `FinishRun` with `aborted`.
+    Aborted,
+    /// The client's stream went away before `FinishRun`.
+    Disconnected,
+}
+
+impl RunExit {
+    /// Whether the run's own invocations must be cancelled on the way out.
+    fn cancels_invocations(self) -> bool {
+        matches!(self, Self::Aborted | Self::Disconnected)
+    }
+
+    /// Whether the downstream stream still needs the end-of-stream marker.
+    fn sends_end_stream(self) -> bool {
+        self != Self::Disconnected
+    }
 }
 
 /// Per-stream state owned by [`serve`]: the output hub, live invocations,
@@ -416,8 +466,7 @@ struct LoopState {
     cancellation: CancellationToken,
     invocations: Arc<Mutex<HashMap<String, CancellationToken>>>,
     tasks: JoinSet<()>,
-    finished: bool,
-    disconnected: bool,
+    exit: Option<RunExit>,
     provider_call_index: u64,
     configured_context_window: Option<u64>,
     run_context_window: Option<u64>,
@@ -517,7 +566,7 @@ impl LoopState {
 
     /// Waits for every invocation, then closes the stream unless the client
     /// already went away.
-    async fn finish(mut self) {
+    async fn finish(mut self, exit: RunExit) {
         while let Some(joined) = self.tasks.join_next().await {
             if let Err(error) = joined
                 && !error.is_cancelled()
@@ -525,7 +574,7 @@ impl LoopState {
                 tracing::warn!(%error, "a RunInference invocation panicked");
             }
         }
-        if !self.disconnected {
+        if exit.sends_end_stream() {
             self.output.emit(connect::encode_end_stream());
         }
     }
@@ -544,14 +593,15 @@ struct RunSetup<'a> {
 impl RunSetup<'_> {
     /// The `RunReady` fields that do not depend on the client's request.
     fn run_ready_defaults(&self, request: &pb::RunInferenceRunRequest) -> pb::RunInferenceRunReady {
-        let display_name = self
+        let routed_model_display_name = self
             .model
-            .map(|model| model.display_name.clone())
-            .unwrap_or_default();
+            .map(|model| model.display_name.as_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
         pb::RunInferenceRunReady {
             resolved_model: request.requested_model.clone(),
             supports_self_summary: true,
-            routed_model_display_name: (!display_name.is_empty()).then_some(display_name),
+            routed_model_display_name,
             accepts_aborted_finish: true,
             accepts_subagent_model_resolution: true,
             ..pb::RunInferenceRunReady::default()
@@ -565,10 +615,9 @@ impl RunSetup<'_> {
         request: &pb::RunInferenceRunRequest,
         context_window_tokens: Option<u64>,
     ) -> pb::RunInferencePromptModelMetadata {
-        let (display_name, vendor) = self.model.map_or_else(
-            || (String::new(), "openai".to_owned()),
-            |model| (model.display_name.clone(), model.vendor.clone()),
-        );
+        let (display_name, vendor) = self.model.map_or(("", "openai"), |model| {
+            (model.display_name.as_str(), model.vendor.as_str())
+        });
         let anthropic = vendor.eq_ignore_ascii_case("anthropic")
             || vendor.eq_ignore_ascii_case("messages")
             || display_name.to_ascii_lowercase().contains("claude");
@@ -613,16 +662,12 @@ fn summarization_config(
 }
 
 fn summary_prompt_chars(context_window_tokens: Option<u64>) -> i32 {
-    let Some(window) =
-        context_window_tokens.filter(|window| *window > 0 && *window < SUMMARY_PROMPT_SCALE_WINDOW)
-    else {
-        return DEFAULT_SUMMARY_PROMPT_CHARS;
-    };
-    let scaled = u64::try_from(DEFAULT_SUMMARY_PROMPT_CHARS)
-        .unwrap_or_default()
-        .saturating_mul(window)
-        / SUMMARY_PROMPT_SCALE_WINDOW;
-    i32::try_from(scaled).unwrap_or(DEFAULT_SUMMARY_PROMPT_CHARS)
+    let window =
+        context_window_tokens.filter(|window| *window > 0 && *window < SUMMARY_PROMPT_SCALE_WINDOW);
+    let chars = window.map_or(DEFAULT_SUMMARY_PROMPT_CHARS, |window| {
+        DEFAULT_SUMMARY_PROMPT_CHARS.saturating_mul(window) / SUMMARY_PROMPT_SCALE_WINDOW
+    });
+    count_i32(chars)
 }
 
 fn overflow_response(message: &str) -> Option<pb::InferenceStreamResponse> {
@@ -706,25 +751,18 @@ fn resolve_subagent_models(
     resolve: pb::RunInferenceResolveSubagentModels,
     models: &[PluginModelDescriptor],
 ) -> pb::RunInferenceSubagentModelsResolved {
-    let byok = models
-        .iter()
-        .map(|model| ByokModel {
-            hash: model.id.clone(),
-            model_id: model.model_id.clone(),
-            display_name: model.display_name.clone(),
-        })
-        .collect::<Vec<_>>();
+    let byok = byok_models(models);
     let resolved = resolve
         .requested_models
         .iter()
         .map(|requested| {
-            let hash = if byok.iter().any(|model| &model.hash == requested) {
+            let hash = if byok.iter().any(|model| model.hash == requested) {
                 Some(requested.clone())
             } else {
                 subagent_models::resolve(&byok, requested)
                     .ok()
                     .map(str::to_owned)
-                    .filter(|hash| byok.iter().any(|model| &model.hash == hash))
+                    .filter(|hash| byok.iter().any(|model| model.hash == hash))
             };
             pb::RunInferenceResolvedSubagentModel {
                 requested: requested.clone(),
@@ -753,6 +791,19 @@ async fn serve_invocation(
     let mut stream = plugins.stream_model(invocation, cancellation.clone(), Some(recorder.clone()));
     let mut tool_calls = HashMap::<usize, (String, String, String)>::new();
     let mut error = None;
+    // One invocation response per provider event except usage, which sends a
+    // pair; the sender is captured once so a stream of deltas allocates nothing.
+    let mut send = |response: pb::InferenceStreamResponse| {
+        emit(
+            &output,
+            pb::run_inference_server_message::Message::InvocationResponse(
+                pb::RunInferenceInvocationResponse {
+                    invocation_id: id.clone(),
+                    response: Some(response),
+                },
+            ),
+        );
+    };
     while let Some(next) = tokio::select! {
         () = cancellation.cancelled() => None,
         next = stream.next() => next,
@@ -760,30 +811,12 @@ async fn serve_invocation(
         match next {
             Ok(event) => {
                 recorder.event(&event).await;
-                for response in model_responses(event, &mut tool_calls, context_window_tokens) {
-                    emit(
-                        &output,
-                        pb::run_inference_server_message::Message::InvocationResponse(
-                            pb::RunInferenceInvocationResponse {
-                                invocation_id: id.clone(),
-                                response: Some(response),
-                            },
-                        ),
-                    );
-                }
+                model_responses(event, &mut tool_calls, context_window_tokens, &mut send);
             }
             Err(value) => {
                 let message = value.to_string();
                 if let Some(response) = overflow_response(&message) {
-                    emit(
-                        &output,
-                        pb::run_inference_server_message::Message::InvocationResponse(
-                            pb::RunInferenceInvocationResponse {
-                                invocation_id: id.clone(),
-                                response: Some(response),
-                            },
-                        ),
-                    );
+                    send(response);
                 }
                 recorder.failed(&value).await;
                 error = Some(message);
@@ -815,15 +848,23 @@ async fn serve_invocation(
     );
 }
 
+/// Projects one provider event onto the invocation responses it produces.
+///
+/// Every event but usage maps to at most one response, so the responses are
+/// handed to `send` instead of collected.
 fn model_responses(
     event: ModelEvent,
     tool_calls: &mut HashMap<usize, (String, String, String)>,
     context_window_tokens: Option<u64>,
-) -> Vec<pb::InferenceStreamResponse> {
+    send: &mut impl FnMut(pb::InferenceStreamResponse),
+) {
     use pb::inference_stream_response::Response;
     let response = match event {
         ModelEvent::Usage(usage) => {
-            return usage_responses(usage, context_window_tokens);
+            for response in usage_responses(usage, context_window_tokens) {
+                send(response);
+            }
+            return;
         }
         ModelEvent::TextDelta(text) => Response::TextPart(pb::InferenceTextStreamPart {
             text,
@@ -878,7 +919,7 @@ fn model_responses(
         }
         ModelEvent::ToolCallArgumentsDelta { index, delta } => {
             let Some((call_id, _, arguments)) = tool_calls.get_mut(&index) else {
-                return Vec::new();
+                return;
             };
             arguments.push_str(&delta);
             Response::ToolCallPart(pb::InferenceToolCallStreamPart {
@@ -892,7 +933,7 @@ fn model_responses(
         }
         ModelEvent::ToolCallEnd { index } => {
             let Some((call_id, name, arguments)) = tool_calls.remove(&index) else {
-                return Vec::new();
+                return;
             };
             Response::ToolCallPart(pb::InferenceToolCallStreamPart {
                 tool_call_id: call_id,
@@ -911,12 +952,9 @@ fn model_responses(
         ModelEvent::TextStart
         | ModelEvent::ThinkingStart
         | ModelEvent::ProviderReplayState(_)
-        | ModelEvent::Done(_) => return Vec::new(),
+        | ModelEvent::Done(_) => return,
     };
-    vec![pb::InferenceStreamResponse {
-        response: Some(response),
-        ..Default::default()
-    }]
+    send(stream_response(response));
 }
 
 fn usage_responses(
@@ -936,17 +974,17 @@ fn usage_responses(
         });
     vec![
         stream_response(Response::Usage(pb::InferenceUsageInfo {
-            prompt_tokens: count(prompt_tokens),
-            completion_tokens: count(completion_tokens),
-            total_tokens: total_tokens.map(count_value),
+            prompt_tokens: count_i32(prompt_tokens.unwrap_or_default()),
+            completion_tokens: count_i32(completion_tokens.unwrap_or_default()),
+            total_tokens: total_tokens.map(count_i32),
         })),
         stream_response(Response::ExtendedUsage(pb::InferenceExtendedUsageInfo {
-            input_tokens: count(usage.input_tokens),
-            output_tokens: count(usage.output_tokens),
-            cache_read_tokens: count(usage.cache_read_tokens),
-            cache_write_tokens: count(usage.cache_write_tokens),
-            max_tokens: count(context_window_tokens),
-            reasoning_tokens: usage.reasoning_tokens.map(count_value),
+            input_tokens: count_i32(usage.input_tokens.unwrap_or_default()),
+            output_tokens: count_i32(usage.output_tokens.unwrap_or_default()),
+            cache_read_tokens: count_i32(usage.cache_read_tokens.unwrap_or_default()),
+            cache_write_tokens: count_i32(usage.cache_write_tokens.unwrap_or_default()),
+            max_tokens: count_i32(context_window_tokens.unwrap_or_default()),
+            reasoning_tokens: usage.reasoning_tokens.map(count_i32),
         })),
     ]
 }
@@ -977,11 +1015,9 @@ fn agent_mode_configs() -> Vec<pb::RunInferenceAgentModeConfig> {
         .collect()
 }
 
-fn count(value: Option<u64>) -> i32 {
-    count_value(value.unwrap_or_default())
-}
-
-fn count_value(value: u64) -> i32 {
+/// A count as Cursor's `i32` field. A count past `i32::MAX` saturates; no real
+/// prompt, context window or summary prompt reaches it.
+fn count_i32(value: u64) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
 }
 
@@ -1009,6 +1045,7 @@ fn emit(output: &OutputHub, message: pb::run_inference_server_message::Message) 
     }
 }
 
+/// Decodes one `BidiAppend` payload into the client message it carries.
 pub(crate) fn decode_append(data: &[u8]) -> Result<pb::RunInferenceClientMessage> {
     pb::RunInferenceClientMessage::decode(data).map_err(Error::from)
 }

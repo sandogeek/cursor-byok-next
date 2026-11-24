@@ -77,7 +77,12 @@ fn connect_frames_decode_across_chunk_boundaries() {
     let frames = frames.lock().unwrap();
     assert_eq!(frames.len(), 2);
     assert_eq!(frames[0].length, 7);
-    assert!(frames[0].error.contains("未知的 protobuf"));
+    assert!(
+        frames[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("未知的 protobuf"))
+    );
     assert!(frames[1].end_stream);
     assert_eq!(frames[1].kind, "end_stream");
     assert!(frames[1].json.contains('{'));
@@ -170,7 +175,7 @@ fn sample_exchange(id: &str, conversation_id: &str, request_id: &str) -> Exchang
             request_kind: "run_request".into(),
             response_kind: "text".into(),
             frame_count: 1,
-            error: String::new(),
+            error: None,
         },
         request: Payload::default(),
         response: Payload::default(),
@@ -380,7 +385,13 @@ async fn dropping_partial_stream_records_an_error_but_empty_body_completes() {
 
     let exchange = server.store().get("1").unwrap().unwrap();
     assert_eq!(exchange.summary.state, ExchangeState::Error);
-    assert!(exchange.summary.error.contains("取消"));
+    assert!(
+        exchange
+            .summary
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("取消"))
+    );
     assert_eq!(exchange.response.raw_hex, hex::encode("first"));
 
     let response = app

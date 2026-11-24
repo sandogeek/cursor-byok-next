@@ -26,6 +26,9 @@ pub struct ToolResultContent {
     pub name: String,
     pub content: String,
     pub is_error: bool,
+    /// The parts as the provider sent them, kept only while a tool result is in
+    /// flight. `content` is the wire form, so a deserialize rebuilds this field
+    /// from it instead of restoring it verbatim.
     #[serde(skip)]
     pub provider_parts: Vec<ContentPart>,
 }
@@ -67,4 +70,18 @@ mod base64_bytes {
         let encoded = String::deserialize(deserializer)?;
         STANDARD.decode(encoded).map_err(serde::de::Error::custom)
     }
+}
+
+/// Concatenates the text parts, skipping images and files. Provider adapters
+/// and the plugin wire share this projection wherever a protocol has only one
+/// text field per turn.
+#[must_use]
+pub fn joined_text(parts: &[ContentPart]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.as_str()),
+            ContentPart::Image { .. } | ContentPart::File { .. } => None,
+        })
+        .collect()
 }

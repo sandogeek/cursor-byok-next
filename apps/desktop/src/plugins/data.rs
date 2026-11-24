@@ -36,15 +36,19 @@ impl PluginDataStore {
         })
     }
 
-    pub async fn read(&self, plugin_id: &str, key: &str) -> Result<serde_json::Value> {
+    /// Reads the JSON stored under `key`, or `None` when nothing was stored yet.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the id or key is illegal, the file cannot be read, or its
+    /// contents are not JSON.
+    pub async fn read(&self, plugin_id: &str, key: &str) -> Result<Option<serde_json::Value>> {
         let path = self.path(plugin_id, key)?;
-        let lock = self.lock(plugin_id);
+        let lock = self.plugin_lock(plugin_id);
         let _guard = lock.lock().await;
         match tokio::fs::read(&path).await {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(serde_json::Value::Null)
-            }
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(Error::Config(format!(
                 "plugin data read failed at {}: {error}",
                 path.display()
@@ -52,6 +56,12 @@ impl PluginDataStore {
         }
     }
 
+    /// Replaces the JSON stored under `key`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the id or key is illegal, the value cannot be serialized, or
+    /// the atomic replacement fails.
     pub async fn update(
         &self,
         plugin_id: &str,
@@ -59,7 +69,7 @@ impl PluginDataStore {
         value: &serde_json::Value,
     ) -> Result<()> {
         let path = self.path(plugin_id, key)?;
-        let lock = self.lock(plugin_id);
+        let lock = self.plugin_lock(plugin_id);
         let _guard = lock.lock().await;
         self.write_locked(&path, key, value).await
     }
@@ -81,7 +91,7 @@ impl PluginDataStore {
     #[cfg(test)]
     pub async fn clear(&self, plugin_id: &str) -> Result<()> {
         validate_component(plugin_id, "plugin id")?;
-        let lock = self.lock(plugin_id);
+        let lock = self.plugin_lock(plugin_id);
         let _guard = lock.lock().await;
         let path = self.root.join(plugin_id);
         match tokio::fs::remove_dir_all(&path).await {
@@ -100,7 +110,7 @@ impl PluginDataStore {
         Ok(self.root.join(plugin_id).join(format!("{key}.json")))
     }
 
-    fn lock(&self, plugin_id: &str) -> Arc<AsyncMutex<()>> {
+    fn plugin_lock(&self, plugin_id: &str) -> Arc<AsyncMutex<()>> {
         let mut locks = self.locks.lock();
         Arc::clone(
             locks
@@ -192,10 +202,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.read("com.example", "state").await.unwrap()["token"],
+            store
+                .read("com.example", "state")
+                .await
+                .unwrap()
+                .expect("state was written")["token"],
             "secret"
         );
         store.clear("com.example").await.unwrap();
-        assert!(store.read("com.example", "state").await.unwrap().is_null());
+        assert!(store.read("com.example", "state").await.unwrap().is_none());
     }
 }

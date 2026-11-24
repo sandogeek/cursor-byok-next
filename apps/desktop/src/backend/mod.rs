@@ -19,7 +19,7 @@ use axum::{
     Router,
     body::{Body, Bytes, to_bytes},
     extract::Extension,
-    http::{HeaderValue, Request, Response, StatusCode, header},
+    http::{HeaderValue, Request, Response, header},
     routing::{get, post},
 };
 use tokio::net::TcpListener;
@@ -227,14 +227,9 @@ fn misc_routes() -> Router {
 }
 
 async fn is_connected() -> Result<Response<Body>> {
-    let payload = connect::encode_message(&ai::IsConnectedResponse {})?;
-    let mut response = Response::new(Body::from(payload));
-    *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/proto"),
-    );
-    Ok(response)
+    Ok(proto_bytes_response(connect::encode_message(
+        &ai::IsConnectedResponse {},
+    )?))
 }
 
 async fn run_inference_sse(
@@ -247,11 +242,7 @@ async fn run_inference_sse(
     let request_id = request.request_id;
     match inference_service.wait_route(&request_id).await {
         InferenceRoute::Upstream => {
-            proxy::forward(
-                Extension(proxy),
-                Request::from_parts(parts, Body::from(body)),
-            )
-            .await
+            proxy::forward_request(&proxy, Request::from_parts(parts, Body::from(body))).await
         }
         InferenceRoute::Local(run) => {
             let (mut receiver, subscription) = inference_service.subscribe(request_id, &run);
@@ -337,11 +328,9 @@ async fn bidi_append(
                         _
                     ))
                 );
-                let response = proxy::forward(
-                    Extension(proxy),
-                    Request::from_parts(parts, Body::from(body)),
-                )
-                .await;
+                let response =
+                    proxy::forward_request(&proxy, Request::from_parts(parts, Body::from(body)))
+                        .await;
                 if finished {
                     inference_service.finish(&request_id);
                 }
@@ -349,27 +338,31 @@ async fn bidi_append(
             }
         }
     }
-    proxy::forward(
-        Extension(proxy),
-        Request::from_parts(parts, Body::from(body)),
-    )
-    .await
+    proxy::forward_request(&proxy, Request::from_parts(parts, Body::from(body))).await
 }
 
-async fn buffered(request: Request<Body>) -> Result<(axum::http::request::Parts, Bytes)> {
+pub(crate) async fn buffered(
+    request: Request<Body>,
+) -> Result<(axum::http::request::Parts, Bytes)> {
     let (parts, body) = request.into_parts();
-    let body = to_bytes(body, MAX_BUFFERED_BYTES)
-        .await
-        .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
-    Ok((parts, body))
+    Ok((parts, read_body(body).await?))
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "every call site builds the response inline, and prost's encode_to_vec takes &self"
-)]
-pub(crate) fn proto_response(message: impl prost::Message) -> Response<Body> {
-    let body = message.encode_to_vec();
+/// Reads a whole request body, refusing anything past [`MAX_BUFFERED_BYTES`].
+pub(crate) async fn read_body(body: Body) -> Result<Bytes> {
+    to_bytes(body, MAX_BUFFERED_BYTES)
+        .await
+        .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))
+}
+
+/// Encodes `message` as an `application/proto` response.
+pub(crate) fn proto_response(message: &impl prost::Message) -> Response<Body> {
+    proto_bytes_response(message.encode_to_vec())
+}
+
+/// Wraps an already-encoded protobuf body as an `application/proto` response.
+pub(crate) fn proto_bytes_response(body: impl Into<Bytes>) -> Response<Body> {
+    let body = body.into();
     let length = body.len();
     let mut response = Response::new(Body::from(body));
     response.headers_mut().insert(
@@ -394,23 +387,19 @@ pub(crate) fn encode_unary(payload: &[u8], framing: Framing) -> Result<Bytes> {
     connect::wrap_unary(payload, framing)
 }
 
-async fn consume_body(request: Request<Body>) -> Result<()> {
-    to_bytes(request.into_body(), MAX_BUFFERED_BYTES)
-        .await
-        .map_err(|error| crate::Error::Protocol(format!("cannot read request body: {error}")))?;
-    Ok(())
-}
-
+/// Resolves a local-vs-forward decision for an account RPC. `local` runs only
+/// when the request carries this app's own Cursor token; the body is drained so
+/// the client sees a complete request/response pair either way.
 pub(crate) async fn local_or_forward(
-    proxy: proxy::CursorProxy,
+    proxy: &proxy::CursorProxy,
     request: Request<Body>,
-    local: impl FnOnce() -> Result<Response<Body>>,
+    local: impl FnOnce() -> Response<Body>,
 ) -> Result<Response<Body>> {
     if harness::request_uses_local_cursor_token(request.headers()) {
-        consume_body(request).await?;
-        return local();
+        read_body(request.into_body()).await?;
+        return Ok(local());
     }
-    proxy::forward(Extension(proxy), request).await
+    proxy::forward_request(proxy, request).await
 }
 
 #[cfg(test)]

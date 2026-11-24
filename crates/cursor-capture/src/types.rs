@@ -117,8 +117,9 @@ pub struct ExchangeSummary {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub response_kind: String,
     pub frame_count: i32,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub error: String,
+    /// Why the exchange failed, present only for [`ExchangeState::Error`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,10 +140,13 @@ pub struct Payload {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content_codec: String,
     pub size: i64,
+    /// The captured body as lowercase hex, clipped to what the UI can render.
+    /// Empty when nothing was captured.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub raw_hex: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub raw_truncated: bool,
+    /// The decoded body, in `decoded_lang`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub decoded_json: String,
     #[serde(
@@ -151,8 +155,10 @@ pub struct Payload {
         skip_serializing_if = "String::is_empty"
     )]
     pub decoded_lang: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub decode_error: String,
+    /// Why the body could not be decoded. A body that decodes cleanly has
+    /// neither this nor [`Payload::raw_hex`] missing for any other reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frames: Vec<FrameView>,
 }
@@ -181,8 +187,9 @@ pub struct FrameView {
     pub json: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub raw_hex: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub error: String,
+    /// Why this frame alone failed to decode, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl FrameView {

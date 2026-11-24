@@ -1,22 +1,34 @@
 //! Defines newline-delimited messages exchanged with a plugin worker.
+//!
+//! Host → worker: [`HostMessage`] frames, one JSON object per line. Worker →
+//! host: [`WorkerMessage`] frames, same framing. A worker may issue
+//! `host_call` frames at any time while its invocation is registered; every
+//! such call must be answered with exactly one `host_result` or `host_error`
+//! carrying the same id.
 
 use serde::{Deserialize, Serialize};
 
+/// One frame the host writes to a worker's stdin.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostMessage<'a> {
+    /// Starts an invocation. The worker answers with events and one `result`.
     Request {
         id: &'a str,
         method: &'a str,
         params: &'a serde_json::Value,
     },
-    Cancel {
-        id: &'a str,
-    },
+    /// Withdraws an in-flight request; the worker should stop and answer with
+    /// a cancelled result.
+    Cancel { id: &'a str },
+    /// The answer to a worker's `host_call`.
     HostResult {
         id: &'a str,
         result: &'a serde_json::Value,
     },
+    /// The failed answer to a worker's `host_call`. `status` carries the HTTP
+    /// status when the failure was an upstream response, so a plugin can tell
+    /// an auth failure from a transport failure.
     HostError {
         id: &'a str,
         error: &'a str,
@@ -25,9 +37,12 @@ pub enum HostMessage<'a> {
     },
 }
 
+/// One frame a worker writes to stdout.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerMessage {
+    /// The terminal answer for a request. `error` is set when the plugin
+    /// reported a failure; `result` is then meaningless.
     Result {
         id: String,
         #[serde(default)]
@@ -35,10 +50,13 @@ pub enum WorkerMessage {
         #[serde(default)]
         error: Option<String>,
     },
+    /// One streamed model event for an in-flight request.
     Event {
         id: String,
         event: serde_json::Value,
     },
+    /// A capability call the worker makes back into the host. `request_id`
+    /// attributes it to the invocation that is allowed to make it.
     HostCall {
         id: String,
         #[serde(rename = "requestId")]

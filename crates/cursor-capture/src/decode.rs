@@ -20,6 +20,8 @@ const AGENT_CLIENT_MESSAGE: &str = "agent.v1.AgentClientMessage";
 /// Connect frame flag bits, from the Connect protocol spec.
 const CONNECT_FLAG_COMPRESSED: u8 = 0x01;
 const CONNECT_FLAG_END_STREAM: u8 = 0x02;
+/// The `[flags u8][length u32 BE]` header preceding every Connect payload.
+const CONNECT_ENVELOPE_BYTES: usize = 5;
 
 /// Why a stored or captured payload could not be decoded for display.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -68,7 +70,8 @@ pub const SERVER_GET_CONFIG_PATH: &str = "/aiserver.v1.ServerConfigService/GetSe
 pub const RUN_SSE_PATH: &str = "/agent.v1.AgentService/RunSSE";
 
 static POOL: LazyLock<DescriptorPool> = LazyLock::new(|| {
-    DescriptorPool::decode(CURSOR_DESCRIPTORS).expect("decode Cursor protobuf descriptors")
+    DescriptorPool::decode(CURSOR_DESCRIPTORS)
+        .unwrap_or_else(|error| panic!("cannot decode the Cursor protobuf descriptors: {error}"))
 });
 
 /// Frame and message lengths travel over the wire as `i32`. Cursor never sends
@@ -105,6 +108,12 @@ static PROTO_JSON: LazyLock<prost_reflect::SerializeOptions> = LazyLock::new(|| 
         .skip_default_fields(true)
 });
 
+/// Incrementally turns captured Connect stream bytes into [`FrameView`]s.
+///
+/// One decoder serves one direction of one exchange: `write` is fed body chunks
+/// as they arrive, and each complete frame is handed to the callback given to
+/// [`ConnectFrameDecoder::new`]. `close` flushes a trailing partial frame as an
+/// error so the UI can show it.
 pub struct ConnectFrameDecoder {
     buffer: Vec<u8>,
     message_type: String,
@@ -152,29 +161,38 @@ impl ConnectFrameDecoder {
             return;
         }
         self.buffer.extend_from_slice(payload);
-        while self.buffer.len() >= 5 && self.frame_count < self.max_frames {
-            let flags = self.buffer[0];
-            let Ok(header) = <[u8; 4]>::try_from(&self.buffer[1..5]) else {
-                return;
-            };
+        // Frames are consumed by index and the buffer is drained once at the
+        // end, so a chunk holding many frames does not shift the rest per frame.
+        let mut consumed = 0;
+        while self.frame_count < self.max_frames {
+            let remaining = &self.buffer[consumed..];
+            if remaining.len() < CONNECT_ENVELOPE_BYTES {
+                break;
+            }
+            let flags = remaining[0];
+            let mut header = [0_u8; 4];
+            header.copy_from_slice(&remaining[1..CONNECT_ENVELOPE_BYTES]);
             let length = usize::try_from(u32::from_be_bytes(header)).unwrap_or(usize::MAX);
             if length > MAX_DECOMPRESSED_BYTES {
                 self.emit(FrameView {
                     flags,
                     length: frame_count(length),
-                    error: "Connect 帧长度异常".into(),
+                    error: Some("Connect 帧长度异常".into()),
                     ..FrameView::default()
                 });
                 self.buffer.clear();
                 return;
             }
-            if self.buffer.len() < 5 + length {
-                return;
+            if remaining.len() < CONNECT_ENVELOPE_BYTES + length {
+                break;
             }
-            let frame_payload = self.buffer[5..5 + length].to_vec();
-            self.buffer.drain(..5 + length);
-            let frame = self.decode(flags, &frame_payload);
+            let frame_payload = &remaining[CONNECT_ENVELOPE_BYTES..CONNECT_ENVELOPE_BYTES + length];
+            let frame = self.decode(flags, frame_payload);
             self.emit(frame);
+            consumed += CONNECT_ENVELOPE_BYTES + length;
+        }
+        if consumed > 0 {
+            self.buffer.drain(..consumed);
         }
     }
 
@@ -184,7 +202,7 @@ impl ConnectFrameDecoder {
             self.emit(FrameView {
                 length: frame_count(self.buffer.len()),
                 raw_hex: clipped_hex(&self.buffer, HEX_CLIP_BYTES),
-                error: "流结束时仍有不完整的 Connect 帧".into(),
+                error: Some("流结束时仍有不完整的 Connect 帧".into()),
                 ..FrameView::default()
             });
         }
@@ -210,7 +228,7 @@ impl ConnectFrameDecoder {
             match decompress_payload(payload, &self.codec) {
                 Ok(bytes) => bytes,
                 Err(err) => {
-                    frame.error = err.to_string();
+                    frame.error = Some(err.to_string());
                     return frame;
                 }
             }
@@ -224,8 +242,8 @@ impl ConnectFrameDecoder {
             return frame;
         }
         match decode_named_message(&self.message_type, &decoded) {
-            None => frame.error = "未知的 protobuf 消息类型".into(),
-            Some(Err(err)) => frame.error = format!("protobuf 解码失败：{err}"),
+            None => frame.error = Some("未知的 protobuf 消息类型".into()),
+            Some(Err(err)) => frame.error = Some(format!("protobuf 解码失败：{err}")),
             Some(Ok(message)) => {
                 frame.message_type.clone_from(&self.message_type);
                 frame.kind = active_oneof_name(&message);
@@ -239,15 +257,24 @@ impl ConnectFrameDecoder {
     }
 }
 
+/// The result of decoding one unary Connect body: the JSON to show plus the
+/// request metadata recovered from it.
 #[derive(Debug, Default)]
 pub struct DecodedUnary {
+    /// The message rendered as protobuf JSON, empty when decoding failed.
     pub json: String,
+    /// The RPC kind the path names (`run_sse`, `bidi_append`, …).
     pub kind: String,
+    /// The `request_id` the body carried, when the RPC has one.
     pub request_id: String,
+    /// The conversation the body belongs to, when it names one.
     pub conversation_id: String,
+    /// Why the body could not be decoded, when it could not.
     pub error: Option<String>,
 }
 
+/// Decodes one unary request body against the message type its path names.
+/// A path this crate knows nothing about decodes as an empty [`DecodedUnary`].
 pub fn decode_unary_request(path: &str, payload: &[u8]) -> DecodedUnary {
     if path == BIDI_APPEND_PATH {
         return decode_bidi_append_request(payload);
@@ -412,6 +439,8 @@ pub fn decode_unary_response(path: &str, payload: &[u8]) -> Result<DecodedRespon
     })
 }
 
+/// The stored bodies the debugger can re-decode: streaming frames, unary
+/// protobuf JSON, and plain text/JSON. Returns whether anything was filled in.
 pub fn hydrate_stored_exchange(exchange: &mut Exchange) -> bool {
     if !exchange.summary.state.is_replayable() {
         return false;
@@ -457,7 +486,7 @@ fn hydrate_stored_request_frames(exchange: &mut Exchange) -> bool {
             exchange.request.frames = frames;
         }
         Ok(_) => {}
-        Err(err) => exchange.request.decode_error = err.to_string(),
+        Err(err) => exchange.request.decode_error = Some(err.to_string()),
     }
     true
 }
@@ -487,7 +516,7 @@ fn hydrate_stored_response_frames(exchange: &mut Exchange) -> bool {
             exchange.response.frames = frames;
         }
         Ok(_) => {}
-        Err(err) => exchange.response.decode_error = err.to_string(),
+        Err(err) => exchange.response.decode_error = Some(err.to_string()),
     }
     true
 }
@@ -503,10 +532,10 @@ fn hydrate_stored_unary_request(exchange: &mut Exchange) -> bool {
         Ok(payload) => {
             let decoded = decode_unary_request(&exchange.summary.path, &payload);
             if let Some(err) = decoded.error {
-                exchange.request.decode_error = err;
+                exchange.request.decode_error = Some(err);
             }
             if decoded.json.is_empty() {
-                return !exchange.request.decode_error.is_empty();
+                return exchange.request.decode_error.is_some();
             }
             exchange.request.decoded_json = decoded.json;
             exchange.request.decoded_lang = "json".into();
@@ -518,7 +547,7 @@ fn hydrate_stored_unary_request(exchange: &mut Exchange) -> bool {
                 exchange.summary.conversation_id = decoded.conversation_id;
             }
         }
-        Err(err) => exchange.request.decode_error = err.to_string(),
+        Err(err) => exchange.request.decode_error = Some(err.to_string()),
     }
     true
 }
@@ -538,9 +567,9 @@ fn hydrate_stored_unary_response(exchange: &mut Exchange) -> bool {
                 exchange.summary.response_kind = decoded.kind;
             }
             Ok(_) => {}
-            Err(err) => exchange.response.decode_error = err.to_string(),
+            Err(err) => exchange.response.decode_error = Some(err.to_string()),
         },
-        Err(err) => exchange.response.decode_error = err.to_string(),
+        Err(err) => exchange.response.decode_error = Some(err.to_string()),
     }
     true
 }
@@ -565,7 +594,7 @@ fn hydrate_stored_text_payload(payload: &mut Payload) -> bool {
     let raw = match hex::decode(payload.raw_hex.trim()) {
         Ok(raw) => raw,
         Err(err) => {
-            payload.decode_error = format!("解析已存储正文失败：{err}");
+            payload.decode_error = Some(format!("解析已存储正文失败：{err}"));
             return true;
         }
     };
@@ -576,18 +605,25 @@ fn hydrate_stored_text_payload(payload: &mut Payload) -> bool {
     payload.decoded_json = decoded.text;
     payload.decoded_lang = decoded.language;
     if let Some(err) = decoded.error {
-        payload.decode_error = err;
+        payload.decode_error = Some(err);
     }
     true
 }
 
+/// One body decoded for display: the text, its language for the editor, and
+/// why it could not be decoded when it could not.
 #[derive(Debug, Default)]
 pub struct DecodedContent {
+    /// The decoded body as text, empty when decoding failed.
     pub text: String,
+    /// The syntax the debug UI highlights `text` with (`json`, `protobuf`, …).
     pub language: String,
+    /// Why the body could not be fully decoded, when it could not.
     pub error: Option<String>,
 }
 
+/// Decodes one captured body for display, honouring its content type and
+/// compression codec. JSON is re-indented; anything else is shown as text.
 pub fn decode_captured_content(payload: &[u8], content_type: &str, codec: &str) -> DecodedContent {
     let decoded = match decode_http_content(payload, codec) {
         Ok(decoded) => decoded,
@@ -915,6 +951,8 @@ fn unary_response_message(path: &str) -> Option<(prost_reflect::MessageDescripto
     Some((method.output(), proto_message_kind(method.output().name())))
 }
 
+/// The request/response protobuf type a streaming RPC carries, or `None` when
+/// `path` is not a streaming method.
 pub fn streaming_request_message_type(path: &str) -> Option<String> {
     if path == RUN_SSE_PATH {
         return Some("aiserver.v1.BidiRequestId".into());
@@ -926,6 +964,8 @@ pub fn streaming_request_message_type(path: &str) -> Option<String> {
     Some(method.input().full_name().to_string())
 }
 
+/// The response protobuf type a streaming RPC returns, or `None` when `path` is
+/// not a streaming method.
 pub fn streaming_response_message_type(path: &str) -> Option<String> {
     if path == RUN_SSE_PATH {
         return Some("agent.v1.AgentServerMessage".into());
@@ -937,10 +977,12 @@ pub fn streaming_response_message_type(path: &str) -> Option<String> {
     Some(method.output().full_name().to_string())
 }
 
+/// Whether the debugger knows how to decode this path's request body.
 pub fn decodes_unary_request(path: &str) -> bool {
     path == BIDI_APPEND_PATH || unary_request_message(path).is_some()
 }
 
+/// Whether the debugger knows how to decode this path's response body.
 pub fn decodes_unary_response(path: &str) -> bool {
     unary_response_message(path).is_some()
 }
@@ -954,12 +996,18 @@ fn decode_named_message(
 }
 
 fn rpc_method_descriptor(path: &str) -> Option<MethodDescriptor> {
-    let parts: Vec<_> = path.trim().trim_matches('/').split('/').collect();
-    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+    let mut parts = path.trim().trim_matches('/').split('/');
+    let (Some(service_name), Some(method_name), None) = (parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if service_name.is_empty() || method_name.is_empty() {
         return None;
     }
-    let service = POOL.get_service_by_name(parts[0])?;
-    service.methods().find(|method| method.name() == parts[1])
+    let service = POOL.get_service_by_name(service_name)?;
+    service
+        .methods()
+        .find(|method| method.name() == method_name)
 }
 
 fn proto_message_kind(name: &str) -> String {

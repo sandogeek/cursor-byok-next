@@ -944,7 +944,7 @@ impl Calls {
     /// Newest calls, the detailed-mode setting, and storage counts.
     pub async fn snapshot(this: Instance<Self>) -> CallsSnapshot {
         this.with(|calls| calls.store.clone())
-            .snapshot(200)
+            .snapshot(calls::DEFAULT_LIST_LIMIT)
             .await
             .into()
     }
@@ -970,17 +970,20 @@ impl Calls {
     /// Turns detailed recording on or off for later calls.
     #[expect(
         clippy::fn_params_excessive_bools,
-        reason = "the toggle maps 1:1 to a TSX boolean; `PayloadStorage::from` converts it here"
+        reason = "the toggle maps 1:1 to a TSX boolean, so the boundary takes the same bool the UI binds to"
     )]
     pub async fn set_detailed(
         this: Instance<Self>,
         detailed: bool,
     ) -> Result<CallsSnapshot, Error> {
         let store = this.with(|calls| calls.store.clone());
-        store
-            .set_detailed_logging(PayloadStorage::from(detailed))
-            .await?;
-        Ok(store.snapshot(200).await.into())
+        let storage = if detailed {
+            PayloadStorage::Detailed
+        } else {
+            PayloadStorage::Metrics
+        };
+        store.set_detailed_logging(storage).await?;
+        Ok(store.snapshot(calls::DEFAULT_LIST_LIMIT).await.into())
     }
 
     /// Deletes stored request and response payloads, keeping summaries.

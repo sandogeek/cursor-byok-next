@@ -43,37 +43,57 @@ pub fn keep_local_loop_services(services: Vec<Service>) -> Vec<Service> {
         .collect()
 }
 
-/// Merges duplicate messages, keeping the most complete declaration.
-#[must_use]
-pub fn merge_messages_by_type_name(messages: Vec<Message>) -> Vec<Message> {
-    let mut index = HashMap::new();
-    let mut merged = Vec::new();
-    for message in messages {
-        if let Some(&existing) = index.get(&message.type_name) {
-            if message_completeness(&message) > message_completeness(&merged[existing]) {
-                merged[existing] = message;
+/// A declaration that can be deduplicated by its fully-qualified name.
+trait NamedDeclaration {
+    /// The fully-qualified type name two declarations share when they collide.
+    fn type_name(&self) -> &str;
+    /// How completely this declaration models the wire shape; higher wins.
+    fn completeness(&self) -> i32;
+}
+
+/// Keeps the most complete declaration per type name, preserving first-seen order.
+fn merge_by_type_name<T: NamedDeclaration>(items: Vec<T>) -> Vec<T> {
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut merged: Vec<T> = Vec::new();
+    for item in items {
+        if let Some(&existing) = index.get(item.type_name()) {
+            if item.completeness() > merged[existing].completeness() {
+                merged[existing] = item;
             }
-            continue;
+        } else {
+            index.insert(item.type_name().to_owned(), merged.len());
+            merged.push(item);
         }
-        index.insert(message.type_name.clone(), merged.len());
-        merged.push(message);
     }
     merged
 }
 
-fn message_completeness(message: &Message) -> i32 {
-    let mut score = length_score(message.fields.len()) * FIELD_COUNT_WEIGHT;
-    for field in &message.fields {
-        if field.kind == FieldKind::Map {
-            score += MAP_FIELD_WEIGHT;
-        }
-        if field.oneof.is_some() {
-            score += ONEOF_FIELD_WEIGHT;
-        }
-        score += type_ref_completeness(field.t.as_ref());
-        score += type_ref_completeness(field.map_value_t.as_ref());
+/// Merges duplicate messages, keeping the most complete declaration.
+#[must_use]
+pub fn merge_messages_by_type_name(messages: Vec<Message>) -> Vec<Message> {
+    merge_by_type_name(messages)
+}
+
+impl NamedDeclaration for Message {
+    fn type_name(&self) -> &str {
+        &self.type_name
     }
-    score
+
+    /// Field count dominates; maps, oneofs and resolved type references add to it.
+    fn completeness(&self) -> i32 {
+        let mut score = length_score(self.fields.len()) * FIELD_COUNT_WEIGHT;
+        for field in &self.fields {
+            if field.kind == FieldKind::Map {
+                score += MAP_FIELD_WEIGHT;
+            }
+            if field.oneof.is_some() {
+                score += ONEOF_FIELD_WEIGHT;
+            }
+            score += type_ref_completeness(field.t.as_ref());
+            score += type_ref_completeness(field.map_value_t.as_ref());
+        }
+        score
+    }
 }
 
 fn type_ref_completeness(token: Option<&TypeToken>) -> i32 {
@@ -89,54 +109,42 @@ fn length_score(len: usize) -> i32 {
 /// Merges duplicate enums, keeping the most complete declaration.
 #[must_use]
 pub fn merge_enums_by_type_name(enums: Vec<Enum>) -> Vec<Enum> {
-    let mut index = HashMap::new();
-    let mut merged = Vec::new();
-    for item in enums {
-        if let Some(&existing) = index.get(&item.type_name) {
-            if enum_completeness(&item) > enum_completeness(&merged[existing]) {
-                merged[existing] = item;
-            }
-            continue;
-        }
-        index.insert(item.type_name.clone(), merged.len());
-        merged.push(item);
-    }
-    merged
+    merge_by_type_name(enums)
 }
 
-fn enum_completeness(item: &Enum) -> i32 {
-    let mut score = length_score(item.values.len()) * FIELD_COUNT_WEIGHT;
-    for value in &item.values {
-        score += length_score(value.name.len());
+impl NamedDeclaration for Enum {
+    fn type_name(&self) -> &str {
+        &self.type_name
     }
-    score
+
+    fn completeness(&self) -> i32 {
+        let mut score = length_score(self.values.len()) * FIELD_COUNT_WEIGHT;
+        for value in &self.values {
+            score += length_score(value.name.len());
+        }
+        score
+    }
 }
 
 /// Merges duplicate services, keeping the most complete declaration.
 #[must_use]
 pub fn merge_services_by_type_name(services: Vec<Service>) -> Vec<Service> {
-    let mut index: HashMap<String, usize> = HashMap::new();
-    let mut merged: Vec<Service> = Vec::new();
-    for service in services {
-        if let Some(&existing) = index.get(&service.type_name) {
-            if service_completeness(&service) > service_completeness(&merged[existing]) {
-                merged[existing] = service;
-            }
-            continue;
-        }
-        index.insert(service.type_name.clone(), merged.len());
-        merged.push(service);
-    }
-    merged
+    merge_by_type_name(services)
 }
 
-fn service_completeness(service: &Service) -> i32 {
-    let mut score = length_score(service.methods.len()) * FIELD_COUNT_WEIGHT;
-    for method in &service.methods {
-        score += name_completeness(&method.input_type);
-        score += name_completeness(&method.output_type);
+impl NamedDeclaration for Service {
+    fn type_name(&self) -> &str {
+        &self.type_name
     }
-    score
+
+    fn completeness(&self) -> i32 {
+        let mut score = length_score(self.methods.len()) * FIELD_COUNT_WEIGHT;
+        for method in &self.methods {
+            score += name_completeness(&method.input_type);
+            score += name_completeness(&method.output_type);
+        }
+        score
+    }
 }
 
 fn name_completeness(type_ref: &str) -> i32 {
@@ -349,7 +357,7 @@ pub fn collect_needed_types(
     for message in messages {
         let context = TypeContext::new(&message.package, message.pos, message.module_start);
         let references = message.fields.iter().flat_map(field_type_references);
-        for type_ref in references {
+        for type_ref in references.into_iter().flatten() {
             scope.collect(type_ref, context, &mut needed, local_types);
         }
     }
@@ -367,17 +375,14 @@ pub fn collect_needed_types(
 }
 
 /// The named types one field refers to: its own type and, for a map, its value.
-fn field_type_references(field: &Field) -> Vec<&str> {
-    let mut references = Vec::with_capacity(2);
-    if field.kind.is_named()
-        && let Some(TypeToken::Named(name)) = &field.t
-    {
-        references.push(name.as_str());
-    }
-    if field.map_value_kind.is_named()
-        && let Some(TypeToken::Named(name)) = &field.map_value_t
-    {
-        references.push(name.as_str());
-    }
-    references
+fn field_type_references(field: &Field) -> [Option<&str>; 2] {
+    let own = match &field.t {
+        Some(TypeToken::Named(name)) if field.kind.is_named() => Some(name.as_str()),
+        _ => None,
+    };
+    let map_value = match &field.map_value_t {
+        Some(TypeToken::Named(name)) if field.map_value_kind.is_named() => Some(name.as_str()),
+        _ => None,
+    };
+    [own, map_value]
 }

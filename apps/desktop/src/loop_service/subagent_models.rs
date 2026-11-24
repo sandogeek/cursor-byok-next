@@ -2,37 +2,51 @@
 
 use crate::{Error, Result};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ByokModel {
-    pub hash: String,
-    pub model_id: String,
-    pub display_name: String,
+/// A configured model, borrowed by the resolution so picking one allocates
+/// nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ByokModel<'a> {
+    pub hash: &'a str,
+    pub model_id: &'a str,
+    pub display_name: &'a str,
 }
 
-pub(crate) fn resolve<'a>(models: &'a [ByokModel], requested: &'a str) -> Result<&'a str> {
+/// Resolves a Task model selection to a configured model hash.
+///
+/// A hash or an exact model id wins; otherwise a display name is matched with
+/// and without its trailing `(...)` suffix.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] when a display name matches several configured
+/// models, because guessing would record the call under the wrong model.
+pub(crate) fn resolve<'models>(
+    models: &'models [ByokModel<'_>],
+    requested: &'models str,
+) -> Result<&'models str> {
     if let Some(model) = models.iter().find(|model| model.hash == requested) {
-        return Ok(&model.hash);
+        return Ok(model.hash);
     }
     let key = display_key(requested);
     let mut matches = models
         .iter()
-        .filter(|model| model.model_id == requested || display_key(&model.display_name) == key)
+        .filter(|model| model.model_id == requested || display_key(model.display_name) == key)
         .collect::<Vec<_>>();
     if matches.is_empty() {
         let key = display_key(without_suffix(requested));
         matches = models
             .iter()
-            .filter(|model| display_key(without_suffix(&model.display_name)) == key)
+            .filter(|model| display_key(without_suffix(model.display_name)) == key)
             .collect();
     }
     match matches.as_slice() {
         [] => Ok(requested),
-        [model] => Ok(&model.hash),
+        [model] => Ok(model.hash),
         _ => Err(Error::Protocol(format!(
             "Task model {requested:?} is ambiguous; use a configured model hash: {}",
             matches
                 .iter()
-                .map(|model| model.hash.as_str())
+                .map(|model| model.hash)
                 .collect::<Vec<_>>()
                 .join(", ")
         ))),
@@ -58,20 +72,38 @@ fn without_suffix(name: &str) -> &str {
 mod tests {
     use super::*;
 
-    fn model(hash: &str, model_id: &str, display_name: &str) -> ByokModel {
-        ByokModel {
-            hash: hash.into(),
-            model_id: model_id.into(),
-            display_name: display_name.into(),
-        }
+    fn models<'a>(entries: &'a [(&'a str, &'a str, &'a str)]) -> Vec<ByokModel<'a>> {
+        entries
+            .iter()
+            .map(|&(hash, model_id, display_name)| ByokModel {
+                hash,
+                model_id,
+                display_name,
+            })
+            .collect()
     }
 
     #[test]
     fn hashes_take_precedence_over_other_models_aliases() {
-        let models = [
-            model("hash-a", "hash-b", "Model A"),
-            model("hash-b", "other-id", "Model B"),
+        let entries = [
+            ("hash-a", "hash-b", "Model A"),
+            ("hash-b", "other-id", "Model B"),
         ];
-        assert_eq!(resolve(&models, "hash-b").unwrap(), "hash-b");
+        let configured = models(&entries);
+        assert_eq!(resolve(&configured, "hash-b").unwrap(), "hash-b");
+    }
+
+    #[test]
+    fn a_display_name_without_its_suffix_still_resolves() {
+        let entries = [("hash-a", "model-a", "Model A (Thinking)")];
+        let configured = models(&entries);
+        assert_eq!(resolve(&configured, "Model A").unwrap(), "hash-a");
+    }
+
+    #[test]
+    fn an_unknown_selection_passes_through() {
+        let entries = [("hash-a", "model-a", "Model A")];
+        let configured = models(&entries);
+        assert_eq!(resolve(&configured, "default").unwrap(), "default");
     }
 }

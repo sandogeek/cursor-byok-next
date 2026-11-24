@@ -1,6 +1,9 @@
 //! Defines and validates the static filesystem plugin manifest.
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 
@@ -35,6 +38,12 @@ pub struct PluginPermissions {
 }
 
 impl PluginManifest {
+    /// Checks every field the loader relies on before a plugin runs: API version,
+    /// ids, entry and icon paths, and the network allowlist.
+    ///
+    /// # Errors
+    ///
+    /// Fails on any of the above, including a path that escapes `directory`.
     pub fn validate(&self, directory: &Path) -> Result<()> {
         if self.api_version != PLUGIN_API_VERSION {
             return Err(Error::Config(format!(
@@ -43,7 +52,7 @@ impl PluginManifest {
             )));
         }
         validate_id(&self.id, "plugin id")?;
-        required(&self.name, "plugin name")?;
+        require_non_empty(&self.name, "plugin name")?;
         Version::parse(&self.version)
             .ok_or_else(|| Error::Config(format!("invalid plugin version: {}", self.version)))?;
         if let Some(minimum) = &self.min_app_version {
@@ -136,44 +145,21 @@ fn validate_network_host(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn required<'a>(value: &'a str, label: &str) -> Result<&'a str> {
-    let value = value.trim();
-    if value.is_empty() {
-        Err(Error::Config(format!("{label} is required")))
-    } else {
-        Ok(value)
+fn require_non_empty(value: &str, label: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(Error::Config(format!("{label} is required")));
     }
+    Ok(())
 }
 
 fn validate_entry_path(directory: &Path, value: &str) -> Result<()> {
-    let path = Path::new(value);
-    if !is_safe_relative_path(path) {
-        return Err(Error::Config(format!("invalid plugin entry path: {value}")));
-    }
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !matches!(extension.as_str(), "js" | "mjs" | "ts" | "mts") {
-        return Err(Error::Config(format!(
-            "unsupported plugin entry format: {value}"
-        )));
-    }
-    let entry = directory.join(path);
-    if !entry.is_file() {
-        return Err(Error::Config(format!(
-            "plugin entry does not exist: {value}"
-        )));
-    }
-    let root = directory.canonicalize()?;
-    let entry = entry.canonicalize()?;
-    if !entry.starts_with(&root) {
-        return Err(Error::Config(format!(
-            "plugin entry escapes its directory: {value}"
-        )));
-    }
-    Ok(())
+    checked_local_file(
+        directory,
+        value,
+        &["js", "mjs", "ts", "mts"],
+        "plugin entry",
+    )
+    .map(drop)
 }
 
 fn is_safe_relative_path(path: &Path) -> bool {
@@ -189,26 +175,44 @@ fn is_safe_relative_path(path: &Path) -> bool {
 }
 
 fn validate_asset_path(directory: &Path, value: &str) -> Result<()> {
+    checked_local_file(directory, value, &["svg", "png", "webp"], "plugin icon").map(drop)
+}
+
+/// Resolves a manifest path against the plugin directory and rejects escapes,
+/// unsupported extensions, and missing files. Manifest strings come from the
+/// plugin, so a `../` here would let it point at anything on disk.
+fn checked_local_file(
+    directory: &Path,
+    value: &str,
+    extensions: &[&str],
+    label: &str,
+) -> Result<PathBuf> {
     let path = Path::new(value);
     if !is_safe_relative_path(path) {
-        return Err(Error::Config(format!("invalid plugin asset path: {value}")));
+        return Err(Error::Config(format!("invalid {label} path: {value}")));
     }
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !matches!(extension.as_str(), "svg" | "png" | "webp") {
+    if !extensions.contains(&extension.as_str()) {
         return Err(Error::Config(format!(
-            "unsupported plugin icon format: {value}"
+            "unsupported {label} format: {value}"
         )));
     }
-    if !directory.join(path).is_file() {
+    let file = directory.join(path);
+    if !file.is_file() {
+        return Err(Error::Config(format!("{label} does not exist: {value}")));
+    }
+    let root = directory.canonicalize()?;
+    let file = file.canonicalize()?;
+    if !file.starts_with(&root) {
         return Err(Error::Config(format!(
-            "plugin icon does not exist: {value}"
+            "{label} escapes its directory: {value}"
         )));
     }
-    Ok(())
+    Ok(file)
 }
 
 #[cfg(test)]

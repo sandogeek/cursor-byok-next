@@ -9,7 +9,9 @@ mod tool;
 pub use inference::{
     ModelInvocation, ModelLatency, ModelRequest, ModelSpec, PromptSpec, Reasoning, Usage,
 };
-pub use message::{ContentPart, ProviderReplayState, Role, ToolCallContent, ToolResultContent};
+pub use message::{
+    ContentPart, ProviderReplayState, Role, ToolCallContent, ToolResultContent, joined_text,
+};
 pub use projection::{ProjectedContent, ProjectedMessage};
 pub use tool::ToolDefinition;
 

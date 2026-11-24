@@ -9,8 +9,8 @@ use crate::types::{
     looks_like_package_name,
 };
 
-#[derive(Debug, Clone)]
 /// A compact-schema class, whose `$p` declares the package of its messages.
+#[derive(Debug, Clone)]
 pub struct CompactClass {
     pub name: String,
     pub extends: String,
@@ -19,8 +19,8 @@ pub struct CompactClass {
     pub package_ref: String,
 }
 
-#[derive(Debug, Clone)]
 /// A package-name constant the compact schema refers to by identifier.
+#[derive(Debug, Clone)]
 pub struct CompactPrefix {
     pub name: String,
     pub package: String,

@@ -47,19 +47,31 @@ impl Reasoning {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ModelSpec {
+    /// The `plugin:`/provider hash the caller routed to.
     pub model_id: String,
+    /// The name to show in recorded calls; the provider's own id when absent.
     pub display_name: Option<String>,
+    /// Whether reasoning is on, and at which depth.
     pub reasoning: Reasoning,
+    /// Whether the caller asked for the provider's fast tier.
     pub latency: ModelLatency,
+    /// When absent, the provider's default applies.
     pub max_output_tokens: Option<u64>,
+    /// The window the client asked for, which bounds compaction, not the
+    /// provider's own limit.
     pub context_window_tokens: Option<u64>,
+    /// Sequences that end generation before the model would.
     #[serde(default)]
     pub stop_sequences: Vec<String>,
+    /// Provider-specific sampling fields, merged into the request body by each
+    /// adapter; a field a protocol owns (`model`, `messages`, `tools`, …) is
+    /// rejected rather than silently replaced.
     #[serde(default)]
     pub extra_params: serde_json::Value,
 }
 
 impl ModelSpec {
+    /// A spec for `model_id` with every optional knob left at its default.
     pub fn new(model_id: &str) -> Self {
         Self {
             model_id: model_id.to_owned(),
@@ -76,34 +88,50 @@ impl ModelSpec {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PromptSpec {
+    /// The system prompt: rules, agent instructions and the model catalog.
     pub instructions: String,
+    /// Tools the provider may call for this turn.
     pub tools: Vec<ToolDefinition>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ModelRequest {
+    /// The system prompt and tools of this turn.
     pub prompt: PromptSpec,
+    /// Which model to call, and with which sampling knobs.
     pub model: ModelSpec,
+    /// The conversation as the client sent it, oldest first.
     pub history: Vec<ProjectedMessage>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ModelInvocation {
+    /// The call id the recorder and the invocation responses share.
     pub call_id: String,
+    /// The client Run the call belongs to.
     pub run_id: String,
+    /// Stable per conversation, so providers and plugins can key their caches.
     pub conversation_id: String,
+    /// 0-based index of this call within the run, for the call log.
     pub provider_call_index: u64,
+    /// Everything the provider is asked for.
     pub request: ModelRequest,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Usage {
+    /// Prompt tokens as the provider bills them.
     pub input_tokens: Option<u64>,
+    /// Prompt tokens that actually occupied the context window, when a provider
+    /// reports it separately (cache reads do not).
     pub context_input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    /// Prompt tokens served from the provider's cache.
     pub cache_read_tokens: Option<u64>,
+    /// Prompt tokens written to the provider's cache.
     pub cache_write_tokens: Option<u64>,
+    /// Output tokens the model spent on hidden reasoning.
     pub reasoning_tokens: Option<u64>,
 }
 

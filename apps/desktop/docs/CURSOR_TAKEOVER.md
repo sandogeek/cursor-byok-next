@@ -51,7 +51,8 @@ pub use self::proxy::{is_cursor_host, Routing as ProxyRouting, UPSTREAM_URL_HEAD
 | 10 | 锁 | 全程持有 `proxy` 锁；`apply_cursor_configuration` 是同步函数，不需要 await | `operation` 串行化 enable/disable/restore/后端接线；`proxy` 锁只在需要时持有 | `apply()` 要 await 账号注入；仅有 `proxy` 锁无法阻止启停在释放锁后交错 |
 | 11 | 账号注入的串行化 | 每次 `enable` 直接写 | `operation` 串行化；仅后端就绪时注入，显式 `.busy_timeout(5s)` | 后端未就绪时请求直通官方，不能注入会被直接转发的伪 token |
 | 12 | 代理 URL 解析 | `reqwest::Url` | 自带 `loopback_host()`（约 10 行） | 只用来判断“是不是 loopback”，不值得为此引入 `reqwest`（它在本仓库会额外拉 native-tls） |
-| 13 | `clear_stale_managed_settings` | `Result<()>` | `Result<bool>`（是否真的清了） | UI 需要区分“没有残留”与“清掉了”，否则每次启动都要弹一次提示 |
+| 13 | 残留清理入口 | `clear_stale()` 单独一个方法 | `clear_proxy_settings` 一个方法同时承担停用清理与残留清理（语义都是"只在完整托管签名匹配时才删"） | 两者判定条件完全相同，只是调用时机不同；保留两个名字会让读者以为规则不同 |
+| 13b | 设置状态查询 | `Result<Option<bool>>`（`None` = 没给 URL，`Some(bool)` = 是否匹配） | `Result<ManagedSettings>`（`NotConfigured` / `Missing` / `Applied`） | `Option<bool>` 在 `report()` 的匹配里要写成 `Ok(None \| Some(false))` 这种嵌套字面量，且 `is_applied` 无处安放；具名枚举让"未配置"和"未生效"显式分开 |
 | 14 | `terminate_cursor` | `Result<()>` | `Result<bool>`（Cursor 是否在运行） | 调用方据此决定日志措辞；也让“没装 Cursor”不被当成失败 |
 | 15 | 意图持久化 | SQLite 键 `cursor_takeover_enabled` | `harness.json` 的 `{ enabled, proxyPort }` | 同上，本仓库还没有数据库；文件损坏/缺失一律读成“关”，绝不凭读不懂的文件接管 |
 | 16 | 数据目录 | `~/.cursor-byok-v3`（CA 在 `ca/`） | `~/.cursor-byok-next`（CA 在 `ca/`） | 两个客户端要能并存，证书也不能互相覆盖 |

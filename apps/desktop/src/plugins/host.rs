@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Serialize;
+use serde::{Deserialize as _, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -29,7 +29,7 @@ use super::{
     },
     origin,
     state::{PluginStateStore, ResourceDraft, ResourcePatch, ResourceRecord, StoredModel},
-    worker::{PluginWorker, WorkerStreamItem},
+    worker::{PluginWorker, WorkerRequest, WorkerStreamItem},
 };
 
 const LIVE_CATALOG_TTL: Duration = Duration::from_secs(15);
@@ -62,7 +62,7 @@ impl std::fmt::Debug for PluginHost {
 struct HostInner {
     catalog: PluginCatalog,
     state: PluginStateStore,
-    entries: RwLock<Option<Vec<PluginEntry>>>,
+    entries: RwLock<Option<Arc<[Arc<PluginEntry>]>>>,
     workers: Mutex<HashMap<String, Arc<PluginWorker>>>,
     live_catalogs: Mutex<HashMap<LiveCatalogKey, LiveCatalogEntry>>,
     /// Serializes the mutations that read the catalog, call into the plugin and
@@ -90,11 +90,17 @@ struct LiveCatalogEntry {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FormSubmitResponse {
+    /// How many resources the submit created.
     pub added: usize,
+    /// How many existing resources it replaced, matched by `key`.
     pub updated: usize,
+    /// Why the follow-up model sync failed, when it did. The resources were
+    /// still saved; this only means their catalog is stale.
     pub model_sync_error: Option<String>,
 }
 
+/// What the Plugins screen renders. `runtime_ready` is false when Bun is
+/// missing, in which case `plugins` came from manifests alone.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginSnapshot {
@@ -104,6 +110,12 @@ pub struct PluginSnapshot {
 }
 
 impl PluginHost {
+    /// Opens the app's managed plugin host under the app data directory.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the data directory cannot be resolved or the plugin workspace
+    /// and data store cannot be created.
     pub fn managed() -> Result<Self> {
         let data_dir = crate::harness::data_dir()?;
         Ok(Self::new(
@@ -134,26 +146,24 @@ impl PluginHost {
         ))
     }
 
+    /// Everything the Plugins screen renders: the Bun runtime state plus each
+    /// plugin's providers, resources, and cached catalogs.
+    ///
+    /// Never fails: a missing runtime is reported as `runtime_ready: false`
+    /// with the manifests it could still read, so the UI can show plugin cards
+    /// before Bun exists.
     pub async fn snapshot(&self) -> PluginSnapshot {
-        let _operation = self.inner.operations.lock().await;
-        let executable = {
-            let mut executable = self.inner.executable.write().await;
-            if self.inner.entries.read().await.is_none() {
-                *executable = find_bun();
-            }
-            executable.clone()
-        };
-        let Some(executable) = executable else {
+        let Some(executable) = self.runtime().await else {
             return PluginSnapshot {
                 runtime_ready: false,
                 runtime_error: Some(super::text("plugin.error.bun_missing")),
-                plugins: self.manifest_plugins(),
+                plugins: self.manifest_plugins().await,
             };
         };
         let entries = self.entries(&executable).await;
-        let mut plugins = Vec::new();
-        for entry in entries {
-            plugins.push(self.descriptor(&entry, &executable).await);
+        let mut plugins = Vec::with_capacity(entries.len());
+        for entry in entries.iter() {
+            plugins.push(self.descriptor(entry, &executable).await);
         }
         if plugins.is_empty() {
             return PluginSnapshot {
@@ -169,6 +179,13 @@ impl PluginHost {
         }
     }
 
+    /// Runs one plugin add-method form and persists the resources it produces.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the runtime, plugin, resource type or method is unknown; a
+    /// required field is empty; a URL field is not a usable origin; the plugin
+    /// returns no resources; or the resources cannot be saved.
     pub async fn form_submit(
         &self,
         plugin_id: &str,
@@ -189,14 +206,13 @@ impl PluginHost {
                     "plugin '{plugin_id}' does not define form method '{method_id}'"
                 ))
             })?;
-        let values = values
-            .as_object()
-            .cloned()
-            .ok_or_else(|| Error::Config("form values must be an object".into()))?;
+        let serde_json::Value::Object(form) = values else {
+            return Err(Error::Config("form values must be an object".into()));
+        };
         let mut submitted = serde_json::Map::new();
         let mut submit_origins = HashSet::new();
         for field in &method.fields {
-            let raw = values
+            let raw = form
                 .get(&field.id)
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
@@ -253,6 +269,12 @@ impl PluginHost {
         })
     }
 
+    /// Removes one stored resource and drops its cached catalog.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the runtime, plugin, resource type or resource is unknown, or
+    /// the store cannot be written.
     pub async fn delete_resource(
         &self,
         plugin_id: &str,
@@ -295,18 +317,23 @@ impl PluginHost {
         Ok(())
     }
 
+    /// Every model of every configured provider, in plugin-declared order.
+    /// Best-effort: an unreadable runtime or a failing catalog yields the models
+    /// that could still be loaded, because Cursor's model picker must not fail
+    /// to open.
     pub async fn configured_models(&self) -> Vec<PluginModelDescriptor> {
         let Ok(executable) = self.executable().await else {
             return Vec::new();
         };
+        let entries = self.entries(&executable).await;
         let mut models = Vec::new();
-        for entry in self.entries(&executable).await {
+        for entry in entries.iter() {
             for provider in &entry.definition.providers {
-                if !self.provider_configured(&entry, provider).await {
+                if !self.provider_configured(entry, provider).await {
                     continue;
                 }
                 let stored = self
-                    .provider_models(&entry, &executable, provider, CatalogRefresh::Cached, None)
+                    .provider_models(entry, &executable, provider, CatalogRefresh::Cached, None)
                     .await
                     .models;
                 models.extend(stored.into_iter().map(|model| {
@@ -322,6 +349,12 @@ impl PluginHost {
         models
     }
 
+    /// Resolves one `plugin:` model id to a descriptor, or `None` when the id is
+    /// not a plugin id or its provider is not configured.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the runtime, plugin or provider is unknown.
     pub async fn model(&self, model_id: &str) -> Result<Option<PluginModelDescriptor>> {
         let Some(id) = parse_model_id(model_id) else {
             return Ok(None);
@@ -344,6 +377,12 @@ impl PluginHost {
             }))
     }
 
+    /// Turns one `plugin:` model into a provider stream the local loop can serve.
+    ///
+    /// The stream emits the plugin's events in order and finishes with the
+    /// plugin's terminal result; a plugin that stops without one is an error
+    /// rather than a silent end, because the loop would otherwise record a
+    /// truncated turn as complete.
     pub fn stream_model(
         &self,
         invocation: ModelInvocation,
@@ -360,9 +399,9 @@ impl PluginHost {
             let upstream_id = parsed.model.to_owned();
             let executable = host.executable().await?;
             let entry = host.find_entry(&executable, &plugin_id).await?;
-            let provider = find_provider(&entry, &provider_id)?.clone();
+            let provider = find_provider(&entry, &provider_id)?;
             let stored = host
-                .provider_models(&entry, &executable, &provider, CatalogRefresh::Cached, None)
+                .provider_models(&entry, &executable, provider, CatalogRefresh::Cached, None)
                 .await
                 .models;
             let stored = stored
@@ -370,10 +409,10 @@ impl PluginHost {
                 .find(|model| model.id == upstream_id)
                 .ok_or_else(|| Error::NotFound(format!("plugin model {model_id}")))?;
             let resource = host
-                .invocation_resource(&plugin_id, &provider, &upstream_id)
+                .invocation_resource(&plugin_id, provider, &upstream_id)
                 .await?;
             let mut model_snapshot = stored.snapshot();
-            if provider.catalog == CatalogMode::Live
+            if provider.live_resource_type().is_some()
                 && let Some(upstream) = live_upstream_id(&upstream_id)
                 && let Some(object) = model_snapshot.as_object_mut()
             {
@@ -392,14 +431,14 @@ impl PluginHost {
             }
             let invocation = Arc::new(invocation);
             let mut items = worker
-                .invoke_streaming_with_origins(
-                    "provider.invoke",
+                .invoke_streaming(WorkerRequest {
+                    method: "provider.invoke",
                     params,
-                    cancellation.clone(),
-                    recorder.clone(),
-                    origins,
-                    Some(Arc::clone(&invocation)),
-                )
+                    cancellation,
+                    recorder,
+                    allowed_origins: origins,
+                    model: Some(Arc::clone(&invocation)),
+                })
                 .await?;
             yield ModelEvent::Start {
                 model_call_id: invocation.call_id.clone(),
@@ -409,8 +448,9 @@ impl PluginHost {
                     WorkerStreamItem::Event(event) => yield event,
                     WorkerStreamItem::Result(result) => {
                         let value = result?;
+                        let bound_resource = resource.as_ref().map(|(kind, record)| (*kind, record));
                         if host
-                            .apply_invocation_result(&plugin_id, resource.as_ref(), &value)
+                            .apply_invocation_result(&plugin_id, bound_resource, &value)
                             .await?
                         {
                             return;
@@ -425,19 +465,19 @@ impl PluginHost {
     }
 
     /// Resolves which stored resource the invocation binds to, if the provider
-    /// advertises one.
-    async fn invocation_resource(
+    /// advertises one. The type is borrowed from the provider declaration.
+    async fn invocation_resource<'a>(
         &self,
         plugin_id: &str,
-        provider: &ProviderDefinition,
+        provider: &'a ProviderDefinition,
         upstream_id: &str,
-    ) -> Result<Option<(String, ResourceRecord)>> {
-        let Some(resource_type) = &provider.resource_type else {
+    ) -> Result<Option<(&'a str, ResourceRecord)>> {
+        let Some(resource_type) = provider.resource_type.as_deref() else {
             return Ok(None);
         };
         if provider.catalog != CatalogMode::Live {
             let record = self.select_resource(plugin_id, resource_type).await?;
-            return Ok(Some((resource_type.clone(), record)));
+            return Ok(Some((resource_type, record)));
         }
         let resource_id = live_resource_id(upstream_id).ok_or_else(|| {
             Error::Provider(format!("invalid live plugin model ID: {upstream_id}"))
@@ -445,7 +485,7 @@ impl PluginHost {
         let record = self
             .find_record(plugin_id, resource_type, resource_id)
             .await?;
-        Ok(Some((resource_type.clone(), record)))
+        Ok(Some((resource_type, record)))
     }
 
     /// Applies the plugin's terminal result. Returns `Ok(true)` when the call
@@ -453,7 +493,7 @@ impl PluginHost {
     async fn apply_invocation_result(
         &self,
         plugin_id: &str,
-        resource: Option<&(String, ResourceRecord)>,
+        resource: Option<(&str, &ResourceRecord)>,
         value: &serde_json::Value,
     ) -> Result<bool> {
         let status = value
@@ -463,13 +503,13 @@ impl PluginHost {
         let patch = value
             .get("patch")
             .filter(|patch| !patch.is_null())
-            .map(|patch| serde_json::from_value::<ResourcePatch>(patch.clone()))
+            .map(ResourcePatch::deserialize)
             .transpose()?;
         if let (Some(patch), Some((resource_type, record))) = (patch, resource) {
             if let Err(error) = self
                 .inner
                 .state
-                .apply_patch(plugin_id, resource_type, &record.id, patch)
+                .apply_patch(plugin_id, resource_type, record.id.as_str(), patch)
                 .await
             {
                 tracing::warn!(plugin = %plugin_id, %error, "failed to apply plugin resource patch");
@@ -493,10 +533,11 @@ impl PluginHost {
         }
     }
 
-    fn manifest_plugins(&self) -> Vec<PluginDescriptor> {
+    async fn manifest_plugins(&self) -> Vec<PluginDescriptor> {
         self.inner
             .catalog
             .manifests()
+            .await
             .into_iter()
             .map(|loaded| PluginDescriptor {
                 id: loaded.manifest.id,
@@ -619,20 +660,44 @@ impl PluginHost {
                 .zip(views)
                 .map(|(record, view)| PluginResourceView::from_record(record, view))
                 .collect(),
-            Ok(_) | Err(_) => records
-                .iter()
-                .map(|record| {
-                    PluginResourceView::from_record(
-                        record,
-                        ResourcePresentation {
-                            display_name: record.key.clone(),
-                            description: serde_json::Value::Null,
-                            metrics: Vec::new(),
-                        },
-                    )
-                })
-                .collect(),
+            Ok(views) => {
+                tracing::warn!(
+                    plugin = %entry.manifest.id,
+                    resource_type = %definition.resource_type,
+                    expected = records.len(),
+                    presented = views.len(),
+                    "plugin returned a resource presentation of the wrong length"
+                );
+                Self::fallback_views(records)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    plugin = %entry.manifest.id,
+                    resource_type = %definition.resource_type,
+                    %error,
+                    "plugin could not present its resources"
+                );
+                Self::fallback_views(records)
+            }
         }
+    }
+
+    /// Renders every record with no plugin-supplied presentation, so a failed
+    /// or malformed `resource.present` never hides resources the user stored.
+    fn fallback_views(records: &[ResourceRecord]) -> Vec<PluginResourceView> {
+        records
+            .iter()
+            .map(|record| {
+                PluginResourceView::from_record(
+                    record,
+                    ResourcePresentation {
+                        display_name: record.key.clone(),
+                        description: serde_json::Value::Null,
+                        metrics: Vec::new(),
+                    },
+                )
+            })
+            .collect()
     }
 
     async fn provider_configured(
@@ -643,13 +708,24 @@ impl PluginHost {
         let Some(resource_type) = &provider.resource_type else {
             return true;
         };
-        !self
+        match self
             .inner
             .state
             .resources(&entry.manifest.id, resource_type)
             .await
-            .unwrap_or_default()
-            .is_empty()
+        {
+            Ok(records) => !records.is_empty(),
+            // A provider whose resources cannot be read is not usable; the
+            // failure is already reported on the resource descriptor.
+            Err(error) => {
+                tracing::warn!(
+                    plugin = %entry.manifest.id,
+                    %error,
+                    "could not read plugin resources to decide if the provider is configured"
+                );
+                false
+            }
+        }
     }
 
     async fn sync_provider_models_for_resource(
@@ -689,7 +765,7 @@ impl PluginHost {
         if !provider.has_models || provider.catalog != CatalogMode::Live {
             return ProviderCatalog::default();
         }
-        let Some(resource_type) = provider.resource_type.as_deref() else {
+        let Some(resource_type) = provider.live_resource_type() else {
             return ProviderCatalog::default();
         };
         let records = self
@@ -819,31 +895,54 @@ impl PluginHost {
             .retain(|key, _| key.plugin != plugin_id || !resource_ids.contains(&key.resource));
     }
 
+    /// Re-detects Bun while the catalog has not been loaded yet, and hands back
+    /// the detected path.
+    ///
+    /// Detection walks `PATH` on the filesystem, so it runs before anything is
+    /// locked.
+    async fn runtime(&self) -> Option<std::path::PathBuf> {
+        if let Some(executable) = self.inner.executable.read().await.clone() {
+            return Some(executable);
+        }
+        let detected = find_bun();
+        let mut executable = self.inner.executable.write().await;
+        if let Some(current) = executable.as_ref() {
+            return Some(current.clone());
+        }
+        executable.clone_from(&detected);
+        detected
+    }
+
     async fn executable(&self) -> Result<std::path::PathBuf> {
-        self.inner
-            .executable
-            .read()
+        self.runtime()
             .await
-            .clone()
             .ok_or_else(|| Error::Runtime(super::text("plugin.error.bun_missing")))
     }
 
-    async fn entries(&self, executable: &Path) -> Vec<PluginEntry> {
+    async fn entries(&self, executable: &Path) -> Arc<[Arc<PluginEntry>]> {
         if let Some(entries) = self.inner.entries.read().await.as_ref() {
-            return entries.clone();
+            return Arc::clone(entries);
         }
-        let loaded = self.inner.catalog.entries(executable).await;
+        let loaded: Arc<[Arc<PluginEntry>]> = self
+            .inner
+            .catalog
+            .entries(executable)
+            .await
+            .into_iter()
+            .map(Arc::new)
+            .collect();
         if !loaded.is_empty() {
-            *self.inner.entries.write().await = Some(loaded.clone());
+            *self.inner.entries.write().await = Some(Arc::clone(&loaded));
         }
         loaded
     }
 
-    async fn find_entry(&self, executable: &Path, plugin_id: &str) -> Result<PluginEntry> {
+    async fn find_entry(&self, executable: &Path, plugin_id: &str) -> Result<Arc<PluginEntry>> {
         self.entries(executable)
             .await
-            .into_iter()
+            .iter()
             .find(|entry| entry.manifest.id == plugin_id)
+            .map(Arc::clone)
             .ok_or_else(|| Error::NotFound(format!("plugin {plugin_id}")))
     }
 
