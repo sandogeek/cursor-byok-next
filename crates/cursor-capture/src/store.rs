@@ -19,6 +19,66 @@ use crate::types::{
 const EVENT_CAPACITY: usize = 256;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+thread_local! {
+    /// How many [`ExchangeStore::apply_update`] closures are running on this
+    /// thread. The store lock is not reentrant, so a callback that reached back
+    /// into the store would deadlock; this turns that into a reported failure.
+    static UPDATE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks the scope in which a caller's update closure runs under the lock.
+struct UpdateScope;
+
+impl UpdateScope {
+    fn enter() -> Self {
+        UPDATE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for UpdateScope {
+    fn drop(&mut self) {
+        UPDATE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Whether this thread is inside an update closure, and so must not take the
+/// store lock again.
+fn inside_update() -> bool {
+    UPDATE_DEPTH.with(std::cell::Cell::get) > 0
+}
+
+/// Why a reentrant call was refused.
+///
+/// Kept apart from [`Inner::last_error`] because the write that usually follows
+/// a successful update clears that field, which would hide the violation, and
+/// because reporting it must not touch the lock the caller already holds.
+#[derive(Debug, Default)]
+struct Refusals(Mutex<Option<String>>);
+
+impl Refusals {
+    /// Records a refused call without touching the store lock.
+    fn record(&self, operation: &str) {
+        *self.0.lock() = Some(format!(
+            "{operation} was called from inside an update closure and was refused"
+        ));
+    }
+}
+
+/// Reports a refused reentrant call without blocking on the lock it would
+/// deadlock on. Returns `true` when the call must be refused.
+fn refuse_reentrancy(store: &ExchangeStore, operation: &'static str) -> bool {
+    if !inside_update() {
+        return false;
+    }
+    store.refusals.record(operation);
+    true
+}
+
+/// How many exchanges the startup backfill hydrates and rewrites per batch. Small
+/// enough that a long history never sits fully decoded in memory.
+const BACKFILL_BATCH: usize = 64;
+
 /// Attaches the failed operation to a wrapped error.
 trait Context<T, E> {
     fn context(self, operation: &'static str) -> Result<T>;
@@ -62,6 +122,9 @@ pub(crate) struct CaptureId {
 pub struct ExchangeStore {
     inner: Arc<Mutex<Inner>>,
     events: broadcast::Sender<StoreEvent>,
+    /// Names of calls refused because they ran inside an update closure. Separate
+    /// from `Inner` so recording one never takes the lock the caller holds.
+    refusals: Arc<Refusals>,
 }
 
 impl std::fmt::Debug for ExchangeStore {
@@ -103,6 +166,7 @@ impl ExchangeStore {
                 last_error: None,
             })),
             events,
+            refusals: Arc::new(Refusals::default()),
         }
     }
 
@@ -134,6 +198,7 @@ impl ExchangeStore {
                 request_bytes INTEGER NOT NULL DEFAULT 0,
                 response_bytes INTEGER NOT NULL DEFAULT 0,
                 payload_json BLOB NOT NULL,
+                summary_json BLOB NOT NULL DEFAULT '{}',
                 updated_at_ms INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS exchanges_conversation_started_idx
@@ -161,48 +226,76 @@ impl ExchangeStore {
         Ok(store)
     }
 
+    /// Hydrates stored exchanges in bounded batches, rewriting only those whose
+    /// decode is out of date. Without batching, a long history would be fully
+    /// deserialized into one `Vec` before any row was updated.
     fn backfill_decoded_exchanges(inner: &mut Inner) -> Result<()> {
         let Some(db) = inner.db.as_mut() else {
             return Ok(());
         };
-        let mut stmt = db
-            .prepare("SELECT payload_json FROM exchanges")
-            .context("preparing the backfill read")?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, Vec<u8>>(0))
-            .context("querying rows to backfill")?;
-        let mut exchanges = Vec::new();
-        for payload in rows {
-            let payload = payload.context("reading a backfill row")?;
+        let mut last_id: i64 = 0;
+        while Self::backfill_batch(db, &mut last_id)? {
+            // Keep going until a batch comes back short.
+        }
+        Ok(())
+    }
+
+    /// Hydrates the next `BACKFILL_BATCH` rows past `last_id`. Returns whether a
+    /// further batch may exist.
+    fn backfill_batch(db: &mut Connection, last_id: &mut i64) -> Result<bool> {
+        let rows = {
+            let mut stmt = db
+                .prepare(
+                    "SELECT CAST(id AS INTEGER) AS row_id, payload_json FROM exchanges
+                     WHERE CAST(id AS INTEGER) > ? ORDER BY row_id ASC LIMIT ?",
+                )
+                .context("preparing the backfill read")?;
+            let mapped = stmt
+                .query_map(params![*last_id, row_limit(BACKFILL_BATCH)], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .context("querying rows to backfill")?;
+            let mut collected = Vec::new();
+            for row in mapped {
+                collected.push(row.context("reading a backfill row")?);
+            }
+            collected
+        };
+        if rows.is_empty() {
+            return Ok(false);
+        }
+        let full_batch = rows.len() == BACKFILL_BATCH;
+        let mut rewrites = Vec::new();
+        for (row_id, payload) in rows {
+            *last_id = row_id;
             let mut exchange: Exchange =
                 serde_json::from_slice(&payload).context("decoding a backfill row")?;
             if hydrate_stored_exchange(&mut exchange).is_changed() {
-                exchanges.push(exchange);
+                rewrites.push(exchange);
             }
         }
-        drop(stmt);
-        if exchanges.is_empty() {
-            return Ok(());
+        if !rewrites.is_empty() {
+            let tx = db
+                .transaction()
+                .context("opening the backfill transaction")?;
+            for exchange in &rewrites {
+                let payload =
+                    serde_json::to_vec(exchange).context("encoding a backfilled exchange")?;
+                tx.execute(
+                    "UPDATE exchanges SET payload_json = ?, conversation_id = ?, request_id = ?, updated_at_ms = ? WHERE id = ?",
+                    params![
+                        payload,
+                        exchange.summary.conversation_id,
+                        exchange.summary.request_id,
+                        Utc::now().timestamp_millis(),
+                        exchange.summary.id
+                    ],
+                )
+                .context("writing a backfilled exchange")?;
+            }
+            tx.commit().context("committing the backfill")?;
         }
-        let tx = db
-            .transaction()
-            .context("opening the backfill transaction")?;
-        for exchange in &exchanges {
-            let payload = serde_json::to_vec(exchange).context("encoding a backfilled exchange")?;
-            tx.execute(
-                "UPDATE exchanges SET payload_json = ?, conversation_id = ?, request_id = ?, updated_at_ms = ? WHERE id = ?",
-                params![
-                    payload,
-                    exchange.summary.conversation_id,
-                    exchange.summary.request_id,
-                    Utc::now().timestamp_millis(),
-                    exchange.summary.id
-                ],
-            )
-            .context("writing a backfilled exchange")?;
-        }
-        tx.commit().context("committing the backfill")?;
-        Ok(())
+        Ok(full_batch)
     }
 
     fn load_recent(inner: &mut Inner) -> Result<()> {
@@ -265,6 +358,16 @@ impl ExchangeStore {
         self.apply_update(id, apply, Persistence::Skip);
     }
 
+    /// Applies `apply` to the cached exchange and notifies subscribers.
+    ///
+    /// # Reentrancy
+    ///
+    /// `apply` runs while the store's lock is held: it must only touch the
+    /// exchange it is given. Calling back into this store from it (or doing
+    /// decoding that should have happened before) would either block on the
+    /// non-reentrant lock or hold it for the length of that work. The
+    /// [`UPDATE_GUARD`] below turns such a call into a degraded answer instead
+    /// of a hang; keep expensive work outside this call.
     fn apply_update(
         &self,
         id: &CaptureId,
@@ -292,7 +395,10 @@ impl ExchangeStore {
             };
             let previous_request_id = exchange.summary.request_id.clone();
             let previous_conversation_id = exchange.summary.conversation_id.clone();
-            apply(exchange);
+            {
+                let _guard = UpdateScope::enter();
+                apply(exchange);
+            }
             if exchange.summary.request_id != previous_request_id
                 || exchange.summary.conversation_id != previous_conversation_id
             {
@@ -318,50 +424,62 @@ impl ExchangeStore {
     /// Returns [`Error::Database`] when the database cannot be read, and
     /// [`Error::Json`] when a stored payload cannot be decoded.
     pub fn summaries(&self, conversation_id: &str) -> Result<Vec<ExchangeSummary>> {
+        if refuse_reentrancy(self, "summaries") {
+            return Ok(Vec::new());
+        }
         let mut inner = self.inner.lock();
+        let conversation = conversation_id.trim();
         if inner.db.is_none() {
+            // The memory branch must apply the same filter as the SQL one, or the
+            // two paths disagree for the same call.
             return Ok(inner
                 .order
                 .iter()
-                .filter_map(|id| inner.exchanges.get(id).map(|item| item.summary.clone()))
+                .filter_map(|id| inner.exchanges.get(id))
+                .filter(|item| {
+                    conversation.is_empty() || item.summary.conversation_id == conversation
+                })
+                .map(|item| item.summary.clone())
                 .collect());
         }
-        let rows = {
-            let Some(db) = inner.db.as_mut() else {
-                return Ok(Vec::new());
-            };
-            let sql = if conversation_id.is_empty() {
-                "SELECT payload_json, conversation_id FROM exchanges
-                 ORDER BY started_at_ms DESC, id DESC"
-            } else {
-                "SELECT payload_json, conversation_id FROM exchanges
-                 WHERE conversation_id = ? ORDER BY started_at_ms DESC, id DESC"
-            };
-            let mut stmt = db.prepare(sql).context("preparing the summary read")?;
-            let mut map_row =
-                |row: &rusqlite::Row<'_>| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?));
-            let mapped = if conversation_id.is_empty() {
-                stmt.query_map([], &mut map_row)
-            } else {
-                stmt.query_map([conversation_id], &mut map_row)
-            }
-            .context("querying exchange summaries")?;
-            let mut collected = Vec::new();
-            for row in mapped {
-                collected.push(row.context("reading a summary row")?);
-            }
-            collected
+        let Some(db) = inner.db.as_mut() else {
+            return Ok(Vec::new());
         };
-        let mut result = Vec::new();
-        for (payload, persisted_conversation_id) in rows {
-            let mut exchange: Exchange =
-                serde_json::from_slice(&payload).context("decoding a summary row")?;
-            exchange.summary.conversation_id = persisted_conversation_id;
-            if let Some(current) = inner.exchanges.get(&exchange.summary.id) {
+        // Only the summary columns are read: `payload_json` holds whole bodies,
+        // and loading it just to summarise would scale memory with history size.
+        // `summary_json` is exactly the shape `ExchangeSummary` serializes to, so
+        // this path never needs to deserialize the full payload.
+        let sql = if conversation.is_empty() {
+            "SELECT id, summary_json FROM exchanges ORDER BY started_at_ms DESC, id DESC"
+        } else {
+            "SELECT id, summary_json FROM exchanges WHERE conversation_id = ?
+             ORDER BY started_at_ms DESC, id DESC"
+        };
+        let mut stmt = db.prepare(sql).context("preparing the summary read")?;
+        let read_row =
+            |row: &rusqlite::Row<'_>| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?));
+        let mapped = if conversation.is_empty() {
+            stmt.query_map([], read_row)
+        } else {
+            stmt.query_map([conversation], read_row)
+        }
+        .context("querying exchange summaries")?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row.context("reading a summary row")?);
+        }
+        drop(stmt);
+        // Reuse the cached (authoritative, in-memory) summary when one exists;
+        // otherwise decode only the small persisted summary.
+        let mut result = Vec::with_capacity(rows.len());
+        for (id, summary_json) in rows {
+            if let Some(current) = inner.exchanges.get(&id) {
                 result.push(current.summary.clone());
-            } else {
-                result.push(exchange.summary);
+                continue;
             }
+            let summary: ExchangeSummary =
+                serde_json::from_slice(&summary_json).context("decoding a summary row")?;
+            result.push(summary);
         }
         Ok(result)
     }
@@ -373,6 +491,9 @@ impl ExchangeStore {
     /// Returns [`Error::Database`] when the database cannot be read, and
     /// [`Error::Json`] when the stored payload cannot be decoded.
     pub fn get(&self, id: &str) -> Result<Option<Exchange>> {
+        if refuse_reentrancy(self, "get") {
+            return Ok(None);
+        }
         let mut inner = self.inner.lock();
         if let Some(exchange) = inner.exchanges.get(id) {
             return Ok(Some(exchange.clone()));
@@ -389,6 +510,9 @@ impl ExchangeStore {
     ///
     /// Returns [`Error::Database`] when the rows cannot be deleted.
     pub fn clear(&self) -> Result<()> {
+        if refuse_reentrancy(self, "clear") {
+            return Ok(());
+        }
         let event = {
             let mut inner = self.inner.lock();
             if let Some(db) = inner.db.as_mut()
@@ -402,6 +526,7 @@ impl ExchangeStore {
             inner.order.clear();
             inner.exchanges.clear();
             inner.last_error = None;
+            *self.refusals.0.lock() = None;
             inner.generation += 1;
             inner.next_number = 1;
             StoreEvent {
@@ -419,6 +544,9 @@ impl ExchangeStore {
     ///
     /// Returns [`Error::Database`] when the aggregate query fails.
     pub fn conversations(&self) -> Result<Vec<ConversationSummary>> {
+        if refuse_reentrancy(self, "conversations") {
+            return Ok(Vec::new());
+        }
         let mut inner = self.inner.lock();
         if let Some(db) = inner.db.as_mut() {
             let rows = {
@@ -487,10 +615,17 @@ impl ExchangeStore {
     /// The store's database path and last persistence failure.
     #[must_use]
     pub fn status(&self) -> StoreStatus {
+        if refuse_reentrancy(self, "status") {
+            return StoreStatus::default();
+        }
         let inner = self.inner.lock();
+        let refused = self.refusals.0.lock().clone();
         StoreStatus {
             database_path: inner.database_path.clone(),
-            last_error: inner.last_error.clone(),
+            // A refused reentrant call outranks a persistence error: it means the
+            // capture path violated the store's contract, so it is not hidden by a
+            // later successful write.
+            last_error: refused.or_else(|| inner.last_error.clone()),
         }
     }
 
@@ -498,6 +633,15 @@ impl ExchangeStore {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<StoreEvent> {
         self.events.subscribe()
+    }
+
+    /// Records a capture-side problem for the debug UI's `/api/status`, so a
+    /// dropped capture job is visible instead of silently missing.
+    pub fn note_error(&self, message: &str) {
+        if refuse_reentrancy(self, "note_error") {
+            return;
+        }
+        self.inner.lock().last_error = Some(message.to_owned());
     }
 
     fn publish(&self, event: StoreEvent) {
@@ -526,45 +670,49 @@ fn cache_exchange(inner: &mut Inner, exchange: Exchange) {
     }
 }
 
+/// Persists an exchange row: the summary columns the list API needs plus the
+/// full payload for the detail view. Both are written together so a summary
+/// never disagrees with its payload.
 fn persist_locked(inner: &mut Inner, id: &str) {
     let (Some(db), Some(exchange)) = (inner.db.as_mut(), inner.exchanges.get(id)) else {
         return;
     };
-    match serde_json::to_vec(exchange) {
-        Ok(payload) => {
-            match db
-                .execute(
-                    "INSERT INTO exchanges (
-                        id, started_at_ms, conversation_id, request_id, state, request_bytes,
-                        response_bytes, payload_json, updated_at_ms
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                    ON CONFLICT(id) DO UPDATE SET
-                        started_at_ms = excluded.started_at_ms,
-                        conversation_id = excluded.conversation_id,
-                        request_id = excluded.request_id,
-                        state = excluded.state,
-                        request_bytes = excluded.request_bytes,
-                        response_bytes = excluded.response_bytes,
-                        payload_json = excluded.payload_json,
-                        updated_at_ms = excluded.updated_at_ms",
-                    params![
-                        exchange.summary.id,
-                        exchange.summary.started_at.timestamp_millis(),
-                        exchange.summary.conversation_id,
-                        exchange.summary.request_id,
-                        exchange.summary.state.label(),
-                        exchange.summary.request_bytes,
-                        exchange.summary.response_bytes,
-                        payload,
-                        Utc::now().timestamp_millis()
-                    ],
-                )
-                .context("writing an exchange row")
-            {
-                Ok(_) => inner.last_error = None,
-                Err(err) => inner.last_error = Some(err.to_string()),
-            }
-        }
+    let written = (|| -> Result<()> {
+        let payload = serde_json::to_vec(exchange).context("encoding an exchange")?;
+        let summary = serde_json::to_vec(&exchange.summary).context("encoding a summary")?;
+        db.execute(
+            "INSERT INTO exchanges (
+                id, started_at_ms, conversation_id, request_id, state, request_bytes,
+                response_bytes, payload_json, summary_json, updated_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(id) DO UPDATE SET
+                started_at_ms = excluded.started_at_ms,
+                conversation_id = excluded.conversation_id,
+                request_id = excluded.request_id,
+                state = excluded.state,
+                request_bytes = excluded.request_bytes,
+                response_bytes = excluded.response_bytes,
+                payload_json = excluded.payload_json,
+                summary_json = excluded.summary_json,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                exchange.summary.id,
+                exchange.summary.started_at.timestamp_millis(),
+                exchange.summary.conversation_id,
+                exchange.summary.request_id,
+                exchange.summary.state.label(),
+                exchange.summary.request_bytes,
+                exchange.summary.response_bytes,
+                payload,
+                summary,
+                Utc::now().timestamp_millis()
+            ],
+        )
+        .context("writing an exchange row")
+        .map(|_changed| ())
+    })();
+    match written {
+        Ok(()) => inner.last_error = None,
         Err(err) => inner.last_error = Some(err.to_string()),
     }
 }

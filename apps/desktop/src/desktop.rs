@@ -71,12 +71,33 @@ impl DesktopSettings {
     /// A missing or unparsable file falls back to the defaults: shell appearance
     /// is cosmetic, so a corrupt `desktop.json` must never block the app from
     /// opening. The next [`save`](Self::save) replaces the file whole.
+    ///
+    /// Only a missing file is silent; any other failure is logged with the path
+    /// and the reason, so a reset appearance is diagnosable.
     #[must_use]
     pub fn at(path: PathBuf) -> Self {
-        let state = fs::read_to_string(&path)
-            .ok()
-            .and_then(|data| serde_json::from_str(&data).ok())
-            .unwrap_or_default();
+        let state = match fs::read_to_string(&path) {
+            Ok(data) => match serde_json::from_str::<State>(&data) {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        path = %path.display(),
+                        "desktop.json is not valid JSON; using the default appearance"
+                    );
+                    State::default()
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => State::default(),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "cannot read desktop.json; using the default appearance"
+                );
+                State::default()
+            }
+        };
         Self { path, state }
     }
 
@@ -111,8 +132,28 @@ impl DesktopSettings {
 ///
 /// Fails on macOS when `AppKit` refuses the change or the main thread is
 /// unavailable; other platforms accept every choice.
+#[cfg(target_os = "macos")]
 pub async fn set_dock_icon(dock_icon: DockIcon) -> Result<()> {
     platform::set_dock_icon(dock_icon).await
+}
+
+/// Applies a Dock choice. Every platform without `AppKit` accepts all of them,
+/// so this only exists for the one async signature the TSX side calls.
+///
+/// # Errors
+///
+/// Never fails on these platforms.
+#[cfg(not(target_os = "macos"))]
+#[expect(
+    clippy::unused_async,
+    reason = "the TSX binding has one signature on every platform; only macOS needs the main-thread round trip"
+)]
+#[expect(
+    clippy::unused_async,
+    reason = "the TSX binding has one signature on every platform; only macOS needs the main-thread round trip"
+)]
+pub async fn set_dock_icon(dock_icon: DockIcon) -> Result<()> {
+    platform::set_dock_icon(dock_icon)
 }
 
 /// Applies the app's appearance to the native window chrome.
@@ -127,8 +168,29 @@ pub async fn set_dock_icon(dock_icon: DockIcon) -> Result<()> {
 ///
 /// Fails on macOS when the main thread is unavailable. Changing the
 /// appearance itself cannot fail.
+#[cfg(target_os = "macos")]
 pub async fn set_app_appearance(appearance: AppAppearance) -> Result<()> {
     platform::set_app_appearance(appearance).await
+}
+
+/// Applies the app's appearance to the native window chrome. The platform
+/// already follows the app's scheme, so this only exists for the async
+/// signature the TSX side calls.
+///
+/// # Errors
+///
+/// Never fails on these platforms.
+#[cfg(not(target_os = "macos"))]
+#[expect(
+    clippy::unused_async,
+    reason = "the TSX binding has one signature on every platform; only macOS needs the main-thread round trip"
+)]
+#[expect(
+    clippy::unused_async,
+    reason = "the TSX binding has one signature on every platform; only macOS needs the main-thread round trip"
+)]
+pub async fn set_app_appearance(appearance: AppAppearance) -> Result<()> {
+    platform::set_app_appearance(appearance)
 }
 
 #[cfg(target_os = "macos")]
@@ -193,11 +255,11 @@ mod platform {
     use super::{AppAppearance, DockIcon};
     use crate::error::Result;
 
-    pub async fn set_dock_icon(_dock_icon: DockIcon) -> Result<()> {
+    pub(super) fn set_dock_icon(_dock_icon: DockIcon) -> Result<()> {
         Ok(())
     }
 
-    pub async fn set_app_appearance(_appearance: AppAppearance) -> Result<()> {
+    pub(super) fn set_app_appearance(_appearance: AppAppearance) -> Result<()> {
         Ok(())
     }
 }

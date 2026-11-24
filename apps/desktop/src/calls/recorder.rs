@@ -22,12 +22,18 @@ use super::{
 };
 
 #[derive(Clone)]
-#[expect(
-    missing_debug_implementations,
-    reason = "the recorder owns a store and task handles that add no useful Debug detail"
-)]
 pub struct CallRecorder {
     inner: Arc<Inner>,
+}
+
+impl std::fmt::Debug for CallRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The inner lock and channel state are not useful and could re-enter the
+        // store, so only the identifying call id is shown.
+        f.debug_struct("CallRecorder")
+            .field("call_id", &self.inner.call_id)
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) struct CancelOnDrop {

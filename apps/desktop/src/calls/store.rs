@@ -304,14 +304,21 @@ impl BufferedLlmChunk {
 }
 
 #[derive(Clone)]
-#[expect(
-    missing_debug_implementations,
-    reason = "the store owns a sqlx pool, whose Debug output is not useful here"
-)]
 pub struct CallStore {
     path: PathBuf,
     connected: Arc<OnceCell<Connected>>,
     degraded: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for CallStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The sqlx pool and write lock say nothing useful and must not be locked
+        // from a Debug impl, so only the file and the degrade flag are shown.
+        f.debug_struct("CallStore")
+            .field("path", &self.path)
+            .field("degraded", &self.degraded.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 struct Connected {

@@ -66,8 +66,14 @@ crates/cursor-capture/
 | 19 | 帧数上限 | `frame_count(usize) -> i32` 名字像计数器 | `clamped_i32(usize) -> i32` | 函数做的是饱和转换，被当作计数器读会让人误以为它统计了什么 |
 | 20 | `Debug` 与锁 | `Debug for ExchangeStore` 取存储锁 | 只打印 subscriber 数量 | 持锁回调里打印 `Debug` 会自锁 |
 | 21 | 死代码 | 保留 `database_path()` | 删除 | 无调用点，保留只会漂移 |
+| 22 | 正文收尾的执行域 | `poll_frame` / `Close` 内同步解码并写 SQLite | poll / Drop 只往有界队列（256 项）交一个任务，专用线程 `cursor-capture-store` 拥有解码器与 `Connection` | 在转发线程里做 JSON 序列化和 `busy_timeout=5s` 的同步写会卡住代理；析构里做递归重活也违反“析构不阻塞”。队列满是显式 `note_error`，转发照常 |
+| 23 | 慢订阅者 | 无（Go 侧无回放队列） | 每订阅者有界队列（1024 帧），满了就断开该订阅者；历史同时受 4096 帧和 64 MiB 限制 | 无界积压的 `Bytes` 只能靠历史裁剪释放，慢读者会让内存随捕获增长 |
+| 24 | 摘要查询 | 反序列化整行 `Exchange` 再取 summary | 只读 `summary_json` 轻量列，命中内存缓存时优先用它 | 摘要列表不该把正文与帧读进内存，历史越长暂停越久 |
+| 25 | 摘要过滤 | memory 与 SQLite 两条路径行为不同 | 两条路径都按 `conversation_id` 过滤 | 同一个 API 在不同后端给出不同结果是隐藏的契约分叉 |
+| 26 | 更新闭包 | — | 闭包仍在锁内执行，但用线程局部深度标记拒绝回调 `get`/`status`/`summaries`/`conversations`/`clear`/`note_error`，拒绝原因写入独立的 `refusals`（不进 `last_error`，因为随后一次成功写会清掉它） | 非重入锁内回调 store 会自锁；不能只靠注释约束内部 API |
+| 27 | 未压缩帧 | 每帧复制 payload | 未压缩帧直接用调用方的切片；只有解压分支拥有 `Vec` | 统一分支返回类型不值得给每帧一次整段副本（单帧上限 64 MiB） |
 
-转发仍在正文被轮询时同步执行诊断回调，解码与 SQLite 写入尚未移出热路径。2 MiB 限制的是每方向原始正文副本，不是解码后帧的总内存；`max_exchanges` 也仅限制内存窗口，不限制磁盘保留量。
+启动后的正文收尾与流式帧都在 `cursor-capture-store` 线程上完成；转发路径只做有界入队。2 MiB 限制的是每方向原始正文副本，不是解码后帧的总内存；`max_exchanges` 也仅限制内存窗口，不限制磁盘保留量。
 
 ## 必须保持的语义（两侧一致）
 
@@ -118,6 +124,11 @@ cargo clippy -p cursor-capture --all-targets -- -D warnings
 | `stream_completes_and_persists_both_chunks` | 第二段发送前能读到第一段，重开 SQLite 后能读到完整捕获 |
 | `clear_during_stream_does_not_overwrite_reused_id` | 清空后旧流继续转发，但不能覆盖复用编号的新记录 |
 | `dropping_partial_stream_records_an_error_but_empty_body_completes` | 未读完丢弃记为错误，合法空体正常完成 |
+| `an_update_closure_that_reaches_back_into_the_store_is_refused_not_hung` | 锁内回调再进 store 被拒绝并记录，不死锁 |
+| `a_full_queue_is_reported_instead_of_blocking` | 抓包队列满时拒绝而非阻塞转发 |
+| `store_associates_conversation_by_request_id`（memory 与 SQLite 各自运行） | 摘要过滤在两条路径上一致 |
+
+正文收尾是异步的，所以读取存储的测试先调 `Server::flush_captures()`（仅测试构建）把队列排空。
 
 **未做的验证**：没有对真实 Cursor 安装做端到端抓包。那一步需要本机把 Cursor 指到 `127.0.0.1:9090`。
 

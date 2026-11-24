@@ -61,6 +61,7 @@ InvokeModel
 | 15 | 调用状态 | 状态列是自由字符串，读写各处手写匹配 | `CallStatus { Running, Completed, Error, Cancelled }`，`as_str`/`from_stored` 集中转换；TSX 边界是 `CallStatusView` 联合类型 | 非法状态在 Rust 里无法构造；界面按联合类型分支，不再猜字符串 |
 | 16 | 终态写入 | `finish_llm_call` 六个位置参数 | `CallOutcome { status, finish_reason, elapsed_ms, error_kind, error_message }`，配 `completed`/`cancelled` 构造器 | 六个相邻参数里交换任意两个都能编译；具名结构让终态字段不会错位 |
 | 17 | 记录失败 | `record_*` 返回 `Result`，调用处必须处理 | `record_*` 不再返回错误：写失败只把 store 标成 degraded，不影响模型调用 | 记录是观测副作用；让它成为调用链上的失败点会让一次 SQLite 抖动中断用户的生成 |
+| 18 | 记录句柄的 `Debug` | 以 `#[expect]` 豁免 | `CallRecorder` 打印 `call_id`，`CallStore` 打印 `path` 与 `degraded`，均 `finish_non_exhaustive()` | “UI 不打印”不是不需要诊断实现的理由；手写实现只取快照，不进锁、不带正文 |
 
 ## 必须保持的不变量
 

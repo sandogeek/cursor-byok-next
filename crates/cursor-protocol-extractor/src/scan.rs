@@ -27,9 +27,9 @@ use crate::compact::{
 use crate::error::Error;
 use crate::resolver::{ModuleStart, module_start_by_id};
 use crate::types::{
-    Diagnostics, Enum, EnumValue, Field, FieldKind, Message, Method, MethodKind, Service, TypeName,
-    TypeToken, ValueKind, google_well_known, is_field_name, is_google_pkg, is_ident,
-    is_local_loop_pkg, looks_like_package_name, parse_type_name,
+    Diagnostics, Enum, EnumValue, Field, FieldKind, FieldNumber, Message, Method, MethodKind,
+    Service, TypeName, TypeToken, ValueKind, google_well_known, is_field_name, is_google_pkg,
+    is_ident, is_local_loop_pkg, looks_like_package_name, parse_type_name,
 };
 
 #[derive(Debug, Default)]
@@ -267,7 +267,7 @@ impl Scanner<'_> {
             let Some(expr) = element.as_expression() else {
                 continue;
             };
-            match parse_field_object(expr) {
+            match parse_field_object_with_diagnostics(expr, &mut self.scan.diagnostics) {
                 Ok(field) => {
                     self.scan.diagnostics.add_parsed_field();
                     fields.push(field);
@@ -293,7 +293,7 @@ impl Scanner<'_> {
         }
     }
 
-    fn parse_enum_values(expr: &Expression<'_>) -> Vec<EnumValue> {
+    fn parse_enum_values(expr: &Expression<'_>, diag: &mut Diagnostics) -> Vec<EnumValue> {
         let Some(array) = array_from_expr(expr) else {
             return Vec::new();
         };
@@ -306,9 +306,11 @@ impl Scanner<'_> {
                 .and_then(number_lit)
                 .and_then(f64_to_i32)
             else {
+                diag.add_unrecognized_input("enum value without an integral `no`");
                 continue;
             };
             let Some(name) = object_prop(item, "name").and_then(string_lit) else {
+                diag.add_unrecognized_input("enum value without a string `name`");
                 continue;
             };
             values.push(EnumValue {
@@ -350,7 +352,7 @@ impl Scanner<'_> {
             return;
         };
         self.push_declared(&type_name);
-        let methods = parse_methods(methods_object);
+        let methods = parse_methods(methods_object, &mut self.scan.diagnostics);
         let TypeName { package, short } = parse_type_name(&type_name);
         self.push_service(Service {
             type_name,
@@ -444,12 +446,14 @@ impl Scanner<'_> {
         let Some(type_name) = first_string_argument(call) else {
             return;
         };
+        let mut diag = std::mem::take(&mut self.scan.diagnostics);
         let values = call
             .arguments
             .get(1)
             .and_then(argument_expr)
-            .map(Self::parse_enum_values)
+            .map(|expr| Self::parse_enum_values(expr, &mut diag))
             .unwrap_or_default();
+        self.scan.diagnostics = diag;
         self.record_enum(type_name, assigned.unwrap_or(""), values, call.span.start);
     }
 
@@ -468,12 +472,14 @@ impl Scanner<'_> {
         else {
             return;
         };
+        let mut diag = std::mem::take(&mut self.scan.diagnostics);
         let values = call
             .arguments
             .get(2)
             .and_then(argument_expr)
-            .map(Self::parse_enum_values)
+            .map(|expr| Self::parse_enum_values(expr, &mut diag))
             .unwrap_or_default();
+        self.scan.diagnostics = diag;
         self.record_enum(type_name, var_name, values, call.span.start);
     }
 
@@ -932,13 +938,29 @@ fn first_string_argument<'a>(call: &'a CallExpression<'a>) -> Option<&'a str> {
 /// Returns [`Error::Field`] when the expression is not an object, or when it
 /// lacks a numeric `no`, a valid `name`, or a string `kind`.
 pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, Error> {
+    parse_field_object_with_diagnostics(expr, &mut Diagnostics::default())
+}
+
+/// [`parse_field_object`], reporting an unrecognized `kind` in `diag` so a
+/// Strict run can reject bundle-format drift instead of silently rendering a
+/// scalar.
+///
+/// # Errors
+///
+/// Same as [`parse_field_object`].
+pub fn parse_field_object_with_diagnostics(
+    expr: &Expression<'_>,
+    diag: &mut Diagnostics,
+) -> Result<Field, Error> {
     let Expression::ObjectExpression(_) = expr.get_inner_expression() else {
         return Err(Error::Field("missing field object".into()));
     };
     let no = object_prop(expr, "no")
         .and_then(number_lit)
-        .and_then(f64_to_i32)
         .ok_or_else(|| Error::Field("missing field no".into()))?;
+    let no = f64_to_i32(no)
+        .ok_or_else(|| Error::Field(format!("field no is not an integer in i32 range: {no}")))?;
+    let number = FieldNumber::try_from(no).map_err(|err| Error::Field(err.to_string()))?;
     let name = object_prop(expr, "name")
         .and_then(string_lit)
         .ok_or_else(|| Error::Field("missing field name".into()))?;
@@ -948,7 +970,11 @@ pub fn parse_field_object(expr: &Expression<'_>) -> Result<Field, Error> {
     let raw_kind = object_prop(expr, "kind")
         .and_then(string_lit)
         .ok_or_else(|| Error::Field("missing field kind".into()))?;
-    let mut field = Field::new(no, name, FieldKind::from_bundle_kind(raw_kind));
+    let kind = FieldKind::parse_bundle_kind(raw_kind);
+    if kind.is_none() {
+        diag.add_unrecognized_input(&format!("unknown field kind `{raw_kind}` on `{name}`"));
+    }
+    let mut field = Field::new(number, name, kind.unwrap_or(FieldKind::Scalar));
     if let Some(enum_call) =
         object_prop(expr, "T").and_then(|value| match value.get_inner_expression() {
             Expression::CallExpression(call) if callee_tail(call) == Some("getEnumType") => {
@@ -1006,26 +1032,40 @@ fn type_token_from_expr(expr: &Expression<'_>) -> Option<TypeToken> {
     }
 }
 
-fn parse_methods(object: &ObjectExpression<'_>) -> Vec<Method> {
+fn parse_methods(object: &ObjectExpression<'_>, diag: &mut Diagnostics) -> Vec<Method> {
     let mut methods = Vec::new();
     for property in &object.properties {
         let ObjectPropertyKind::ObjectProperty(prop) = property else {
             continue;
         };
+        // A property without a `name` is an ordinary field of the object, not a
+        // method declaration; only once `name` is present does a missing `I`/`O`
+        // mean a candidate method the extractor could not read.
         let Some(name) = object_prop(&prop.value, "name").and_then(string_lit) else {
             continue;
         };
         let Some(input) = object_prop(&prop.value, "I").and_then(member_or_ident) else {
+            diag.add_unrecognized_input(&format!("service method `{name}` has no readable `I`"));
             continue;
         };
         let Some(output) = object_prop(&prop.value, "O").and_then(member_or_ident) else {
+            diag.add_unrecognized_input(&format!("service method `{name}` has no readable `O`"));
             continue;
         };
-        let kind = object_prop(&prop.value, "kind")
-            .and_then(member_or_ident)
-            .map_or(MethodKind::Unary, |value| {
-                MethodKind::from_bundle_kind(last_segment(&value))
-            });
+        let kind = object_prop(&prop.value, "kind").and_then(member_or_ident);
+        let kind = match kind {
+            Some(value) => {
+                let raw = last_segment(&value);
+                let parsed = MethodKind::parse_bundle_kind(raw);
+                if parsed.is_none() {
+                    diag.add_unrecognized_input(&format!(
+                        "service method `{name}` has unknown kind `{raw}`"
+                    ));
+                }
+                parsed.unwrap_or(MethodKind::Unary)
+            }
+            None => MethodKind::Unary,
+        };
         methods.push(Method {
             name: name.to_string(),
             input_type: input,

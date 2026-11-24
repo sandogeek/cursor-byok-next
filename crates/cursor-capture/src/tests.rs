@@ -198,6 +198,34 @@ fn store_associates_conversation_by_request_id() {
     assert_eq!(conversations[0].exchange_count, 2);
 }
 
+#[test]
+fn an_update_closure_that_reaches_back_into_the_store_is_refused_not_hung() {
+    let store = ExchangeStore::memory(20);
+    let id = store.create(sample_exchange("1", "conv-a", "req-a"));
+
+    let read_back = std::cell::Cell::new(None);
+    // Without the guard this would block forever on the non-reentrant lock the
+    // update already holds.
+    store.update(&id, |exchange| {
+        exchange.summary.status = Some(418);
+        read_back.set(store.get("1").unwrap());
+    });
+
+    assert!(
+        read_back.take().is_none(),
+        "the reentrant read is refused rather than deadlocking"
+    );
+    let status = store.status();
+    assert!(
+        status
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("refused")),
+        "{status:?}"
+    );
+    assert_eq!(store.get("1").unwrap().unwrap().summary.status, Some(418));
+}
+
 #[tokio::test]
 async fn debug_api_serves_original_ui_and_status() {
     let dir = TempDir::new().unwrap();
@@ -275,6 +303,8 @@ async fn debug_api_serves_original_ui_and_status() {
         proxied.into_body().collect().await.unwrap().to_bytes(),
         r#"{"hello":"cursor"}"#
     );
+    // The finished body is written by the capture sink, not the forwarding path.
+    server.flush_captures();
 
     let list = app
         .oneshot(
@@ -311,6 +341,8 @@ async fn stream_completes_and_persists_both_chunks() {
         .unwrap()
         .to_bytes();
     assert_eq!(tail, "second");
+    // The last body is written by the capture sink; wait for it before dropping.
+    server.flush_captures();
     drop(server);
 
     let reopened = ExchangeStore::persistent(dir.path().join("stream.db"), 20).unwrap();
@@ -361,6 +393,9 @@ async fn clear_during_stream_does_not_overwrite_reused_id() {
             .to_bytes(),
         "second"
     );
+    // The old body's tail and the new request are both captured off the
+    // forwarding path; let the sink finish before reading the store.
+    server.flush_captures();
     for exchange in [
         server.store().get("1").unwrap().unwrap(),
         ExchangeStore::persistent(dir.path().join("stream.db"), 20)
@@ -382,6 +417,8 @@ async fn dropping_partial_stream_records_an_error_but_empty_body_completes() {
     let server = serve_stream_fixture(&dir, gate).await;
     let app = Arc::clone(&server).router();
     drop(first_stream_chunk(app.clone()).await);
+    // Capture work runs off the forwarding path; wait for it before asserting.
+    server.flush_captures();
 
     let exchange = server.store().get("1").unwrap().unwrap();
     assert_eq!(exchange.summary.state, ExchangeState::Error);
@@ -400,6 +437,7 @@ async fn dropping_partial_stream_records_an_error_but_empty_body_completes() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     drop(response);
+    server.flush_captures();
     assert_eq!(
         server.store().get("2").unwrap().unwrap().summary.state,
         ExchangeState::Completed

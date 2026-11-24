@@ -12,7 +12,7 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::AsyncWriteExt,
     process::ChildStdin,
     sync::{Mutex, mpsc, watch},
     task::JoinHandle,
@@ -43,6 +43,20 @@ pub enum WorkerStreamItem {
 /// Frames queued for the single stdin writer, as bytes ready to send.
 type Writer = mpsc::Sender<Vec<u8>>;
 
+/// Events one invocation may have queued for its consumer. Bounded so a plugin
+/// that emits faster than the model pipeline drains cannot grow memory without
+/// limit; a full queue ends the invocation instead of dropping events silently.
+const EVENT_QUEUE_ITEMS: usize = 4_096;
+/// Live invocations one worker serves at once. Each costs a task plus its event
+/// queue, so a burst is capped rather than spawned without bound.
+const MAX_ACTIVE_INVOCATIONS: usize = 16;
+/// `host_call`s one invocation may have in flight. A plugin that fans out calls
+/// without awaiting them is rejected past this instead of spawning forever.
+const MAX_HOST_CALLS_PER_INVOCATION: usize = 8;
+/// Longest single NDJSON line read from a worker's stdout or stderr. Output that
+/// never ends with a newline must be cut off rather than buffered indefinitely.
+const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 #[cfg(test)]
 static LAST_INVOKE_FRAME: parking_lot::Mutex<Vec<u8>> = parking_lot::Mutex::new(Vec::new());
 
@@ -56,9 +70,45 @@ pub(crate) fn last_invoke_frame() -> Vec<u8> {
 /// liveness watch that tells the SDK bridge the invocation is still running.
 struct Registration {
     guard: InvocationGuard,
-    receiver: mpsc::UnboundedReceiver<WorkerStreamItem>,
-    items: mpsc::UnboundedSender<WorkerStreamItem>,
+    receiver: mpsc::Receiver<WorkerStreamItem>,
+    items: mpsc::Sender<WorkerStreamItem>,
     active: watch::Receiver<()>,
+}
+
+/// Per-invocation concurrency, so a plugin cannot spawn without bound.
+struct InvocationBudget {
+    host_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl InvocationBudget {
+    fn new() -> Self {
+        Self {
+            host_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Takes one `host_call` slot, or reports the invocation is saturated.
+    fn try_acquire_host_call(&self) -> bool {
+        let mut current = self.host_calls.load(Ordering::Relaxed);
+        loop {
+            if current >= MAX_HOST_CALLS_PER_INVOCATION {
+                return false;
+            }
+            match self.host_calls.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release_host_call(&self) {
+        self.host_calls.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct Pending(parking_lot::Mutex<PendingInvocationMap>);
@@ -67,9 +117,10 @@ struct Pending(parking_lot::Mutex<PendingInvocationMap>);
 type PendingInvocationMap = Option<HashMap<String, PendingInvocation>>;
 
 struct PendingInvocation {
-    items: mpsc::UnboundedSender<WorkerStreamItem>,
+    items: mpsc::Sender<WorkerStreamItem>,
     active: watch::Sender<()>,
     state: Arc<InvocationState>,
+    budget: Arc<InvocationBudget>,
 }
 
 struct InvocationGuard {
@@ -92,21 +143,27 @@ impl Pending {
     /// site because the returned guard must keep the map alive.
     fn register(self: &Arc<Self>, state: InvocationState) -> Result<Registration> {
         let id = uuid::Uuid::new_v4().to_string();
-        let (items, receiver) = mpsc::unbounded_channel();
+        let mut pending = self.0.lock();
+        let map = pending
+            .as_mut()
+            .ok_or_else(|| Error::Provider("plugin worker stopped".into()))?;
+        if map.len() >= MAX_ACTIVE_INVOCATIONS {
+            return Err(Error::Provider(format!(
+                "plugin worker is already running {MAX_ACTIVE_INVOCATIONS} invocations"
+            )));
+        }
+        let (items, receiver) = mpsc::channel(EVENT_QUEUE_ITEMS);
         let (active, active_rx) = watch::channel(());
         *state.events.lock() = Some(items.clone());
-        self.0
-            .lock()
-            .as_mut()
-            .ok_or_else(|| Error::Provider("plugin worker stopped".into()))?
-            .insert(
-                id.clone(),
-                PendingInvocation {
-                    items: items.clone(),
-                    active,
-                    state: Arc::new(state),
-                },
-            );
+        map.insert(
+            id.clone(),
+            PendingInvocation {
+                items: items.clone(),
+                active,
+                state: Arc::new(state),
+                budget: Arc::new(InvocationBudget::new()),
+            },
+        );
         Ok(Registration {
             guard: InvocationGuard {
                 id,
@@ -118,7 +175,7 @@ impl Pending {
         })
     }
 
-    fn sender(&self, id: &str) -> Option<mpsc::UnboundedSender<WorkerStreamItem>> {
+    fn sender(&self, id: &str) -> Option<mpsc::Sender<WorkerStreamItem>> {
         self.0
             .lock()
             .as_ref()?
@@ -130,10 +187,23 @@ impl Pending {
         self.0.lock().as_mut()?.remove(id)
     }
 
-    fn authorization(&self, id: &str) -> Option<(Arc<InvocationState>, watch::Receiver<()>)> {
+    /// The state and liveness watch one `host_call` runs under, plus the budget
+    /// the spawned call must hold a slot in.
+    fn authorization(
+        &self,
+        id: &str,
+    ) -> Option<(
+        Arc<InvocationState>,
+        watch::Receiver<()>,
+        Arc<InvocationBudget>,
+    )> {
         let pending = self.0.lock();
         let invocation = pending.as_ref()?.get(id)?;
-        Some((Arc::clone(&invocation.state), invocation.active.subscribe()))
+        Some((
+            Arc::clone(&invocation.state),
+            invocation.active.subscribe(),
+            Arc::clone(&invocation.budget),
+        ))
     }
 
     fn is_closed(&self) -> bool {
@@ -144,7 +214,9 @@ impl Pending {
         let pending = self.0.lock().take();
         for (_, PendingInvocation { items, active, .. }) in pending.into_iter().flatten() {
             drop(active);
-            let _ = items.send(WorkerStreamItem::Result(Err(Error::Provider(
+            // A full queue cannot take the terminal error; the consumer ends when
+            // the sender drops with this map, so nothing is silently "completed".
+            let _ = items.try_send(WorkerStreamItem::Result(Err(Error::Provider(
                 message.into(),
             ))));
         }
@@ -210,7 +282,7 @@ pub(super) struct InvocationState {
     recorder: Option<CallRecorder>,
     recorder_claimed: AtomicBool,
     model: Option<Arc<ModelInvocation>>,
-    events: parking_lot::Mutex<Option<mpsc::UnboundedSender<WorkerStreamItem>>>,
+    events: parking_lot::Mutex<Option<mpsc::Sender<WorkerStreamItem>>>,
 }
 
 impl InvocationState {
@@ -224,8 +296,16 @@ impl InvocationState {
     }
 
     pub(super) fn emit(&self, event: ModelEvent) {
-        if let Some(events) = self.events.lock().as_ref() {
-            let _ = events.send(WorkerStreamItem::Event(event));
+        let Some(events) = self.events.lock().as_ref().cloned() else {
+            return;
+        };
+        if events.try_send(WorkerStreamItem::Event(event)).is_err() {
+            // The consumer fell behind its budget. End the invocation with an
+            // explicit error instead of dropping an event and continuing as
+            // if the stream were still complete.
+            let _ = events.try_send(WorkerStreamItem::Result(Err(Error::Provider(
+                "plugin event queue overflowed; the invocation was ended".into(),
+            ))));
         }
     }
 
@@ -327,7 +407,7 @@ impl PluginWorker {
     pub async fn invoke_streaming(
         &self,
         request: WorkerRequest<'_>,
-    ) -> Result<mpsc::UnboundedReceiver<WorkerStreamItem>> {
+    ) -> Result<mpsc::Receiver<WorkerStreamItem>> {
         let WorkerRequest {
             method,
             params,
@@ -337,10 +417,6 @@ impl PluginWorker {
             model,
         } = request;
         let (writer, pending) = self.connection().await?;
-        let permit = writer
-            .reserve()
-            .await
-            .map_err(|_| Error::Provider("plugin worker stopped".into()))?;
         let request_cancellation = CancellationToken::new();
         let Registration {
             guard: request,
@@ -358,7 +434,7 @@ impl PluginWorker {
             model,
             events: parking_lot::Mutex::new(None),
         })?;
-        permit.send({
+        let request_bytes = {
             let bytes = encode_message(&HostMessage::Request {
                 id: &request.id,
                 method,
@@ -369,28 +445,37 @@ impl PluginWorker {
                 *LAST_INVOKE_FRAME.lock() = bytes.clone();
             }
             bytes
-        });
-        let writer = writer.clone();
+        };
         let request_id = request.id.clone();
+        // Two tasks so the caller can drain (and a cancellation can land) before
+        // the request frame is written; neither task lets a wedged child's stdin
+        // queue block local teardown.
+        let send_cancellation = request_cancellation.clone();
+        tokio::spawn({
+            let writer = writer.clone();
+            async move {
+                tokio::select! {
+                    () = send_cancellation.cancelled() => {}
+                    result = writer.send(request_bytes) => {
+                        if result.is_err() {
+                            tracing::warn!("plugin worker stopped before its request was sent");
+                        }
+                    }
+                }
+            }
+        });
         tokio::spawn(async move {
             tokio::select! {
+                // Local teardown first: request-cancel, deregistration and the
+                // error to the consumer never depend on the child still reading.
                 () = cancellation.cancelled() => {
                     request_cancellation.cancel();
-                    if let Ok(bytes) = encode_message(&HostMessage::Cancel { id: &request_id }) {
-                        let _ = writer.send(bytes).await;
-                    }
-                    if let Some(PendingInvocation {
-                        items,
-                        active,
-                        ..
-                    }) = pending.remove(&request_id)
-                    {
-                        drop(active);
-                        let _ = items.send(WorkerStreamItem::Result(Err(Error::Cancelled)));
-                    }
+                    deregister(&pending, &request_id);
+                    deliver_cancel(&writer, &request_id);
                 }
                 () = items.closed() => {
                     request_cancellation.cancel();
+                    deregister(&pending, &request_id);
                 }
                 _ = active.changed() => {}
             }
@@ -456,9 +541,26 @@ impl PluginWorker {
         if let Some(stderr) = child.stderr.take() {
             let plugin_id = self.inner.plugin_id.clone();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::warn!(plugin = %plugin_id, "{line}");
+                let mut lines = LineReader::new(stderr);
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(line)) => {
+                            let line = String::from_utf8_lossy(&line);
+                            tracing::warn!(plugin = %plugin_id, "{line}");
+                        }
+                        Ok(None) => break,
+                        Err(LineError::TooLong) => {
+                            tracing::warn!(
+                                plugin = %plugin_id,
+                                limit = MAX_LINE_BYTES,
+                                "plugin worker stderr line exceeded the limit; truncating the rest"
+                            );
+                        }
+                        Err(LineError::Io(error)) => {
+                            tracing::debug!(plugin = %plugin_id, %error, "reading plugin stderr failed");
+                            break;
+                        }
+                    }
                 }
             });
         }
@@ -492,9 +594,27 @@ async fn read_stdout(
     pending: &Pending,
     host: &HostContext,
 ) {
-    let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(message) = serde_json::from_str::<WorkerMessage>(&line) else {
+    let mut lines = LineReader::new(stdout);
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(LineError::TooLong) => {
+                // A worker that emits an unterminated line larger than the limit
+                // cannot be trusted to recover, so this generation is stopped.
+                tracing::warn!(
+                    plugin = host.plugin_id(),
+                    limit = MAX_LINE_BYTES,
+                    "plugin worker wrote an oversized protocol line; stopping it"
+                );
+                return;
+            }
+            Err(LineError::Io(error)) => {
+                tracing::warn!(plugin = host.plugin_id(), %error, "reading plugin stdout failed");
+                break;
+            }
+        };
+        let Ok(message) = serde_json::from_slice::<WorkerMessage>(&line) else {
             tracing::warn!(
                 plugin = host.plugin_id(),
                 "plugin worker wrote an invalid message"
@@ -503,32 +623,10 @@ async fn read_stdout(
         };
         match message {
             WorkerMessage::Result { id, result, error } => {
-                if let Some(PendingInvocation {
-                    items,
-                    active,
-                    state,
-                }) = pending.remove(&id)
-                {
-                    drop(active);
-                    let value = if error.is_some() {
-                        Err(state.failure())
-                    } else {
-                        Ok(result)
-                    };
-                    let _ = items.send(WorkerStreamItem::Result(value));
-                }
+                deliver_result(pending, &id, result, error.as_ref());
             }
             WorkerMessage::Event { id, event } => {
-                if let Some(sender) = pending.sender(&id) {
-                    match wire::model_event(&event) {
-                        Ok(event) => {
-                            let _ = sender.send(WorkerStreamItem::Event(event));
-                        }
-                        Err(error) => {
-                            let _ = sender.send(WorkerStreamItem::Result(Err(error)));
-                        }
-                    }
-                }
+                deliver_event(pending, host, &id, &event);
             }
             WorkerMessage::HostCall {
                 id,
@@ -536,55 +634,218 @@ async fn read_stdout(
                 method,
                 params,
             } => {
-                let Some((invocation, mut active)) = pending.authorization(&request_id) else {
-                    if let Ok(bytes) = encode_message(&HostMessage::HostError {
-                        id: &id,
-                        error: "plugin invocation is no longer active",
-                        status: None,
-                    }) {
-                        let _ = writer.send(bytes).await;
-                    }
-                    continue;
-                };
-                let host = host.clone();
-                let writer = writer.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        biased;
-                        _ = active.changed() => {
-                            if let Ok(bytes) = encode_message(&HostMessage::HostError {
-                                id: &id,
-                                error: "plugin invocation is no longer active",
-                                status: None,
-                            }) {
-                                let _ = writer.send(bytes).await;
-                            }
-                        }
-                        () = async {
-                            let response = match host.call(&invocation, &method, params).await {
-                                Ok(result) => encode_message(&HostMessage::HostResult { id: &id, result: &result }),
-                                Err(error) => {
-                                    let (message, status) = match error {
-                                        Error::HttpStatus { status, body } => {
-                                            (format!("HTTP {status}: {body}"), Some(status))
-                                        }
-                                        Error::Cancelled => ("run was cancelled".into(), None),
-                                        error => (error.to_string(), None),
-                                    };
-                                    encode_message(&HostMessage::HostError {
-                                        id: &id,
-                                        error: &message,
-                                        status,
-                                    })
-                                }
-                            };
-                            if let Ok(bytes) = response {
-                                let _ = writer.send(bytes).await;
-                            }
-                        } => {},
-                    }
-                });
+                spawn_host_call(writer, pending, host, id, &request_id, method, params);
             }
+        }
+    }
+}
+
+/// Delivers a terminal `Result` frame, waking the consumer with the invocation's
+/// own failure message when the plugin reported an error.
+fn deliver_result(pending: &Pending, id: &str, result: serde_json::Value, error: Option<&String>) {
+    if let Some(PendingInvocation {
+        items,
+        active,
+        state,
+        budget: _,
+    }) = pending.remove(id)
+    {
+        drop(active);
+        let value = if error.is_some() {
+            Err(state.failure())
+        } else {
+            Ok(result)
+        };
+        let _ = items.try_send(WorkerStreamItem::Result(value));
+    }
+}
+
+/// Delivers one streamed event, ending the invocation explicitly if the event
+/// cannot be converted or the queue is full.
+fn deliver_event(pending: &Pending, host: &HostContext, id: &str, event: &serde_json::Value) {
+    let Some(sender) = pending.sender(id) else {
+        return;
+    };
+    let event = match wire::model_event(event) {
+        Ok(event) => event,
+        Err(error) => {
+            let _ = sender.try_send(WorkerStreamItem::Result(Err(error)));
+            return;
+        }
+    };
+    if sender.try_send(WorkerStreamItem::Event(event)).is_ok() {
+        return;
+    }
+    tracing::warn!(
+        plugin = host.plugin_id(),
+        "plugin event queue overflowed; ending the invocation"
+    );
+    let _ = sender.try_send(WorkerStreamItem::Result(Err(Error::Provider(
+        "plugin event queue overflowed; the invocation was ended".into(),
+    ))));
+}
+
+/// Spawns the task that runs one `host_call`, holding an invocation slot.
+fn spawn_host_call(
+    writer: &Writer,
+    pending: &Pending,
+    host: &HostContext,
+    id: String,
+    request_id: &str,
+    method: String,
+    params: serde_json::Value,
+) {
+    let Some((invocation, mut active, budget)) = pending.authorization(request_id) else {
+        let _ = send_host_error(writer, &id, "plugin invocation is no longer active", None);
+        return;
+    };
+    if !budget.try_acquire_host_call() {
+        let _ = send_host_error(writer, &id, "too many concurrent host calls", None);
+        return;
+    }
+    let host = host.clone();
+    let writer = writer.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = active.changed() => {
+                let _ = send_host_error(
+                    &writer,
+                    &id,
+                    "plugin invocation is no longer active",
+                    None,
+                );
+            }
+            () = async {
+                let response = host_call_response(&host, &invocation, &method, params, &id).await;
+                if let Ok(bytes) = response
+                    && writer.try_send(bytes).is_err()
+                {
+                    // A full stdin queue means the child stopped reading; report
+                    // it rather than block the call.
+                    tracing::warn!("plugin stdin queue is full; dropped a host-call result");
+                }
+            } => {},
+        }
+        budget.release_host_call();
+    });
+}
+
+/// Turns one `host_call` outcome into the frame sent back over stdin.
+async fn host_call_response(
+    host: &HostContext,
+    invocation: &InvocationState,
+    method: &str,
+    params: serde_json::Value,
+    id: &str,
+) -> Result<Vec<u8>> {
+    match host.call(invocation, method, params).await {
+        Ok(result) => encode_message(&HostMessage::HostResult {
+            id,
+            result: &result,
+        }),
+        Err(error) => {
+            let (message, status) = match error {
+                Error::HttpStatus { status, body } => {
+                    (format!("HTTP {status}: {body}"), Some(status))
+                }
+                Error::Cancelled => ("run was cancelled".into(), None),
+                error => (error.to_string(), None),
+            };
+            encode_message(&HostMessage::HostError {
+                id,
+                error: &message,
+                status,
+            })
+        }
+    }
+}
+
+/// Best-effort `HostError` frame; a full stdin queue drops it rather than
+/// blocking the reader loop.
+fn send_host_error(writer: &Writer, id: &str, error: &str, status: Option<u16>) -> Option<()> {
+    let bytes = encode_message(&HostMessage::HostError { id, error, status }).ok()?;
+    writer.try_send(bytes).ok()
+}
+
+/// The outcome of one [`LineReader::next_line`] call.
+enum LineError {
+    /// The line exceeded [`MAX_LINE_BYTES`] before a newline or EOF.
+    TooLong,
+    /// The underlying stream reported an error.
+    Io(std::io::Error),
+}
+
+/// Reads newline-terminated frames from a worker's stdout/stderr without
+/// buffering an entire unterminated line.
+///
+/// `BufReader::lines` waits for a newline or EOF before yielding anything, so a
+/// process that keeps writing without one grows the buffer without limit. This
+/// reader checks the accumulated length as it goes and reports
+/// [`LineError::TooLong`] once a frame passes [`MAX_LINE_BYTES`].
+struct LineReader<R> {
+    reader: R,
+    buffer: Vec<u8>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> LineReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buffer: Vec::new(),
+        }
+    }
+
+    /// Returns the next line without its terminator, `None` at EOF, or an error.
+    async fn next_line(&mut self) -> std::result::Result<Option<Vec<u8>>, LineError> {
+        use tokio::io::AsyncReadExt;
+        loop {
+            if let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
+                let mut line: Vec<u8> = self.buffer.drain(..=position).collect();
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return Ok(Some(line));
+            }
+            if self.buffer.len() > MAX_LINE_BYTES {
+                return Err(LineError::TooLong);
+            }
+            let mut chunk = [0u8; 8 * 1024];
+            let read = self.reader.read(&mut chunk).await.map_err(LineError::Io)?;
+            if read == 0 {
+                if self.buffer.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(std::mem::take(&mut self.buffer)));
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
+        }
+    }
+}
+
+/// Removes one invocation from the registry and tells its consumer it was
+/// cancelled. Runs locally, independent of the child process.
+fn deregister(pending: &Pending, request_id: &str) {
+    if let Some(PendingInvocation { items, active, .. }) = pending.remove(request_id) {
+        drop(active);
+        let _ = items.try_send(WorkerStreamItem::Result(Err(Error::Cancelled)));
+    }
+}
+
+/// Best-effort delivery of a `Cancel` frame. It must never block the teardown
+/// path: if the child stopped reading stdin, the frame is dropped, which is
+/// harmless because the invocation is already deregistered locally.
+fn deliver_cancel(writer: &Writer, request_id: &str) {
+    let Ok(bytes) = encode_message(&HostMessage::Cancel { id: request_id }) else {
+        return;
+    };
+    match writer.try_send(bytes) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::debug!(
+                "plugin stdin queue is full; dropping the cancel frame for a deregistered invocation"
+            );
         }
     }
 }
@@ -812,7 +1073,7 @@ mod tests {
             mut receiver,
             ..
         } = pending.register(invocation(HashSet::new())).unwrap();
-        let (_, mut active) = pending.authorization(&completed.id).unwrap();
+        let (_, mut active, _) = pending.authorization(&completed.id).unwrap();
         let PendingInvocation {
             items,
             active: signal,
@@ -820,7 +1081,7 @@ mod tests {
         } = pending.remove(&completed.id).unwrap();
         drop(signal);
         items
-            .send(WorkerStreamItem::Result(Ok(serde_json::Value::Null)))
+            .try_send(WorkerStreamItem::Result(Ok(serde_json::Value::Null)))
             .unwrap();
         match receiver.recv().await {
             Some(WorkerStreamItem::Result(Ok(value))) => assert!(value.is_null()),
@@ -835,7 +1096,7 @@ mod tests {
             ..
         } = pending.register(invocation(HashSet::new())).unwrap();
         let id = cancelled.id.clone();
-        let (_, mut active) = pending.authorization(&id).unwrap();
+        let (_, mut active, _) = pending.authorization(&id).unwrap();
         drop(cancelled);
         assert!(receiver.recv().await.is_none());
         assert!(active.changed().await.is_err());
@@ -868,7 +1129,7 @@ mod tests {
             receiver: mut failed,
             ..
         } = old.register(invocation(HashSet::new())).unwrap();
-        let (_, mut active) = old.authorization(&old_request.id).unwrap();
+        let (_, mut active, _) = old.authorization(&old_request.id).unwrap();
         let new = Arc::new(Pending::open());
         let Registration {
             guard: new_request,
@@ -1085,6 +1346,11 @@ mod tests {
             super::super::definition::PluginDefinitionLoader::in_temporary_workspace(root).unwrap();
         let entry = plugin_dir.join("main.ts").canonicalize().unwrap();
         let definition = loader.load(&executable, &entry).await.unwrap();
+        let providers = super::super::catalog::validate_definition(
+            "dev.cursorbyoknext.plugins.echo",
+            &definition,
+        )
+        .unwrap();
         let plugin = super::super::catalog::PluginEntry {
             entry,
             manifest: serde_json::from_slice(
@@ -1092,6 +1358,7 @@ mod tests {
             )
             .unwrap(),
             definition,
+            providers,
             icon: String::new(),
         };
         (
@@ -1306,7 +1573,7 @@ export default defineProviderPlugin({ providers: [provider] });
             active,
         } = pending.register(invocation(HashSet::new())).unwrap();
         pending.remove(&guard.id);
-        let _ = items.send(WorkerStreamItem::Result(Ok(
+        let _ = items.try_send(WorkerStreamItem::Result(Ok(
             serde_json::json!({"ok": true}),
         )));
         drop(active);
@@ -1314,6 +1581,74 @@ export default defineProviderPlugin({ providers: [provider] });
             panic!("pre-send handles must still receive the worker result");
         };
         assert_eq!(value["ok"], true);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn register_rejects_more_than_the_active_invocation_budget() {
+        let pending = Arc::new(Pending::open());
+        let mut guards = Vec::new();
+        for _ in 0..MAX_ACTIVE_INVOCATIONS {
+            guards.push(pending.register(invocation(HashSet::new())).unwrap());
+        }
+        let overflow = pending.register(invocation(HashSet::new()));
+        assert!(overflow.is_err(), "a burst must be capped");
+        drop(guards);
+    }
+
+    #[tokio::test]
+    async fn line_reader_splits_frames_and_rejects_an_oversized_line() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            writer.write_all(b"first\nsecond\r\n").await.unwrap();
+            writer
+                .write_all(&vec![b'x'; MAX_LINE_BYTES + 8])
+                .await
+                .unwrap();
+        });
+        let mut lines = LineReader::new(reader);
+        assert_eq!(lines.next_line().await.ok().unwrap().unwrap(), b"first");
+        assert_eq!(lines.next_line().await.ok().unwrap().unwrap(), b"second");
+        assert!(matches!(lines.next_line().await, Err(LineError::TooLong)));
+    }
+
+    #[tokio::test]
+    async fn event_overflow_ends_the_invocation_instead_of_dropping_events() {
+        let pending = Arc::new(Pending::open());
+        let Registration {
+            guard,
+            mut receiver,
+            ..
+        } = pending.register(invocation(HashSet::new())).unwrap();
+        let sender = pending.sender(&guard.id).unwrap();
+        for _ in 0..EVENT_QUEUE_ITEMS {
+            sender
+                .try_send(WorkerStreamItem::Event(ModelEvent::TextStart))
+                .unwrap();
+        }
+        // One past the bound: the queue must refuse rather than grow.
+        assert!(
+            sender
+                .try_send(WorkerStreamItem::Event(ModelEvent::TextStart))
+                .is_err(),
+            "the event queue must be bounded"
+        );
+        // A full queue still delivers the terminal error once a slot is free.
+        let _ = receiver.try_recv();
+        sender
+            .try_send(WorkerStreamItem::Result(Err(Error::Provider(
+                "overflow".into(),
+            ))))
+            .unwrap();
+        let mut saw_result = false;
+        while let Ok(item) = receiver.try_recv() {
+            if matches!(item, WorkerStreamItem::Result(_)) {
+                saw_result = true;
+            }
+        }
+        assert!(saw_result);
         drop(guard);
     }
 }

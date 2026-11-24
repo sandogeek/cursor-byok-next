@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::error::Error;
 use crate::types::{
-    Diagnostics, Enum, EnumValue, Field, FieldKind, Message, TypeToken, ValueKind,
+    Diagnostics, Enum, EnumValue, Field, FieldKind, FieldNumber, Message, TypeToken, ValueKind,
     google_well_known, is_field_name, is_scalar_id, looks_like_full_type_name,
     looks_like_package_name,
 };
@@ -147,7 +147,7 @@ pub fn parse_compact_schema_array(
     let type_refs = parse_compact_type_refs(rest.trim());
     let mut fields = Vec::new();
     for part in parts {
-        match parse_compact_field(part.trim()) {
+        match parse_compact_field_with_diagnostics(part.trim(), diag) {
             Ok(field) => {
                 diag.add_parsed_field();
                 fields.push(field);
@@ -229,8 +229,22 @@ pub fn parse_compact_type_refs(rest: &str) -> Vec<String> {
 /// # Errors
 ///
 /// Returns [`Error::Field`] when the entry is not `no name type`, when `no` is
-/// not an integer, or when `name` is not a valid field name.
+/// not a proto field number, or when `name` is not a valid field name.
 pub fn parse_compact_field(spec: &str) -> Result<Field, Error> {
+    parse_compact_field_with_diagnostics(spec, &mut Diagnostics::default())
+}
+
+/// [`parse_compact_field`], reporting a non-scalar map value type in `diag`
+/// (the compact syntax has no way to spell a non-map message value), so Strict
+/// runs can reject it.
+///
+/// # Errors
+///
+/// Same as [`parse_compact_field`].
+pub fn parse_compact_field_with_diagnostics(
+    spec: &str,
+    diag: &mut Diagnostics,
+) -> Result<Field, Error> {
     let invalid = || Error::Field(format!("invalid compact field: {spec}"));
     let mut parts = spec.splitn(3, char::is_whitespace);
     let no = parts.next().ok_or_else(invalid)?;
@@ -239,6 +253,7 @@ pub fn parse_compact_field(spec: &str) -> Result<Field, Error> {
             "compact field number is not an integer: {no}"
         )));
     };
+    let number = FieldNumber::try_from(no).map_err(|err| Error::Field(err.to_string()))?;
     let name = parts.next().ok_or_else(invalid)?;
     if !is_field_name(name) {
         return Err(invalid());
@@ -246,7 +261,7 @@ pub fn parse_compact_field(spec: &str) -> Result<Field, Error> {
     let type_spec = parts.next().unwrap_or("").trim();
     let (type_part, oneof) = split_compact_type_and_oneof(type_spec);
     let (raw, flag) = split_compact_flag(type_part);
-    let mut field = Field::new(no, name, FieldKind::Scalar);
+    let mut field = Field::new(number, name, FieldKind::Scalar);
     field.repeated = flag == Some('*');
     field.optional = flag == Some('?');
     field.oneof = oneof;
@@ -256,6 +271,11 @@ pub fn parse_compact_field(spec: &str) -> Result<Field, Error> {
         let scalar = compact_scalar(key).ok_or_else(invalid)?;
         field.map_key = Some(scalar);
         let (kind, token) = compact_value_token(value);
+        if kind != ValueKind::Scalar {
+            diag.add_unrecognized_input(&format!(
+                "compact map value `{value}` on `{name}` is not a scalar type"
+            ));
+        }
         field.map_value_kind = kind;
         field.map_value_t = Some(token);
         return Ok(field);

@@ -4,6 +4,7 @@ mod capture;
 mod config;
 mod decode;
 mod proxy;
+mod sink;
 mod store;
 mod types;
 mod web;

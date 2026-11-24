@@ -40,16 +40,17 @@ pub fn number_lit(expr: &Expression<'_>) -> Option<f64> {
 }
 
 /// JS numbers are doubles, so every integer read out of the AST goes through
-/// here: out-of-range values are rejected instead of silently saturating. A
-/// proto field id or enum number that does not fit cannot come from a Cursor
-/// bundle, so dropping it surfaces as a diagnostic instead of a wrong schema.
+/// here: non-integral and out-of-range values are rejected instead of silently
+/// truncating or saturating. A proto field id or enum number that does not fit
+/// cannot come from a Cursor bundle, so dropping it surfaces as a diagnostic
+/// instead of a wrong schema.
 #[must_use]
 pub fn f64_to_i32(value: f64) -> Option<i32> {
-    if value.is_finite() && (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&value) {
+    if is_integral_in(value, f64::from(i32::MIN), f64::from(i32::MAX)) {
         #[expect(
             clippy::as_conversions,
             clippy::cast_possible_truncation,
-            reason = "the range check above makes the cast exact"
+            reason = "the finite-integral-in-range check above makes the cast exact"
         )]
         let converted = value as i32;
         Some(converted)
@@ -60,18 +61,23 @@ pub fn f64_to_i32(value: f64) -> Option<i32> {
 
 #[must_use]
 pub fn f64_to_u32(value: f64) -> Option<u32> {
-    if value.is_finite() && (0.0..=f64::from(u32::MAX)).contains(&value) {
+    if is_integral_in(value, 0.0, f64::from(u32::MAX)) {
         #[expect(
             clippy::as_conversions,
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "the range check above makes the cast exact"
+            reason = "the finite-integral-in-range check above makes the cast exact"
         )]
         let converted = value as u32;
         Some(converted)
     } else {
         None
     }
+}
+
+/// Whether `value` is a finite whole number inside `min..=max`.
+fn is_integral_in(value: f64, min: f64, max: f64) -> bool {
+    value.is_finite() && value.fract() == 0.0 && (min..=max).contains(&value)
 }
 
 #[must_use]

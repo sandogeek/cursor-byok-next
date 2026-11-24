@@ -3,10 +3,11 @@
 use std::collections::HashMap;
 
 use super::{
-    BundleScan, Enum, Field, FieldKind, Message, Service, Strictness, SymbolKind, TypeContext,
-    TypeToken, ValueKind, declaration_coverage, extract_from_sources, has_placeholder,
-    merge_messages_by_type_name, parse_field_object_source, reclassify_enum_fields,
-    resolver_from_scan, scan_source, validate_required_agent_shapes,
+    BundleScan, Enum, ExtractError, Field, FieldKind, FieldNumber, FieldType, MapValue, Message,
+    NamedFieldKind, Service, Strictness, SymbolKind, TypeContext, TypeToken, ValueKind,
+    declaration_coverage, extract_from_sources, has_placeholder, merge_messages_by_type_name,
+    parse_field_object_source, reclassify_enum_fields, resolver_from_scan, scan_source,
+    validate_required_shapes,
 };
 
 fn field_by_name<'a>(fields: &'a [Field], name: &str) -> Option<&'a Field> {
@@ -58,6 +59,41 @@ fn parse_field_object_supports_shorthand_type() {
     )
     .expect("parse shorthand T");
     assert_eq!(field.type_token, Some(TypeToken::Named("T".into())));
+    assert_eq!(
+        field.field_type(),
+        FieldType::Named {
+            kind: NamedFieldKind::Message,
+            name: Some("T".into()),
+        }
+    );
+}
+
+#[test]
+fn a_scalar_field_carries_no_map_parts_even_when_the_object_lists_them() {
+    let field =
+        parse_field_object_source(r#"{no:1,name:"n",kind:"scalar",T:5,K:9,V:{kind:"message"}}"#)
+            .expect("parse");
+
+    assert_eq!(field.field_type(), FieldType::Scalar { width: Some(5) });
+}
+
+#[test]
+fn a_map_field_binds_its_key_and_value_to_the_map_shape() {
+    let field = parse_field_object_source(
+        r#"{no:1,name:"labels",kind:"map",K:9,V:{kind:"message",T:Row}}"#,
+    )
+    .expect("parse");
+
+    assert_eq!(
+        field.field_type(),
+        FieldType::Map {
+            key: Some(9),
+            value: MapValue::Named {
+                kind: NamedFieldKind::Message,
+                name: Some("Row".into()),
+            },
+        }
+    );
 }
 
 #[test]
@@ -306,7 +342,11 @@ fn merge_messages_prefers_primary_bundle_and_keeps_supplemental_types() {
             type_name: "aiserver.v1.Shared".into(),
             var_name: String::new(),
             internal_name: String::new(),
-            fields: vec![Field::new(1, "primary", FieldKind::Scalar)],
+            fields: vec![Field::new(
+                FieldNumber::try_from(1).unwrap(),
+                "primary",
+                FieldKind::Scalar,
+            )],
             package: "aiserver.v1".into(),
             short_name: "Shared".into(),
             pos: 0,
@@ -316,7 +356,11 @@ fn merge_messages_prefers_primary_bundle_and_keeps_supplemental_types() {
             type_name: "aiserver.v1.Shared".into(),
             var_name: String::new(),
             internal_name: String::new(),
-            fields: vec![Field::new(1, "supplemental", FieldKind::Scalar)],
+            fields: vec![Field::new(
+                FieldNumber::try_from(1).unwrap(),
+                "supplemental",
+                FieldKind::Scalar,
+            )],
             package: "aiserver.v1".into(),
             short_name: "Shared".into(),
             pos: 0,
@@ -347,7 +391,11 @@ fn merge_messages_prefers_qualified_type_references() {
         fields: vec![Field {
             type_token: Some(TypeToken::Named("uR".into())),
             oneof: Some("result".into()),
-            ..Field::new(5, "edit_result", FieldKind::Message)
+            ..Field::new(
+                FieldNumber::try_from(5).unwrap(),
+                "edit_result",
+                FieldKind::Message,
+            )
         }],
         package: "aiserver.v1".into(),
         short_name: "BuiltinToolResult".into(),
@@ -361,7 +409,11 @@ fn merge_messages_prefers_qualified_type_references() {
         fields: vec![Field {
             type_token: Some(TypeToken::Named("aiserver.v1.EditResult".into())),
             oneof: Some("result".into()),
-            ..Field::new(5, "edit_result", FieldKind::Message)
+            ..Field::new(
+                FieldNumber::try_from(5).unwrap(),
+                "edit_result",
+                FieldKind::Message,
+            )
         }],
         package: "aiserver.v1".into(),
         short_name: "BuiltinToolResult".into(),
@@ -381,7 +433,11 @@ fn merge_messages_prefers_more_complete_definition() {
         type_name: "aiserver.v1.RunInferencePromptModelMetadata".into(),
         var_name: String::new(),
         internal_name: String::new(),
-        fields: vec![Field::new(1, "vendor", FieldKind::Scalar)],
+        fields: vec![Field::new(
+            FieldNumber::try_from(1).unwrap(),
+            "vendor",
+            FieldKind::Scalar,
+        )],
         package: "aiserver.v1".into(),
         short_name: "RunInferencePromptModelMetadata".into(),
         pos: 0,
@@ -392,20 +448,32 @@ fn merge_messages_prefers_more_complete_definition() {
         var_name: String::new(),
         internal_name: String::new(),
         fields: vec![
-            Field::new(1, "vendor", FieldKind::Scalar),
+            Field::new(
+                FieldNumber::try_from(1).unwrap(),
+                "vendor",
+                FieldKind::Scalar,
+            ),
             Field {
                 type_token: Some(TypeToken::Named(
                     "aiserver.v1.RunInferenceAgentModeConfig".into(),
                 )),
                 repeated: true,
-                ..Field::new(46, "agent_mode_configs", FieldKind::Message)
+                ..Field::new(
+                    FieldNumber::try_from(46).unwrap(),
+                    "agent_mode_configs",
+                    FieldKind::Message,
+                )
             },
             Field {
                 type_token: Some(TypeToken::Named(
                     "aiserver.v1.RunInferenceAskQuestionConfig".into(),
                 )),
                 optional: true,
-                ..Field::new(48, "ask_question_config", FieldKind::Message)
+                ..Field::new(
+                    FieldNumber::try_from(48).unwrap(),
+                    "ask_question_config",
+                    FieldKind::Message,
+                )
             },
         ],
         package: "aiserver.v1".into(),
@@ -501,7 +569,7 @@ fn assert_run_inference_maps(by_type: &HashMap<String, Message>) {
 }
 
 #[test]
-fn validate_required_agent_shapes_accepts_run_inference_mode_config() {
+fn validate_required_shapes_accepts_run_inference_mode_config() {
     const BODY: &str = r"
 message RunInferenceAgentModeConfig {
   string mode_id = 1;
@@ -517,11 +585,11 @@ service InferenceService {
   rpc RunInferenceSSE(BidiRequestId) returns (stream RunInferenceServerMessage) {}
 }
 ";
-    validate_required_agent_shapes("aiserver_v1.proto", BODY).expect("valid shapes");
+    validate_required_shapes("aiserver_v1.proto", "aiserver.v1", BODY).expect("valid shapes");
 }
 
 #[test]
-fn validate_required_agent_shapes_stays_inside_message_block() {
+fn validate_required_shapes_stays_inside_message_block() {
     const BODY: &str = r"
 message RunInferencePromptModelMetadata {
   string vendor = 1;
@@ -531,9 +599,138 @@ message Other {
   optional RunInferenceAskQuestionConfig ask_question_config = 48;
 }
 ";
-    let err =
-        validate_required_agent_shapes("aiserver_v1.proto", BODY).expect_err("cross-message leak");
+    let err = validate_required_shapes("aiserver_v1.proto", "aiserver.v1", BODY)
+        .expect_err("cross-message leak");
     assert!(err.to_string().contains("agent_mode_configs"), "got {err}");
+}
+
+#[test]
+fn validate_required_shapes_rejects_a_missing_message() {
+    const BODY: &str = r"
+message RunInferenceAgentModeConfig {
+  string mode_id = 1;
+  bool enable_ask_question_tool = 2;
+  optional RunInferenceSwitchModeToolConfig switch_mode_tool_config = 3;
+}
+service InferenceService {
+  rpc RunInference(stream RunInferenceClientMessage) returns (stream RunInferenceServerMessage) {}
+  rpc RunInferenceSSE(BidiRequestId) returns (stream RunInferenceServerMessage) {}
+}
+";
+    let err = validate_required_shapes("aiserver_v1.proto", "aiserver.v1", BODY)
+        .expect_err("missing metadata");
+    assert!(
+        err.to_string().contains("RunInferencePromptModelMetadata"),
+        "got {err}"
+    );
+}
+
+#[test]
+fn validate_required_shapes_rejects_a_missing_service() {
+    const BODY: &str = r"
+message RunInferenceAgentModeConfig {
+  string mode_id = 1;
+  bool enable_ask_question_tool = 2;
+  optional RunInferenceSwitchModeToolConfig switch_mode_tool_config = 3;
+}
+message RunInferencePromptModelMetadata {
+  repeated RunInferenceAgentModeConfig agent_mode_configs = 46;
+  optional RunInferenceAskQuestionConfig ask_question_config = 48;
+}
+";
+    let err = validate_required_shapes("aiserver_v1.proto", "aiserver.v1", BODY)
+        .expect_err("missing service");
+    assert!(err.to_string().contains("InferenceService"), "got {err}");
+}
+
+#[test]
+fn validate_required_shapes_rejects_agent_package_without_stream_shapes() {
+    let err = validate_required_shapes("agent_v1.proto", "agent.v1", "syntax = \"proto3\";\n")
+        .expect_err("empty agent package");
+    assert!(err.to_string().contains("agent_v1.proto"), "got {err}");
+}
+
+#[test]
+fn strict_extract_rejects_a_bundle_with_no_declarations() {
+    const BUNDLE: &str = "// a valid JS file without any protobuf declarations\nvar unused = 1;\n";
+    let err = extract_from_sources(&[BUNDLE.to_string()], Strictness::Strict)
+        .expect_err("empty extraction must not pass strict");
+    assert!(err.to_string().contains("shape"), "got {err}");
+}
+
+#[test]
+fn lenient_extract_keeps_files_for_a_bundle_with_no_declarations() {
+    const BUNDLE: &str = "// a valid JS file without any protobuf declarations\nvar unused = 1;\n";
+    let result = extract_from_sources(&[BUNDLE.to_string()], Strictness::Lenient).expect("lenient");
+    assert!(result.files.contains_key("agent_v1.proto"));
+    assert!(!result.diagnostics.shape_errors.is_empty());
+}
+
+#[test]
+fn strict_extract_rejects_invalid_field_numbers() {
+    const BUNDLE: &str = r#"
+var Keep=n.makeMessageType("aiserver.v1.Keep",()=>[{no:0,name:"zero",kind:"scalar",T:9}]);
+var Ads={typeName:"aiserver.v1.InAppAdService",methods:{ping:{name:"Ping",I:Keep,O:Keep,kind:n.MethodKind.Unary}}};
+"#;
+    let result = extract_from_sources(&[BUNDLE.to_string()], Strictness::Lenient).expect("lenient");
+    assert!(
+        result.diagnostics.skipped_field_objects >= 1,
+        "a `no: 0` field must be skipped"
+    );
+    let strict = extract_from_sources(&[BUNDLE.to_string()], Strictness::Strict);
+    assert!(strict.is_err(), "a skipped field must fail strict");
+}
+
+#[test]
+fn field_number_rejects_zero_missing_and_reserved_tags() {
+    assert!(FieldNumber::try_from(0).is_err());
+    assert!(FieldNumber::try_from(-1).is_err());
+    assert!(FieldNumber::try_from(19_000).is_err());
+    assert!(FieldNumber::try_from(19_999).is_err());
+    assert!(FieldNumber::try_from(536_870_912).is_err());
+    assert_eq!(FieldNumber::try_from(1).unwrap().get(), 1);
+    assert_eq!(
+        FieldNumber::try_from(536_870_911).unwrap().get(),
+        536_870_911
+    );
+    assert_eq!(FieldNumber::try_from(20_000).unwrap().get(), 20_000);
+}
+
+#[test]
+fn strict_extract_rejects_unknown_bundle_kind() {
+    const BUNDLE: &str = r#"
+var Keep=n.makeMessageType("aiserver.v1.Keep",()=>[{no:1,name:"id",kind:"not_a_kind",T:9}]);
+var Ads={typeName:"aiserver.v1.InAppAdService",methods:{ping:{name:"Ping",I:Keep,O:Keep,kind:n.MethodKind.Unary}}};
+"#;
+    let lenient =
+        extract_from_sources(&[BUNDLE.to_string()], Strictness::Lenient).expect("lenient");
+    assert!(
+        !lenient.diagnostics.unrecognized_inputs.is_empty(),
+        "unknown kind must be reported"
+    );
+    let strict = extract_from_sources(&[BUNDLE.to_string()], Strictness::Strict);
+    assert!(strict.is_err(), "an unknown kind must fail strict");
+}
+
+#[test]
+fn strict_extract_rejects_a_method_missing_its_output() {
+    const BUNDLE: &str = r#"
+var Keep=n.makeMessageType("aiserver.v1.Keep",()=>[{no:1,name:"id",kind:"scalar",T:9}]);
+var Ads={typeName:"aiserver.v1.InAppAdService",methods:{ok:{name:"Ok",I:Keep,O:Keep,kind:n.MethodKind.Unary},broken:{name:"Broken",I:Keep}}};
+"#;
+    let lenient =
+        extract_from_sources(&[BUNDLE.to_string()], Strictness::Lenient).expect("lenient");
+    assert!(
+        lenient
+            .diagnostics
+            .unrecognized_inputs
+            .iter()
+            .any(|item| item.contains("Broken")),
+        "the broken method must be reported: {:?}",
+        lenient.diagnostics.unrecognized_inputs
+    );
+    let strict = extract_from_sources(&[BUNDLE.to_string()], Strictness::Strict);
+    assert!(strict.is_err(), "a broken method must fail strict");
 }
 
 #[test]
@@ -560,20 +757,73 @@ var Ads={typeName:"aiserver.v1.InAppAdService",methods:{ping:{name:"Ping",I:Keep
 "#;
     let result = extract_from_sources(&[BUNDLE.to_string()], Strictness::Lenient).expect("extract");
     assert!(result.files.contains_key("aiserver_v1.proto"));
-    assert_eq!(result.diagnostics.shape_errors, Vec::<String>::new());
+    assert!(
+        !result.diagnostics.shape_errors.is_empty(),
+        "the missing local-loop shapes must still be reported"
+    );
 }
 
 #[test]
-fn write_protos_replaces_directory_atomically() {
+fn write_protos_replaces_the_previous_directory() {
     let dir = tempfile::tempdir().expect("tempdir");
     let output = dir.path().join("out");
     std::fs::create_dir_all(&output).expect("create output");
     std::fs::write(output.join("stale.proto"), "old").expect("stale");
     let mut files = std::collections::HashMap::new();
     files.insert("agent_v1.proto".into(), "syntax = \"proto3\";\n".into());
-    super::write_protos(&output, &files).expect("write");
+    let warnings = super::write_protos(&output, &files).expect("write");
+    assert!(warnings.is_empty(), "{warnings:?}");
     assert!(output.join("agent_v1.proto").exists());
     assert!(!output.join("stale.proto").exists());
+}
+
+#[test]
+fn write_protos_leaves_no_staged_directory_behind() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out");
+    std::fs::create_dir_all(&output).expect("create output");
+    std::fs::write(output.join("stale.proto"), "old").expect("stale");
+    let mut files = std::collections::HashMap::new();
+    files.insert("agent_v1.proto".into(), "syntax = \"proto3\";\n".into());
+
+    super::write_protos(&output, &files).expect("write");
+
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("readdir")
+        .map(|entry| entry.expect("entry").file_name().to_string_lossy().into())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["out".to_string()],
+        "neither temp nor backup remains"
+    );
+}
+
+#[test]
+fn a_failed_publish_keeps_the_previous_contents_in_place() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("out");
+    std::fs::create_dir_all(&output).expect("create output");
+    std::fs::write(output.join("stale.proto"), "old").expect("stale");
+    // A file name with a path separator cannot be written into the staged
+    // directory, so the publish fails before the swap.
+    let mut files = std::collections::HashMap::new();
+    files.insert("nested/agent_v1.proto".into(), "syntax".into());
+
+    let error = super::write_protos(&output, &files).expect_err("publish fails");
+
+    assert!(matches!(error, ExtractError::Publish { .. }), "{error:?}");
+    assert!(
+        output.join("stale.proto").exists(),
+        "a failed publish must not drop the previous contents"
+    );
+    assert!(
+        !std::fs::read_dir(dir.path())
+            .expect("readdir")
+            .filter_map(std::result::Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp.")),
+        "the staged directory was cleaned up"
+    );
 }
 
 #[test]

@@ -13,11 +13,12 @@ mod validate;
 
 pub use compact::{
     CompactIndex, CompactPendingMessage, CompactSchema, parse_compact_field,
-    parse_compact_schema_array,
+    parse_compact_field_with_diagnostics, parse_compact_schema_array,
 };
 pub use error::Error;
 pub use extract::{
-    ExtractError, ExtractResult, Strictness, extract_from_files, extract_from_sources, write_protos,
+    ExtractError, ExtractResult, RollbackFailure, Strictness, extract_from_files,
+    extract_from_sources, write_protos,
 };
 pub use merge::{
     DeclarationCoverage, declaration_coverage, merge_enums_by_type_name,
@@ -29,14 +30,15 @@ pub use resolver::{
     AliasIndex, ModuleImports, ModuleStart, TypeContext, TypeResolver, build_alias_index,
     build_module_imports,
 };
-pub use scan::{BundleScan, parse_field_object, scan_source};
+pub use scan::{BundleScan, parse_field_object, parse_field_object_with_diagnostics, scan_source};
 pub use types::{
-    Diagnostics, Enum, EnumValue, Field, FieldKind, Message, Method, MethodKind, Service,
+    Diagnostics, Enum, EnumValue, Field, FieldKind, FieldNumber, FieldType, InvalidFieldNumber,
+    InvalidFieldNumberReason, MapValue, Message, Method, MethodKind, NamedFieldKind, Service,
     SymbolKind, TypeName, TypeToken, ValueKind, google_well_known, is_field_name, is_google_pkg,
     is_ident, is_local_loop_pkg, is_scalar_id, looks_like_full_type_name, looks_like_package_name,
     looks_like_versioned_type, parse_type_name, scalar_name,
 };
-pub use validate::{has_placeholder, validate_required_agent_shapes};
+pub use validate::{has_placeholder, proto_block, validate_required_shapes};
 
 /// Indexes a scan's declarations, aliases and module imports into a resolver.
 #[must_use]

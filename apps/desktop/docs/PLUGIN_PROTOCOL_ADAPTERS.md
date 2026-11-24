@@ -57,6 +57,11 @@ cursor-byok/server/plugins/build-in/magpie/
 | 10 | 停止序列 | 上游 helper 无该字段（Cursor `InferenceModelConfig.stop_sequences` 未投影） | `project.rs` 只把 `stop_sequences` 放进 `ModelSpec`，由适配器按协议写：Chat `stop`、Anthropic `stop_sequences`、Responses 无停止字段故丢弃 | 三个协议字段名不同；原样合并 `stop` 会让 Anthropic/Responses 在严格网关 400 |
 | 11 | 工具名为 provider 合法名 | helper 直接使用 `tool.name` | `ToolNames` 每次调用建无冲突双向映射：别名只含 `[A-Za-z0-9_-]`（`a.b` → `a_b`），超 64 字符取前 57 + sha256 前 7；撞名再追加 `_2` 并同样截断；三个协议（含 Anthropic）共用；回给 Cursor 的 `ToolCallStart`、`tool_use` 一律还原原名 | Cursor 的 MCP 工具有两种不合规来源：`${serverIdentifier}-${toolName}`（本机 `user-eamodio.gitlens-extension-GitKraken-…` 带 `.`，长名可 68+），以及 MCP server 自报的 `x.y` / `a/b`。OpenAI 要求 `^[a-zA-Z0-9_-]{1,64}$`，Anthropic 同样限制字符集，直通会 400；截断带 hash 是为了让只在 64 位之后分叉的名字仍不撞 |
 | 12 | 非 2xx 错误体 | 读完整响应体，等待 EOF | 64 KiB 上限 + 10s deadline；先记录 HTTP 状态，再读错误体，超时/读失败只截断文本，状态码照常回给 Magpie | 网关可能发完 401 头却不结束 body；状态码不能因为错误体延迟而丢失 |
+| 13 | 内容块状态 | 三个 map 按同一 index 关联（`block_types` / `thinking_text` / `thinking_signatures`），关闭时缺项按空串兜底 | `BTreeMap<usize, BlockState>`，变体 `Text` / `Thinking { text, signature }` / `Tool` / `Other` 各自携带数据 | 旧形状允许“thinking 块却没有签名槽”，缺失被默认值掩盖；现在文本与签名只能在同一个 `Thinking` 里出现，未知块类型显式保留前向容忍 |
+| 14 | 插件事件的投递 | 事件直接写入 unbounded 队列 | 有界事件队列（4096 项），满时以终止错误结束本次调用 | 插件刷事件比消费者快时，无界队列会把内存吃光；静默丢事件又会让调用被记成成功 |
+| 15 | 并发的插件调用数 | 无上限 | 每插件 16 个活动调用，超出时注册失败 | 每次调用是一个 Bun 进程内的并发流；不设上限时客户端可以无限叠加 |
+| 16 | 单行 JSONL 上限 | 无上限 | 16 MiB，超限即停止这一代 worker | `BufReader::read_line` 会为一行分配任意大的 `String`，一个坏插件就能撑爆内存 |
+| 17 | 取消与 stdin 的竞争 | 取消只在流关闭时生效 | 请求发送与拆卸分成两个任务；取消路径只 `try_send`，不阻塞在写满的 stdin 上 | 一个不读 stdin 的 worker 会让取消路径永远等不到，调用也就永远不结束 |
 
 ## 必须保持的不变量
 

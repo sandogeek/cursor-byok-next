@@ -36,6 +36,9 @@ const STREAM_READ_BATCH: usize = 256;
 /// Unread lines buffered between the reader task and the plugin. A stream that
 /// outruns its consumer applies backpressure here instead of growing unbounded.
 const STREAM_LINE_BUFFER: usize = 256;
+/// Streams one invocation may keep open at once. Each holds a reader task and a
+/// line queue, so an uncapped count is unbounded work per invocation.
+const MAX_STREAMS_PER_INVOCATION: usize = 16;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -70,11 +73,21 @@ pub(super) struct HostContext {
     network_hosts: Arc<HashSet<String>>,
     /// Whether a resource's own origin counts as allowed; the manifest decides.
     resource_origin: bool,
-    streams: Arc<Mutex<HashMap<String, StreamLines>>>,
+    /// Open streams keyed by stream id, shared across invocations. Entries are
+    /// tagged with the owning invocation's cancellation token so the reader task
+    /// can drop them when that invocation ends.
+    streams: Arc<Mutex<HashMap<String, OpenStream>>>,
     /// Built on the first network call so a plugin with none never pays for it.
     http: OnceLock<reqwest::Client>,
     #[cfg(test)]
     sdk_projections: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A stream open under one invocation. Dropping it (via removal or invocation
+/// cancellation) frees the reader task through the shared cancellation token.
+struct OpenStream {
+    lines: StreamLines,
+    cancellation: CancellationToken,
 }
 
 impl HostContext {
@@ -116,10 +129,7 @@ impl HostContext {
             "network.stream.open" => self.stream_open(invocation, params).await,
             "network.stream.read" => self.stream_read(params).await,
             "network.stream.close" => {
-                self.streams
-                    .lock()
-                    .await
-                    .remove(wire::required_str(&params, "streamId", HOST_CALL)?);
+                self.close_stream(&params).await?;
                 Ok(Value::Null)
             }
             "protocol.stream" => super::adapters::stream(self, invocation, params).await,
@@ -316,6 +326,9 @@ impl HostContext {
             method: _,
             recorder,
         } = self.request(invocation, &params).await?;
+        // The stream belongs to this invocation: when the invocation is cancelled
+        // the reader task observes the token and stops, and the entry is dropped
+        // on the next read/close. A plugin cannot leak one past its call.
         let cancellation = invocation.cancellation.clone();
         let response = tokio::select! {
             () = cancellation.cancelled() => return Err(Error::Cancelled),
@@ -326,13 +339,30 @@ impl HostContext {
             recorder.response_headers(status).await;
         }
         let headers = header_map(&response);
-        let (sender, receiver) = mpsc::channel::<Result<String>>(STREAM_LINE_BUFFER);
-        tokio::spawn(stream_body(response, sender, cancellation, recorder));
         let stream_id = uuid::Uuid::new_v4().to_string();
-        self.streams
-            .lock()
-            .await
-            .insert(stream_id.clone(), Arc::new(Mutex::new(receiver)));
+        {
+            let mut streams = self.streams.lock().await;
+            prune_cancelled_streams(&mut streams);
+            if streams.len() >= MAX_STREAMS_PER_INVOCATION {
+                return Err(Error::Provider(
+                    "too many open plugin network streams".into(),
+                ));
+            }
+            let (sender, receiver) = mpsc::channel::<Result<String>>(STREAM_LINE_BUFFER);
+            tokio::spawn(stream_body(
+                response,
+                sender,
+                cancellation.clone(),
+                recorder,
+            ));
+            streams.insert(
+                stream_id.clone(),
+                OpenStream {
+                    lines: Arc::new(Mutex::new(receiver)),
+                    cancellation,
+                },
+            );
+        }
         Ok(serde_json::json!({
             "streamId": stream_id,
             "status": status,
@@ -342,13 +372,14 @@ impl HostContext {
 
     async fn stream_read(&self, params: Value) -> Result<Value> {
         let stream_id = wire::required_str(&params, "streamId", HOST_CALL)?;
-        // Clone out the handle and release both maps' guards before waiting:
-        // the lock must not be held across `recv()`.
+        // Clone out the handle and release the map guard before waiting: the lock
+        // must not be held across `recv()`.
         let lines_handle = {
-            let streams = self.streams.lock().await;
+            let mut streams = self.streams.lock().await;
+            prune_cancelled_streams(&mut streams);
             streams
                 .get(stream_id)
-                .cloned()
+                .map(|stream| Arc::clone(&stream.lines))
                 .ok_or_else(|| Error::Protocol(format!("unknown plugin stream: {stream_id}")))?
         };
         let mut receiver = lines_handle.lock().await;
@@ -379,6 +410,21 @@ impl HostContext {
         }
         Ok(serde_json::json!({ "lines": lines, "done": false }))
     }
+
+    /// Removes one stream, cancelling its reader task.
+    async fn close_stream(&self, params: &Value) -> Result<()> {
+        let stream_id = wire::required_str(params, "streamId", HOST_CALL)?;
+        if let Some(stream) = self.streams.lock().await.remove(stream_id) {
+            stream.cancellation.cancel();
+        }
+        Ok(())
+    }
+}
+
+/// Drops streams whose owning invocation was cancelled, so a plugin that never
+/// calls `network.stream.close` cannot keep a reader task alive past its call.
+fn prune_cancelled_streams(streams: &mut HashMap<String, OpenStream>) {
+    streams.retain(|_, stream| !stream.cancellation.is_cancelled());
 }
 
 /// Splits a streaming reply into lines for `network.stream.read`, forwarding each
@@ -396,19 +442,24 @@ async fn stream_body(
     loop {
         let chunk = tokio::select! {
             () = cancellation.cancelled() => {
-                let _ = sender.send(Err(Error::Cancelled)).await;
+                send_terminal(&sender, Err(Error::Cancelled), &cancellation).await;
                 return;
             }
             chunk = body.next() => chunk,
         };
         let Some(chunk) = chunk else { break };
         let Ok(chunk) = chunk else {
-            fail(&sender, "cannot read plugin network stream").await;
+            fail(&sender, "cannot read plugin network stream", &cancellation).await;
             return;
         };
         total = total.saturating_add(chunk.len());
         if total > MAX_STREAM_BYTES {
-            fail(&sender, "plugin network stream is larger than allowed").await;
+            fail(
+                &sender,
+                "plugin network stream is larger than allowed",
+                &cancellation,
+            )
+            .await;
             return;
         }
         if let Some(recorder) = &recorder {
@@ -425,10 +476,14 @@ async fn stream_body(
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
-            if sender
-                .send(Ok(String::from_utf8_lossy(&line).into_owned()))
-                .await
-                .is_err()
+            // The receiver may be full because the plugin stopped reading; the
+            // cancellation branch means that no longer blocks this task forever.
+            if !send_line(
+                &sender,
+                String::from_utf8_lossy(&line).into_owned(),
+                &cancellation,
+            )
+            .await
             {
                 return;
             }
@@ -437,14 +492,43 @@ async fn stream_body(
         buffered.truncate(buffered.len() - consumed);
     }
     if !buffered.is_empty() {
-        let _ = sender
-            .send(Ok(String::from_utf8_lossy(&buffered).into_owned()))
-            .await;
+        let line = String::from_utf8_lossy(&buffered).into_owned();
+        let _ = send_line(&sender, line, &cancellation).await;
     }
 }
 
-async fn fail(sender: &mpsc::Sender<Result<String>>, message: &str) {
-    let _ = sender.send(Err(Error::Provider(message.into()))).await;
+/// Sends one line unless the invocation was cancelled. Returns whether the send
+/// completed (so the caller knows whether to keep reading).
+async fn send_line(
+    sender: &mpsc::Sender<Result<String>>,
+    line: String,
+    cancellation: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        () = cancellation.cancelled() => false,
+        result = sender.send(Ok(line)) => result.is_ok(),
+    }
+}
+
+async fn fail(
+    sender: &mpsc::Sender<Result<String>>,
+    message: &str,
+    cancellation: &CancellationToken,
+) {
+    send_terminal(sender, Err(Error::Provider(message.into())), cancellation).await;
+}
+
+/// Delivers a terminal message unless the invocation was cancelled; a full queue
+/// is not awaited past cancellation.
+async fn send_terminal(
+    sender: &mpsc::Sender<Result<String>>,
+    message: Result<String>,
+    cancellation: &CancellationToken,
+) {
+    tokio::select! {
+        () = cancellation.cancelled() => {}
+        _ = sender.send(message) => {}
+    }
 }
 
 fn response_too_large() -> Error {

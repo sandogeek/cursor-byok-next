@@ -31,7 +31,7 @@ use tokio::sync::Mutex;
 
 use self::{
     account::AccountStore,
-    ca::CaManager,
+    ca::{CaManager, LoadedCa},
     proxy::{ProxyRuntime, Routing},
     settings::{ManagedSettings, SettingsStore},
     state::{HarnessState, HarnessStateStore, PortChoice},
@@ -85,6 +85,33 @@ pub enum CaState {
     Ready,
     /// The pair is incomplete, mismatched or expired.
     Invalid,
+}
+
+/// What the user asked takeover to do.
+///
+/// A switch at the TSX boundary is a boolean; this is the same two states with
+/// a name the state machine can read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TakeoverIntent {
+    Enabled,
+    Disabled,
+}
+
+impl TakeoverIntent {
+    #[must_use]
+    fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+impl From<bool> for TakeoverIntent {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
 }
 
 /// How much of takeover is actually working right now.
@@ -223,7 +250,7 @@ impl CursorHarness {
         let Some(url) = self.saved_proxy_url() else {
             return Ok(false);
         };
-        self.paths.settings.clear_proxy_settings(&url)
+        self.clear_proxy_settings(&url).await
     }
 
     /// Generates the CA when missing. Blocking work: run it from a task.
@@ -246,20 +273,19 @@ impl CursorHarness {
     /// Turns takeover on or off. Enabling fails before touching Cursor when the
     /// CA is not trusted. The persisted intent is committed before files change.
     ///
-    /// The flag stays a `bool` because it is the `#[class]` boundary the TSX
-    /// takeover switch calls; an enum would change the generated binding.
-    #[expect(
-        clippy::fn_params_excessive_bools,
-        reason = "the bool is the TSX takeover switch's argument at the native boundary"
-    )]
-    pub async fn set_enabled(&self, enabled: bool) -> Result<HarnessStatus> {
+    /// # Errors
+    ///
+    /// Fails when the intent cannot be saved, the CA is missing or untrusted,
+    /// or Cursor's settings cannot be written. A failed enable leaves the
+    /// persisted intent at `Enabled`, so the next status call retries it.
+    pub async fn set_takeover(&self, intent: TakeoverIntent) -> Result<HarnessStatus> {
         let _operation = self.operation.lock().await;
-        self.update_intent(|intent| intent.enabled = enabled)?;
+        self.update_intent(|state| state.enabled = intent.is_enabled())
+            .await?;
 
-        if enabled {
-            self.enable().await?;
-        } else {
-            self.disable().await?;
+        match intent {
+            TakeoverIntent::Enabled => self.enable().await?,
+            TakeoverIntent::Disabled => self.disable().await?,
         }
         Ok(self.report().await)
     }
@@ -273,15 +299,16 @@ impl CursorHarness {
     /// keeps its previous value.
     pub async fn set_preferred_port(&self, port: Option<u16>) -> Result<HarnessStatus> {
         let _operation = self.operation.lock().await;
-        self.update_intent(|intent| intent.preferred_port = PortChoice::from_boundary(port))?;
+        self.update_intent(|intent| intent.preferred_port = PortChoice::from_boundary(port))
+            .await?;
         Ok(self.report().await)
     }
 
     /// The one read-modify-write of the intent. Callers hold `operation`.
-    fn update_intent(&self, change: impl FnOnce(&mut HarnessState)) -> Result<()> {
+    async fn update_intent(&self, change: impl FnOnce(&mut HarnessState)) -> Result<()> {
         let mut intent = *self.intent.read();
         change(&mut intent);
-        self.paths.state.save(intent)?;
+        self.save_intent(intent).await?;
         *self.intent.write() = intent;
         Ok(())
     }
@@ -348,18 +375,20 @@ impl CursorHarness {
     /// `security`, so it must not block the async runtime.
     async fn ca_state(&self) -> CaState {
         let paths = Arc::clone(&self.paths);
-        let inspected = tokio::task::spawn_blocking(move || paths.ca.state()).await;
-        match inspected {
-            Ok(Ok(state)) => state,
-            Ok(Err(error)) => {
+        match blocking("the CA inspection task failed", move || paths.ca.state()).await {
+            Ok(state) => state,
+            Err(error) => {
                 tracing::warn!(%error, "could not inspect the local CA");
                 CaState::Invalid
             }
-            Err(error) => {
-                tracing::warn!(%error, "the CA inspection task failed");
-                CaState::Invalid
-            }
         }
+    }
+
+    /// Loads the CA off the async runtime: reading and parsing the key pair is
+    /// CPU and file work, and on a network filesystem it can stall.
+    async fn ca_load(&self) -> Result<LoadedCa> {
+        let paths = Arc::clone(&self.paths);
+        blocking("the CA load task failed", move || paths.ca.load()).await
     }
 
     /// Reads the managed state of Cursor's `settings.json` off the async
@@ -367,11 +396,43 @@ impl CursorHarness {
     async fn managed_settings(&self, proxy_url: Option<&str>) -> Result<ManagedSettings> {
         let paths = Arc::clone(&self.paths);
         let proxy_url = proxy_url.map(str::to_owned);
-        tokio::task::spawn_blocking(move || paths.settings.managed_state(proxy_url.as_deref()))
-            .await
-            .map_err(|error| {
-                Error::Process(format!("the settings inspection task failed: {error}"))
-            })?
+        blocking("the settings inspection task failed", move || {
+            paths.settings.managed_state(proxy_url.as_deref())
+        })
+        .await
+    }
+
+    /// Writes Cursor's proxy setting off the async thread; Cursor may be
+    /// running, so this is a read-modify-write of a JSONC file plus a rename.
+    async fn write_proxy_settings(&self, proxy_url: &str) -> Result<()> {
+        let paths = Arc::clone(&self.paths);
+        let proxy_url = proxy_url.to_owned();
+        blocking("the settings write task failed", move || {
+            paths.settings.write_proxy_settings(&proxy_url)
+        })
+        .await
+    }
+
+    /// Clears this app's proxy setting off the async thread. Only a managed,
+    /// loopback entry is touched; anything else is left alone, and `false`
+    /// reports that nothing matched.
+    async fn clear_proxy_settings(&self, proxy_url: &str) -> Result<bool> {
+        let paths = Arc::clone(&self.paths);
+        let proxy_url = proxy_url.to_owned();
+        blocking("the settings cleanup task failed", move || {
+            paths.settings.clear_proxy_settings(&proxy_url)
+        })
+        .await
+    }
+
+    /// Writes `harness.json` off the async thread so a slow disk cannot stall
+    /// the operation that holds Cursor's state machine.
+    async fn save_intent(&self, intent: HarnessState) -> Result<()> {
+        let paths = Arc::clone(&self.paths);
+        blocking("the takeover intent save task failed", move || {
+            paths.state.save(intent)
+        })
+        .await
     }
 
     fn saved_proxy_url(&self) -> Option<String> {
@@ -382,7 +443,7 @@ impl CursorHarness {
     }
 
     async fn enable(&self) -> Result<()> {
-        if !matches!(self.paths.ca.state()?, CaState::Ready) {
+        if self.ca_state().await != CaState::Ready {
             return Err(Error::Config(
                 "trust the local CA before enabling Cursor takeover".into(),
             ));
@@ -408,6 +469,9 @@ impl CursorHarness {
         if let Some(url) = running_url {
             return self.apply(&url).await;
         }
+        // Load the CA before taking the proxy lock: reading and parsing the key
+        // pair is blocking work, and the proxy lock is held across the start.
+        let ca = self.ca_load().await?;
         let mut proxy = self.proxy.lock().await;
         let Some(url) = proxy.url() else {
             // Reuse the port the user chose, else the one Cursor's settings were
@@ -417,7 +481,6 @@ impl CursorHarness {
             let preferred = intent
                 .preferred_port
                 .request(intent.proxy_port, DEFAULT_PROXY_PORT);
-            let ca = self.paths.ca.load()?;
             let started = proxy.start(self.routing.clone(), ca, preferred).await?;
             if started.port != preferred {
                 tracing::warn!(
@@ -434,14 +497,17 @@ impl CursorHarness {
             // Cursor's files and the remembered port must both name the port that
             // is actually open, or the next start leaves Cursor on a dead port. A
             // failure in either write undoes the proxy that is already listening.
-            let applied = self
-                .apply(&url)
-                .await
-                .and_then(|()| self.update_intent(|intent| intent.proxy_port = Some(port)));
+            let applied = match self.apply(&url).await {
+                Ok(()) => {
+                    self.update_intent(|intent| intent.proxy_port = Some(port))
+                        .await
+                }
+                Err(error) => Err(error),
+            };
             if let Err(error) = applied {
                 // A rollback that also fails is worth a log line: Cursor's settings
                 // may still name the port that is about to close.
-                if let Err(cleanup) = self.paths.settings.clear_proxy_settings(&url) {
+                if let Err(cleanup) = self.clear_proxy_settings(&url).await {
                     tracing::warn!(%cleanup, "could not roll back Cursor proxy settings");
                 }
                 self.proxy.lock().await.stop().await;
@@ -468,7 +534,7 @@ impl CursorHarness {
     /// still points at it would leave Cursor talking to a closed port.
     async fn clear_settings_then_stop(&self, proxy_url: Option<String>) -> Result<()> {
         if let Some(url) = proxy_url {
-            self.paths.settings.clear_proxy_settings(&url)?;
+            self.clear_proxy_settings(&url).await?;
         }
         self.proxy.lock().await.stop().await;
         Ok(())
@@ -480,7 +546,26 @@ impl CursorHarness {
         if self.routing.has_backend() {
             self.paths.account.inject_if_missing().await?;
         }
-        self.paths.settings.write_proxy_settings(proxy_url)
+        self.write_proxy_settings(proxy_url).await
+    }
+}
+
+/// Runs one blocking file or process operation on the blocking pool.
+///
+/// `context` names the operation in the error the caller sees, so a failed
+/// blocking task is distinguishable from a failed file operation.
+async fn blocking<T: Send + 'static>(
+    context: &'static str,
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    if let Ok(current) = tokio::runtime::Handle::try_current() {
+        current.spawn_blocking(operation).await.map_err(|error| {
+            Error::Process(format!(
+                "{context}: the blocking task did not finish: {error}"
+            ))
+        })?
+    } else {
+        operation()
     }
 }
 
@@ -516,9 +601,17 @@ mod tests {
         let harness = harness(&dir);
         harness.initialize_ca().unwrap();
 
-        assert!(harness.set_enabled(true).await.is_err());
+        assert!(harness.set_takeover(TakeoverIntent::Enabled).await.is_err());
         assert!(!dir.path().join("settings.json").exists());
         assert!(harness.paths.state.load().enabled);
+    }
+
+    #[test]
+    fn a_boundary_switch_maps_to_an_intent() {
+        assert_eq!(TakeoverIntent::from(true), TakeoverIntent::Enabled);
+        assert_eq!(TakeoverIntent::from(false), TakeoverIntent::Disabled);
+        assert!(TakeoverIntent::Enabled.is_enabled());
+        assert!(!TakeoverIntent::Disabled.is_enabled());
     }
 
     #[tokio::test]
@@ -603,7 +696,7 @@ mod tests {
         assert_eq!(status.preferred_proxy_port, Some(41000));
         assert_eq!(
             harness.paths.state.load().preferred_port,
-            PortChoice::Fixed(41000)
+            PortChoice::Fixed(std::num::NonZeroU16::new(41000).unwrap())
         );
         assert_eq!(harness.paths.state.load().proxy_port, None);
     }
@@ -632,7 +725,8 @@ mod tests {
 
     #[test]
     fn the_port_to_bind_prefers_the_choice_over_the_last_bind() {
-        let chosen = PortChoice::Fixed(42000).request(Some(41000), DEFAULT_PROXY_PORT);
+        let chosen = PortChoice::Fixed(std::num::NonZeroU16::new(42000).unwrap())
+            .request(Some(41000), DEFAULT_PROXY_PORT);
         assert_eq!(chosen, 42000);
 
         let never_chosen = PortChoice::Unset.request(Some(41000), DEFAULT_PROXY_PORT);

@@ -10,7 +10,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use super::{
     Error, Result,
     definition::PluginDefinitionLoader,
-    descriptor::{CatalogMode, PluginModuleDefinition},
+    descriptor::{CatalogMode, PluginModuleDefinition, ValidatedProvider},
     manifest::{PluginManifest, validate_id},
 };
 
@@ -30,7 +30,11 @@ pub struct PluginCatalog {
 pub(crate) struct PluginEntry {
     pub entry: PathBuf,
     pub manifest: PluginManifest,
+    /// The declaration as the plugin produced it; resources are read from here.
     pub definition: PluginModuleDefinition,
+    /// The same providers, with their model source resolved. The host reads
+    /// these instead of the raw `hasModels` / `catalog` / `resourceType` trio.
+    pub providers: Vec<ValidatedProvider>,
     pub icon: String,
 }
 
@@ -139,11 +143,12 @@ async fn load_plugin(
             .map_err(|error| Error::context("plugin manifest task failed".to_owned(), error))??;
     let entry = directory.join(&manifest.entry).canonicalize()?;
     let definition = loader.load(executable, &entry).await?;
-    validate_definition(&manifest.id, &definition)?;
+    let providers = validate_definition(&manifest.id, &definition)?;
     Ok(PluginEntry {
         entry,
         manifest,
         definition,
+        providers,
         icon,
     })
 }
@@ -171,13 +176,17 @@ fn validate_localized_text(
     }
 }
 
-fn validate_definition(plugin_id: &str, definition: &PluginModuleDefinition) -> Result<()> {
+pub(super) fn validate_definition(
+    plugin_id: &str,
+    definition: &PluginModuleDefinition,
+) -> Result<Vec<ValidatedProvider>> {
     if definition.providers.is_empty() {
         return Err(Error::Config(format!(
             "plugin '{plugin_id}' must define at least one provider"
         )));
     }
     let mut provider_ids = std::collections::HashSet::new();
+    let mut validated = Vec::with_capacity(definition.providers.len());
     for provider in &definition.providers {
         validate_id(&provider.id, "plugin provider id")?;
         validate_localized_text(&provider.display_name, || {
@@ -192,19 +201,17 @@ fn validate_definition(plugin_id: &str, definition: &PluginModuleDefinition) -> 
                 provider.id
             )));
         }
-        if provider.catalog == CatalogMode::Live {
-            if !provider.has_models {
-                return Err(Error::Config(format!(
-                    "plugin '{plugin_id}' provider '{}' live catalog requires models",
-                    provider.id
-                )));
-            }
-            if provider.resource_type.is_none() {
-                return Err(Error::Config(format!(
-                    "plugin '{plugin_id}' provider '{}' live catalog requires a resource type",
-                    provider.id
-                )));
-            }
+        if provider.catalog == CatalogMode::Live && !provider.has_models {
+            return Err(Error::Config(format!(
+                "plugin '{plugin_id}' provider '{}' live catalog requires models",
+                provider.id
+            )));
+        }
+        if provider.catalog == CatalogMode::Live && provider.resource_type.is_none() {
+            return Err(Error::Config(format!(
+                "plugin '{plugin_id}' provider '{}' live catalog requires a resource type",
+                provider.id
+            )));
         }
         if !provider_ids.insert(provider.id.clone()) {
             return Err(Error::Config(format!(
@@ -223,6 +230,14 @@ fn validate_definition(plugin_id: &str, definition: &PluginModuleDefinition) -> 
                 provider.id
             )));
         }
+        // The checks above are the ones a user can act on; this one re-states
+        // them as a type, so the host cannot construct an invalid provider.
+        validated.push(
+            provider
+                .clone()
+                .validated()
+                .map_err(|error| Error::Config(format!("plugin '{plugin_id}' {error}")))?,
+        );
     }
     let mut resource_types = std::collections::HashSet::new();
     for resource in &definition.resources {
@@ -244,7 +259,7 @@ fn validate_definition(plugin_id: &str, definition: &PluginModuleDefinition) -> 
             validate_form_fields(plugin_id, &method.id, &method.fields)?;
         }
     }
-    Ok(())
+    Ok(validated)
 }
 
 fn validate_form_fields(

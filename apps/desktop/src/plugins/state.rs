@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use super::{Error, Result, data::PluginDataStore};
 use crate::time::now_ms;
 
+/// What every `Debug` in this module prints instead of stored credentials.
+const REDACTED: &str = "[REDACTED]";
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "status", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ResourceState {
@@ -39,14 +42,28 @@ impl ResourceState {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ResourceRecord {
     pub id: String,
     pub key: String,
+    /// Credentials the plugin calls upstream with; never rendered by `Debug`.
     pub private_data: serde_json::Value,
     pub state: ResourceState,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+impl std::fmt::Debug for ResourceRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResourceRecord")
+            .field("id", &self.id)
+            .field("key", &self.key)
+            .field("private_data", &REDACTED)
+            .field("state", &self.state)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("updated_at_ms", &self.updated_at_ms)
+            .finish()
+    }
 }
 
 impl ResourceRecord {
@@ -83,19 +100,30 @@ fn state_json(state: &ResourceState) -> serde_json::Value {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourceDraft {
     pub key: String,
+    /// Credentials the plugin calls upstream with; never rendered by `Debug`.
     pub private_data: serde_json::Value,
     /// The state the plugin reports with a new resource; ready when absent.
     #[serde(default)]
     pub state: Option<ResourceState>,
 }
 
+impl std::fmt::Debug for ResourceDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResourceDraft")
+            .field("key", &self.key)
+            .field("private_data", &REDACTED)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
 /// A partial update a plugin sends after a call: only the fields it names are
 /// replaced, so an omitted `state` keeps the stored one.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourcePatch {
     #[serde(default)]
@@ -104,7 +132,21 @@ pub struct ResourcePatch {
     pub state: Option<ResourceState>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+impl std::fmt::Debug for ResourcePatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let private_data = if self.private_data.is_some() {
+            REDACTED
+        } else {
+            "<unchanged>"
+        };
+        f.debug_struct("ResourcePatch")
+            .field("private_data", &private_data)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub struct StoredModel {
     pub id: String,
     pub display_name: String,
@@ -114,8 +156,22 @@ pub struct StoredModel {
     pub max_output_tokens: Option<u64>,
     #[serde(default)]
     pub images: bool,
+    /// Credentials this model calls upstream with; never rendered by `Debug`.
     #[serde(default)]
     pub private_data: serde_json::Value,
+}
+
+impl std::fmt::Debug for StoredModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredModel")
+            .field("id", &self.id)
+            .field("display_name", &self.display_name)
+            .field("description", &self.description)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field("images", &self.images)
+            .field("private_data", &REDACTED)
+            .finish()
+    }
 }
 
 impl StoredModel {
@@ -222,6 +278,10 @@ impl PluginStateStore {
 
     /// Applies a plugin's drafts, matching them to stored resources by `key`.
     ///
+    /// The whole list is one [`PluginDataStore::mutate`] transaction, so two
+    /// concurrent drafts cannot overwrite each other with an older snapshot, and
+    /// a cancelled caller cannot leave a half-applied update.
+    ///
     /// # Errors
     ///
     /// Fails when a draft has a blank key, or the stored list cannot be read or
@@ -232,41 +292,43 @@ impl PluginStateStore {
         resource_type: &str,
         drafts: Vec<ResourceDraft>,
     ) -> Result<UpsertOutcome> {
-        let mut records = self.resources(plugin_id, resource_type).await?;
         let now = now_ms();
-        let mut outcome = UpsertOutcome {
-            added: 0,
-            updated: 0,
-            changed_ids: Vec::new(),
-        };
-        for draft in drafts {
+        for draft in &drafts {
             if draft.key.trim().is_empty() {
                 return Err(Error::Protocol("plugin resource draft requires key".into()));
             }
-            let state = draft.state.unwrap_or(ResourceState::Ready);
-            if let Some(existing) = records.iter_mut().find(|record| record.key == draft.key) {
-                existing.private_data = draft.private_data;
-                existing.state = state;
-                existing.updated_at_ms = now;
-                outcome.changed_ids.push(existing.id.clone());
-                outcome.updated += 1;
-            } else {
-                let id = uuid::Uuid::new_v4().to_string();
-                outcome.changed_ids.push(id.clone());
-                records.push(ResourceRecord {
-                    id,
-                    key: draft.key,
-                    private_data: draft.private_data,
-                    state,
-                    created_at_ms: now,
-                    updated_at_ms: now,
-                });
-                outcome.added += 1;
-            }
         }
-        self.save_resources(plugin_id, resource_type, &records)
-            .await?;
-        Ok(outcome)
+        self.mutate_resources(plugin_id, resource_type, move |mut records| {
+            let mut outcome = UpsertOutcome {
+                added: 0,
+                updated: 0,
+                changed_ids: Vec::new(),
+            };
+            for draft in drafts {
+                let state = draft.state.unwrap_or(ResourceState::Ready);
+                if let Some(existing) = records.iter_mut().find(|record| record.key == draft.key) {
+                    existing.private_data = draft.private_data;
+                    existing.state = state;
+                    existing.updated_at_ms = now;
+                    outcome.changed_ids.push(existing.id.clone());
+                    outcome.updated += 1;
+                } else {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    outcome.changed_ids.push(id.clone());
+                    records.push(ResourceRecord {
+                        id,
+                        key: draft.key,
+                        private_data: draft.private_data,
+                        state,
+                        created_at_ms: now,
+                        updated_at_ms: now,
+                    });
+                    outcome.added += 1;
+                }
+            }
+            Ok((records, outcome))
+        })
+        .await
     }
 
     /// Applies a partial update to one resource.
@@ -282,20 +344,23 @@ impl PluginStateStore {
         resource_id: &str,
         patch: ResourcePatch,
     ) -> Result<()> {
-        let mut records = self.resources(plugin_id, resource_type).await?;
-        let record = records
-            .iter_mut()
-            .find(|record| record.id == resource_id)
-            .ok_or_else(|| Error::NotFound(format!("plugin resource {resource_id}")))?;
-        if let Some(private_data) = patch.private_data {
-            record.private_data = private_data;
-        }
-        if let Some(state) = patch.state {
-            record.state = state;
-        }
-        record.updated_at_ms = now_ms();
-        self.save_resources(plugin_id, resource_type, &records)
-            .await
+        let resource_id = resource_id.to_owned();
+        let now = now_ms();
+        self.mutate_resources(plugin_id, resource_type, move |mut records| {
+            let record = records
+                .iter_mut()
+                .find(|record| record.id == resource_id)
+                .ok_or_else(|| Error::NotFound(format!("plugin resource {resource_id}")))?;
+            if let Some(private_data) = patch.private_data {
+                record.private_data = private_data;
+            }
+            if let Some(state) = patch.state {
+                record.state = state;
+            }
+            record.updated_at_ms = now;
+            Ok((records, ()))
+        })
+        .await
     }
 
     /// Deletes one resource and returns the record that was removed.
@@ -310,29 +375,40 @@ impl PluginStateStore {
         resource_type: &str,
         resource_id: &str,
     ) -> Result<ResourceRecord> {
-        let mut records = self.resources(plugin_id, resource_type).await?;
-        let index = records
-            .iter()
-            .position(|record| record.id == resource_id)
-            .ok_or_else(|| Error::NotFound(format!("plugin resource {resource_id}")))?;
-        let removed = records.remove(index);
-        self.save_resources(plugin_id, resource_type, &records)
-            .await?;
-        Ok(removed)
+        let resource_id = resource_id.to_owned();
+        self.mutate_resources(plugin_id, resource_type, move |mut records| {
+            let index = records
+                .iter()
+                .position(|record| record.id == resource_id)
+                .ok_or_else(|| Error::NotFound(format!("plugin resource {resource_id}")))?;
+            let removed = records.remove(index);
+            Ok((records, removed))
+        })
+        .await
     }
 
-    async fn save_resources(
+    /// Runs one read-modify-write of the whole resource list under the store's
+    /// per-key lock. Every entry point above goes through here, so a UI edit and
+    /// a concurrent provider-result patch cannot interleave.
+    async fn mutate_resources<T, F>(
         &self,
         plugin_id: &str,
         resource_type: &str,
-        records: &[ResourceRecord],
-    ) -> Result<()> {
+        change: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Vec<ResourceRecord>) -> Result<(Vec<ResourceRecord>, T)> + Send + 'static,
+    {
         self.data
-            .update(
-                plugin_id,
-                &resource_key(resource_type),
-                &serde_json::to_value(records)?,
-            )
+            .mutate(plugin_id, &resource_key(resource_type), move |existing| {
+                let records: Vec<ResourceRecord> = existing
+                    .map(serde_json::from_value)
+                    .transpose()?
+                    .unwrap_or_default();
+                let (records, output) = change(records)?;
+                Ok((serde_json::to_value(records)?, output))
+            })
             .await
     }
 }
@@ -383,5 +459,108 @@ mod tests {
         let records = store.resources("dev.example", "account").await.unwrap();
         assert_eq!(records[0].private_data["token"], "two");
         assert!(!serde_json::to_string(&records).unwrap().contains("display"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_resource_updates_keep_both_changes() {
+        let (_root, store) = store();
+        let outcome = store
+            .upsert_resources(
+                "dev.example",
+                "account",
+                vec![
+                    ResourceDraft {
+                        key: "acct-1".into(),
+                        private_data: serde_json::json!({"token":"one"}),
+                        state: None,
+                    },
+                    ResourceDraft {
+                        key: "acct-2".into(),
+                        private_data: serde_json::json!({"token":"two"}),
+                        state: None,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let mut ids = outcome.changed_ids;
+        let first = ids.remove(0);
+        let second = ids.remove(0);
+        let (left, right) = tokio::join!(
+            store.apply_patch(
+                "dev.example",
+                "account",
+                &first,
+                ResourcePatch {
+                    private_data: Some(serde_json::json!({"token":"one-updated"})),
+                    state: None,
+                },
+            ),
+            store.apply_patch(
+                "dev.example",
+                "account",
+                &second,
+                ResourcePatch {
+                    private_data: Some(serde_json::json!({"token":"two-updated"})),
+                    state: None,
+                },
+            ),
+        );
+        left.unwrap();
+        right.unwrap();
+        let records = store.resources("dev.example", "account").await.unwrap();
+        let tokens: Vec<&str> = records
+            .iter()
+            .map(|record| record.private_data["token"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(tokens, vec!["one-updated", "two-updated"]);
+    }
+
+    #[test]
+    fn debug_never_prints_private_data() {
+        let secret = "sentinel-secret-value";
+        let record = ResourceRecord {
+            id: "r1".into(),
+            key: "acct".into(),
+            private_data: serde_json::json!({ "token": secret }),
+            state: ResourceState::Ready,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let draft = ResourceDraft {
+            key: "acct".into(),
+            private_data: serde_json::json!({ "token": secret }),
+            state: None,
+        };
+        let patch = ResourcePatch {
+            private_data: Some(serde_json::json!({ "token": secret })),
+            state: None,
+        };
+        let model = StoredModel {
+            id: "m1".into(),
+            display_name: "Model".into(),
+            description: None,
+            max_output_tokens: None,
+            images: false,
+            private_data: serde_json::json!({ "token": secret }),
+        };
+        for rendered in [
+            format!("{record:?}"),
+            format!("{draft:?}"),
+            format!("{patch:?}"),
+            format!("{model:?}"),
+            // Nested debug output must not bypass the redaction either.
+            format!("{:?}", vec![record.clone()]),
+            format!("{:?}", Some(record)),
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "Debug leaked a credential: {rendered}"
+            );
+            assert!(
+                rendered.contains("REDACTED"),
+                "Debug should say so: {rendered}"
+            );
+        }
     }
 }

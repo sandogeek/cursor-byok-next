@@ -7,8 +7,8 @@ use std::{
 
 use crate::resolver::{TypeContext, TypeResolver, fallback_type_token};
 use crate::types::{
-    Diagnostics, Enum, Field, FieldKind, Message, MethodKind, Service, SymbolKind, TypeName,
-    TypeToken, ValueKind, parse_type_name, scalar_name,
+    Diagnostics, Enum, Field, FieldType, MapValue, Message, MethodKind, Service, SymbolKind,
+    TypeName, parse_type_name, scalar_name,
 };
 
 /// The repository the generated `go_package` option points at.
@@ -277,8 +277,9 @@ impl Renderer<'_> {
             emit(
                 out,
                 format_args!(
-                    "{indent_str}{prefix}{field_type} {} = {};\n",
-                    field.name, field.number
+                    "{indent_str}{prefix}{field_type} {} = {number};\n",
+                    field.name,
+                    number = field.number
                 ),
             );
         }
@@ -289,8 +290,9 @@ impl Renderer<'_> {
                 emit(
                     out,
                     format_args!(
-                        "{indent_str}  {field_type} {} = {};\n",
-                        field.name, field.number
+                        "{indent_str}  {field_type} {} = {number};\n",
+                        field.name,
+                        number = field.number
                     ),
                 );
             }
@@ -327,33 +329,26 @@ impl Renderer<'_> {
         parent_path: &str,
         context: TypeContext<'_>,
     ) -> String {
-        match field.kind {
-            FieldKind::Scalar => match field.type_token {
-                Some(TypeToken::Scalar(id)) => {
-                    scalar_name(id).unwrap_or(FALLBACK_SCALAR).to_owned()
-                }
-                _ => FALLBACK_SCALAR.to_owned(),
+        match field.field_type() {
+            FieldType::Scalar { width } => width
+                .and_then(scalar_name)
+                .unwrap_or(FALLBACK_SCALAR)
+                .to_owned(),
+            FieldType::Named { kind, name } => match name {
+                Some(name) => self.resolve_named(&name, parent_path, context, kind.symbol_kind()),
+                None => FALLBACK_SCALAR.to_owned(),
             },
-            FieldKind::Message | FieldKind::Enum => match &field.type_token {
-                Some(TypeToken::Named(name)) => {
-                    self.resolve_named(name, parent_path, context, SymbolKind::of(field.kind))
-                }
-                _ => FALLBACK_SCALAR.to_owned(),
-            },
-            FieldKind::Map => {
-                let key = field.map_key.and_then(scalar_name).unwrap_or("string");
-                let value = match (field.map_value_kind, &field.map_value_t) {
-                    (ValueKind::Scalar, Some(TypeToken::Scalar(id))) => {
-                        scalar_name(*id).unwrap_or(FALLBACK_SCALAR).to_owned()
-                    }
-                    (ValueKind::Message | ValueKind::Enum, Some(TypeToken::Named(name))) => self
-                        .resolve_named(
-                            name,
-                            parent_path,
-                            context,
-                            SymbolKind::of_value(field.map_value_kind),
-                        ),
-                    _ => FALLBACK_SCALAR.to_owned(),
+            FieldType::Map { key, value } => {
+                let key = key.and_then(scalar_name).unwrap_or("string");
+                let value = match value {
+                    MapValue::Scalar { width } => width
+                        .and_then(scalar_name)
+                        .unwrap_or(FALLBACK_SCALAR)
+                        .to_owned(),
+                    MapValue::Named { kind, name } => name.map_or_else(
+                        || FALLBACK_SCALAR.to_owned(),
+                        |name| self.resolve_named(&name, parent_path, context, kind.symbol_kind()),
+                    ),
                 };
                 format!("map<{key}, {value}>")
             }
@@ -415,15 +410,18 @@ pub fn collect_imports(
     for message in messages {
         let context = TypeContext::new(&message.package, message.pos, message.module_start);
         for field in &message.fields {
-            if field.kind.is_named()
-                && let Some(TypeToken::Named(name)) = &field.type_token
-            {
-                add(name, context, SymbolKind::of(field.kind));
-            }
-            if field.map_value_kind.is_named()
-                && let Some(TypeToken::Named(name)) = &field.map_value_t
-            {
-                add(name, context, SymbolKind::of_value(field.map_value_kind));
+            // Only a named field, or a map's value, can reference a
+            // declaration; `field_type` already bound the name to its kind.
+            let referenced = match field.field_type() {
+                FieldType::Named { kind, name } => name.map(|name| (name, kind)),
+                FieldType::Map {
+                    value: MapValue::Named { kind, name },
+                    ..
+                } => name.map(|name| (name, kind)),
+                FieldType::Scalar { .. } | FieldType::Map { .. } => None,
+            };
+            if let Some((name, kind)) = referenced {
+                add(&name, context, kind.symbol_kind());
             }
         }
     }

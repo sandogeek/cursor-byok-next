@@ -90,6 +90,10 @@ Local serve()
 | 24 | `subscribe` 的所有权 | `run: &Arc<Run>`，内部再 `Arc::clone` | `run: Arc<Run>`，直接移入订阅 | 调用点本来就持有 `Arc`；接受 `&Arc` 等于要求调用方保留一份所有权义务，却无法省掉克隆 |
 | 25 | 魔法数字 | `mpsc::channel(64)`、错误码 `13` / `3` | `RUN_INPUT_QUEUE_FRAMES` / `INVOCATION_CODE_*` | 同一个 `13` 在别处可能是任意常量；命名后 `code: 13` 不再需要读者去查 gRPC 文档 |
 | 26 | 模块名 | `service.rs`（与 `output` / `project` 并列时没有指向任何东西） | `inference.rs`，与主类型 `InferenceService` 同名 | AGENTS 约定“叶子模块以主条目命名”；`service` 在有多个 service 的仓库里不是名字 |
+| 27 | 输出回放与订阅 | 无上限，回放只有帧数上限 | 历史同时受 4096 帧与 64 MiB 限制；每个订阅者是有界队列（1024 帧），满了就断开该订阅者并记 `lagged` | `mpsc::unbounded_channel` 让慢读者无限积压 `Bytes`，历史裁剪也释放不了它们。有滞后订阅者时不发结束帧，调用不会被记成完整成功 |
+| 28 | 后端 serve 的生命周期 | 只保存 `JoinHandle`，没有停止语义 | 显式 `Backend::shutdown()` 发 graceful 信号并等待；`Drop` 只发信号 + `abort`，不阻塞 | 丢弃 `JoinHandle` 是 detach 不是取消；端口会在“已停止”的对象后面继续监听 |
+| 29 | 后端地址的读取 | `if let Some(addr) = backend.borrow().clone()`，`watch::Ref` 临时值活在分支里 | 先 `let addr = { backend.borrow().clone() };` 再进分支 | 分支内的 await 会让 `watch` 读锁跨越 `.await`，阻塞其他发送方 |
+| 30 | 后端启动的失败重试 | 启动失败后状态停在不可再试 | 失败后回到 `Idle`，下一次 `status()` / `setEnabled` 会重试 | 应用可以在引擎尚未就绪时被调用；一次失败不该让 local loop 永久关着 |
 
 ## 必须保持的不变量
 

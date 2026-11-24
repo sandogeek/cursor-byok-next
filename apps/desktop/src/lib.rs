@@ -80,15 +80,19 @@ impl From<desktop::DockIcon> for DesktopState {
 
 /// Desktop shell settings. macOS restores and applies the Dock choice at startup.
 #[class]
-#[expect(
-    missing_debug_implementations,
-    reason = "the class owns a settings file handle behind a lock; the TSX side never Debug-prints it"
-)]
 pub struct Desktop {
     settings: parking_lot::Mutex<desktop::DesktopSettings>,
     /// The appearance last handed to `AppKit`; `None` before any was. Asking
     /// for the same one again then costs no trip to the main thread.
     applied: parking_lot::Mutex<Option<AppAppearance>>,
+}
+
+impl std::fmt::Debug for Desktop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Locks are deliberately not taken: a Debug call must not block on or
+        // re-enter the settings the UI is using.
+        f.debug_struct("Desktop").finish_non_exhaustive()
+    }
 }
 
 #[class]
@@ -260,13 +264,20 @@ pub struct HarnessState {
 ///
 /// Create one and keep it for the app's lifetime: it owns the proxy task.
 #[class]
-#[expect(
-    missing_debug_implementations,
-    reason = "the class owns proxy state and a watch channel; the TSX side never Debug-prints it"
-)]
 pub struct Harness {
     inner: Arc<CursorHarness>,
     backend: watch::Receiver<Option<String>>,
+}
+
+impl std::fmt::Debug for Harness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `CursorHarness` already redacts its own state; the backend address is a
+        // small non-secret value and is what makes this object identifiable.
+        f.debug_struct("Harness")
+            .field("inner", &self.inner)
+            .field("backend", &self.backend.borrow().clone())
+            .finish()
+    }
 }
 
 // A class: `new Harness()`, `await harness.status()`, `await harness.setEnabled(true)`.
@@ -302,7 +313,7 @@ impl Harness {
         let (harness, mut backend) =
             this.with(|harness| (Arc::clone(&harness.inner), harness.backend.clone()));
         attach_backend(&harness, &mut backend).await?;
-        harness.set_enabled(enabled).await.map(Into::into)
+        harness.set_takeover(enabled.into()).await.map(Into::into)
     }
 
     /// Connects the local service after it starts listening. Existing takeover
@@ -683,12 +694,16 @@ pub struct PluginFormValue {
 ///
 /// Create one and keep it for the app's lifetime: it owns plugin workers.
 #[class]
-#[expect(
-    missing_debug_implementations,
-    reason = "the class owns plugin workers and their process state"
-)]
 pub struct Plugins {
     inner: Arc<PluginHost>,
+}
+
+impl std::fmt::Debug for Plugins {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `PluginHost` holds worker processes and their mutable state; naming the
+        // object is enough to identify it in a log without walking that state.
+        f.debug_struct("Plugins").finish_non_exhaustive()
+    }
 }
 
 #[class]
@@ -1034,12 +1049,16 @@ impl From<calls::LlmCallResponseChunk> for CallChunkRecord {
 /// Create one and keep it for the app's lifetime: it shares the store with the
 /// local loop.
 #[class]
-#[expect(
-    missing_debug_implementations,
-    reason = "the class owns the SQLite-backed call store"
-)]
 pub struct Calls {
     store: CallStore,
+}
+
+impl std::fmt::Debug for Calls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `CallStore` owns the SQLite pool; naming the wrapper keeps its Debug
+        // independent of database connection state.
+        f.debug_struct("Calls").field("store", &self.store).finish()
+    }
 }
 
 #[class]
@@ -1222,7 +1241,10 @@ async fn attach_backend(
     if backend.borrow().is_none() {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), backend.changed()).await;
     }
-    if let Some(addr) = backend.borrow().clone() {
+    // Bind the address before the branch so the `watch::Ref` is released here
+    // and does not stay borrowed across `set_backend_addr`'s await.
+    let addr = backend.borrow().clone();
+    if let Some(addr) = addr {
         harness
             .set_backend_addr(addr.parse().map_err(|error| {
                 HarnessError::Config(format!("invalid local backend address: {error}"))

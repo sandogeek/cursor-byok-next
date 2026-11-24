@@ -42,14 +42,21 @@ pub use knowledge::KnowledgeService;
 
 pub struct Backend {
     addr: SocketAddr,
-    _task: JoinHandle<()>,
+    /// Fires the graceful shutdown the axum server waits on.
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The serving task. `None` once [`Backend::shutdown`] has awaited it.
+    task: Option<JoinHandle<()>>,
 }
+
+/// How long [`Backend::shutdown`] waits for in-flight requests to finish.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl std::fmt::Debug for Backend {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Backend")
             .field("addr", &self.addr)
+            .field("serving", &self.task.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -62,16 +69,63 @@ impl Backend {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let app = router(plugins, inference, proxy, knowledge);
+        Ok(Self::serve(listener, addr, app))
+    }
+
+    fn serve(listener: TcpListener, addr: SocketAddr, app: Router) -> Self {
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            if let Err(error) = axum::serve(listener, app).await {
+            let serving = axum::serve(listener, app).with_graceful_shutdown(async move {
+                let _ = stopped.await;
+            });
+            if let Err(error) = serving.await {
                 tracing::error!(%error, "local loop backend stopped unexpectedly");
             }
         });
-        Ok(Self { addr, _task: task })
+        Self {
+            addr,
+            shutdown: Some(shutdown),
+            task: Some(task),
+        }
     }
 
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Stops the server and waits until it released the port.
+    ///
+    /// Requests already running get [`SHUTDOWN_GRACE`] to finish; anything
+    /// longer is cut off, because a stopped backend must not keep the port.
+    pub async fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        match tokio::time::timeout(SHUTDOWN_GRACE, task).await {
+            Ok(Ok(())) => tracing::debug!(addr = %self.addr, "the local loop backend stopped"),
+            Ok(Err(error)) => tracing::warn!(%error, "the local loop backend task failed"),
+            Err(_) => tracing::warn!(
+                addr = %self.addr,
+                "the local loop backend did not stop within the grace period"
+            ),
+        }
+    }
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        // `Drop` cannot await, so it only signals and aborts. A backend dropped
+        // without `shutdown` stops serving instead of lingering detached.
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+            tracing::debug!(addr = %self.addr, "aborted the local loop backend");
+        }
     }
 }
 
@@ -541,5 +595,41 @@ mod tests {
             ready.message,
             Some(pb::run_inference_server_message::Message::RunReady(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_the_port_and_drop_stops_serving() {
+        let root = tempfile::tempdir().unwrap();
+        let plugins = PluginHost::for_test(root.path()).unwrap();
+        let knowledge = KnowledgeService::with_root(root.path().join("rules")).unwrap();
+        let app = router_for_test(
+            plugins.clone(),
+            knowledge.clone(),
+            proxy::CursorProxy::default(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let backend = Backend::serve(listener, addr, app);
+        assert_eq!(backend.addr(), addr);
+
+        backend.shutdown().await;
+
+        // The port must be bindable again: a stopped backend cannot keep it.
+        let rebound = TcpListener::bind(addr)
+            .await
+            .expect("the port was released");
+        drop(rebound);
+
+        let app = router_for_test(plugins, knowledge, proxy::CursorProxy::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let backend = Backend::serve(listener, addr, app);
+        drop(backend);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let rebound = TcpListener::bind(addr)
+            .await
+            .expect("Drop stopped the server");
+        drop(rebound);
     }
 }

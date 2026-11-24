@@ -95,8 +95,11 @@ src/ui/appearance.ts     34  外观持久化（Storage 键）+ 启动返回值
 | 13 | 数据目录 | 无此信息 | 「关于」显示 `dataDir` 并可复制 | 用户排查接管 / 插件问题需要知道 `~/.cursor-byok-next` 在哪；该值由 Rust 提供，TSX 不拼路径 |
 | 14 | 页面标题 | `PageContent` 内部滚动 | 应用壳统一标题栏 + 唯一滚动区 | `CURSOR_UI.md`：内容区是唯一滚动所有者 |
 | 15 | 保存反馈 | toast | 卡片内行内 notice（成功）/ 页尾 alert（失败） | 本仓库没有 toast 组件；设置项的反馈贴近控件更明确 |
-| 16 | 端口意图的存储形态 | 上游把端口配置当普通数字，缺省即默认端口 | `PortChoice { Unset, OsAssigned, Fixed(u16) }`；JSON 与 TSX 边界仍是 `null / 0 / number` | “没选过”和“这次让 OS 挑”是两种意图，只用一个数字表示会让重启后行为分叉；自定义 `Serialize`/`Deserialize` 保持线上格式 |
-| 17 | 原子写 | 每处各写一遍 temp + rename（`harness.json`、`settings.json`、CA 文件、规则库） | 统一到 `src/atomic.rs` 的 `write` / `write_with_mode`：同目录临时文件、随机后缀、Windows 先删再 rename、失败时清理临时文件 | 四份实现里只有一份处理了 Windows 的 rename 覆盖和临时文件清理；写 Cursor 文件与 CA 的原子性是不变量 5，不能各写各的 |
+| 16 | 端口意图的存储形态 | 上游把端口配置当普通数字，缺省即默认端口 | `PortChoice { Unset, OsAssigned, Fixed(NonZeroU16) }`；JSON 与 TSX 边界仍是 `null / 0 / number` | “没选过”和“这次让 OS 挑”是两种意图，只用一个数字表示会让重启后行为分叉；`NonZeroU16` 让 `Fixed(0)` 这种非法状态无法构造，自定义 `Serialize`/`Deserialize` 保持线上格式 |
+| 17 | 原子写 | 每处各写一遍 temp + rename（`harness.json`、`settings.json`、CA 文件、规则库） | 统一到 `src/atomic.rs` 的 `write` / `write_with_mode`：同目录临时文件、`create_new`、随机后缀、失败时由 RAII guard 清理临时文件 | 四份实现里只有一份处理了临时文件清理；写 Cursor 文件与 CA 的原子性是不变量 5，不能各写各的 |
+| 18 | 覆盖目标的差异 | 未区分平台 | `replace` 直接 `fs::rename`（Windows 的 `MoveFileEx` 会替换目标），不再先删目标 | 先删再 rename 会留出一个“目标不存在”的窗口，崩溃后既没有旧文件也没有新文件 |
+| 19 | 端口选择的值域 | 普通 `u16` | `PortChoice::Fixed(NonZeroU16)` | `Fixed(0)` 与 `OsAssigned` 序列化后无法区分，读回来会变体漂移；零只能表示“让 OS 挑” |
+| 20 | 写入的文件权限 | OS 默认 | 未指定 mode 的写保留原文件 mode；指定 mode 时在建文件那一刻设置 | 重写 `ca.key`（0600）不能让权限退回 0644 |
 
 ## 必须保持的不变量
 

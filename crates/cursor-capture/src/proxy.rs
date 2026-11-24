@@ -23,6 +23,7 @@ use crate::decode::{
     is_unary_proto_content_type, raw_hex, streaming_request_message_type,
     streaming_response_message_type,
 };
+use crate::sink::CaptureSink;
 use crate::store::{CaptureId, ExchangeStore, sorted_headers};
 use crate::types::{Error, Exchange, ExchangeState, ExchangeSummary, FrameView, Payload, Result};
 use crate::web;
@@ -46,6 +47,8 @@ pub struct Server {
     upstream_url: String,
     database_path: String,
     store: ExchangeStore,
+    /// Runs capture decode and persistence off the forwarding path.
+    sink: CaptureSink,
     client: HttpsClient,
 }
 
@@ -70,6 +73,7 @@ impl Server {
             upstream_url,
             database_path,
             store,
+            sink: CaptureSink::start(),
             client: https_client(),
         })
     }
@@ -125,6 +129,13 @@ impl Server {
         self.store.clear()
     }
 
+    /// Waits until background capture work finishes. Tests call it to observe
+    /// writes that the forwarding path queues rather than performs inline.
+    #[cfg(test)]
+    pub fn flush_captures(&self) {
+        self.sink.flush();
+    }
+
     fn capture_request(&self, request: Request<Body>) -> (CaptureId, Request<Body>) {
         let path = request.uri().path().to_owned();
         let mut upstream_url = self.upstream.clone();
@@ -178,22 +189,34 @@ impl Server {
     where
         B: http_body::Body,
     {
+        let sink = self.sink.clone();
+        let done_sink = sink.clone();
         let max_frames = self.config.max_frames;
-        let decoder = target
+        // Decoding happens on the sink thread, never inside `poll_frame` or
+        // `Drop`. The only work the forwarding path does is a bounded queue push.
+        let decoder: Option<Arc<Mutex<ConnectFrameDecoder>>> = target
             .side
             .streaming_message_type(&target.path)
             .map(|message_type| {
                 let store = self.store.clone();
                 let frame_id = target.id.clone();
                 let side = target.side;
+                let sink = sink.clone();
                 Arc::new(Mutex::new(ConnectFrameDecoder::new(
                     &message_type,
                     &target.codec,
                     max_frames,
                     move |frame| {
-                        store.update_transient(&frame_id, |exchange| {
-                            side.record_frame(exchange, frame);
-                        });
+                        let job_store = store.clone();
+                        let frame_id = frame_id.clone();
+                        let record = move || {
+                            job_store.update_transient(&frame_id, |exchange| {
+                                side.record_frame(exchange, frame);
+                            });
+                        };
+                        if !sink.submit(Box::new(record)) {
+                            store.note_error("抓包队列已满，流式帧记录不完整");
+                        }
                     },
                 )))
             });
@@ -208,10 +231,18 @@ impl Server {
                 }
             },
             move |captured| {
-                if let Some(decoder) = decoder {
-                    decoder.lock().close();
+                // Decode, serialization and the SQLite write all run on the sink
+                // thread; `Drop` only hands the job over.
+                let job_store = store.clone();
+                let job = move || {
+                    if let Some(decoder) = decoder {
+                        decoder.lock().close();
+                    }
+                    target.store(&job_store, captured);
+                };
+                if !done_sink.submit(Box::new(job)) {
+                    store.note_error("抓包队列已满，正文未写入数据库");
                 }
-                target.store(&store, captured);
             },
         )
     }

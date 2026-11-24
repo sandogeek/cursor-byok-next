@@ -67,6 +67,91 @@ pub fn google_well_known(short: &str) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
+/// The largest proto field number; the schema spec stops here because the tag
+/// varint would otherwise not fit in 32 bits.
+pub const MAX_FIELD_NUMBER: i32 = 536_870_911;
+/// Protobuf reserves `19000..=19999` for its own implementation; a bundle that
+/// uses one of those numbers is not describing a compilable schema.
+pub const RESERVED_FIELD_NUMBERS: std::ops::RangeInclusive<i32> = 19_000..=19_999;
+
+/// A proto field number: a positive tag outside the reserved range.
+///
+/// Constructing one is the only way to reach [`Field::number`], so a parser that
+/// accepts `no: 0` or `no: 1.5` cannot produce a field at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FieldNumber(i32);
+
+impl FieldNumber {
+    /// The tag as it is rendered into a proto file.
+    #[must_use]
+    pub fn get(self) -> i32 {
+        self.0
+    }
+}
+
+impl TryFrom<i32> for FieldNumber {
+    type Error = InvalidFieldNumber;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        if !(1..=MAX_FIELD_NUMBER).contains(&value) {
+            return Err(InvalidFieldNumber {
+                number: value,
+                reason: InvalidFieldNumberReason::OutOfRange,
+            });
+        }
+        if RESERVED_FIELD_NUMBERS.contains(&value) {
+            return Err(InvalidFieldNumber {
+                number: value,
+                reason: InvalidFieldNumberReason::Reserved,
+            });
+        }
+        Ok(Self(value))
+    }
+}
+
+impl fmt::Display for FieldNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Why [`FieldNumber::try_from`] rejected a tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidFieldNumberReason {
+    /// Outside `1..=536_870_911`.
+    OutOfRange,
+    /// Inside protobuf's reserved `19000..=19999`.
+    Reserved,
+}
+
+/// A tag that is not a valid proto field number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidFieldNumber {
+    /// The rejected integer.
+    pub number: i32,
+    /// Which rule the integer broke.
+    pub reason: InvalidFieldNumberReason,
+}
+
+impl fmt::Display for InvalidFieldNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.reason {
+            InvalidFieldNumberReason::OutOfRange => write!(
+                f,
+                "field number {} is outside 1..={MAX_FIELD_NUMBER}",
+                self.number
+            ),
+            InvalidFieldNumberReason::Reserved => write!(
+                f,
+                "field number {} is inside the reserved range 19000..=19999",
+                self.number
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InvalidFieldNumber {}
+
 /// How a proto declaration stores its value: inline scalar, named message,
 /// named enum, or a map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,16 +163,25 @@ pub enum FieldKind {
 }
 
 impl FieldKind {
-    /// Reads a bundle `kind` string; unknown kinds are treated as scalars,
-    /// which is what the renderer already did with them.
+    /// Reads a bundle `kind` string, reporting whether it was one the extractor
+    /// knows. Callers keep the old scalar fallback for [`Strictness::Lenient`]
+    /// (`Lenient`) output but record the drift so strict runs reject it.
+    #[must_use]
+    pub fn parse_bundle_kind(value: &str) -> Option<Self> {
+        match value.trim() {
+            "message" => Some(Self::Message),
+            "enum" => Some(Self::Enum),
+            "map" => Some(Self::Map),
+            "scalar" => Some(Self::Scalar),
+            _ => None,
+        }
+    }
+
+    /// The lenient reading of a bundle `kind` string: unknown kinds render as
+    /// scalars, which is what the old renderer did with them.
     #[must_use]
     pub fn from_bundle_kind(value: &str) -> Self {
-        match value.trim() {
-            "message" => Self::Message,
-            "enum" => Self::Enum,
-            "map" => Self::Map,
-            _ => Self::Scalar,
-        }
+        Self::parse_bundle_kind(value).unwrap_or(Self::Scalar)
     }
 
     /// Whether the declaration points at a named type.
@@ -142,14 +236,23 @@ pub enum MethodKind {
 }
 
 impl MethodKind {
+    /// Reads a bundle method kind, reporting whether the string was known.
+    #[must_use]
+    pub fn parse_bundle_kind(value: &str) -> Option<Self> {
+        match value.trim() {
+            "Unary" => Some(Self::Unary),
+            "ServerStreaming" => Some(Self::ServerStreaming),
+            "ClientStreaming" => Some(Self::ClientStreaming),
+            "BiDiStreaming" => Some(Self::BiDiStreaming),
+            _ => None,
+        }
+    }
+
+    /// The lenient reading of a bundle method kind: unknown values are unary,
+    /// which is what the old scanner assumed.
     #[must_use]
     pub fn from_bundle_kind(value: &str) -> Self {
-        match value.trim() {
-            "ServerStreaming" => Self::ServerStreaming,
-            "ClientStreaming" => Self::ClientStreaming,
-            "BiDiStreaming" => Self::BiDiStreaming,
-            _ => Self::Unary,
-        }
+        Self::parse_bundle_kind(value).unwrap_or(Self::Unary)
     }
 }
 
@@ -209,10 +312,99 @@ pub fn named_completeness(type_ref: &str) -> i32 {
     }
 }
 
+/// The validated reading of a [`Field`]: what the declaration actually
+/// stores, with the type data bound to the shape that uses it.
+///
+/// The raw parser state keeps `kind`, `type_token` and the map parts as
+/// separate fields, because a bundle can be read in any order. Readers use
+/// this type instead, so a map key can never be read off a scalar field and a
+/// scalar can never carry a message name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldType {
+    /// An inline scalar. `width` is the bundle's scalar code when it named
+    /// one; a missing or mismatched code renders as the fallback scalar.
+    Scalar { width: Option<i32> },
+    /// A reference to a message or enum declaration.
+    Named {
+        kind: NamedFieldKind,
+        name: Option<String>,
+    },
+    /// A map from a scalar key to a scalar, message or enum value.
+    Map { key: Option<i32>, value: MapValue },
+}
+
+/// Which declaration a named reference points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NamedFieldKind {
+    Message,
+    Enum,
+}
+
+impl NamedFieldKind {
+    #[must_use]
+    pub fn symbol_kind(self) -> SymbolKind {
+        match self {
+            Self::Message => SymbolKind::Message,
+            Self::Enum => SymbolKind::Enum,
+        }
+    }
+
+    #[must_use]
+    pub fn field_kind(self) -> FieldKind {
+        match self {
+            Self::Message => FieldKind::Message,
+            Self::Enum => FieldKind::Enum,
+        }
+    }
+}
+
+/// The value half of a [`FieldType::Map`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MapValue {
+    /// A scalar value; `width` is the bundle's scalar code when it named one.
+    Scalar { width: Option<i32> },
+    /// A message or enum declared somewhere the resolver can find it.
+    Named {
+        kind: NamedFieldKind,
+        name: Option<String>,
+    },
+}
+
+impl FieldType {
+    /// The named reference this type points at, if any. A map is not named:
+    /// only its value can be, and that is [`MapValue::name`].
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::Named { name, .. } => name.as_deref(),
+            Self::Scalar { .. } | Self::Map { .. } => None,
+        }
+    }
+}
+
+impl MapValue {
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::Named { name, .. } => name.as_deref(),
+            Self::Scalar { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn named_kind(&self) -> Option<NamedFieldKind> {
+        match self {
+            Self::Named { kind, .. } => Some(*kind),
+            Self::Scalar { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
-    /// Proto field number, read from the bundle's `no`.
-    pub number: i32,
+    /// Proto field number, read from the bundle's `no` through
+    /// [`FieldNumber::try_from`].
+    pub number: FieldNumber,
     pub name: String,
     pub kind: FieldKind,
     /// Named or scalar type, read from the bundle's `T`.
@@ -229,7 +421,7 @@ pub struct Field {
 impl Field {
     /// Builds a field with no type token, label or map part yet.
     #[must_use]
-    pub fn new(number: i32, name: &str, kind: FieldKind) -> Self {
+    pub fn new(number: FieldNumber, name: &str, kind: FieldKind) -> Self {
         Self {
             number,
             name: name.to_owned(),
@@ -241,6 +433,64 @@ impl Field {
             map_key: None,
             map_value_kind: ValueKind::Scalar,
             map_value_t: None,
+        }
+    }
+
+    /// The validated shape of this field.
+    ///
+    /// [`Field`] keeps the parser's intermediate state: `kind`, `type_token`
+    /// and the map parts arrive in whatever order the bundle's object literal
+    /// listed them, so any combination is constructible. Every reader that
+    /// needs to know what the field stores goes through this projection, which
+    /// is total and keeps each piece of type data with the shape that uses it.
+    #[must_use]
+    pub fn field_type(&self) -> FieldType {
+        match self.kind {
+            FieldKind::Scalar => {
+                let width = match self.type_token {
+                    Some(TypeToken::Scalar(width)) => Some(width),
+                    _ => None,
+                };
+                FieldType::Scalar { width }
+            }
+            FieldKind::Message | FieldKind::Enum => FieldType::Named {
+                kind: match self.kind {
+                    FieldKind::Enum => NamedFieldKind::Enum,
+                    _ => NamedFieldKind::Message,
+                },
+                name: match &self.type_token {
+                    Some(TypeToken::Named(name)) => Some(name.clone()),
+                    _ => None,
+                },
+            },
+            FieldKind::Map => {
+                let value = match (self.map_value_kind, &self.map_value_t) {
+                    (ValueKind::Scalar, Some(TypeToken::Scalar(width))) => MapValue::Scalar {
+                        width: Some(*width),
+                    },
+                    (ValueKind::Scalar, _) => MapValue::Scalar { width: None },
+                    (ValueKind::Message, Some(TypeToken::Named(name))) => MapValue::Named {
+                        kind: NamedFieldKind::Message,
+                        name: Some(name.clone()),
+                    },
+                    (ValueKind::Enum, Some(TypeToken::Named(name))) => MapValue::Named {
+                        kind: NamedFieldKind::Enum,
+                        name: Some(name.clone()),
+                    },
+                    (ValueKind::Message | ValueKind::Enum, _) => MapValue::Named {
+                        kind: if self.map_value_kind == ValueKind::Enum {
+                            NamedFieldKind::Enum
+                        } else {
+                            NamedFieldKind::Message
+                        },
+                        name: None,
+                    },
+                };
+                FieldType::Map {
+                    key: self.map_key,
+                    value,
+                }
+            }
         }
     }
 }
@@ -328,6 +578,10 @@ pub struct Diagnostics {
     /// Parse errors dropped after [`DIAGNOSTIC_SAMPLE_LIMIT`] were kept.
     pub overflowed_parse_errors: usize,
     pub shape_errors: Vec<String>,
+    /// Bundle strings the extractor did not recognize (unknown field/method
+    /// kinds, malformed service methods). Lenient runs render the old fallback
+    /// but Strict runs reject them, because they signal bundle-format drift.
+    pub unrecognized_inputs: Vec<String>,
 }
 
 impl Diagnostics {
@@ -372,6 +626,14 @@ impl Diagnostics {
         self.shape_errors.push(error.to_string());
     }
 
+    /// Records a bundle string the extractor could not recognize. Lenient runs
+    /// keep rendering a fallback, but the input is reported so Strict fails.
+    pub fn add_unrecognized_input(&mut self, reason: &str) {
+        if self.unrecognized_inputs.len() < DIAGNOSTIC_SAMPLE_LIMIT {
+            self.unrecognized_inputs.push(reason.to_string());
+        }
+    }
+
     /// Folds `other` into `self`, keeping every counter and collection.
     pub fn merge_from(&mut self, mut other: Diagnostics) {
         self.total_field_objects += other.total_field_objects;
@@ -399,6 +661,11 @@ impl Diagnostics {
             self.overflowed_parse_errors += dropped;
         }
         self.shape_errors.append(&mut other.shape_errors);
+        self.unrecognized_inputs
+            .append(&mut other.unrecognized_inputs);
+        if self.unrecognized_inputs.len() > DIAGNOSTIC_SAMPLE_LIMIT {
+            self.unrecognized_inputs.truncate(DIAGNOSTIC_SAMPLE_LIMIT);
+        }
     }
 
     #[must_use]
@@ -409,6 +676,7 @@ impl Diagnostics {
             || !self.missing_declarations.is_empty()
             || !self.parse_errors.is_empty()
             || !self.shape_errors.is_empty()
+            || !self.unrecognized_inputs.is_empty()
     }
 }
 
@@ -416,7 +684,7 @@ impl fmt::Display for Diagnostics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "诊断汇总: fields {}/{} 解析成功, declarations {}/{} 已提取, skipped={}, unresolved={}, placeholders={}, empty_messages={}, parse_errors={}, shape_errors={}",
+            "诊断汇总: fields {}/{} 解析成功, declarations {}/{} 已提取, skipped={}, unresolved={}, placeholders={}, empty_messages={}, parse_errors={}, shape_errors={}, unrecognized={}",
             self.parsed_field_objects,
             self.total_field_objects,
             self.extracted_types,
@@ -426,7 +694,8 @@ impl fmt::Display for Diagnostics {
             self.placeholder_hits.len(),
             self.empty_messages.len(),
             self.parse_errors.len(),
-            self.shape_errors.len()
+            self.shape_errors.len(),
+            self.unrecognized_inputs.len()
         )?;
         if self.skipped_field_objects > 0 {
             writeln!(f, "字段解析失败样例:")?;
@@ -447,6 +716,12 @@ impl fmt::Display for Diagnostics {
             writeln!(f, "必要形状校验失败:")?;
             for error in &self.shape_errors {
                 writeln!(f, "  - {error}")?;
+            }
+        }
+        if !self.unrecognized_inputs.is_empty() {
+            writeln!(f, "无法识别的输入:")?;
+            for item in &self.unrecognized_inputs {
+                writeln!(f, "  - {item}")?;
             }
         }
         if !self.unresolved_type_refs.is_empty() {

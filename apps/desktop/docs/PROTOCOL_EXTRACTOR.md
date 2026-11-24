@@ -68,6 +68,16 @@ crates/cursor-protocol-extractor/
 | 18 | 模块内重复 | `build_module_imports` 与 `scan` 各自线性查模块起点 | `resolver::module_start_by_id` 一处二分/预表 | 两份逻辑对同一 bundle 偏移量的答案可能不同，二次映射会改坏已解析的 offset |
 | 19 | 合并覆盖率 | 逐名 `clone` 后排序再比较 | `HashSet<&str>` + `difference`，`sort_unstable` | 覆盖率只是集合差，不需要一份拥有所有权的副本 |
 | 20 | 扫描状态所有权 | `Scanner` 与 `BundleScan` 各有一份 `module_starts` | 只保留 `BundleScan` 的那一份 | 同一状态两个所有者，写入路径不一致时会导致偏移量错位 |
+| 21 | 字段号校验 | `Field.No` 是裸 `int`；解析只要求能转 `int` | `FieldNumber::try_from(i32)` 校验 `1..=536870911` 且排除 `19000..=19999`；`Field::number` 只能由它构造 | 非法字段号（0、负数、保留段）以前会变成 `no = 0;` 这样的产物；把不变量推进类型后，解析器与渲染器都拿不到无效编号 |
+| 22 | 浮点转整数 | Go `int(...)` 直接截断小数 | `f64_to_i32` / `f64_to_u32` 同时检查 finite、整数性、范围 | `1.5` 以前静默变 `1`，会悄悄改 schema 语义；现在落成 skipped-field 诊断 |
+| 23 | Strict 完整性 | `validateRequiredAgentShapes` 只在“声明存在”时校验字段 | `validate_required_shapes` 按包要求声明必须存在，再校验成员 | 以前完全无 protobuf 的合法 JS 会写出两个空 package 并退出 0；现在 Strict 明确失败，Lenient 仍写文件但保留 `shape_errors` |
+| 24 | 未知输入 | 未知 `kind` 回退 scalar / unary，无记录 | `parse_bundle_kind` 返回 `Option`；解析点记入 `diagnostics.unrecognized_inputs` | Strict 因上游格式漂移失败，Lenient 仍沿用旧 fallback，但漂移不再不可见 |
+| 25 | 服务方法丢失 | 缺 `I`/`O` 时 `continue` | 有 `name` 但缺 `I`/`O` 的候选方法记入 `unrecognized_inputs` | 没有 `name` 的属性仍视为普通字段（有意跳过）；真正像方法的坏声明以前会静默消失 |
+| 26 | 字段类型的读取形态 | Go 的 `Field` 只有 `Kind` + 各自可选字段，读者自行兜底 | `Field::field_type() -> FieldType::{Scalar{width}, Named{kind,name}, Map{key,value}}`，`MapValue::{Scalar,Named}` | 原始扫描态允许任意组合（scalar 带 map key 等）；渲染器与导入收集只读投影，类型数据与其形状绑定，`Optional` 的 width/name 不再由调用点各自猜 |
+| 27 | 目录发布的契约 | `os.Rename` 两次，注释当作原子发布 | 文档明确为 **staged replace with rollback**；两次 rename 之间目标不存在，崩溃时旧内容留在 backup 目录 | 跨平台的普通 rename 无法原子替换非空目录；把契约说小才不会让读者以为有原子性 |
+| 28 | 发布失败的错误 | 回滚失败会覆盖最初的发布错误 | `ExtractError::Publish` 同时保留 `source`（发布失败）、`rollback`（回滚失败）与 `backup`（旧内容所在目录）；清理失败作为附加 note，绝不替换原因 | 错误链必须保留“为什么没发布成功”，否则日志只剩“回滚也失败了” |
+| 29 | 临时目录与旧 backup 清理 | `defer os.RemoveAll` 与 `let _ =` 静默 | 发布成功后的清理失败作为 `ExtractResult::write_warnings` 返回（CLI 打印），发布失败时的清理失败附加到 `Publish` 错误 | 清理失败说明临时盘已满或权限不足，静默会让下次运行更奇怪 |
+| 30 | 未识别输入的诊断出口 | 无 | `Diagnostics::unrecognized_inputs`，Strict 计入 `has_failure()`，Lenient 只展示 | 上游格式漂移对 Strict 是失败，对 Lenient 是可见但不阻断 |
 
 ## 必须保持的语义（两侧一致）
 
@@ -117,8 +127,13 @@ cargo clippy -p cursor-protocol-extractor --all-targets -- -D warnings
 | `extract_services_supports_anonymous_descriptors` | 匿名服务 |
 | `merge_messages_prefers_*` | 合并策略 |
 | `compact_factory_extracts_run_inference_mode_config` | compact `$()` / `enumType` / `QT` |
-| `validate_required_agent_shapes_accepts_run_inference_mode_config` | Inference 形状 |
-| `validate_required_agent_shapes_stays_inside_message_block` | 形状检查不跨 message 泄漏 |
+| `validate_required_shapes_accepts_run_inference_mode_config` | Inference 形状 |
+| `validate_required_shapes_stays_inside_message_block` | 形状检查不跨 message 泄漏 |
+| `validate_required_shapes_rejects_a_missing_message` / `..._a_missing_service` / `..._agent_package_without_stream_shapes` | 必需声明整体缺失即失败 |
+| `strict_extract_rejects_a_bundle_with_no_declarations` / `lenient_extract_keeps_files_for_a_bundle_with_no_declarations` | 空提取：Strict 失败，Lenient 仍写文件 |
+| `strict_extract_rejects_invalid_field_numbers` / `field_number_rejects_zero_missing_and_reserved_tags` | 0 / 负数 / 保留段 / 最大值边界 |
+| `strict_extract_rejects_unknown_bundle_kind` | `kind` 未知不回退成功 |
+| `strict_extract_rejects_a_method_missing_its_output` | 缺 `O` 的候选方法有诊断 |
 | `local_loop_extract_drops_unrelated_packages` | 不输出 `origin.v1` |
 | `scan_records_oxc_parse_errors` | oxc 语法错误进入诊断 |
 | `no_strict_extract_keeps_files_when_required_shapes_are_missing` | `--no-strict` 仍写出文件 |

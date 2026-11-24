@@ -50,11 +50,42 @@ struct UsageState {
     reasoning: Option<u64>,
 }
 
+/// One open content block, with the state its deltas accumulate into.
+///
+/// Anthropic reports blocks by index and opens them with a type; keeping the
+/// type and its buffers in one map means a `thinking` block cannot exist
+/// without a place for its text and signature.
+enum BlockState {
+    Text,
+    Thinking {
+        text: String,
+        signature: String,
+    },
+    Tool,
+    /// A block type this adapter does not model. It is tracked only so its
+    /// stop event is accepted instead of being read as a protocol error.
+    Other,
+}
+
+impl BlockState {
+    fn from_type(kind: &str) -> Self {
+        match kind {
+            "text" => Self::Text,
+            "thinking" => Self::Thinking {
+                text: String::new(),
+                signature: String::new(),
+            },
+            "tool_use" => Self::Tool,
+            _ => Self::Other,
+        }
+    }
+}
+
 pub(super) struct Parser {
     tool_names: ToolNames,
-    block_types: std::collections::BTreeMap<usize, String>,
-    thinking_text: std::collections::BTreeMap<usize, String>,
-    thinking_signatures: std::collections::BTreeMap<usize, String>,
+    /// Open blocks by index, in Anthropic's own order so stops are emitted in
+    /// the order the stream opened them.
+    blocks: std::collections::BTreeMap<usize, BlockState>,
     thinking_blocks: Vec<Value>,
     usage: UsageState,
     saw_usage: bool,
@@ -67,9 +98,7 @@ impl Parser {
     pub(super) fn new(tool_names: ToolNames) -> Self {
         Self {
             tool_names,
-            block_types: std::collections::BTreeMap::new(),
-            thinking_text: std::collections::BTreeMap::new(),
-            thinking_signatures: std::collections::BTreeMap::new(),
+            blocks: std::collections::BTreeMap::new(),
             thinking_blocks: Vec::new(),
             usage: empty_usage(),
             saw_usage: false,
@@ -79,31 +108,29 @@ impl Parser {
         }
     }
 
-    fn close_block(&mut self, index: usize, kind: &str, emit: &mut dyn FnMut(ModelEvent)) {
-        match kind {
-            "text" => emit(ModelEvent::TextEnd),
-            "thinking" => {
-                let thinking = self.thinking_text.remove(&index).unwrap_or_default();
-                let signature = self.thinking_signatures.remove(&index).unwrap_or_default();
+    fn close_block(&mut self, index: usize, state: BlockState, emit: &mut dyn FnMut(ModelEvent)) {
+        match state {
+            BlockState::Text => emit(ModelEvent::TextEnd),
+            BlockState::Thinking { text, signature } => {
                 emit(ModelEvent::ThinkingEnd);
                 if !signature.is_empty() {
                     self.thinking_blocks.push(json!({
                         "type": "thinking",
-                        "thinking": thinking,
+                        "thinking": text,
                         "signature": signature,
                     }));
                     emit(ModelEvent::ThinkingSignature(signature));
                 }
             }
-            "tool_use" => emit(ModelEvent::ToolCallEnd { index }),
-            _ => {}
+            BlockState::Tool => emit(ModelEvent::ToolCallEnd { index }),
+            BlockState::Other => {}
         }
     }
 
     fn close_remaining(&mut self, emit: &mut dyn FnMut(ModelEvent)) {
-        let remaining = std::mem::take(&mut self.block_types);
-        for (index, kind) in remaining {
-            self.close_block(index, &kind, emit);
+        let remaining = std::mem::take(&mut self.blocks);
+        for (index, state) in remaining {
+            self.close_block(index, state, emit);
         }
     }
 
@@ -126,14 +153,10 @@ impl Parser {
         let index = required_index(value)?;
         let block = value.get("content_block").and_then(Value::as_object);
         let kind = required_type(block)?;
-        self.block_types.insert(index, kind.clone());
+        self.blocks.insert(index, BlockState::from_type(&kind));
         match kind.as_str() {
             "text" => emit(ModelEvent::TextStart),
-            "thinking" => {
-                self.thinking_text.insert(index, String::new());
-                self.thinking_signatures.insert(index, String::new());
-                emit(ModelEvent::ThinkingStart);
-            }
+            "thinking" => emit(ModelEvent::ThinkingStart),
             "redacted_thinking" => {
                 let data = map_text_field(block, "data")
                     .ok_or_else(|| Error::Provider("Anthropic event is missing data".into()))?;
@@ -178,19 +201,19 @@ impl Parser {
             }
             "thinking_delta" => {
                 if let Some(delta_text) = map_text_field(delta, "thinking") {
-                    self.thinking_text
-                        .entry(index)
-                        .or_default()
-                        .push_str(delta_text);
+                    if let Some(BlockState::Thinking { text, .. }) = self.blocks.get_mut(&index) {
+                        text.push_str(delta_text);
+                    }
                     emit(ModelEvent::ThinkingDelta(delta_text.to_owned()));
                 }
             }
             "signature_delta" => {
-                if let Some(signature) = map_text_field(delta, "signature") {
-                    self.thinking_signatures
-                        .entry(index)
-                        .or_default()
-                        .push_str(signature);
+                if let Some(signature) = map_text_field(delta, "signature")
+                    && let Some(BlockState::Thinking {
+                        signature: slot, ..
+                    }) = self.blocks.get_mut(&index)
+                {
+                    slot.push_str(signature);
                 }
             }
             "input_json_delta" => {
@@ -219,13 +242,11 @@ impl Parser {
             "thinking_delta" | "signature_delta" => "thinking",
             _ => return,
         };
-        if let std::collections::btree_map::Entry::Vacant(entry) = self.block_types.entry(index) {
-            entry.insert(kind.into());
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.blocks.entry(index) {
+            entry.insert(BlockState::from_type(kind));
             if kind == "text" {
                 emit(ModelEvent::TextStart);
             } else {
-                self.thinking_text.insert(index, String::new());
-                self.thinking_signatures.insert(index, String::new());
                 emit(ModelEvent::ThinkingStart);
             }
         }
@@ -237,8 +258,8 @@ impl Parser {
         emit: &mut dyn FnMut(ModelEvent),
     ) -> Result<()> {
         let index = required_index(value)?;
-        if let Some(kind) = self.block_types.remove(&index) {
-            self.close_block(index, &kind, emit);
+        if let Some(state) = self.blocks.remove(&index) {
+            self.close_block(index, state, emit);
         }
         Ok(())
     }
@@ -933,6 +954,83 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Anthropic stream ended without message_stop"
+        );
+    }
+
+    #[test]
+    fn a_thinking_block_keeps_its_text_and_signature_together() {
+        let events = collect_events(
+            &mut Parser::new(names(&invocation())),
+            &[
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"a"}}"#,
+                r#"{"type":"content_block_stop","index":0}"#,
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":""}}"#,
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"b"}}"#,
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"sig-b"}}"#,
+                r#"{"type":"content_block_stop","index":1}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        )
+        .unwrap();
+        // Each block's signature belongs to that block's own text, never a
+        // sibling's: only index 1 signs, and it signs "b".
+        let replay = events
+            .iter()
+            .find_map(|event| match event {
+                ModelEvent::ProviderReplayState(state) => Some(&state.value),
+                _ => None,
+            })
+            .expect("a signed block produces replay state");
+        assert_eq!(
+            replay["blocks"],
+            json!([{ "type": "thinking", "thinking": "b", "signature": "sig-b" }])
+        );
+    }
+
+    #[test]
+    fn an_unknown_block_type_is_tolerated_and_never_closed() {
+        let events = collect_events(
+            &mut Parser::new(names(&invocation())),
+            &[
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"future_block"}}"#,
+                r#"{"type":"content_block_stop","index":0}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        )
+        .unwrap();
+        assert_eq!(events, vec![ModelEvent::Done(FinishReason::Stop)]);
+    }
+
+    #[test]
+    fn a_delta_before_its_start_opens_the_block_implicitly() {
+        let events = collect_events(
+            &mut Parser::new(names(&invocation())),
+            &[
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"implicit"}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                ModelEvent::ThinkingStart,
+                ModelEvent::ThinkingDelta("implicit".into()),
+                ModelEvent::ThinkingEnd,
+                ModelEvent::ThinkingSignature("sig".into()),
+                ModelEvent::ProviderReplayState(crate::model::ProviderReplayState {
+                    provider_kind: REPLAY_KIND.into(),
+                    value: json!({ "blocks": [
+                        { "type": "thinking", "thinking": "implicit", "signature": "sig" }
+                    ] }),
+                }),
+                ModelEvent::Done(FinishReason::Stop),
+            ]
         );
     }
 }

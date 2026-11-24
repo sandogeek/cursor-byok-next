@@ -43,10 +43,6 @@ pub enum CatalogMode {
 impl ProviderDefinition {
     /// The resource type a live catalog is read through, or `None` when this
     /// provider has no live catalog.
-    ///
-    /// Validation rejects a live catalog without models or without a resource
-    /// type, but the compiler cannot see that pair of constraints, so it is
-    /// stated once here instead of at every call site.
     #[must_use]
     pub fn live_resource_type(&self) -> Option<&str> {
         if !self.has_models || self.catalog != CatalogMode::Live {
@@ -54,6 +50,81 @@ impl ProviderDefinition {
         }
         self.resource_type.as_deref()
     }
+
+    /// The validated form of this declaration, or the reason it cannot be one.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a live catalog has no models or names no resource type, or
+    /// when a model list has no resource type to bind to.
+    pub fn validated(self) -> Result<ValidatedProvider, ValidationError> {
+        let models = match (self.has_models, self.catalog) {
+            (false, _) => ModelSource::None,
+            (true, CatalogMode::Live) => {
+                let resource_type = self.resource_type.clone().ok_or_else(|| {
+                    ValidationError::LiveCatalogWithoutResourceType(self.id.clone())
+                })?;
+                ModelSource::Live { resource_type }
+            }
+            (true, CatalogMode::Snapshot) => ModelSource::Snapshot {
+                resource_type: self.resource_type.clone(),
+            },
+        };
+        Ok(ValidatedProvider {
+            definition: self,
+            models,
+        })
+    }
+}
+
+/// A provider declaration that passed validation, with its model source
+/// resolved.
+///
+/// The raw JSON shape keeps `hasModels`, `catalog` and `resourceType` as three
+/// independent fields, which allows combinations that mean nothing. Once
+/// validated, [`ModelSource`] states the one thing the rest of the app reads:
+/// where the provider's models come from.
+#[derive(Clone, Debug)]
+pub struct ValidatedProvider {
+    /// The declaration as the plugin wrote it, for the descriptor the UI reads.
+    pub definition: ProviderDefinition,
+    pub models: ModelSource,
+}
+
+impl ValidatedProvider {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.definition.id
+    }
+
+    /// The resource type this provider's models or calls bind to, if any.
+    #[must_use]
+    pub fn bound_resource_type(&self) -> Option<&str> {
+        match &self.models {
+            ModelSource::None => self.definition.resource_type.as_deref(),
+            ModelSource::Snapshot { resource_type } => resource_type.as_deref(),
+            ModelSource::Live { resource_type } => Some(resource_type.as_str()),
+        }
+    }
+}
+
+/// Where a provider's models come from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelSource {
+    /// The provider declares no models, so it never appears in the picker.
+    None,
+    /// Models the plugin listed when a resource was added. `resource_type` is
+    /// `None` when the list does not bind to a stored resource.
+    Snapshot { resource_type: Option<String> },
+    /// Models listed live through stored resources of `resource_type`.
+    Live { resource_type: String },
+}
+
+/// Why a provider declaration cannot become a [`ValidatedProvider`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ValidationError {
+    #[error("provider '{0}' a live catalog requires a resource type")]
+    LiveCatalogWithoutResourceType(String),
 }
 
 impl CatalogMode {
@@ -307,18 +378,19 @@ impl PluginModelDescriptor {
     pub fn new(
         plugin_id: &str,
         plugin_name: &str,
-        provider: &ProviderDefinition,
+        provider: &ValidatedProvider,
         model: &StoredModel,
     ) -> Self {
+        let definition = &provider.definition;
         Self {
-            id: model_id(plugin_id, &provider.id, &model.id),
+            id: model_id(plugin_id, &definition.id, &model.id),
             plugin_id: plugin_id.to_owned(),
             plugin_name: plugin_name.to_owned(),
-            provider_id: provider.id.clone(),
+            provider_id: definition.id.clone(),
             model_id: model.id.clone(),
             display_name: model.display_name.clone(),
             description: model.description.clone(),
-            provider_type: provider.provider_type.clone(),
+            provider_type: definition.provider_type.clone(),
             max_output_tokens: model.max_output_tokens,
             images: model.images,
         }
@@ -328,6 +400,63 @@ impl PluginModelDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn provider(catalog: CatalogMode, resource_type: Option<&str>) -> ProviderDefinition {
+        ProviderDefinition {
+            id: "gateway".into(),
+            display_name: serde_json::json!("Gateway"),
+            description: serde_json::Value::Null,
+            provider_type: "openai".into(),
+            resource_type: resource_type.map(str::to_owned),
+            has_models: true,
+            catalog,
+        }
+    }
+
+    #[test]
+    fn a_provider_without_models_states_no_model_source() {
+        let mut definition = provider(CatalogMode::Snapshot, Some("gateway"));
+        definition.has_models = false;
+        let validated = definition.validated().unwrap();
+
+        assert_eq!(validated.models, ModelSource::None);
+        assert_eq!(validated.bound_resource_type(), Some("gateway"));
+    }
+
+    #[test]
+    fn a_snapshot_catalog_carries_its_optional_binding() {
+        let validated = provider(CatalogMode::Snapshot, Some("gateway"))
+            .validated()
+            .unwrap();
+        assert_eq!(
+            validated.models,
+            ModelSource::Snapshot {
+                resource_type: Some("gateway".into())
+            }
+        );
+
+        let unbound = provider(CatalogMode::Snapshot, None).validated().unwrap();
+        assert_eq!(unbound.bound_resource_type(), None);
+    }
+
+    #[test]
+    fn a_live_catalog_must_name_its_resource_type() {
+        let validated = provider(CatalogMode::Live, Some("gateway"))
+            .validated()
+            .unwrap();
+        assert_eq!(
+            validated.models,
+            ModelSource::Live {
+                resource_type: "gateway".into()
+            }
+        );
+
+        let error = provider(CatalogMode::Live, None).validated().unwrap_err();
+        assert_eq!(
+            error,
+            ValidationError::LiveCatalogWithoutResourceType("gateway".into())
+        );
+    }
 
     #[test]
     fn parses_stable_model_ids_with_slashes() {

@@ -60,6 +60,9 @@ fn main() -> ExitCode {
     match extract_from_files(&inputs, &output, strictness) {
         Ok(result) => {
             eprint!("{}", result.diagnostics);
+            for warning in &result.write_warnings {
+                eprintln!("warning: {warning}");
+            }
             let messages = result.messages.len();
             let enums = result.enums.len();
             let services = result.services.len();

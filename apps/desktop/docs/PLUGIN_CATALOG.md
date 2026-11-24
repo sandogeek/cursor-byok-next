@@ -58,6 +58,12 @@ cursor-byok/server/plugins/build-in/magpie/ apps/desktop/plugins/build-in/magpie
 | 10 | `import` / `actions` 能力 | 资源定义携带导入与动作描述，SDK worker 有 `import.parse` / `resource.action` | 三处一起删除：`ResourceDefinition` 字段、`sdk/plugin.ts` 的 `__descriptor` 输出、`sdk/worker.ts` 的两个 method | beta 不做向后兼容：宿主没有执行路径，保留类型与字段只会让插件以为导入和动作可用。重新移植时按 `resource.ts`/`plugin.ts`/`worker.ts`/`descriptor.rs` 四层一起补 |
 | 11 | 宿主能力与进程隔离 | `registry.rs` 兼办进程管理与 SDK 能力 | `worker.rs` 只管进程与 JSONL，能力在 `host_calls.rs`；live 目录缓存在 `catalog_cache.rs` | 进程传输不应决定插件权限：越权检查集中在 `host_calls.rs`，改权限只改一处；`worker.rs` 从 1760 行降到 ~1240 行，缓存单测不再需要起 Bun |
 | 12 | catalog 与表单字段类型 | `catalog` / `methodType` / `fieldType` 是自由字符串，校验时手写 `matches!` | `CatalogMode`、`AddMethodKind`、`FormFieldKind` 枚举，serde 按 `snake_case` 解析，未知值在反序列化时就失败 | 插件声明里只有这三种取值；枚举让“不在列表里”变成解析错误，不用在每个使用点重复校验。边界仍输出字符串，插件协议不变 |
+| 13 | 资源的读改写 | `upsert` / `patch` / `remove` 各自 `load` → 改 → `save` | 三者走 `PluginDataStore::mutate`，整个读改写是一次按 `(plugin, key)` 的临界区 | 并发补丁原本会互相覆盖：后面读到的还是补丁前的快照。锁仍按 key 而不是按插件，两个资源互不阻塞 |
+| 14 | 写入锁的所有权 | 写文件在持锁的 async 任务里完成 | 锁的 `OwnedMutexGuard` 移进 `spawn_blocking`，写盘结束后才释放 | 调用方 future 被取消会在写盘完成前丢锁，下一次读到旧值；锁必须与真实写入同生命周期 |
+| 15 | 写入时的文件权限 | 依赖 OS 默认 | `TemporaryFile` + `create_new` + 显式 mode；未指定 mode 的写保留原文件权限 | 秘密文件（`ca.key`）在 0600 上重写不能变成 0644，也不能因为一次写入失败留下半个临时文件 |
+| 16 | 敏感数据与 `Debug` | `ResourceRecord` / `ResourceDraft` / `ResourcePatch` / `StoredModel` 派生 `Debug` | 手写 `Debug`，`private_data` 打印 `[REDACTED]`（补丁未设置时打印 `<unchanged>`） | 私有数据就是网关密钥；`{:?}` 会出现在日志、断言失败和调试器里 |
+| 17 | provider 的模型来源 | `hasModels` + `catalog` + `resourceType` 三个可冲突字段 | 校验后转成 `ValidatedProvider { models: ModelSource }`，`None` / `Snapshot { resource_type }` / `Live { resource_type }` | 原始 JSON 形状不变，但宿主只读 `ValidatedProvider`：`Live` 必然带资源类型，`Snapshot` 的绑定是可选的，编译器替每个调用点记住这条约束 |
+| 18 | 临时运行目录的清理 | `Drop` 里同步 `remove_dir_all` | `Drop` 只把路径交给进程级的 `cursor-byok-next-plugin-cleanup` 线程；失败带路径记录 | 目录里可能有 Bun cache，递归删除不是恒定时间；析构不能阻塞，也不能假定 Tokio runtime 还在 |
 
 ## 必须保持的不变量
 

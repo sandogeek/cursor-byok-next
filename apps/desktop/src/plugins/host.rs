@@ -25,9 +25,9 @@ use super::{
     },
     data::PluginDataStore,
     descriptor::{
-        CatalogMode, FormFieldKind, PluginDescriptor, PluginModelDescriptor,
-        PluginProviderDescriptor, PluginResourceDescriptor, PluginResourceView, ProviderDefinition,
-        ResourceDefinition, ResourcePresentation, parse_model_id,
+        FormFieldKind, ModelSource, PluginDescriptor, PluginModelDescriptor,
+        PluginProviderDescriptor, PluginResourceDescriptor, PluginResourceView, ResourceDefinition,
+        ResourcePresentation, ValidatedProvider, parse_model_id,
     },
     find_bun, origin,
     state::{PluginStateStore, ResourceDraft, ResourcePatch, ResourceRecord, StoredModel},
@@ -300,7 +300,7 @@ impl PluginHost {
         let entries = self.entries(&executable).await;
         let mut models = Vec::new();
         for entry in entries.iter() {
-            for provider in &entry.definition.providers {
+            for provider in &entry.providers {
                 if !self.provider_configured(entry, provider).await {
                     continue;
                 }
@@ -392,14 +392,14 @@ impl PluginHost {
                 .invocation_resource(&plugin_id, provider, &upstream_id)
                 .await?;
             let mut model_snapshot = stored.snapshot();
-            if provider.live_resource_type().is_some()
+            if matches!(provider.models, ModelSource::Live { .. })
                 && let Some(upstream) = live_upstream_id(&upstream_id)
                 && let Some(object) = model_snapshot.as_object_mut()
             {
                 object.insert("id".into(), serde_json::Value::String(upstream.to_owned()));
             }
             let params = serde_json::json!({
-                "providerId": provider_id,
+                "providerId": provider.id(),
                 "model": model_snapshot,
                 "resource": resource.as_ref().map(|(resource_type, record)| record.snapshot(resource_type)),
             });
@@ -448,13 +448,13 @@ impl PluginHost {
     async fn invocation_resource<'a>(
         &self,
         plugin_id: &str,
-        provider: &'a ProviderDefinition,
+        provider: &'a ValidatedProvider,
         upstream_id: &str,
     ) -> Result<Option<(&'a str, ResourceRecord)>> {
-        let Some(resource_type) = provider.resource_type.as_deref() else {
+        let Some(resource_type) = provider.bound_resource_type() else {
             return Ok(None);
         };
-        if provider.catalog != CatalogMode::Live {
+        if !matches!(provider.models, ModelSource::Live { .. }) {
             let record = self.select_resource(plugin_id, resource_type).await?;
             return Ok(Some((resource_type, record)));
         }
@@ -535,7 +535,7 @@ impl PluginHost {
     async fn descriptor(&self, entry: &PluginEntry, executable: &Path) -> PluginDescriptor {
         let plugin_id = &entry.manifest.id;
         let mut providers = Vec::new();
-        for provider in &entry.definition.providers {
+        for provider in &entry.providers {
             let ProviderCatalog {
                 models: stored,
                 error: catalog_error,
@@ -543,15 +543,16 @@ impl PluginHost {
                 .provider_models(entry, executable, provider, CatalogRefresh::Cached, None)
                 .await;
             let configured = self.provider_configured(entry, provider).await;
+            let definition = &provider.definition;
             providers.push(PluginProviderDescriptor {
-                id: provider.id.clone(),
+                id: definition.id.clone(),
                 plugin_id: plugin_id.clone(),
-                display_name: provider.display_name.clone(),
-                description: provider.description.clone(),
-                provider_type: provider.provider_type.clone(),
-                resource_type: provider.resource_type.clone(),
-                has_models: provider.has_models,
-                catalog: provider.catalog,
+                display_name: definition.display_name.clone(),
+                description: definition.description.clone(),
+                provider_type: definition.provider_type.clone(),
+                resource_type: definition.resource_type.clone(),
+                has_models: definition.has_models,
+                catalog: definition.catalog,
                 configured,
                 catalog_error,
                 models: stored
@@ -679,12 +680,8 @@ impl PluginHost {
             .collect()
     }
 
-    async fn provider_configured(
-        &self,
-        entry: &PluginEntry,
-        provider: &ProviderDefinition,
-    ) -> bool {
-        let Some(resource_type) = &provider.resource_type else {
+    async fn provider_configured(&self, entry: &PluginEntry, provider: &ValidatedProvider) -> bool {
+        let Some(resource_type) = provider.bound_resource_type() else {
             return true;
         };
         match self
@@ -715,8 +712,8 @@ impl PluginHost {
         changed: &HashSet<String>,
     ) -> Option<String> {
         let mut errors = Vec::new();
-        for provider in &entry.definition.providers {
-            if provider.resource_type.as_deref() != Some(resource_type) {
+        for provider in &entry.providers {
+            if provider.bound_resource_type() != Some(resource_type) {
                 continue;
             }
             let catalog = self
@@ -737,14 +734,11 @@ impl PluginHost {
         &self,
         entry: &PluginEntry,
         executable: &Path,
-        provider: &ProviderDefinition,
+        provider: &ValidatedProvider,
         refresh: CatalogRefresh,
         only: Option<&HashSet<String>>,
     ) -> ProviderCatalog {
-        if !provider.has_models || provider.catalog != CatalogMode::Live {
-            return ProviderCatalog::default();
-        }
-        let Some(resource_type) = provider.live_resource_type() else {
+        let ModelSource::Live { resource_type } = &provider.models else {
             return ProviderCatalog::default();
         };
         let records = self
@@ -780,13 +774,13 @@ impl PluginHost {
         &self,
         entry: &PluginEntry,
         executable: &Path,
-        provider: &ProviderDefinition,
+        provider: &ValidatedProvider,
         record: &ResourceRecord,
         refresh: CatalogRefresh,
     ) -> LiveCatalogEntry {
         let key = LiveCatalogKey {
             plugin: entry.manifest.id.clone(),
-            provider: provider.id.clone(),
+            provider: provider.id().to_owned(),
             resource: record.id.clone(),
         };
         if let Some(cached) = self.inner.catalogs.get(&key, refresh).await {
@@ -803,12 +797,12 @@ impl PluginHost {
         &self,
         entry: &PluginEntry,
         executable: &Path,
-        provider: &ProviderDefinition,
+        provider: &ValidatedProvider,
         resource: Option<&ResourceRecord>,
     ) -> Result<Vec<StoredModel>> {
         // A resource record is only meaningful with the type it was stored
         // under, so a provider that declares no type gets no snapshot.
-        let snapshot = match (provider.resource_type.as_deref(), resource) {
+        let snapshot = match (provider.bound_resource_type(), resource) {
             (Some(resource_type), Some(record)) => Some(record.snapshot(resource_type)),
             _ => None,
         };
@@ -817,7 +811,7 @@ impl PluginHost {
             .await
             .invoke(
                 "models.list",
-                serde_json::json!({ "providerId": provider.id, "resource": snapshot }),
+                serde_json::json!({ "providerId": provider.id(), "resource": snapshot }),
                 Self::resource_origins(entry, resource),
             )
             .await?;
@@ -972,12 +966,11 @@ fn resource_storage_error(plugin_id: &str, error: &Error) -> String {
     super::text("plugin.error.storage_unreadable")
 }
 
-fn find_provider<'a>(entry: &'a PluginEntry, provider_id: &str) -> Result<&'a ProviderDefinition> {
+fn find_provider<'a>(entry: &'a PluginEntry, provider_id: &str) -> Result<&'a ValidatedProvider> {
     entry
-        .definition
         .providers
         .iter()
-        .find(|provider| provider.id == provider_id)
+        .find(|provider| provider.id() == provider_id)
         .ok_or_else(|| {
             Error::NotFound(format!(
                 "plugin '{}' provider {provider_id}",

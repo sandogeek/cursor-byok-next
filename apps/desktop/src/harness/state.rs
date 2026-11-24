@@ -5,7 +5,7 @@
 //! start can restore takeover on the same port instead of leaving Cursor broken
 //! until someone toggles it.
 
-use std::{fs, path::PathBuf};
+use std::{fs, num::NonZeroU16, path::PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -19,8 +19,10 @@ pub enum PortChoice {
     Unset,
     /// The user asked for a fresh OS-assigned port, even if a fixed one worked.
     OsAssigned,
-    /// A specific port the user typed.
-    Fixed(u16),
+    /// A specific port the user typed. `0` cannot be stored here: it is the
+    /// "let the OS pick" sentinel, so [`PortChoice::OsAssigned`] is the only
+    /// state that means it.
+    Fixed(NonZeroU16),
 }
 
 impl PortChoice {
@@ -30,8 +32,7 @@ impl PortChoice {
     pub fn from_boundary(port: Option<u16>) -> Self {
         match port {
             None => Self::Unset,
-            Some(0) => Self::OsAssigned,
-            Some(port) => Self::Fixed(port),
+            Some(port) => NonZeroU16::new(port).map_or(Self::OsAssigned, Self::Fixed),
         }
     }
 
@@ -41,7 +42,7 @@ impl PortChoice {
         match self {
             Self::Unset => None,
             Self::OsAssigned => Some(0),
-            Self::Fixed(port) => Some(port),
+            Self::Fixed(port) => Some(port.get()),
         }
     }
 
@@ -49,7 +50,7 @@ impl PortChoice {
     #[must_use]
     pub fn request(self, last_bound: Option<u16>, fallback: u16) -> u16 {
         match self {
-            Self::Fixed(port) => port,
+            Self::Fixed(port) => port.get(),
             // An explicit "let the OS pick" overrides the remembered port.
             Self::OsAssigned => 0,
             Self::Unset => last_bound.unwrap_or(fallback),
@@ -99,12 +100,37 @@ impl HarnessStateStore {
 
     /// A missing or unreadable file means "off": never take over on the
     /// strength of a file we cannot read.
+    ///
+    /// A missing file is silent, because it is the first run. Any other failure
+    /// is logged with the path so a takeover that silently came back off is
+    /// diagnosable.
     #[must_use]
     pub fn load(&self) -> HarnessState {
-        fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|data| serde_json::from_str(&data).ok())
-            .unwrap_or_default()
+        let data = match fs::read_to_string(&self.path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return HarnessState::default();
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %self.path.display(),
+                    "cannot read harness.json; takeover stays off"
+                );
+                return HarnessState::default();
+            }
+        };
+        match serde_json::from_str(&data) {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %self.path.display(),
+                    "harness.json is not valid JSON; takeover stays off"
+                );
+                HarnessState::default()
+            }
+        }
     }
 
     /// Writes the intent atomically, so a crash cannot leave half a file.
@@ -143,7 +169,7 @@ mod tests {
         let state = HarnessState {
             enabled: true,
             proxy_port: Some(41000),
-            preferred_port: PortChoice::Fixed(41000),
+            preferred_port: PortChoice::Fixed(NonZeroU16::new(41000).unwrap()),
         };
 
         store.save(state).unwrap();
@@ -208,5 +234,40 @@ mod tests {
         assert_eq!(fixed.request(Some(41000), 39831), 42000);
         assert_eq!(unset.request(Some(41000), 39831), 41000);
         assert_eq!(unset.request(None, 39831), 39831);
+    }
+
+    #[test]
+    fn every_constructible_port_choice_round_trips_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = HarnessStateStore::at(dir.path().join("harness.json"));
+        let choices = [
+            PortChoice::Unset,
+            PortChoice::OsAssigned,
+            PortChoice::Fixed(NonZeroU16::new(41000).unwrap()),
+        ];
+
+        for choice in choices {
+            let state = HarnessState {
+                enabled: true,
+                proxy_port: Some(41000),
+                preferred_port: choice,
+            };
+            store.save(state).unwrap();
+            assert_eq!(store.load().preferred_port, choice, "{choice:?}");
+        }
+    }
+
+    #[test]
+    fn zero_is_only_ever_the_os_assigned_choice() {
+        assert_eq!(
+            PortChoice::from_boundary(Some(0)),
+            PortChoice::OsAssigned,
+            "a boundary 0 maps to the OS pick, so `Fixed(0)` is unrepresentable"
+        );
+        assert_eq!(
+            PortChoice::from_boundary(Some(1)),
+            PortChoice::from_boundary(Some(1))
+        );
+        assert_ne!(PortChoice::from_boundary(Some(1)), PortChoice::OsAssigned);
     }
 }

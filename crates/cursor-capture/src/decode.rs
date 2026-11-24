@@ -239,24 +239,31 @@ impl ConnectFrameDecoder {
             raw_hex: clipped_hex(payload, HEX_CLIP_BYTES),
             ..FrameView::default()
         };
-        let decoded = if frame.compressed {
+        // Only a compressed frame needs owned bytes: an uncompressed frame is
+        // decoded straight from the caller's slice, so a normal stream never
+        // copies a payload just to share one code path.
+        let inflated;
+        let decoded: &[u8] = if frame.compressed {
             match decompress_payload(payload, &self.codec) {
-                Ok(bytes) => bytes,
+                Ok(bytes) => {
+                    inflated = bytes;
+                    &inflated
+                }
                 Err(err) => {
                     frame.error = Some(err.to_string());
                     return frame;
                 }
             }
         } else {
-            payload.to_vec()
+            payload
         };
         if frame.end_stream {
             frame.kind = FrameView::KIND_END_STREAM.into();
             frame.message_type = "connect.error.v1.EndStreamResponse".into();
-            frame.json = pretty_json(&decoded);
+            frame.json = pretty_json(decoded);
             return frame;
         }
-        match decode_named_message(&self.message_type, &decoded) {
+        match decode_named_message(&self.message_type, decoded) {
             None => frame.error = Some("未知的 protobuf 消息类型".into()),
             Some(Err(err)) => frame.error = Some(format!("protobuf 解码失败：{err}")),
             Some(Ok(message)) => {

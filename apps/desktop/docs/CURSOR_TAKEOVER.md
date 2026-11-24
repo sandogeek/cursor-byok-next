@@ -69,6 +69,10 @@ pub use self::proxy::{is_cursor_host, Routing as ProxyRouting, UPSTREAM_URL_HEAD
 | 25 | native 实例所有权 | 服务端拥有长生命周期 harness | `App.tsx` 模块级单例持有 `Harness` / `Plugins` / `Calls`，不在 `mount` 回调内临时构造 | NSH 的 JS 对象被 GC 时会 drop 其 Rust 实例。临时 `new Harness()` 在 `status()` 返回后触发 `ProxyRuntime::drop`，代理被 abort，但 TSX 镜像仍显示已接管，Cursor 对已配置端口反复 `ECONNREFUSED`。应用级所有者必须与 socket 生命周期一致 |
 | 26 | 代理启动返回值 | 上游返回 `{ url, port }` 对象 | `ProxyRuntime::start` 返回 `StartedProxy { url, port }` | 具名结构让调用方读字段而不是解构元组；端口只存一份，`url`/`port` 不再各自缓存 |
 | 27 | 白名单与路由表 | 两份列表分别维护 | 共用 `backend::PROVIDED_PATHS` | 两份列表漂移时页面“能开”但请求直通官方，是无声错误；抽成一个 `const` 后编译器负责两边一致 |
+| 28 | 阻塞调用的执行域 | `apply_cursor_configuration` 等同步函数直接在 async 入口调用 | CA 检查/加载、`settings.json` 读改写、`harness.json` 保存一律经 `harness::blocking` 走 `spawn_blocking`（无 runtime 时退化为直调） | macOS 的 CA 检查会起 `security` 子进程，配置读写是 JSONC 读改写再 rename；它们都在 `operation` 串行区内，留在 worker 上会饿死其他任务。`operation` 仍是唯一的串行点，不变量顺序不变 |
+| 29 | 启停参数 | `SetEnabled { enabled }`（HTTP DTO） | native 边界仍是 `setEnabled(enabled: boolean)`，核心是 `set_takeover(TakeoverIntent)` | 前端开关就该是布尔，但核心状态机不该收裸 bool；`From<bool>` 是唯一的翻译点 |
+| 30 | 首选端口的表示 | 整数端口，`0` 表示让系统分配 | `PortChoice::{Unset, OsAssigned, Fixed(NonZeroU16)}` | `Fixed(0)` 与 `OsAssigned` 原本是两个可构造但不相等的状态，落到文件后读回来会变成另一个；`NonZeroU16` 让零只可能是 `OsAssigned`。边界仍是 `Option<u16>` |
+| 31 | 读不出来的意图 / 外观 | 直接回默认值 | 仍是默认值，但拒绝文件与解析失败会带路径 `warn` | 缺文件是首次运行，静默；权限、I/O、JSON 损坏是故障，静默重置会让用户无法诊断 |
 
 ### 顺带修掉的上游隐患
 
@@ -181,7 +185,10 @@ nsh test                    # 28 passed（含 App.test.tsx）
 | `injects_the_local_account_and_repairs_its_membership` | 本地账号注入 + 会员字段自愈 |
 | `leaves_a_real_signed_in_account_alone` | 真实登录不覆盖 |
 | `recognises_only_the_injected_cursor_token` | token 判定边界 |
-| `a_missing_file_reads_as_off` / `a_save_state` / `a_corrupt_file_reads_as_off` | 意图持久化与降级 |
+| `a_missing_file_reads_as_off` / `a_saved_state_reads_back` / `a_corrupt_file_reads_as_off` | 意图持久化与降级 |
+| `every_constructible_port_choice_round_trips_through_the_file` | #30：每个可构造的端口选择经过文件往返后仍是自身 |
+| `zero_is_only_ever_the_os_assigned_choice` | #30：边界 `0` 只映射到 `OsAssigned` |
+| `a_boundary_switch_maps_to_an_intent` | #29：布尔开关与 `TakeoverIntent` 的双向映射 |
 | `only_cursor_hosts_are_cursor_hosts` | 域名判定（含大小写与尾点） |
 | `a_backendless_takeover_routes_nothing` | #1：无后端不改写 |
 | `backend_loop_rpcs_stay_with_cursor_upstream` | #24：`AgentService/Run*` 不接管 |

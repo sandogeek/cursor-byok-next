@@ -20,6 +20,9 @@ hex = "0.4"
 hudsucker = { version = "0.25", features = ["http2"] }
 json5 = "0.4"
 nsh-core = "0.6.0"
+# `nsh-base` has no hand-written caller in this crate, but every generated
+# platform entry under `.nsh/rust/` calls `nsh_base::registry()`, so removing it
+# breaks `nsh run`/`nsh package` on every target.
 nsh-base = "0.6.0"
 parking_lot = "0.12"
 pem = "3"
@@ -29,7 +32,6 @@ rcgen = { version = "0.14", features = ["aws_lc_rs", "pem", "x509-parser"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha1 = "0.10"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 thiserror = "2"
@@ -57,3 +59,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSAppearance", "NSApplication", "NSResponder", "NSRunningApplication"] }
+# Only `harness::ca`'s macOS trust check fingerprints the CA with SHA-1, which is
+# what `security find-certificate` prints.
+sha1 = "0.10"

@@ -286,7 +286,7 @@ impl InferenceService {
         &self,
         request_id: String,
         run: Arc<Run>,
-    ) -> (mpsc::UnboundedReceiver<Bytes>, Subscription) {
+    ) -> (mpsc::Receiver<Bytes>, Subscription) {
         let mut subscriptions = run.subscriptions.lock();
         subscriptions.active += 1;
         subscriptions.generation += 1;
@@ -601,6 +601,15 @@ impl LoopState {
             {
                 tracing::warn!(%error, "a RunInference invocation panicked");
             }
+        }
+        if self.output.lagged() > 0 {
+            // A reader fell so far behind that frames were dropped; the run is
+            // not a complete delivery, so do not mark the stream complete.
+            tracing::warn!(
+                lagged = self.output.lagged(),
+                "dropped a lagging RunInference subscriber; output is incomplete"
+            );
+            return;
         }
         if exit.sends_end_stream() {
             self.output.emit(connect::encode_end_stream());

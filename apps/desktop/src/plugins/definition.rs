@@ -16,6 +16,10 @@ const DEFINITION_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const OUTPUT_PREFIX: &str = "CURSOR_BYOK_NEXT_PLUGIN_DEFINITION:";
 
+/// How long a test waits for the cleanup thread to delete a workspace.
+#[cfg(test)]
+const CLEANUP_WAIT: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Debug)]
 pub struct PluginDefinitionLoader {
     workspace: Arc<RuntimeDirectory>,
@@ -34,8 +38,73 @@ struct RuntimeDirectory(PathBuf);
 
 impl Drop for RuntimeDirectory {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // A workspace can hold a Bun cache, so deleting it is not constant
+        // work. This runs on whatever thread releases the last owner: an async
+        // worker task, a dropped future, or a destructor chain. Hand the
+        // recursive delete to the cleanup thread instead.
+        schedule_cleanup(self.0.clone());
     }
+}
+
+/// Removes one workspace, logging rather than panicking on failure.
+fn remove_workspace(path: &Path) {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => tracing::debug!(dir = %path.display(), "removed the plugin workspace"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(%error, dir = %path.display(), "could not remove the plugin workspace");
+        }
+    }
+}
+
+/// Queues a workspace for deletion.
+///
+/// The queue has its own thread rather than a Tokio task: `Drop` cannot assume
+/// a runtime is still alive, and it must not block. A missing or dead thread
+/// leaks the directory with a log line — the temporary directory is the OS's
+/// to reclaim.
+fn schedule_cleanup(path: PathBuf) {
+    let Some(queue) = cleanup_queue() else {
+        tracing::warn!(
+            dir = %path.display(),
+            "no plugin workspace cleanup thread; leaving it to the temporary directory"
+        );
+        return;
+    };
+    if let Err(std::sync::mpsc::SendError(path)) = queue.send(path) {
+        tracing::warn!(
+            dir = %path.display(),
+            "the plugin workspace cleanup thread is gone; leaving it in place"
+        );
+    }
+}
+
+/// The cleanup queue, started on first use.
+///
+/// One thread serves every workspace for the process's lifetime: a directory
+/// cannot start its own thread on the runtime that is being torn down.
+fn cleanup_queue() -> Option<&'static std::sync::mpsc::Sender<PathBuf>> {
+    static QUEUE: std::sync::OnceLock<Option<std::sync::mpsc::Sender<PathBuf>>> =
+        std::sync::OnceLock::new();
+    QUEUE
+        .get_or_init(|| {
+            let (sender, receiver) = std::sync::mpsc::channel::<PathBuf>();
+            let spawned = std::thread::Builder::new()
+                .name("cursor-byok-next-plugin-cleanup".into())
+                .spawn(move || {
+                    while let Ok(path) = receiver.recv() {
+                        remove_workspace(&path);
+                    }
+                });
+            match spawned {
+                Ok(_) => Some(sender),
+                Err(error) => {
+                    tracing::warn!(%error, "cannot start the plugin workspace cleanup thread");
+                    None
+                }
+            }
+        })
+        .as_ref()
 }
 
 impl PluginDefinitionLoader {
@@ -211,5 +280,34 @@ mod tests {
             crate::plugins::descriptor::AddMethodKind::Form
         );
         assert_eq!(descriptor.resources[0].add[0].fields[0].id, "base-url");
+    }
+
+    #[test]
+    fn dropping_the_workspace_removes_it_off_the_dropping_thread() {
+        let parent = tempfile::tempdir().unwrap();
+        let loader = PluginDefinitionLoader::in_temporary_workspace(parent.path()).unwrap();
+        let workspace = loader.workspace().to_path_buf();
+        // Give the delete real work: a nested directory, as the Bun cache is.
+        std::fs::create_dir_all(workspace.join("sdk/cache/nested")).unwrap();
+
+        drop(loader);
+
+        // The delete happens on the cleanup thread, so it is observed by waiting.
+        let deadline = std::time::Instant::now() + CLEANUP_WAIT;
+        while workspace.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !workspace.exists(),
+            "the cleanup thread removed the workspace"
+        );
+    }
+
+    #[test]
+    fn a_missing_workspace_is_not_an_error() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("already-gone");
+        remove_workspace(&missing);
+        assert!(!missing.exists());
     }
 }
