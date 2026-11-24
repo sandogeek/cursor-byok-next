@@ -49,7 +49,7 @@ url = "2"
 [build-dependencies]
 prost = "0.14"
 prost-types = "0.14"
-protox = "0.9"
+protox = "0.10"
 
 [dev-dependencies]
 http-body-util = "0.1"
