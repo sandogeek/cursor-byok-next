@@ -18,6 +18,38 @@ const MAX_COMPONENT_BYTES: usize = 128;
 pub struct PluginDataStore {
     root: PathBuf,
     locks: Arc<Mutex<HashMap<LockKey, Arc<AsyncMutex<()>>>>>,
+    /// Lets a test hold the blocking write open, so the caller can be cancelled
+    /// while its guard is already inside the write task.
+    #[cfg(test)]
+    gate: Option<Arc<WriteGate>>,
+}
+
+/// A test-only latch for the blocking write.
+#[cfg(test)]
+#[derive(Default, Debug)]
+struct WriteGate {
+    entered: std::sync::atomic::AtomicBool,
+    open: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl WriteGate {
+    /// Blocks the writing thread until the test opens the gate.
+    fn wait(&self) {
+        use std::sync::atomic::Ordering;
+        self.entered.store(true, Ordering::SeqCst);
+        while !self.open.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+
+    fn entered(&self) -> bool {
+        self.entered.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn open(&self) {
+        self.open.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// One lock per stored key, so unrelated keys of the same plugin are independent
@@ -41,6 +73,8 @@ impl PluginDataStore {
         Ok(Self {
             root,
             locks: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            gate: None,
         })
     }
 
@@ -103,10 +137,16 @@ impl PluginDataStore {
         let existing = read_json(&path).await?;
         let (value, output) = change(existing)?;
         let bytes = serde_json::to_vec_pretty(&value)?;
+        #[cfg(test)]
+        let gate = self.gate.clone();
         // The owned guard moves into the blocking task, so the serialization
         // outlives a cancelled caller future instead of ending at its drop.
         tokio::task::spawn_blocking(move || {
             let _guard: OwnedMutexGuard<()> = guard;
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                gate.wait();
+            }
             write_once(&directory, &temporary, &path, &bytes)
         })
         .await
@@ -275,14 +315,25 @@ mod tests {
     async fn a_write_lands_after_a_caller_that_stopped_waiting() {
         let root = tempfile::tempdir().unwrap();
         let store = PluginDataStore::at(root.path().join("data")).unwrap();
-        // `timeout` drops the update future as soon as the deadline passes; on
-        // first poll the blocking write is already queued and holds the key lock.
-        let first = tokio::time::timeout(
-            std::time::Duration::from_nanos(1),
-            store.update("com.example", "state", &serde_json::json!({ "n": 1 })),
-        )
-        .await;
-        assert!(first.is_err(), "the 1ns timeout should cancel the caller");
+        let gate = Arc::new(WriteGate::default());
+        let mut gated = store.clone();
+        gated.gate = Some(Arc::clone(&gate));
+
+        let first = tokio::spawn(async move {
+            gated
+                .update("com.example", "state", &serde_json::json!({ "n": 1 }))
+                .await
+        });
+        // Cancel the caller while its guard sits inside the blocking write.
+        while !gate.entered() {
+            tokio::task::yield_now().await;
+        }
+        first.abort();
+        assert!(first.await.is_err(), "the caller must be cancelled");
+
+        // The write still owns the key lock, so the newer value cannot land
+        // before it; the gate only decides when the older write finishes.
+        gate.open();
         store
             .update("com.example", "state", &serde_json::json!({ "n": 2 }))
             .await
