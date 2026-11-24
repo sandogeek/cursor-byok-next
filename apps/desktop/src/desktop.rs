@@ -247,10 +247,18 @@ mod platform {
     use super::{AppAppearance, DockIcon};
     use crate::error::Result;
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the macOS path can fail, and the exported function has one signature on every platform"
+    )]
     pub(super) fn set_dock_icon(_dock_icon: DockIcon) -> Result<()> {
         Ok(())
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the macOS path can fail, and the exported function has one signature on every platform"
+    )]
     pub(super) fn set_app_appearance(_appearance: AppAppearance) -> Result<()> {
         Ok(())
     }

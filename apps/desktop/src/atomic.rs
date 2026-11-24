@@ -76,6 +76,10 @@ fn existing_mode(path: &Path) -> io::Result<Option<u32>> {
 /// Windows keeps ACLs, which this module deliberately does not rewrite; a
 /// replacing rename keeps the destination's ACL when one already exists.
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Unix path can fail, and `write_inner` asks both platforms the same `io::Result` question"
+)]
 fn existing_mode(_path: &Path) -> io::Result<Option<u32>> {
     Ok(None)
 }
@@ -98,10 +102,10 @@ fn write_file(path: &Path, data: &[u8], mode: Option<u32>) -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
+        use std::io::Write as _;
         // Windows keeps ACLs; a new file inherits the parent directory's, which is
         // the same answer `fs::write` gives, so there is no mode to apply here.
         let _ = mode;
-        use std::io::Write as _;
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
