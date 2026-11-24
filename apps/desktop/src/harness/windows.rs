@@ -25,7 +25,7 @@ pub fn is_installed(cert: &str) -> Result<bool> {
     Ok(found)
 }
 
-/// The LocalMachine `Root` store, closed on drop when not closed explicitly.
+/// The `LocalMachine` `Root` store, closed on drop when not closed explicitly.
 struct RootStore(*mut c_void);
 
 impl RootStore {
@@ -101,12 +101,12 @@ impl Certificate {
         // SAFETY: a context returned by the enumeration is live, and
         // `pbCertEncoded`/`cbCertEncoded` describe one encoded certificate it
         // owns.
-        unsafe {
-            let context = &*self.0;
-            let length =
-                usize::try_from(context.cbCertEncoded).expect("certificate length fits usize");
-            slice::from_raw_parts(context.pbCertEncoded, length)
-        }
+        let context = unsafe { &*self.0 };
+        let length = usize::try_from(context.cbCertEncoded).expect("certificate length fits usize");
+        // SAFETY: `pbCertEncoded` and `length` come from the live context above,
+        // which this guard keeps alive for as long as the returned slice is
+        // borrowed.
+        unsafe { slice::from_raw_parts(context.pbCertEncoded, length) }
     }
 
     /// Frees this context and returns the next one in the store.

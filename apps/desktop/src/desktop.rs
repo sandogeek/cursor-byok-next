@@ -148,10 +148,6 @@ pub async fn set_dock_icon(dock_icon: DockIcon) -> Result<()> {
     clippy::unused_async,
     reason = "the TSX binding has one signature on every platform; only macOS needs the main-thread round trip"
 )]
-#[expect(
-    clippy::unused_async,
-    reason = "the TSX binding has one signature on every platform; only macOS needs the main-thread round trip"
-)]
 pub async fn set_dock_icon(dock_icon: DockIcon) -> Result<()> {
     platform::set_dock_icon(dock_icon)
 }
@@ -181,10 +177,6 @@ pub async fn set_app_appearance(appearance: AppAppearance) -> Result<()> {
 ///
 /// Never fails on these platforms.
 #[cfg(not(target_os = "macos"))]
-#[expect(
-    clippy::unused_async,
-    reason = "the TSX binding has one signature on every platform; only macOS needs the main-thread round trip"
-)]
 #[expect(
     clippy::unused_async,
     reason = "the TSX binding has one signature on every platform; only macOS needs the main-thread round trip"
