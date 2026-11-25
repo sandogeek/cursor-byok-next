@@ -86,7 +86,7 @@ cd apps/desktop && nsh check && nsh test
 nsh test test-fixtures/Visual.test.tsx --target macos
 ```
 
-Rust 覆盖：最终 schema 与重复打开、往返、详细模式快照、敏感头、首个请求认领、TTFR/TTFT first-wins、完成/失败/取消幂等、终态后所有字段只读、drop 收尾、观测队列排空、两种清理、payload 上限与截断标志、保留策略、官方路由不落库。`magpie_invocation_records_the_completed_call` 与 `magpie_invocation_records_cancellation` 走真实 Bun + 假网关。TSX 覆盖列表、详情、清理确认、空状态、详情不存在和中英文；`callSync.test.ts` 覆盖旧轮询与卸载后的结果失效。测试夹具 `capabilities.host` 含 `calls.*`。
+Rust 覆盖：最终 schema 与重复打开、往返、详细模式快照、敏感头、首个请求认领、TTFR/TTFT first-wins、完成/失败/取消幂等、终态后所有字段只读、drop 收尾、观测队列排空、两种清理、payload 上限与截断标志、保留策略、官方路由不落库。`magpie_invocation_records_the_completed_call` 与 `magpie_invocation_records_cancellation` 走真实 QuickJS 插件 + 假网关。TSX 覆盖列表、详情、清理确认、空状态、详情不存在和中英文；`callSync.test.ts` 覆盖旧轮询与卸载后的结果失效。测试夹具 `capabilities.host` 含 `calls.*`。
 
 ### 设计完成清单（调用列表 / 详情）
 

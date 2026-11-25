@@ -1,6 +1,9 @@
 # PRD：插件运行时从 Bun 子进程换成进程内 QuickJS
 
-状态：待实现
+状态：已实现，落地记录见 [PLUGIN_RUNTIME_VM.md](PLUGIN_RUNTIME_VM.md)。与本文的差异：
+- `sdk/collect.ts` 保留为编译期 collector 入口（独立 VM + descriptor 校验需要它），没有被删除；`bunfig.toml`、`definition.rs`、临时目录与清理线程确实消失。
+- 具体上限以代码为准：堆 64 MiB、JS 栈 512 KiB、每次进 JS 5 s 线程 CPU、模块初始化 10 s 墙钟、每 VM 1024 个 timer。
+- `build.rs` 的 oxc 步骤抽到 `plugin_compile.rs`，并由 `tests/plugin_compile.rs` 覆盖。
 产品：Cursor-BYOK-Next 桌面端
 关联：[插件目录](PLUGIN_CATALOG.md)、[协议适配器](PLUGIN_PROTOCOL_ADAPTERS.md)、[插件协议适配器 PRD](PLUGIN_RUNTIME_PRD.md)
 

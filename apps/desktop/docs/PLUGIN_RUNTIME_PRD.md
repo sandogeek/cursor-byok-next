@@ -1,6 +1,6 @@
 # PRD：插件协议适配器下沉 Rust
 
-状态：已实现  
+状态：已实现（其中「Bun 插件」前提已由 [PLUGIN_QUICKJS_PRD.md](PLUGIN_QUICKJS_PRD.md) / [PLUGIN_RUNTIME_VM.md](PLUGIN_RUNTIME_VM.md) 的进程内 QuickJS VM 取代）  
 产品：Cursor-BYOK-Next 桌面端
 
 ## 1. 目标

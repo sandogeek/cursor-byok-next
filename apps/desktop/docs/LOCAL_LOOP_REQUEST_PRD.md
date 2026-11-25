@@ -1,6 +1,6 @@
 # PRD：local loop 标准协议路径不再构造 `LlmRequest`
 
-状态：已实现。适用范围：Cursor-BYOK-Next 的本地 `InvokeModel`。前置工作见 [local loop](LOCAL_LOOP.md) 和 [Rust 协议适配器](PLUGIN_PROTOCOL_ADAPTERS.md)。
+状态：已实现。适用范围：Cursor-BYOK-Next 的本地 `InvokeModel`。前置工作见 [local loop](LOCAL_LOOP.md) 和 [Rust 协议适配器](PLUGIN_PROTOCOL_ADAPTERS.md)。文中「发给 Bun」的传输后来由 [插件运行时 VM](PLUGIN_RUNTIME_VM.md) 换成进程内会话队列，投影边界与所有权结论不变。
 
 ## 决策与收益
 

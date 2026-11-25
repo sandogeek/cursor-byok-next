@@ -27,7 +27,7 @@ harness (Rust)            local CA, MITM for *.cursor.sh only, managed settings.
 backend (Rust)            InferenceService/RunInferenceSSE + BidiService/BidiAppend
       │
       ▼
-Magpie plugin (Bun)       picks a model from your gateway, streams the response
+Magpie plugin (QuickJS)   picks a model from your gateway, streams the response
       │
       ▼
 Your OpenAI- / Anthropic-compatible API
@@ -37,7 +37,7 @@ Your OpenAI- / Anthropic-compatible API
 |---|---|---|
 | Takeover | `apps/desktop/src/harness/` | Proxy lifecycle, local CA, `settings.json`, local account cache |
 | Local loop | `apps/desktop/src/loop_service/`, `backend/` | Cursor's inference stream, model catalog, server config |
-| Plugin host | `apps/desktop/src/plugins/` | Bun workers, Magpie catalog, Chat Completions / Responses / Anthropic adapters |
+| Plugin host | `apps/desktop/src/plugins/` | Isolated QuickJS VMs, Magpie catalog, Chat Completions / Responses / Anthropic adapters |
 | Call log | `apps/desktop/src/calls/` | SQLite records of every Magpie `InvokeModel` |
 | UI | `apps/desktop/App.tsx`, `src/screens/`, `src/ui/` | TSX screens mirroring Rust state |
 | Debug tools | `crates/cursor-capture/`, `crates/cursor-protocol-extractor/` | Traffic capture and protobuf schema extraction |
@@ -48,8 +48,10 @@ holds a mirror and calls methods.
 ## Requirements
 
 - macOS 14+, Windows 10 1809+ or Linux with GTK 4.14+ and glibc 2.39 (Ubuntu 24.04 and later)
-- [Bun](https://bun.sh) on `PATH` — the built-in Magpie plugin runs in a Bun subprocess
 - To build: Rust 1.97+ and the `nsh` CLI 0.6.0
+
+The built-in Magpie plugin runs in an in-process QuickJS VM compiled into the
+application, so no external JavaScript runtime is needed.
 
 ## Install
 

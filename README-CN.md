@@ -24,7 +24,7 @@ harness（Rust）           本地 CA、只 MITM *.cursor.sh、托管 settings.j
 backend（Rust）           InferenceService/RunInferenceSSE + BidiService/BidiAppend
       │
       ▼
-Magpie 插件（Bun）        按网关选择模型并转发响应
+Magpie 插件（QuickJS）    按网关选择模型并转发响应
       │
       ▼
 你的 OpenAI / Anthropic 兼容 API
@@ -34,7 +34,7 @@ Magpie 插件（Bun）        按网关选择模型并转发响应
 |---|---|---|
 | 接管 | `apps/desktop/src/harness/` | 代理生命周期、本地 CA、`settings.json`、本地账号缓存 |
 | local loop | `apps/desktop/src/loop_service/`、`backend/` | Cursor 推理流、模型目录、server config |
-| 插件宿主 | `apps/desktop/src/plugins/` | Bun worker、Magpie 目录、Chat Completions / Responses / Anthropic 适配器 |
+| 插件宿主 | `apps/desktop/src/plugins/` | 独立 QuickJS VM、Magpie 目录、Chat Completions / Responses / Anthropic 适配器 |
 | 调用记录 | `apps/desktop/src/calls/` | 每次 Magpie `InvokeModel` 的 SQLite 记录 |
 | 界面 | `apps/desktop/App.tsx`、`src/screens/`、`src/ui/` | 镜像 Rust 状态的 TSX 屏幕 |
 | 调试工具 | `crates/cursor-capture/`、`crates/cursor-protocol-extractor/` | 抓包调试器与 proto 提取器 |
@@ -44,8 +44,9 @@ Rust 是代理、CA、Cursor 设置与数据库的唯一写者；TSX 只持有�
 ## 环境要求
 
 - macOS 14+、Windows 10 1809+，或 GTK 4.14+ 与 glibc 2.39 的 Linux（Ubuntu 24.04 及以后）
-- `PATH` 上有 [Bun](https://bun.sh)：内置 Magpie 插件在 Bun 子进程里跑
 - 从源码构建需要 Rust 1.97+ 与 `nsh` CLI 0.6.0
+
+内置 Magpie 插件跑在编进应用的进程内 QuickJS VM 里，不需要额外的 JS 运行时。
 
 ## 安装
 

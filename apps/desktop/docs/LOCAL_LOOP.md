@@ -50,7 +50,7 @@ Cursor agent-host（managed-local）
 Local serve()
 ├── RunRequest → RunReady（vendor / summarization / subagent / 本地 rules）
 ├── InvokeModel → PluginHost.stream_model → 登记 Arc<ModelInvocation>
-│                  → Bun Magpie provider.invoke（仅 providerId / model / resource）
+│                  → QuickJS 插件 VM 里的 Magpie provider.invoke（仅 providerId / model / resource）
 │                  → protocol.stream → Rust 适配器从登记项读核心请求 → HTTP/SSE
 │                  → ModelEvent → InferenceStreamResponse
 ├── CancelInvocation / FinishRun → CancellationToken
@@ -72,11 +72,11 @@ Local serve()
 | 6 | 调用记录 | CallRecorder + SQLite | `calls/` + Magpie 首个 HTTP 观测 | 见 `MODEL_CALLS.md`；只记录本地 Magpie，不记录官方模型 |
 | 7 | Free entitlement 缓存 | Stripe 失败时回落已确认的 free | 本地 token stub，官方 token 原样转发 | 没有 entitlement 缓存 |
 | 8 | HTTP/2 bidi / Poll / WebSocket | 有传输层重映射 | 只实现 SSE + BidiAppend | `GetServerConfig.http2_config=1` 把 Cursor 钉在 HTTP/1.1 |
-| 9 | 运行时 | Deno worker | PATH 上的 Bun | 沿用插件目录移植 |
+| 9 | 运行时 | Deno worker | 进程内独立 QuickJS VM | 沿用插件目录移植；无外部运行时 |
 | 10 | 账号 stub | 本地 token 或已确认 free | 只认本应用签发的 token | 真实登录不覆盖（不变量 4） |
 | 11 | 断流生命周期 | 只移除路由 | 最后读流断开保留 300s 重连；超时取消所有子 invocation、关闭输出并释放重放历史 | 客户端异常断开后不能继续消耗模型额度；短暂断线仍可恢复同一 Run |
 | 12 | 文件附件 | 拒绝 `InferenceFilePart` | 保留 bytes / media type / filename；Responses 发 `input_file`，Chat 仅 PDF，Messages 仅 PDF 或 `text/*` | 按 provider 协议支持范围透传，不把未知二进制伪装成图片或文本；不支持的类型明确报错 |
-| 13 | 标准协议请求 | invoke 时构造 SDK `LlmRequest` JSON 并塞进 Bun | 标准路径不构造 SDK JSON；适配器直接读 `ModelInvocation`；自定义插件显式 `readRequest()` | 见 `LOCAL_LOOP_REQUEST_PRD.md`：长历史和附件不再为了选端点而序列化进 Bun |
+| 13 | 标准协议请求 | invoke 时构造 SDK `LlmRequest` JSON 并塞进插件 | 标准路径不构造 SDK JSON；适配器直接读 `ModelInvocation`；自定义插件显式 `readRequest()` | 见 `LOCAL_LOOP_REQUEST_PRD.md`：长历史和附件不再为了选端点而序列化进插件 |
 | 14 | 后端启动 | Tokio 应用启动阶段创建 | 同步构造只建共享状态；异步成员用当前 runtime 启动，`Idle → Starting → Running`；失败或 panic 回 `Idle` | nsh 引擎线程不在 Tokio 上下文中；直接 `spawn` 会 panic 并毒化锁，失败必须能被后续状态刷新重试 |
 | 15 | 后端任务所有权 | 服务端持有长生命周期 `Backend` | `BackendWatch.backend: OnceLock<Backend>` 持有；`Backend` 的 `JoinHandle` 随进程存活 | 原先用 `std::mem::forget` 泄漏句柄；放进 `OnceLock` 表达“只启动一次、活到进程结束”，也让重复启动能被记录 |
 | 16 | 状态锁 | `std::sync::Mutex`，poison 时清毒继续 | `parking_lot::Mutex`，无 poison 状态 | 状态锁中毒后继续用是未定义的状态；换成无 poison 的锁后不需要恢复分支，也不需要额外测试 |
@@ -128,4 +128,4 @@ cargo test -p nsh-app-cursor-byok-next --lib
 cd apps/desktop && nsh check && nsh test
 ```
 
-`plugin_model_starts_a_local_inference_run` 覆盖：`plugin:` id 的 BidiAppend 开本地 Run，RunInferenceSSE 立刻给出 `RunReady`。`the_last_subscription_cancels_a_disconnected_run_after_its_grace_period` 用虚拟时钟覆盖重连与超时清理；`magpie_invocation_serializes_files_and_propagates_cancellation` 走真实 Bun + 本地假网关，验证 Responses / Chat 的 PDF、Messages 的纯文本文档，以及取消后关闭上游 HTTP。`magpie_invocation_marks_resource_invalid_on_http_401` 覆盖鉴权失败把资源标为 `invalid`。`magpie_invoke_frame_does_not_include_or_grow_with_the_model_body` 固定模型 / 资源 / 等长 ID，比较短历史、长历史和 1 MiB 附件的 `provider.invoke` 帧：帧大小不变，且无正文、工具定义或附件标记，标准路径 SDK 投影次数为 0。`magpie_catalog_through_real_bun` 继续覆盖模型目录 worker 路径；协议请求体与 SSE 等价性见 `PLUGIN_PROTOCOL_ADAPTERS.md`。真实 Cursor + 已配置 Magpie 网关的端到端 turn 仍需单独验收。
+`plugin_model_starts_a_local_inference_run` 覆盖：`plugin:` id 的 BidiAppend 开本地 Run，RunInferenceSSE 立刻给出 `RunReady`。`the_last_subscription_cancels_a_disconnected_run_after_its_grace_period` 用虚拟时钟覆盖重连与超时清理；`magpie_invocation_serializes_files_per_protocol` 与 `magpie_invocation_propagates_cancellation` 走真实 QuickJS 插件 + 本地假网关，验证 Responses / Chat 的 PDF、Messages 的纯文本文档，以及取消后关闭上游 HTTP。`magpie_invocation_marks_resource_invalid_on_http_401` 覆盖鉴权失败把资源标为 `invalid`。`magpie_invoke_frame_does_not_include_or_grow_with_the_model_body` 固定模型 / 资源 / 等长 ID，比较短历史、长历史和 1 MiB 附件的 `provider.invoke` 帧：帧大小不变，且无正文、工具定义或附件标记，标准路径 SDK 投影次数为 0。`magpie_catalog_through_quickjs` 继续覆盖模型目录 worker 路径；协议请求体与 SSE 等价性见 `PLUGIN_PROTOCOL_ADAPTERS.md`。真实 Cursor + 已配置 Magpie 网关的端到端 turn 仍需单独验收。

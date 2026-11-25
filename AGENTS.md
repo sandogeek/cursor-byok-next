@@ -31,6 +31,7 @@ cursor-byok-nsh/
     │   ├── CURSOR_UI.md           # 接管页 UI
     │   ├── I18N.md                # 界面语言（nsh/i18n）
     │   ├── PLUGIN_CATALOG.md      # Magpie 插件目录
+    │   ├── PLUGIN_QUICKJS_PRD.md  # PRD：Bun 子进程 → 进程内 QuickJS VM
     │   ├── PLUGIN_RUNTIME_VM.md   # 独立 QuickJS VM、oxc 编译、native 能力与验收
     │   ├── PLUGIN_PROTOCOL_ADAPTERS.md # 协议适配器下沉 Rust
     │   ├── LOCAL_LOOP.md          # local loop 服务端接入
