@@ -1,9 +1,6 @@
 //! Defines and validates the static filesystem plugin manifest.
 
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
+use std::collections::HashSet;
 
 use serde::Deserialize;
 
@@ -44,7 +41,7 @@ impl PluginManifest {
     /// # Errors
     ///
     /// Fails on any of the above, including a path that escapes `directory`.
-    pub fn validate(&self, directory: &Path) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.api_version != PLUGIN_API_VERSION {
             return Err(Error::Config(format!(
                 "plugin '{}' uses unsupported API version {}",
@@ -59,8 +56,20 @@ impl PluginManifest {
             Version::parse(minimum)
                 .ok_or_else(|| Error::Config(format!("invalid plugin minAppVersion: {minimum}")))?;
         }
-        validate_entry_path(directory, &self.entry)?;
-        validate_asset_path(directory, &self.icon)?;
+        if std::path::Path::new(&self.entry)
+            .extension()
+            .is_none_or(|ext| ext != "js")
+            || self.entry.starts_with('/')
+            || self
+                .entry
+                .split('/')
+                .any(|part| part.is_empty() || part == ".." || part == ".")
+        {
+            return Err(Error::Config("invalid embedded module id".into()));
+        }
+        if self.icon != "assets/magpie.svg" {
+            return Err(Error::Config("unknown embedded plugin icon".into()));
+        }
         let mut hosts = HashSet::new();
         for host in &self.permissions.network {
             validate_network_host(host)?;
@@ -150,69 +159,6 @@ fn require_non_empty(value: &str, label: &str) -> Result<()> {
         return Err(Error::Config(format!("{label} is required")));
     }
     Ok(())
-}
-
-fn validate_entry_path(directory: &Path, value: &str) -> Result<()> {
-    checked_local_file(
-        directory,
-        value,
-        &["js", "mjs", "ts", "mts"],
-        "plugin entry",
-    )
-    .map(drop)
-}
-
-fn is_safe_relative_path(path: &Path) -> bool {
-    !path.is_absolute()
-        && !path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir
-                    | std::path::Component::RootDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
-}
-
-fn validate_asset_path(directory: &Path, value: &str) -> Result<()> {
-    checked_local_file(directory, value, &["svg", "png", "webp"], "plugin icon").map(drop)
-}
-
-/// Resolves a manifest path against the plugin directory and rejects escapes,
-/// unsupported extensions, and missing files. Manifest strings come from the
-/// plugin, so a `../` here would let it point at anything on disk.
-fn checked_local_file(
-    directory: &Path,
-    value: &str,
-    extensions: &[&str],
-    label: &str,
-) -> Result<PathBuf> {
-    let path = Path::new(value);
-    if !is_safe_relative_path(path) {
-        return Err(Error::Config(format!("invalid {label} path: {value}")));
-    }
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !extensions.contains(&extension.as_str()) {
-        return Err(Error::Config(format!(
-            "unsupported {label} format: {value}"
-        )));
-    }
-    let file = directory.join(path);
-    if !file.is_file() {
-        return Err(Error::Config(format!("{label} does not exist: {value}")));
-    }
-    let root = directory.canonicalize()?;
-    let file = file.canonicalize()?;
-    if !file.starts_with(&root) {
-        return Err(Error::Config(format!(
-            "{label} escapes its directory: {value}"
-        )));
-    }
-    Ok(file)
 }
 
 #[cfg(test)]

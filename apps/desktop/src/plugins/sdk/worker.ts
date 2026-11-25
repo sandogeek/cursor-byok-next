@@ -1,4 +1,6 @@
-import { argv, stdin, stdout } from "node:process";
+import * as host from "cursor-byok-next:host";
+declare function __entry(): string;
+declare function __send(frame: string): void;
 import {
   ProtocolHttpError,
   __getRegisteredPlugin,
@@ -9,35 +11,27 @@ import {
 import type { ModelEvent, ProviderSupport } from "cursor-byok-next:provider";
 import type { ResourceAddMethod, ResourceSupport } from "cursor-byok-next:resource";
 
-const args = argv.slice(2);
-if (args.length !== 1) throw new Error("plugin entry URL is required");
-await import(args[0]);
+await import(__entry());
 const plugin = __getRegisteredPlugin();
-const pendingHost = new Map<string, { resolve(value: unknown): void; reject(error: Error): void }>();
 const controllers = new Map<string, AbortController>();
-let hostSequence = 0;
-let writeQueue = Promise.resolve();
-
-function send(value: unknown): Promise<void> {
-  const operation = writeQueue.then(
-    () =>
-      new Promise<void>((resolve, reject) => {
-        stdout.write(`${JSON.stringify(value)}\n`, (error) => {
-          if (error) reject(error);
-          else resolve();
-        });
-      }),
-  );
-  writeQueue = operation.catch(() => undefined);
-  return operation;
-}
-
-function hostCall(requestId: string, method: string, params: unknown): Promise<unknown> {
-  const id = `${requestId}:host:${++hostSequence}`;
-  return new Promise((resolve, reject) => {
-    pendingHost.set(id, { resolve, reject });
-    void send({ type: "host_call", id, requestId, method, params });
-  });
+function send(value: unknown): Promise<void> { __send(JSON.stringify(value) + "\n"); return Promise.resolve(); }
+async function hostCall(requestId: string, method: string, params: unknown): Promise<unknown> {
+ try {
+  const p = (params ?? {}) as Record<string, unknown>;
+  switch (method) {
+    case "network.fetch": return await host.fetch(requestId, String(p.url), JSON.stringify(p)).then(JSON.parse);
+    case "network.stream.open": return await host.streamOpen(requestId, String(p.url), JSON.stringify(p)).then(JSON.parse);
+    case "network.stream.read": return await host.streamRead(requestId, String(p.streamId)).then(JSON.parse);
+    case "network.stream.close": return await host.streamClose(requestId, String(p.streamId));
+    case "protocol.stream": return await host.protocolStream(requestId, JSON.stringify(p)).then(JSON.parse);
+    default: throw new Error("unsupported host method");
+  }
+ } catch (error) {
+   if (error && typeof error === "object" && "status" in error && typeof error.status === "number") {
+     throw new ProtocolHttpError(error.status, "upstream request failed");
+   }
+   throw error;
+ }
 }
 
 async function* streamLines(requestId: string, streamId: string): AsyncGenerator<string> {
@@ -115,7 +109,7 @@ async function dispatch(message: { id: string; method: string; params?: JsonValu
             model: params.model as never,
             resource: (params.resource ?? null) as never,
             readRequest: () => {
-              request ??= hostCall(message.id, "provider.readRequest", null);
+              request ??= (async () => JSON.parse(host.readRequest(message.id)))();
               return request as never;
             },
           },
@@ -195,42 +189,9 @@ async function dispatch(message: { id: string; method: string; params?: JsonValu
   }
 }
 
-function handleLine(line: string) {
-  if (!line.trim()) return;
+// Rust calls synchronously; invocation work settles through the VM microtask queue.
+(globalThis as unknown as { __recv: (line: string) => void }).__recv = (line: string) => {
   const message = JSON.parse(line);
-  if (message.type === "request") {
-    void dispatch(message);
-  } else if (message.type === "cancel") {
-    controllers.get(message.id)?.abort();
-  } else if (message.type === "host_result") {
-    const pending = pendingHost.get(message.id);
-    if (!pending) return;
-    pendingHost.delete(message.id);
-    pending.resolve(message.result);
-  } else if (message.type === "host_error") {
-    const pending = pendingHost.get(message.id);
-    if (!pending) return;
-    pendingHost.delete(message.id);
-    pending.reject(
-      typeof message.status === "number"
-        ? new ProtocolHttpError(
-          message.status,
-          String(message.error ?? "").replace(new RegExp(`^HTTP ${message.status}: `), ""),
-        )
-        : new Error(message.error),
-    );
-  }
-}
-
-stdin.setEncoding("utf8");
-let buffered = "";
-stdin.on("data", (chunk: string) => {
-  buffered += chunk;
-  for (;;) {
-    const newline = buffered.indexOf("\n");
-    if (newline < 0) break;
-    const line = buffered.slice(0, newline);
-    buffered = buffered.slice(newline + 1);
-    handleLine(line);
-  }
-});
+  if (message.type === "request") void dispatch(message);
+  else if (message.type === "cancel") controllers.get(message.id)?.abort();
+};

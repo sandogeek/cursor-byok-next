@@ -3,7 +3,7 @@
 上游实现：`cursor-byok/server/src/plugin/sdk/protocol/{openai_chat,openai_responses,anthropic}.ts`。
 本移植：`apps/desktop/src/plugins/adapters/` + `sdk/{plugin,worker}.ts` + Magpie `provider.ts`。
 
-范围只有一件事：**把三个 TS 协议 helper 改成宿主 Rust 适配器**。插件仍用 Bun 选协议、拼端点、组鉴权头并分类错误；请求体、HTTP/SSE 与事件归一化归 Rust。不引入 NSH 插件类型，不迁移目录拉取。
+范围只有一件事：**把三个 TS 协议 helper 改成宿主 Rust 适配器**。插件在 QuickJS 中选协议、拼端点、组鉴权头并分类错误；请求体、HTTP/SSE 与事件归一化归 Rust。不引入 NSH 插件类型，不迁移目录拉取。
 
 ## 目录映射
 
@@ -31,7 +31,7 @@ cursor-byok/server/plugins/build-in/magpie/
 ```text
 目录：Magpie TS models.list → context.network.fetch → TS 解析 /v1/models → 宿主 live 缓存
 推理：Cursor local loop → PluginHost.stream_model
-     → 登记 Arc<ModelInvocation> → Bun Magpie provider.invoke（无正文）
+     → 登记 Arc<ModelInvocation> → QuickJS Magpie provider.invoke（无正文）
        ├─ TS：选协议、选端点、组鉴权头、401/协议错误分类
        └─ hostCall "protocol.stream" {protocol, url, model, headers}
           → Rust 适配器：从登记项借用核心请求 → 请求体 → 网关 HTTP/SSE → ModelEvent
@@ -46,7 +46,7 @@ cursor-byok/server/plugins/build-in/magpie/
 | # | 主题 | 上游 TS helper | nsh 版 | 原因 |
 |---|---|---|---|---|
 | 1 | 协议实现位置 | Bun SDK `:protocol/*` | 宿主 `plugins/adapters/` | PRD：协议在 Rust，策略在 TS |
-| 2 | 请求体来源 | helper 参数带完整 `LlmRequest` | invoke 时登记 `Arc<ModelInvocation>`；适配器直接读核心请求；`protocol.stream` 不含消息 | 会话投影只有一个所有者；长历史和附件不再为了选端点而序列化进 Bun |
+| 2 | 请求体来源 | helper 参数带完整 `LlmRequest` | invoke 时登记 `Arc<ModelInvocation>`；适配器直接读核心请求；`protocol.stream` 不含消息 | 会话投影只有一个所有者；长历史和附件不再为了选端点而序列化进 VM |
 | 3 | 事件通道 | worker JSONL `event` | 适配器直写 `WorkerStreamItem::Event(ModelEvent)` | 避免事件二次编解码 |
 | 4 | 非 2xx | 三个 `HttpError` | 统一 `ProtocolHttpError`，`host_error.status` | 删除 helper 后 Magpie 只需一种分类 |
 | 5 | 错误体上限 | 读完整响应体 | 64 KiB 截断 + 短 deadline | 避免超长响应进入调用记录与错误链，且不让半开的 body 拖住状态码 |
@@ -59,7 +59,7 @@ cursor-byok/server/plugins/build-in/magpie/
 | 12 | 非 2xx 错误体 | 读完整响应体，等待 EOF | 64 KiB 上限 + 10s deadline；先记录 HTTP 状态，再读错误体，超时/读失败只截断文本，状态码照常回给 Magpie | 网关可能发完 401 头却不结束 body；状态码不能因为错误体延迟而丢失 |
 | 13 | 内容块状态 | 三个 map 按同一 index 关联（`block_types` / `thinking_text` / `thinking_signatures`），关闭时缺项按空串兜底 | `BTreeMap<usize, BlockState>`，变体 `Text` / `Thinking { text, signature }` / `Tool` / `Other` 各自携带数据 | 旧形状允许“thinking 块却没有签名槽”，缺失被默认值掩盖；现在文本与签名只能在同一个 `Thinking` 里出现，未知块类型显式保留前向容忍 |
 | 14 | 插件事件的投递 | 事件直接写入 unbounded 队列 | 有界事件队列（4096 项），满时以终止错误结束本次调用 | 插件刷事件比消费者快时，无界队列会把内存吃光；静默丢事件又会让调用被记成成功 |
-| 15 | 并发的插件调用数 | 无上限 | 每插件 16 个活动调用，超出时注册失败 | 每次调用是一个 Bun 进程内的并发流；不设上限时客户端可以无限叠加 |
+| 15 | 并发的插件调用数 | 无上限 | 每插件 16 个活动调用，超出时注册失败 | 每次调用是一个 QuickJS VM 内的并发流；不设上限时客户端可以无限叠加 |
 | 16 | 单行 JSONL 上限 | 无上限 | 16 MiB，超限即停止这一代 worker | `BufReader::read_line` 会为一行分配任意大的 `String`，一个坏插件就能撑爆内存 |
 | 17 | 取消与 stdin 的竞争 | 取消只在流关闭时生效 | 请求发送与拆卸分成两个任务；取消路径只 `try_send`，不阻塞在写满的 stdin 上 | 一个不读 stdin 的 worker 会让取消路径永远等不到，调用也就永远不结束 |
 
@@ -91,9 +91,13 @@ cursor-byok/server/plugins/build-in/magpie/
 | Magpie invoke 帧不含正文且不随历史/附件增大 | `magpie_invoke_frame_does_not_include_or_grow_with_the_model_body` |
 | 自定义插件 `readRequest` 复用、并发隔离、取消后不可读、invoke 句柄先于发送取得 | `plugins/worker.rs` |
 | `401` → 资源 `invalid` | `magpie_invocation_marks_resource_invalid_on_http_401` |
-| 目录仍走 TS `network.fetch` | `magpie_catalog_through_real_bun` |
+| 目录仍走 TS `network.fetch` | `magpie_catalog_through_quickjs` |
 
 ```sh
 cargo test -p nsh-app-cursor-byok-next --lib
 cd apps/desktop && nsh check && nsh test
 ```
+
+## 进程内 VM 能力入口
+
+QuickJS 的 `sdk/host.ts` 通过 native Promise 调用 `HostContext::call("protocol.stream")`，再进入原有 Rust 适配器。文本、thinking、tool 与 usage 事件直接写 Rust invocation 流，不经过 VM 或能力会话帧；`wire` 投影与 CallRecorder 所有权不变。详见 [PLUGIN_RUNTIME_VM.md](PLUGIN_RUNTIME_VM.md)。

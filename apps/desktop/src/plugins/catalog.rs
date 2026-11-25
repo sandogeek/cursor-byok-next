@@ -1,34 +1,26 @@
 //! Loads only the app's embedded Magpie plugin.
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
-
 use base64::{Engine, engine::general_purpose::STANDARD};
 
 use super::{
     Error, Result,
-    definition::PluginDefinitionLoader,
     descriptor::{CatalogMode, PluginModuleDefinition, ValidatedProvider},
     manifest::{PluginManifest, validate_id},
+    vm::{self, loader::Modules},
 };
 
-const MANIFEST_FILE_NAME: &str = "plugin.json";
-const MAX_ICON_BYTES: u64 = 1024 * 1024;
 /// The running app's version: the same string `nsh.json` publishes, because the
 /// crate version tracks the release.
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Debug)]
 pub struct PluginCatalog {
-    directory: PathBuf,
-    definition_loader: PluginDefinitionLoader,
+    modules: Modules,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PluginEntry {
-    pub entry: PathBuf,
+    pub entry: String,
     pub manifest: PluginManifest,
     /// The declaration as the plugin produced it; resources are read from here.
     pub definition: PluginModuleDefinition,
@@ -39,62 +31,37 @@ pub(crate) struct PluginEntry {
 }
 
 impl PluginCatalog {
-    /// The app's own plugin catalog: a private workspace under the temp dir
-    /// that holds the embedded Magpie.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the workspace or its SDK files cannot be created.
-    pub fn managed() -> Result<Self> {
-        Self::in_temporary_workspace(&std::env::temp_dir())
+    /// Opens the immutable, embedded module catalog; no runtime files are written.
+    pub fn managed() -> Self {
+        Self {
+            modules: Modules::embedded(),
+        }
     }
-
     #[cfg(test)]
-    pub(super) fn for_test(root: &Path) -> Result<Self> {
-        Self::in_temporary_workspace(root)
+    pub(super) fn for_test(_root: &std::path::Path) -> Self {
+        Self::managed()
     }
-
-    fn in_temporary_workspace(parent: &Path) -> Result<Self> {
-        let definition_loader = PluginDefinitionLoader::in_temporary_workspace(parent)?;
-        let directory = super::builtin::materialize_magpie(definition_loader.workspace())?;
-        Ok(Self {
-            directory,
-            definition_loader,
-        })
+    #[cfg(test)]
+    pub(super) fn with_modules(modules: Modules) -> Self {
+        Self { modules }
     }
-
-    pub(crate) fn loader(&self) -> &PluginDefinitionLoader {
-        &self.definition_loader
+    pub(crate) fn loader(&self) -> Modules {
+        self.modules
     }
-
-    /// Loads the bundled plugin's entry module. A load failure is logged and
-    /// reported as an empty list, because the UI shows manifests instead.
-    pub(crate) async fn entries(&self, executable: &Path) -> Vec<PluginEntry> {
-        match load_plugin(self.directory.clone(), &self.definition_loader, executable).await {
-            Ok(entry) => vec![entry],
-            Err(error) => {
-                tracing::warn!(%error, "failed to load bundled Magpie");
-                Vec::new()
-            }
-        }
+    pub(crate) async fn entries(&self) -> Result<Vec<PluginEntry>> {
+        let LoadedManifest { manifest, icon } = load_manifest()?;
+        let definition = vm::collect(self.modules, manifest.entry.clone()).await?;
+        let providers = validate_definition(&manifest.id, &definition)?;
+        Ok(vec![PluginEntry {
+            entry: manifest.entry.clone(),
+            manifest,
+            definition,
+            providers,
+            icon,
+        }])
     }
-
-    /// Reads the embedded manifest and icon without a worker, for the UI's
-    /// state before Bun is available. Both reads are filesystem work, so they
-    /// run off the async runtime.
-    pub(crate) async fn manifests(&self) -> Vec<LoadedManifest> {
-        let directory = self.directory.clone();
-        let loaded = tokio::task::spawn_blocking(move || load_manifest(&directory))
-            .await
-            .map_err(|error| Error::context("plugin manifest task failed".to_owned(), error))
-            .and_then(std::convert::identity);
-        match loaded {
-            Ok(manifest) => vec![manifest],
-            Err(error) => {
-                tracing::warn!(%error, "failed to load the bundled Magpie manifest");
-                Vec::new()
-            }
-        }
+    pub(crate) fn manifests() -> Vec<LoadedManifest> {
+        load_manifest().into_iter().collect()
     }
 }
 
@@ -107,12 +74,17 @@ pub(crate) struct LoadedManifest {
     pub icon: String,
 }
 
-fn load_manifest(directory: &Path) -> Result<LoadedManifest> {
-    let manifest: PluginManifest =
-        serde_json::from_slice(&fs::read(directory.join(MANIFEST_FILE_NAME))?)?;
-    manifest.validate(directory)?;
+fn load_manifest() -> Result<LoadedManifest> {
+    let manifest: PluginManifest = serde_json::from_str(super::builtin::MANIFEST)?;
+    manifest.validate()?;
     require_app_version(&manifest, APP_VERSION)?;
-    let icon = icon_data_url(directory, &manifest.icon)?;
+    if Modules::embedded().source(&manifest.entry).is_none() {
+        return Err(Error::Config("unknown embedded entry".into()));
+    }
+    let icon = format!(
+        "data:image/svg+xml;base64,{}",
+        STANDARD.encode(super::builtin::ICON)
+    );
     Ok(LoadedManifest { manifest, icon })
 }
 
@@ -127,30 +99,6 @@ fn require_app_version(manifest: &PluginManifest, app_version: &str) -> Result<(
         "plugin '{}' requires app version {minimum} or newer (current {app_version})",
         manifest.id
     )))
-}
-
-async fn load_plugin(
-    directory: PathBuf,
-    loader: &PluginDefinitionLoader,
-    executable: &Path,
-) -> Result<PluginEntry> {
-    // Reading the manifest and the icon touches the filesystem; keep it off the
-    // async runtime.
-    let manifest_directory = directory.clone();
-    let LoadedManifest { manifest, icon } =
-        tokio::task::spawn_blocking(move || load_manifest(&manifest_directory))
-            .await
-            .map_err(|error| Error::context("plugin manifest task failed".to_owned(), error))??;
-    let entry = directory.join(&manifest.entry).canonicalize()?;
-    let definition = loader.load(executable, &entry).await?;
-    let providers = validate_definition(&manifest.id, &definition)?;
-    Ok(PluginEntry {
-        entry,
-        manifest,
-        definition,
-        providers,
-        icon,
-    })
 }
 
 /// Accepts a bare string or a locale map. `label` only runs on failure, so
@@ -291,40 +239,6 @@ fn validate_form_fields(
     Ok(())
 }
 
-fn icon_data_url(directory: &Path, relative: &str) -> Result<String> {
-    let root = directory.canonicalize()?;
-    let path = directory.join(relative).canonicalize()?;
-    if !path.starts_with(&root) {
-        return Err(Error::Config(format!(
-            "plugin icon escapes its directory: {relative}"
-        )));
-    }
-    if fs::metadata(&path)?.len() > MAX_ICON_BYTES {
-        return Err(Error::Config(format!(
-            "plugin icon exceeds {MAX_ICON_BYTES} bytes: {relative}"
-        )));
-    }
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let mime = match extension.as_str() {
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "webp" => "image/webp",
-        _ => {
-            return Err(Error::Config(format!(
-                "unsupported plugin icon: {relative}"
-            )));
-        }
-    };
-    Ok(format!(
-        "data:{mime};base64,{}",
-        STANDARD.encode(fs::read(path)?)
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,62 +250,34 @@ mod tests {
     #[tokio::test]
     async fn embedded_magpie_ignores_installed_manifests_and_source() {
         let root = tempfile::tempdir().unwrap();
-        let installed = root.path().join("plugins/installed");
-        fs::create_dir_all(&installed).unwrap();
-        let shadow = super::super::builtin::materialize_magpie(&installed).unwrap();
-        fs::write(shadow.join("main.ts"), "throw new Error('untrusted')").unwrap();
-        let arbitrary = installed.join("arbitrary");
-        fs::rename(&shadow, &arbitrary).unwrap();
-        let impostor = super::super::builtin::materialize_magpie(&installed).unwrap();
-        fs::write(impostor.join("main.ts"), "throw new Error('same version')").unwrap();
-        let manifest_path = arbitrary.join("plugin.json");
-        let mut manifest: serde_json::Value =
-            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-        manifest["id"] = serde_json::json!("dev.example.arbitrary");
-        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-
-        let catalog = PluginCatalog::for_test(root.path()).unwrap();
-        let manifests = catalog.manifests().await;
+        let impostor = root.path().join("plugins/installed/magpie");
+        std::fs::create_dir_all(&impostor).unwrap();
+        std::fs::write(impostor.join("main.ts"), "throw new Error('untrusted')").unwrap();
+        let catalog = PluginCatalog::for_test(root.path());
+        let manifests = PluginCatalog::manifests();
         assert_eq!(manifests.len(), 1);
-        let LoadedManifest {
-            manifest: magpie,
-            icon,
-        } = &manifests[0];
-        assert_eq!(magpie.id, super::super::builtin::MAGPIE_PLUGIN_ID);
-        assert!(magpie.permissions.resource_origin);
-        assert_eq!(magpie.permissions.network, Vec::<String>::new());
-        assert!(icon.starts_with("data:image/svg+xml;base64,"));
-        assert_ne!(catalog.directory, impostor);
         assert_eq!(
-            fs::read_to_string(catalog.directory.join("main.ts")).unwrap(),
-            include_str!("../../plugins/build-in/magpie/main.ts")
+            manifests[0].manifest.id,
+            super::super::builtin::MAGPIE_PLUGIN_ID
+        );
+        assert!(manifests[0].manifest.permissions.resource_origin);
+        assert_eq!(
+            manifests[0].manifest.permissions.network,
+            Vec::<String>::new()
+        );
+        assert!(manifests[0].icon.starts_with("data:image/svg+xml;base64,"));
+        let entries = catalog.entries().await.unwrap();
+        assert_eq!(entries[0].definition.providers[0].id, "magpie");
+        assert_eq!(entries[0].definition.resources[0].resource_type, "gateway");
+        assert_eq!(
+            std::fs::read_to_string(impostor.join("main.ts")).unwrap(),
+            "throw new Error('untrusted')"
         );
         assert_eq!(
-            fs::read_to_string(impostor.join("main.ts")).unwrap(),
-            "throw new Error('same version')"
+            std::fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "collector must not materialize a runtime workspace"
         );
-    }
-
-    #[tokio::test]
-    async fn bun_collects_embedded_magpie() {
-        match std::process::Command::new("bun").arg("--version").output() {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            result => assert!(result.unwrap().status.success()),
-        }
-        let root = tempfile::Builder::new()
-            .prefix("magpie smoke ")
-            .tempdir()
-            .unwrap();
-        let catalog = PluginCatalog::for_test(root.path()).unwrap();
-        let entry = load_plugin(
-            catalog.directory.clone(),
-            catalog.loader(),
-            Path::new("bun"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(entry.definition.providers[0].id, "magpie");
-        assert_eq!(entry.definition.resources[0].resource_type, "gateway");
     }
 
     #[test]
@@ -428,5 +314,22 @@ mod tests {
             }],
         };
         validate_definition("dev.example", &definition).unwrap();
+    }
+    #[test]
+    fn collector_works_in_a_process_with_no_runtime_on_path_or_home() {
+        let home = tempfile::tempdir().unwrap();
+        for test in [
+            "plugins::catalog::tests::embedded_magpie_ignores_installed_manifests_and_source",
+            "plugins::host::tests::magpie_catalog_through_quickjs",
+        ] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test])
+                .env("PATH", "")
+                .env("HOME", home.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "no-runtime child failed: {test}");
+        }
+        assert!(!home.path().join(".bun").exists());
     }
 }

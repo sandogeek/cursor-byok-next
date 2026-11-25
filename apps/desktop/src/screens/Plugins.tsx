@@ -102,8 +102,8 @@ export function Plugins(props: { catalog: PluginCatalog }) {
       </If>
       <If when={!state.loading() && !state.error() && !runtimeReady()}>
         <Surface class="items-center gap-2 p-8">
-          <Text role="header" class="text-base font-semibold text-foreground">{current().runtimeReady ? t("plugins.runtime.failed") : t("plugins.runtime.missingBun")}</Text>
-          <Text class="max-w-md text-center text-sm text-muted-foreground">{current().runtimeReady ? (current().runtimeError ?? magpie()?.runtimeError ?? t("plugins.runtime.retry")) : t("plugins.runtime.installBun")}</Text>
+          <Text role="header" class="text-base font-semibold text-foreground">{t("plugins.runtime.failed")}</Text>
+          <Text class="max-w-md text-center text-sm text-muted-foreground">{current().runtimeError ?? magpie()?.runtimeError ?? t("plugins.runtime.retry")}</Text>
           <Button label={t("plugins.runtime.refresh")} loading={state.loading()} disabled={busy()} onPress={() => state.refetch()} />
         </Surface>
       </If>

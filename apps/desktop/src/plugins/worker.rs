@@ -1,9 +1,7 @@
-//! Runs one long-lived, sandboxed Bun process per active plugin.
+//! Runs one thread-confined `QuickJS` VM per active trusted plugin.
 
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
-    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU16, Ordering},
@@ -12,8 +10,6 @@ use std::{
 };
 
 use tokio::{
-    io::AsyncWriteExt,
-    process::ChildStdin,
     sync::{Mutex, mpsc, watch},
     task::JoinHandle,
 };
@@ -23,9 +19,9 @@ use super::{
     Error, Result,
     builtin::MAGPIE_PLUGIN_ID,
     catalog::PluginEntry,
-    definition::{PluginDefinitionLoader, file_url},
     host_calls::HostContext,
     protocol::{HostMessage, WorkerMessage},
+    vm::{self, loader::Modules},
     wire,
 };
 use crate::{calls::CallRecorder, model::ModelInvocation, provider::ModelEvent};
@@ -40,8 +36,8 @@ pub enum WorkerStreamItem {
     Result(Result<serde_json::Value>),
 }
 
-/// Frames queued for the single stdin writer, as bytes ready to send.
-type Writer = mpsc::Sender<Vec<u8>>;
+/// Complete frames in the bounded in-process session queue.
+type Writer = std::sync::mpsc::SyncSender<Vec<u8>>;
 
 /// Events one invocation may have queued for its consumer. Bounded so a plugin
 /// that emits faster than the model pipeline drains cannot grow memory without
@@ -53,18 +49,6 @@ const MAX_ACTIVE_INVOCATIONS: usize = 16;
 /// `host_call`s one invocation may have in flight. A plugin that fans out calls
 /// without awaiting them is rejected past this instead of spawning forever.
 const MAX_HOST_CALLS_PER_INVOCATION: usize = 8;
-/// Longest single NDJSON line read from a worker's stdout or stderr. Output that
-/// never ends with a newline must be cut off rather than buffered indefinitely.
-const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
-
-#[cfg(test)]
-static LAST_INVOKE_FRAME: parking_lot::Mutex<Vec<u8>> = parking_lot::Mutex::new(Vec::new());
-
-#[cfg(test)]
-pub(crate) fn last_invoke_frame() -> Vec<u8> {
-    LAST_INVOKE_FRAME.lock().clone()
-}
-
 /// A registered stream: the guard that unregisters it, the stream the caller
 /// reads events from, the sender the worker impl writes them to, and the
 /// liveness watch that tells the SDK bridge the invocation is still running.
@@ -76,7 +60,7 @@ struct Registration {
 }
 
 /// Per-invocation concurrency, so a plugin cannot spawn without bound.
-struct InvocationBudget {
+pub(super) struct InvocationBudget {
     host_calls: std::sync::atomic::AtomicUsize,
 }
 
@@ -88,7 +72,7 @@ impl InvocationBudget {
     }
 
     /// Takes one `host_call` slot, or reports the invocation is saturated.
-    fn try_acquire_host_call(&self) -> bool {
+    pub(super) fn try_acquire_host_call(&self) -> bool {
         let mut current = self.host_calls.load(Ordering::Relaxed);
         loop {
             if current >= MAX_HOST_CALLS_PER_INVOCATION {
@@ -106,12 +90,12 @@ impl InvocationBudget {
         }
     }
 
-    fn release_host_call(&self) {
+    pub(super) fn release_host_call(&self) {
         self.host_calls.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-struct Pending(parking_lot::Mutex<PendingInvocationMap>);
+pub(super) struct Pending(parking_lot::Mutex<PendingInvocationMap>);
 
 /// The invocation registry while the worker runs, or `None` once it stopped.
 type PendingInvocationMap = Option<HashMap<String, PendingInvocation>>;
@@ -135,7 +119,7 @@ impl Drop for InvocationGuard {
 }
 
 impl Pending {
-    fn open() -> Self {
+    pub(super) fn open() -> Self {
         Self(parking_lot::Mutex::new(Some(HashMap::new())))
     }
 
@@ -184,12 +168,14 @@ impl Pending {
     }
 
     fn remove(&self, id: &str) -> Option<PendingInvocation> {
-        self.0.lock().as_mut()?.remove(id)
+        let invocation = self.0.lock().as_mut()?.remove(id)?;
+        invocation.state.cancellation.cancel();
+        Some(invocation)
     }
 
     /// The state and liveness watch one `host_call` runs under, plus the budget
     /// the spawned call must hold a slot in.
-    fn authorization(
+    pub(super) fn authorization(
         &self,
         id: &str,
     ) -> Option<(
@@ -210,9 +196,19 @@ impl Pending {
         self.0.lock().is_none()
     }
 
-    fn close(&self, message: &str) {
+    pub(super) fn close(&self, message: &str) {
         let pending = self.0.lock().take();
-        for (_, PendingInvocation { items, active, .. }) in pending.into_iter().flatten() {
+        for (
+            _,
+            PendingInvocation {
+                items,
+                active,
+                state,
+                ..
+            },
+        ) in pending.into_iter().flatten()
+        {
+            state.cancellation.cancel();
             drop(active);
             // A full queue cannot take the terminal error; the consumer ends when
             // the sender drops with this map, so nothing is silently "completed".
@@ -253,14 +249,16 @@ impl std::fmt::Debug for PluginWorker {
 
 struct PluginWorkerInner {
     plugin_id: String,
-    executable: PathBuf,
-    entry: PathBuf,
-    loader: PluginDefinitionLoader,
+    entry: String,
+    loader: Modules,
     host: HostContext,
     process: Mutex<Option<WorkerProcess>>,
+    #[cfg(test)]
+    last_invoke_frame: parking_lot::Mutex<Vec<u8>>,
 }
 
 struct WorkerProcess {
+    session: vm::Session,
     task: JoinHandle<()>,
     writer: Writer,
     pending: Arc<Pending>,
@@ -300,6 +298,7 @@ impl InvocationState {
             return;
         };
         if events.try_send(WorkerStreamItem::Event(event)).is_err() {
+            self.cancellation.cancel();
             // The consumer fell behind its budget. End the invocation with an
             // explicit error instead of dropping an event and continuing as
             // if the stream were still complete.
@@ -330,21 +329,18 @@ impl InvocationState {
     }
 }
 
-/// Frames queued for the single stdin writer. The writer drains one frame at a
-/// time, so this only absorbs bursts from concurrent invocations.
-const WRITE_QUEUE_FRAMES: usize = 32;
-
 impl PluginWorker {
-    pub fn new(plugin: &PluginEntry, executable: PathBuf, loader: PluginDefinitionLoader) -> Self {
+    pub fn new(plugin: &PluginEntry, loader: Modules) -> Self {
         let plugin_id = plugin.manifest.id.clone();
         Self {
             inner: Arc::new(PluginWorkerInner {
                 host: HostContext::new(&plugin_id, &plugin.manifest.permissions),
                 plugin_id,
-                executable,
                 entry: plugin.entry.clone(),
                 loader,
                 process: Mutex::new(None),
+                #[cfg(test)]
+                last_invoke_frame: parking_lot::Mutex::new(Vec::new()),
             }),
         }
     }
@@ -373,7 +369,7 @@ impl PluginWorker {
                 model: None,
             })
             .await?;
-        match tokio::time::timeout(INVOCATION_TIMEOUT, async {
+        if let Ok(result) = tokio::time::timeout(INVOCATION_TIMEOUT, async {
             while let Some(item) = items.recv().await {
                 if let WorkerStreamItem::Result(result) = item {
                     return result;
@@ -386,11 +382,10 @@ impl PluginWorker {
         })
         .await
         {
-            Ok(result) => result,
-            Err(_) => Err(Error::Provider(format!(
-                "plugin '{}' invocation timed out",
-                self.inner.plugin_id
-            ))),
+            result
+        } else {
+            self.stop().await;
+            Err(Error::Provider("plugin invocation timed out".into()))
         }
     }
 
@@ -416,7 +411,7 @@ impl PluginWorker {
             allowed_origins,
             model,
         } = request;
-        let (writer, pending) = self.connection().await?;
+        let (writer, pending, stop) = self.connection().await?;
         let request_cancellation = CancellationToken::new();
         let Registration {
             guard: request,
@@ -436,40 +431,32 @@ impl PluginWorker {
         })?;
         let request_bytes = {
             let bytes = encode_message(&HostMessage::Request {
-                id: &request.id,
-                method,
-                params: &params,
+                id: request.id.clone(),
+                method: method.to_owned(),
+                params: params.clone(),
             })?;
             #[cfg(test)]
             if method == "provider.invoke" {
-                *LAST_INVOKE_FRAME.lock() = bytes.clone();
+                *self.inner.last_invoke_frame.lock() = bytes.clone();
             }
             bytes
         };
         let request_id = request.id.clone();
-        // Two tasks so the caller can drain (and a cancellation can land) before
-        // the request frame is written; neither task lets a wedged child's stdin
-        // queue block local teardown.
-        let send_cancellation = request_cancellation.clone();
-        tokio::spawn({
-            let writer = writer.clone();
-            async move {
-                tokio::select! {
-                    () = send_cancellation.cancelled() => {}
-                    result = writer.send(request_bytes) => {
-                        if result.is_err() {
-                            tracing::warn!("plugin worker stopped before its request was sent");
-                        }
-                    }
-                }
-            }
-        });
+        // One complete frame enters the bounded session queue, or registration is withdrawn.
+        writer
+            .try_send(request_bytes)
+            .map_err(|_| Error::Runtime("plugin request queue is unavailable".into()))?;
         tokio::spawn(async move {
             tokio::select! {
+                () = tokio::time::sleep(INVOCATION_TIMEOUT) => { request_cancellation.cancel(); pending.close("plugin invocation timed out"); stop.store(true, Ordering::Release); }
                 // Local teardown first: request-cancel, deregistration and the
                 // error to the consumer never depend on the child still reading.
                 () = cancellation.cancelled() => {
                     request_cancellation.cancel();
+                    deregister(&pending, &request_id);
+                    deliver_cancel(&writer, &request_id);
+                }
+                () = request_cancellation.cancelled() => {
                     deregister(&pending, &request_id);
                     deliver_cancel(&writer, &request_id);
                 }
@@ -484,12 +471,19 @@ impl PluginWorker {
         Ok(receiver)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "shutdown is only exercised by the worker tests")
-    )]
     pub async fn stop(&self) {
-        self.inner.process.lock().await.take();
+        let process = self.inner.process.lock().await.take();
+        if let Some(mut process) = process {
+            process.session.stop.store(true, Ordering::Release);
+            if let Some(thread) = process.session.thread.take() {
+                let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_invoke_frame(&self) -> Vec<u8> {
+        self.inner.last_invoke_frame.lock().clone()
     }
 
     #[cfg(test)]
@@ -497,7 +491,7 @@ impl PluginWorker {
         self.inner.host.sdk_projection_count()
     }
 
-    async fn connection(&self) -> Result<(Writer, Arc<Pending>)> {
+    async fn connection(&self) -> Result<(Writer, Arc<Pending>, Arc<AtomicBool>)> {
         let mut process = self.inner.process.lock().await;
         if process
             .as_ref()
@@ -508,135 +502,58 @@ impl PluginWorker {
         let Some(process) = process.as_ref() else {
             return Err(Error::Provider("plugin worker was not started".into()));
         };
-        Ok((process.writer.clone(), Arc::clone(&process.pending)))
+        Ok((
+            process.writer.clone(),
+            Arc::clone(&process.pending),
+            Arc::clone(&process.session.stop),
+        ))
     }
 
     fn spawn(&self) -> Result<WorkerProcess> {
-        let entry_url = file_url(&self.inner.entry)?;
-        let mut command = self.inner.loader.bun_command(&self.inner.executable);
-        command
-            .arg(self.inner.loader.worker_path())
-            .arg(entry_url.as_str())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command.spawn().map_err(|source| {
-            Error::context(
-                format!(
-                    "cannot start plugin worker {}",
-                    self.inner.executable.display()
-                ),
-                source,
-            )
-        })?;
-        let stdin = child
-            .stdin
+        let pending = Arc::new(Pending::open());
+        let mut session = vm::spawn(
+            self.inner.loader,
+            self.inner.entry.clone(),
+            &pending,
+            self.inner.host.clone(),
+        )?;
+        let writer = session.writer.clone();
+        let mut output = session
+            .output
             .take()
-            .ok_or_else(|| Error::Config("cannot open plugin worker stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::Config("cannot open plugin worker stdout".into()))?;
-        if let Some(stderr) = child.stderr.take() {
-            let plugin_id = self.inner.plugin_id.clone();
-            tokio::spawn(async move {
-                let mut lines = LineReader::new(stderr);
-                loop {
-                    match lines.next_line().await {
-                        Ok(Some(line)) => {
-                            let line = String::from_utf8_lossy(&line);
-                            tracing::warn!(plugin = %plugin_id, "{line}");
+            .ok_or_else(|| Error::Runtime("plugin output unavailable".into()))?;
+        let task = tokio::spawn({
+            let pending = Arc::clone(&pending);
+            let host = self.inner.host.clone();
+            let stop = Arc::clone(&session.stop);
+            async move {
+                while let Some(frame) = output.recv().await {
+                    let Ok(message) = serde_json::from_slice::<WorkerMessage>(&frame) else {
+                        break;
+                    };
+                    match message {
+                        WorkerMessage::Result { id, result, error } => {
+                            deliver_result(&pending, &id, result, error.as_ref());
                         }
-                        Ok(None) => break,
-                        Err(LineError::TooLong) => {
-                            tracing::warn!(
-                                plugin = %plugin_id,
-                                limit = MAX_LINE_BYTES,
-                                "plugin worker stderr line exceeded the limit; truncating the rest"
-                            );
+                        WorkerMessage::Event { id, event } => {
+                            deliver_event(&pending, &host, &id, &event);
                         }
-                        Err(LineError::Io(error)) => {
-                            tracing::debug!(plugin = %plugin_id, %error, "reading plugin stderr failed");
+                        WorkerMessage::HostCall { .. } => {
+                            tracing::warn!(target: "plugin", "rejected legacy host_call frame");
                             break;
                         }
                     }
                 }
-            });
-        }
-        let pending = Arc::new(Pending::open());
-        let (writer, messages) = mpsc::channel(WRITE_QUEUE_FRAMES);
-        let task = tokio::spawn({
-            let plugin_id = self.inner.plugin_id.clone();
-            let writer = writer.clone();
-            let pending = Arc::clone(&pending);
-            let host = self.inner.host.clone();
-            async move {
-                tokio::select! {
-                    () = read_stdout(stdout, &writer, &pending, &host) => {},
-                    _ = write_stdin(stdin, messages) => {},
-                    _ = child.wait() => {},
-                }
-                pending.close(&format!("plugin '{plugin_id}' worker exited"));
+                pending.close("plugin VM exited");
+                stop.store(true, Ordering::Release);
             }
         });
         Ok(WorkerProcess {
+            session,
             task,
             writer,
             pending,
         })
-    }
-}
-
-async fn read_stdout(
-    stdout: tokio::process::ChildStdout,
-    writer: &Writer,
-    pending: &Pending,
-    host: &HostContext,
-) {
-    let mut lines = LineReader::new(stdout);
-    loop {
-        let line = match lines.next_line().await {
-            Ok(Some(line)) => line,
-            Ok(None) => break,
-            Err(LineError::TooLong) => {
-                // A worker that emits an unterminated line larger than the limit
-                // cannot be trusted to recover, so this generation is stopped.
-                tracing::warn!(
-                    plugin = host.plugin_id(),
-                    limit = MAX_LINE_BYTES,
-                    "plugin worker wrote an oversized protocol line; stopping it"
-                );
-                return;
-            }
-            Err(LineError::Io(error)) => {
-                tracing::warn!(plugin = host.plugin_id(), %error, "reading plugin stdout failed");
-                break;
-            }
-        };
-        let Ok(message) = serde_json::from_slice::<WorkerMessage>(&line) else {
-            tracing::warn!(
-                plugin = host.plugin_id(),
-                "plugin worker wrote an invalid message"
-            );
-            continue;
-        };
-        match message {
-            WorkerMessage::Result { id, result, error } => {
-                deliver_result(pending, &id, result, error.as_ref());
-            }
-            WorkerMessage::Event { id, event } => {
-                deliver_event(pending, host, &id, &event);
-            }
-            WorkerMessage::HostCall {
-                id,
-                request_id,
-                method,
-                params,
-            } => {
-                spawn_host_call(writer, pending, host, id, &request_id, method, params);
-            }
-        }
     }
 }
 
@@ -669,6 +586,7 @@ fn deliver_event(pending: &Pending, host: &HostContext, id: &str, event: &serde_
     let event = match wire::model_event(event) {
         Ok(event) => event,
         Err(error) => {
+            pending.remove(id);
             let _ = sender.try_send(WorkerStreamItem::Result(Err(error)));
             return;
         }
@@ -680,152 +598,14 @@ fn deliver_event(pending: &Pending, host: &HostContext, id: &str, event: &serde_
         plugin = host.plugin_id(),
         "plugin event queue overflowed; ending the invocation"
     );
+    pending.remove(id);
     let _ = sender.try_send(WorkerStreamItem::Result(Err(Error::Provider(
         "plugin event queue overflowed; the invocation was ended".into(),
     ))));
 }
 
-/// Spawns the task that runs one `host_call`, holding an invocation slot.
-fn spawn_host_call(
-    writer: &Writer,
-    pending: &Pending,
-    host: &HostContext,
-    id: String,
-    request_id: &str,
-    method: String,
-    params: serde_json::Value,
-) {
-    let Some((invocation, mut active, budget)) = pending.authorization(request_id) else {
-        let _ = send_host_error(writer, &id, "plugin invocation is no longer active", None);
-        return;
-    };
-    if !budget.try_acquire_host_call() {
-        let _ = send_host_error(writer, &id, "too many concurrent host calls", None);
-        return;
-    }
-    let host = host.clone();
-    let writer = writer.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            biased;
-            _ = active.changed() => {
-                let _ = send_host_error(
-                    &writer,
-                    &id,
-                    "plugin invocation is no longer active",
-                    None,
-                );
-            }
-            () = async {
-                let response = host_call_response(&host, &invocation, &method, params, &id).await;
-                if let Ok(bytes) = response
-                    && writer.try_send(bytes).is_err()
-                {
-                    // A full stdin queue means the child stopped reading; report
-                    // it rather than block the call.
-                    tracing::warn!("plugin stdin queue is full; dropped a host-call result");
-                }
-            } => {},
-        }
-        budget.release_host_call();
-    });
-}
-
-/// Turns one `host_call` outcome into the frame sent back over stdin.
-async fn host_call_response(
-    host: &HostContext,
-    invocation: &InvocationState,
-    method: &str,
-    params: serde_json::Value,
-    id: &str,
-) -> Result<Vec<u8>> {
-    match host.call(invocation, method, params).await {
-        Ok(result) => encode_message(&HostMessage::HostResult {
-            id,
-            result: &result,
-        }),
-        Err(error) => {
-            let (message, status) = match error {
-                Error::HttpStatus { status, body } => {
-                    (format!("HTTP {status}: {body}"), Some(status))
-                }
-                Error::Cancelled => ("run was cancelled".into(), None),
-                error => (error.to_string(), None),
-            };
-            encode_message(&HostMessage::HostError {
-                id,
-                error: &message,
-                status,
-            })
-        }
-    }
-}
-
-/// Best-effort `HostError` frame; a full stdin queue drops it rather than
-/// blocking the reader loop.
-fn send_host_error(writer: &Writer, id: &str, error: &str, status: Option<u16>) -> Option<()> {
-    let bytes = encode_message(&HostMessage::HostError { id, error, status }).ok()?;
-    writer.try_send(bytes).ok()
-}
-
-/// The outcome of one [`LineReader::next_line`] call.
-enum LineError {
-    /// The line exceeded [`MAX_LINE_BYTES`] before a newline or EOF.
-    TooLong,
-    /// The underlying stream reported an error.
-    Io(std::io::Error),
-}
-
-/// Reads newline-terminated frames from a worker's stdout/stderr without
-/// buffering an entire unterminated line.
-///
-/// `BufReader::lines` waits for a newline or EOF before yielding anything, so a
-/// process that keeps writing without one grows the buffer without limit. This
-/// reader checks the accumulated length as it goes and reports
-/// [`LineError::TooLong`] once a frame passes [`MAX_LINE_BYTES`].
-struct LineReader<R> {
-    reader: R,
-    buffer: Vec<u8>,
-}
-
-impl<R: tokio::io::AsyncRead + Unpin> LineReader<R> {
-    fn new(reader: R) -> Self {
-        Self {
-            reader,
-            buffer: Vec::new(),
-        }
-    }
-
-    /// Returns the next line without its terminator, `None` at EOF, or an error.
-    async fn next_line(&mut self) -> std::result::Result<Option<Vec<u8>>, LineError> {
-        use tokio::io::AsyncReadExt;
-        loop {
-            if let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
-                let mut line: Vec<u8> = self.buffer.drain(..=position).collect();
-                line.pop();
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
-                return Ok(Some(line));
-            }
-            if self.buffer.len() > MAX_LINE_BYTES {
-                return Err(LineError::TooLong);
-            }
-            let mut chunk = [0u8; 8 * 1024];
-            let read = self.reader.read(&mut chunk).await.map_err(LineError::Io)?;
-            if read == 0 {
-                if self.buffer.is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(std::mem::take(&mut self.buffer)));
-            }
-            self.buffer.extend_from_slice(&chunk[..read]);
-        }
-    }
-}
-
 /// Removes one invocation from the registry and tells its consumer it was
-/// cancelled. Runs locally, independent of the child process.
+/// cancelled. Runs locally, independent of the VM thread.
 fn deregister(pending: &Pending, request_id: &str) {
     if let Some(PendingInvocation { items, active, .. }) = pending.remove(request_id) {
         drop(active);
@@ -834,38 +614,28 @@ fn deregister(pending: &Pending, request_id: &str) {
 }
 
 /// Best-effort delivery of a `Cancel` frame. It must never block the teardown
-/// path: if the child stopped reading stdin, the frame is dropped, which is
+/// path: if the VM stopped reading requests, the frame is dropped, which is
 /// harmless because the invocation is already deregistered locally.
 fn deliver_cancel(writer: &Writer, request_id: &str) {
-    let Ok(bytes) = encode_message(&HostMessage::Cancel { id: request_id }) else {
+    let Ok(bytes) = encode_message(&HostMessage::Cancel {
+        id: request_id.to_owned(),
+    }) else {
         return;
     };
     match writer.try_send(bytes) {
-        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => {
+        Ok(()) | Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+        Err(std::sync::mpsc::TrySendError::Full(_)) => {
             tracing::debug!(
-                "plugin stdin queue is full; dropping the cancel frame for a deregistered invocation"
+                "plugin session queue is full; dropping the cancel frame for a deregistered invocation"
             );
         }
     }
 }
 
-fn encode_message(message: &HostMessage<'_>) -> Result<Vec<u8>> {
+fn encode_message(message: &HostMessage) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec(message)?;
     bytes.push(b'\n');
     Ok(bytes)
-}
-
-// A single writer finishes each frame even if its requesting future is dropped.
-async fn write_stdin(
-    mut stdin: ChildStdin,
-    mut messages: mpsc::Receiver<Vec<u8>>,
-) -> std::io::Result<()> {
-    while let Some(bytes) = messages.recv().await {
-        stdin.write_all(&bytes).await?;
-        stdin.flush().await?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -894,7 +664,8 @@ fn recorded_network_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{super::find_bun, *};
+    use super::*;
+    use tokio::io::AsyncWriteExt;
 
     fn invocation(allowed_origins: HashSet<String>) -> InvocationState {
         InvocationState {
@@ -1313,58 +1084,29 @@ mod tests {
         assert!(!summary.detailed);
     }
 
-    async fn echo_worker(
-        root: &std::path::Path,
-        source: &str,
-    ) -> (
-        super::super::definition::PluginDefinitionLoader,
-        PluginWorker,
-    ) {
-        let executable = find_bun().expect("install Bun on PATH to run plugin worker tests");
-        let plugin_dir = root.join("echo");
-        std::fs::create_dir_all(plugin_dir.join("assets")).unwrap();
-        std::fs::write(
-            plugin_dir.join("assets/icon.svg"),
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8"/></svg>"#,
-        )
-        .unwrap();
-        std::fs::write(
-            plugin_dir.join("plugin.json"),
-            r#"{
-              "apiVersion": 1,
-              "id": "dev.cursorbyoknext.plugins.echo",
-              "name": "Echo",
-              "version": "0.1.0",
-              "icon": "assets/icon.svg",
-              "entry": "main.ts",
-              "permissions": { "network": [], "resourceOrigin": false }
-            }"#,
-        )
-        .unwrap();
-        std::fs::write(plugin_dir.join("main.ts"), source).unwrap();
-        let loader =
-            super::super::definition::PluginDefinitionLoader::in_temporary_workspace(root).unwrap();
-        let entry = plugin_dir.join("main.ts").canonicalize().unwrap();
-        let definition = loader.load(&executable, &entry).await.unwrap();
+    async fn echo_worker(_root: &std::path::Path, source: &str) -> (Modules, PluginWorker) {
+        // The fixtures are JS modules; author-facing TS compilation has separate build tests.
+        let source = source
+            .replace(
+                "import type { ProviderSupport } from \"cursor-byok-next:provider\";",
+                "",
+            )
+            .replace(": ProviderSupport", "");
+        let mut table = super::super::builtin::MODULES.to_vec();
+        table.push(("echo/main.js", Box::leak(source.into_boxed_str())));
+        let loader = Modules(Box::leak(table.into_boxed_slice()));
+        let definition = vm::collect(loader, "echo/main.js".into()).await.unwrap();
         let providers = super::super::catalog::validate_definition(
             "dev.cursorbyoknext.plugins.echo",
             &definition,
         )
         .unwrap();
         let plugin = super::super::catalog::PluginEntry {
-            entry,
-            manifest: serde_json::from_slice(
-                &std::fs::read(plugin_dir.join("plugin.json")).unwrap(),
-            )
-            .unwrap(),
-            definition,
-            providers,
-            icon: String::new(),
+            entry: "echo/main.js".into(),
+            manifest: serde_json::from_value(serde_json::json!({"apiVersion":1,"id":"dev.cursorbyoknext.plugins.echo","name":"Echo","version":"0.1.0","icon":"assets/magpie.svg","entry":"echo/main.js","permissions":{"network":[],"resourceOrigin":false}})).unwrap(),
+            definition, providers, icon: String::new(),
         };
-        (
-            loader.clone(),
-            PluginWorker::new(&plugin, executable, loader),
-        )
+        (loader, PluginWorker::new(&plugin, loader))
     }
 
     fn echo_invocation(text: &str) -> Arc<crate::model::ModelInvocation> {
@@ -1455,10 +1197,6 @@ export default defineProviderPlugin({ providers: [provider] });
 
     #[tokio::test]
     async fn custom_plugin_reads_the_sdk_request_once_per_invoke() {
-        assert!(
-            find_bun().is_some(),
-            "install Bun on PATH to run plugin worker tests"
-        );
         let temp = tempfile::tempdir().unwrap();
         let (_loader, worker) = echo_worker(temp.path(), ECHO_PLUGIN).await;
         let events = invoke_echo(&worker, echo_invocation("hello"), CancellationToken::new()).await;
@@ -1477,10 +1215,6 @@ export default defineProviderPlugin({ providers: [provider] });
 
     #[tokio::test]
     async fn concurrent_invokes_cannot_read_each_others_requests() {
-        assert!(
-            find_bun().is_some(),
-            "install Bun on PATH to run plugin worker tests"
-        );
         let temp = tempfile::tempdir().unwrap();
         let (_loader, worker) = echo_worker(temp.path(), ECHO_PLUGIN).await;
         let first = invoke_echo(&worker, echo_invocation("alpha"), CancellationToken::new());
@@ -1505,10 +1239,6 @@ export default defineProviderPlugin({ providers: [provider] });
 
     #[tokio::test]
     async fn cancelled_invokes_cannot_read_the_model_request() {
-        assert!(
-            find_bun().is_some(),
-            "install Bun on PATH to run plugin worker tests"
-        );
         let source = r#"
 import { defineProviderPlugin } from "cursor-byok-next:plugin";
 import type { ProviderSupport } from "cursor-byok-next:provider";
@@ -1596,59 +1326,448 @@ export default defineProviderPlugin({ providers: [provider] });
         drop(guards);
     }
 
-    #[tokio::test]
-    async fn line_reader_splits_frames_and_rejects_an_oversized_line() {
-        use tokio::io::AsyncWriteExt;
-
-        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(async move {
-            writer.write_all(b"first\nsecond\r\n").await.unwrap();
-            writer
-                .write_all(&vec![b'x'; MAX_LINE_BYTES + 8])
-                .await
-                .unwrap();
-        });
-        let mut lines = LineReader::new(reader);
-        assert_eq!(lines.next_line().await.ok().unwrap().unwrap(), b"first");
-        assert_eq!(lines.next_line().await.ok().unwrap().unwrap(), b"second");
-        assert!(matches!(lines.next_line().await, Err(LineError::TooLong)));
-    }
-
-    #[tokio::test]
-    async fn event_overflow_ends_the_invocation_instead_of_dropping_events() {
+    #[test]
+    fn event_overflow_ends_the_invocation_instead_of_dropping_events() {
         let pending = Arc::new(Pending::open());
         let Registration {
             guard,
             mut receiver,
-            ..
+            items,
+            active,
         } = pending.register(invocation(HashSet::new())).unwrap();
-        let sender = pending.sender(&guard.id).unwrap();
+        let cancellation = pending
+            .authorization(&guard.id)
+            .unwrap()
+            .0
+            .cancellation
+            .clone();
+        let event = serde_json::json!({"type":"text-start"});
         for _ in 0..EVENT_QUEUE_ITEMS {
-            sender
-                .try_send(WorkerStreamItem::Event(ModelEvent::TextStart))
-                .unwrap();
+            deliver_event(&pending, &host(), &guard.id, &event);
         }
-        // One past the bound: the queue must refuse rather than grow.
-        assert!(
-            sender
-                .try_send(WorkerStreamItem::Event(ModelEvent::TextStart))
-                .is_err(),
-            "the event queue must be bounded"
-        );
-        // A full queue still delivers the terminal error once a slot is free.
-        let _ = receiver.try_recv();
-        sender
-            .try_send(WorkerStreamItem::Result(Err(Error::Provider(
-                "overflow".into(),
-            ))))
-            .unwrap();
-        let mut saw_result = false;
+        assert_eq!(receiver.len(), EVENT_QUEUE_ITEMS);
+        deliver_event(&pending, &host(), &guard.id, &event);
+        assert!(pending.authorization(&guard.id).is_none());
+        assert!(cancellation.is_cancelled());
+        assert!(active.has_changed().is_err());
+        drop(items);
+        let mut count = 0;
         while let Ok(item) = receiver.try_recv() {
-            if matches!(item, WorkerStreamItem::Result(_)) {
-                saw_result = true;
+            assert!(matches!(item, WorkerStreamItem::Event(_)));
+            count += 1;
+        }
+        assert_eq!(count, EVENT_QUEUE_ITEMS);
+        assert!(
+            receiver.is_closed(),
+            "overflow must close the stream, never fabricate a successful result"
+        );
+    }
+    #[tokio::test]
+    async fn native_calls_are_concurrent_but_the_ninth_is_rejected() {
+        let source = r#"
+import { defineProviderPlugin } from "cursor-byok-next:plugin";
+export default defineProviderPlugin({providers:[{id:'echo',displayName:'Echo',providerType:'echo',async invoke(input, output, context) {
+ const results = await Promise.allSettled(Array.from({length:9},()=>context.network.fetch('https://not-allowed.invalid/')));
+ output.emit({type:'text-delta',text:JSON.stringify(results.map(result=>result.status==='rejected'?String(result.reason):'resolved'))});
+ return {status:'completed'};
+}}]});
+"#;
+        let temp = tempfile::tempdir().unwrap();
+        let (_, worker) = echo_worker(temp.path(), source).await;
+        let events = invoke_echo(&worker, echo_invocation("hello"), CancellationToken::new()).await;
+        let text = events
+            .iter()
+            .find_map(|event| {
+                if let ModelEvent::TextDelta(text) = event {
+                    Some(text)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let results: Vec<String> = serde_json::from_str(text).unwrap();
+        assert_eq!(results.len(), 9);
+        assert!(
+            results[8].contains("too many concurrent host calls"),
+            "{results:?}"
+        );
+        assert!(
+            results[..8]
+                .iter()
+                .all(|error| error.contains("ERR_ACCESS_DENIED")),
+            "{results:?}"
+        );
+        worker.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_stopped_vm_is_rebuilt_on_the_next_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, worker) = echo_worker(temp.path(), ECHO_PLUGIN).await;
+        let before = invoke_echo(&worker, echo_invocation("first"), CancellationToken::new()).await;
+        worker.stop().await;
+        let after = invoke_echo(&worker, echo_invocation("second"), CancellationToken::new()).await;
+        assert_ne!(before.len(), 0);
+        assert_ne!(after.len(), 0);
+        worker.stop().await;
+    }
+
+    #[tokio::test]
+    async fn session_frames_are_golden_and_capabilities_are_not_frames() {
+        let modules = Modules(Box::leak(
+            vec![(
+                "sdk/worker.js",
+                r"
+globalThis.__recv = async line => {
+ const message=JSON.parse(line);
+ await __host(message.id, 'network.fetch', JSON.stringify({url:'http://example.invalid'})).catch(()=>null);
+ if(message.method==='provider.invoke') __send(JSON.stringify({type:'event',id:message.id,event:{type:'text-start'}}));
+ __send(JSON.stringify({type:'result',id:message.id,result:null}));
+};
+",
+            )]
+            .into_boxed_slice(),
+        ));
+        let pending = Arc::new(Pending::open());
+        let mut session = vm::spawn(modules, "unused.js".into(), &pending, host()).unwrap();
+        let mut output = session.output.take().unwrap();
+        for method in ["provider.invoke", "models.list"] {
+            let registration = pending.register(invocation(HashSet::new())).unwrap();
+            let id = &registration.guard.id;
+            let request =
+                format!(r#"{{"type":"request","id":"{id}","method":"{method}","params":{{}}}}"#);
+            session.writer.try_send(request.into_bytes()).unwrap();
+            if method == "provider.invoke" {
+                assert_eq!(
+                    output.recv().await.unwrap(),
+                    format!(r#"{{"type":"event","id":"{id}","event":{{"type":"text-start"}}}}"#)
+                        .as_bytes()
+                );
+            }
+            assert_eq!(
+                output.recv().await.unwrap(),
+                format!(r#"{{"type":"result","id":"{id}","result":null}}"#).as_bytes()
+            );
+            assert!(
+                output.try_recv().is_err(),
+                "models.list has one result; capability completions must never enter the session queue"
+            );
+        }
+        session.stop.store(true, Ordering::Release);
+        let thread = session.thread.take().unwrap();
+        tokio::task::spawn_blocking(move || thread.join().unwrap())
+            .await
+            .unwrap();
+    }
+    async fn network_probe(
+        worker: &PluginWorker,
+        origin: &str,
+        text: &str,
+        cancellation: CancellationToken,
+    ) -> mpsc::Receiver<WorkerStreamItem> {
+        worker.invoke_streaming(WorkerRequest {
+            method: "provider.invoke",
+            params: serde_json::json!({"providerId":"echo","model":{"id":"echo","displayName":"Echo"},"resource":null}),
+            cancellation, recorder: None,
+            allowed_origins: HashSet::from([origin.to_owned()]),
+            model: Some(echo_invocation(text)),
+        }).await.unwrap()
+    }
+
+    async fn tasks_drained(host: &HostContext) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while host.active_task_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_promises_resolve_reject_and_preserve_only_safe_http_status() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new()
+            .route(
+                "/fetch",
+                axum::routing::get(|| async { (axum::http::StatusCode::CREATED, "ok") }),
+            )
+            .route(
+                "/error",
+                axum::routing::post(|| async {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "secret-upstream-body",
+                    )
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let source = r"
+import { defineProviderPlugin } from 'cursor-byok-next:plugin';
+export default defineProviderPlugin({providers:[{
+ id:'echo',displayName:'Echo',providerType:'echo',async invoke(input, output, context) {
+  const reply=await context.network.fetch('ORIGIN/fetch');
+  let errorStatus, errorMessage, denied;
+  try { await context.protocol.stream({protocol:'openai-chat',url:'ORIGIN/error',model:'echo'}); }
+  catch(error) { errorStatus=error.status; errorMessage=error.message; }
+  try { await context.network.fetch('http://example.invalid/forbidden'); }
+  catch(error) { denied=String(error); }
+  output.emit({type:'text-delta',text:JSON.stringify({status:reply.status,body:reply.body,errorStatus,errorMessage,denied})});
+  return {status:'completed'};
+ }
+}]});
+".replace("ORIGIN", &origin);
+        let temp = tempfile::tempdir().unwrap();
+        let (_, mut worker) = echo_worker(temp.path(), &source).await;
+        Arc::get_mut(&mut worker.inner).unwrap().host = host();
+        let mut items = network_probe(&worker, &origin, "start", CancellationToken::new()).await;
+        let mut payload = None;
+        while let Some(item) = items.recv().await {
+            match item {
+                WorkerStreamItem::Event(crate::provider::ModelEvent::TextDelta(text)) => {
+                    payload = Some(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+                }
+                WorkerStreamItem::Result(result) => {
+                    result.unwrap();
+                    break;
+                }
+                WorkerStreamItem::Event(_) => {}
             }
         }
-        assert!(saw_result);
-        drop(guard);
+        let payload = payload.unwrap();
+        assert_eq!(payload["status"], 201);
+        assert_eq!(payload["body"], "ok");
+        assert_eq!(payload["errorStatus"], 503);
+        assert!(
+            payload["denied"]
+                .as_str()
+                .unwrap()
+                .contains("ERR_ACCESS_DENIED")
+        );
+        assert!(!payload.to_string().contains("secret-upstream-body"));
+        tasks_drained(&worker.inner.host).await;
+        worker.stop().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancellation_aborts_signal_rejects_native_promises_and_drains_tasks() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (accepted, ready) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            let _ = accepted.send(());
+            std::future::pending::<()>().await;
+        });
+        let source = r"
+import { defineProviderPlugin } from 'cursor-byok-next:plugin';
+let aborted=false, rejected=false;
+export default defineProviderPlugin({providers:[{
+ id:'echo',displayName:'Echo',providerType:'echo',async invoke(input, output, context) {
+  const request=await input.readRequest();
+  if(request.messages[0].content[0].text==='start') {
+   context.signal.addEventListener('abort',()=>{aborted=context.signal.aborted;});
+   try { await context.network.fetch('ORIGIN/hold'); } catch { rejected=true; }
+  } else { output.emit({type:'text-delta',text:JSON.stringify({aborted,rejected})}); }
+  return {status:'completed'};
+ }
+}]});
+"
+        .replace("ORIGIN", &origin);
+        let temp = tempfile::tempdir().unwrap();
+        let (_, mut worker) = echo_worker(temp.path(), &source).await;
+        Arc::get_mut(&mut worker.inner).unwrap().host = host();
+        let cancellation = CancellationToken::new();
+        let mut items = network_probe(&worker, &origin, "start", cancellation.clone()).await;
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(worker.inner.host.active_task_count(), 1);
+        cancellation.cancel();
+        if let Some(item) = items.recv().await {
+            assert!(matches!(item, WorkerStreamItem::Result(Err(_))));
+        }
+        tasks_drained(&worker.inner.host).await;
+        let events = invoke_echo(
+            &worker,
+            echo_invocation("inspect"),
+            CancellationToken::new(),
+        )
+        .await;
+        let text = events
+            .iter()
+            .find_map(|event| match event {
+                crate::provider::ModelEvent::TextDelta(text) => Some(text),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(text).unwrap(),
+            serde_json::json!({"aborted":true,"rejected":true})
+        );
+        worker.stop().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn network_stream_limits_and_ownership_are_per_invocation_and_eof_cleans_tasks() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/events",
+            axum::routing::get(|| async { "data: first\n\ndata: second\n\n" }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let host = host();
+        let first = invocation(HashSet::from([origin.clone()]));
+        let second = invocation(HashSet::from([origin.clone()]));
+        let mut ids = Vec::new();
+        for _ in 0..MAX_HOST_CALLS_PER_INVOCATION * 2 {
+            let opened = host
+                .call(
+                    &first,
+                    "network.stream.open",
+                    serde_json::json!({"url":format!("{origin}/events")}),
+                )
+                .await
+                .unwrap();
+            ids.push(opened["streamId"].as_str().unwrap().to_owned());
+        }
+        let error = host
+            .call(
+                &first,
+                "network.stream.open",
+                serde_json::json!({"url":format!("{origin}/events")}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("too many open"));
+        let own = host
+            .call(
+                &second,
+                "network.stream.open",
+                serde_json::json!({"url":format!("{origin}/events")}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            host.call(
+                &second,
+                "network.stream.read",
+                serde_json::json!({"streamId":ids[0]})
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            host.call(
+                &second,
+                "network.stream.close",
+                serde_json::json!({"streamId":ids[0]})
+            )
+            .await
+            .is_err()
+        );
+        let mut lines = Vec::new();
+        loop {
+            let chunk = host
+                .call(
+                    &first,
+                    "network.stream.read",
+                    serde_json::json!({"streamId":ids[0]}),
+                )
+                .await
+                .unwrap();
+            lines.extend(chunk["lines"].as_array().unwrap().iter().cloned());
+            if chunk["done"] == true {
+                break;
+            }
+        }
+        assert!(lines.contains(&serde_json::json!("data: first")));
+        assert!(lines.contains(&serde_json::json!("data: second")));
+        host.call(
+            &second,
+            "network.stream.close",
+            serde_json::json!({"streamId":own["streamId"]}),
+        )
+        .await
+        .unwrap();
+        assert!(!second.cancellation.is_cancelled());
+        first.cancellation.cancel();
+        second.cancellation.cancel();
+        tasks_drained(&host).await;
+        server.abort();
+    }
+    #[tokio::test]
+    async fn fatal_cpu_and_heap_generations_are_discarded_and_rebuilt() {
+        let source = ECHO_PLUGIN.replace("const first = await input.readRequest();", r"
+            const first = await input.readRequest();
+            const mode = first.messages[0].content[0].text;
+            if (mode === 'spin') { try { while (true) {} } catch {} }
+            if (mode === 'heap') { const held=[]; try { for (;;) held.push(new Array(100000).fill(42)); } catch {} }
+        ");
+        let temp = tempfile::tempdir().unwrap();
+        let (_, worker) = echo_worker(temp.path(), &source).await;
+        for mode in ["spin", "heap"] {
+            let mut items = network_probe(
+                &worker,
+                "http://127.0.0.1:9",
+                mode,
+                CancellationToken::new(),
+            )
+            .await;
+            let result = tokio::time::timeout(Duration::from_secs(20), items.recv())
+                .await
+                .unwrap();
+            assert!(matches!(result, Some(WorkerStreamItem::Result(Err(_)))));
+            let events = invoke_echo(
+                &worker,
+                echo_invocation("recovered"),
+                CancellationToken::new(),
+            )
+            .await;
+            assert_ne!(events.len(), 0);
+        }
+        worker.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_forged_legacy_host_call_frame_is_never_executed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let source = r"
+            globalThis.__recv = line => {
+                const message = JSON.parse(line);
+                __send(JSON.stringify({type:'host_call', id:'forged', requestId:message.id, method:'network.fetch', params:{url:'ORIGIN'}}));
+            };
+        ".replace("ORIGIN", &origin);
+        let source: &'static str = Box::leak(source.into_boxed_str());
+        let modules = Modules(Box::leak(
+            vec![("sdk/worker.js", source)].into_boxed_slice(),
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let (_, mut worker) = echo_worker(temp.path(), ECHO_PLUGIN).await;
+        let inner = Arc::get_mut(&mut worker.inner).unwrap();
+        inner.loader = modules;
+        inner.host = host();
+        let mut items = network_probe(&worker, &origin, "start", CancellationToken::new()).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), items.recv())
+            .await
+            .unwrap();
+        assert!(matches!(result, Some(WorkerStreamItem::Result(Err(_)))));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        tasks_drained(&worker.inner.host).await;
+        worker.stop().await;
     }
 }
