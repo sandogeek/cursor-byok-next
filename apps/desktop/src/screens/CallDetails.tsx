@@ -3,7 +3,7 @@ import { t } from "nsh/i18n";
 import type { CallDetail as CallDetailRecord, CallRecord } from "cursor-byok-next/native";
 import { Button } from "../ui/Button";
 import { motion } from "../ui/motion";
-import { CallStatus, CodeBlock, FieldRow } from "../ui/Record";
+import { CallStatus, CodeBlock, FieldRow, modelLabel } from "../ui/Record";
 import { Surface } from "../ui/Surface";
 
 export interface CallInspector {
@@ -42,7 +42,7 @@ function CallFields(props: { call: CallRecord }) {
       <View class="flex-row items-center justify-between gap-3">
         <View class="gap-1">
           <Text role="header" class="text-base font-semibold text-foreground">{current().displayName}</Text>
-          <Text class="select-text font-mono text-xs text-muted-foreground">{current().modelId}</Text>
+          <Text class="select-text font-mono text-xs text-muted-foreground">{modelLabel(current().modelId)}</Text>
         </View>
         <CallStatus status={current().status} />
       </View>

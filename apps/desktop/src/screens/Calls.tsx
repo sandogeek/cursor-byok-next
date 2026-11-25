@@ -4,7 +4,7 @@ import type { CallDetail, CallRecord, CallsSnapshot } from "cursor-byok-next/nat
 import { Button, IconButton } from "../ui/Button";
 import { Dialog } from "../ui/Dialog";
 import { motion } from "../ui/motion";
-import { CallStatus, RowButton } from "../ui/Record";
+import { CallStatus, modelLabel, RowButton } from "../ui/Record";
 import { Surface } from "../ui/Surface";
 import { Switch } from "../ui/Switch";
 import { SnapshotSync } from "./callSync";
@@ -171,7 +171,7 @@ export function Calls(props: { log: CallLog; onOpen: (callId: string) => void })
                     </View>
                     <View class="min-w-40 flex-1 overflow-hidden gap-0.5">
                       <Text class="truncate text-sm text-foreground">{call().displayName}</Text>
-                      <Text class="truncate font-mono text-xs text-muted-foreground">{call().modelId}</Text>
+                      <Text class="truncate font-mono text-xs text-muted-foreground">{modelLabel(call().modelId)}</Text>
                       <Text class="truncate text-xs text-muted-foreground">{formatTime(call().createdAtMs)}</Text>
                     </View>
                     <Text class="w-12 shrink-0 text-end font-mono text-xs tabular-nums text-muted-foreground">{formatCount(call().httpStatus ?? undefined)}</Text>

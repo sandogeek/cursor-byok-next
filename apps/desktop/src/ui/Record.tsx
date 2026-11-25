@@ -6,6 +6,17 @@ import { Button } from "./Button";
 import { colorMotion, controlMotion } from "./motion";
 import { StatusBadge } from "./Surface";
 
+const LIVE_RESOURCE_PREFIX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\//i;
+
+/**
+ * The model id without the live-catalog resource id `PluginHost` binds in front
+ * of it (`state` generates those ids as UUIDs); `modelHash` on the details
+ * screen still carries the whole id.
+ */
+export function modelLabel(modelId: string) {
+  return modelId.replace(LIVE_RESOURCE_PREFIX, "");
+}
+
 export function FieldRow(props: { label: string; value: string; mono?: boolean }) {
   return (
     <View class="flex-row items-start justify-between gap-4 border-b border-border py-2">

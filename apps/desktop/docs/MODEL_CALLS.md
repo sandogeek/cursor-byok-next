@@ -62,6 +62,7 @@ InvokeModel
 | 16 | 终态写入 | `finish_llm_call` 六个位置参数 | `CallOutcome { status, finish_reason, elapsed_ms, error_kind, error_message }`，配 `completed`/`cancelled` 构造器 | 六个相邻参数里交换任意两个都能编译；具名结构让终态字段不会错位 |
 | 17 | 记录失败 | `record_*` 返回 `Result`，调用处必须处理 | `record_*` 不再返回错误：写失败只把 store 标成 degraded，不影响模型调用 | 记录是观测副作用；让它成为调用链上的失败点会让一次 SQLite 抖动中断用户的生成 |
 | 18 | 记录句柄的 `Debug` | 以 `#[expect]` 豁免 | `CallRecorder` 打印 `call_id`，`CallStore` 打印 `path` 与 `degraded`，均 `finish_non_exhaustive()` | “UI 不打印”不是不需要诊断实现的理由；手写实现只取快照，不进锁、不带正文 |
+| 19 | 列表的模型标识 | `call.model_id` 原样显示 | `modelLabel()` 去掉 live 目录绑定的资源 UUID 前缀，`modelHash` / 详情仍保留完整 id | `model_id` 里的 `<resource-uuid>/` 是发现模型时防止跨资源重名用的内部坐标，不是用户认得的模型；只在显示层剥离，落库值与 Cursor 侧映射不变 |
 
 ## 必须保持的不变量
 
@@ -86,7 +87,7 @@ cd apps/desktop && nsh check && nsh test
 nsh test test-fixtures/Visual.test.tsx --target macos
 ```
 
-Rust 覆盖：最终 schema 与重复打开、往返、详细模式快照、敏感头、首个请求认领、TTFR/TTFT first-wins、完成/失败/取消幂等、终态后所有字段只读、drop 收尾、观测队列排空、两种清理、payload 上限与截断标志、保留策略、官方路由不落库。`magpie_invocation_records_the_completed_call` 与 `magpie_invocation_records_cancellation` 走真实 QuickJS 插件 + 假网关。TSX 覆盖列表、详情、清理确认、空状态、详情不存在和中英文；`callSync.test.ts` 覆盖旧轮询与卸载后的结果失效。测试夹具 `capabilities.host` 含 `calls.*`。
+Rust 覆盖：最终 schema 与重复打开、往返、详细模式快照、敏感头、首个请求认领、TTFR/TTFT first-wins、完成/失败/取消幂等、终态后所有字段只读、drop 收尾、观测队列排空、两种清理、payload 上限与截断标志、保留策略、官方路由不落库。`magpie_invocation_records_the_completed_call` 与 `magpie_invocation_records_cancellation` 走真实 QuickJS 插件 + 假网关。TSX 覆盖列表、详情、清理确认、空状态、详情不存在和中英文；`callSync.test.ts` 覆盖旧轮询与卸载后的结果失效，`record.test.ts` 覆盖 `modelLabel` 只剥 UUID 资源前缀。测试夹具 `capabilities.host` 含 `calls.*`。
 
 ### 设计完成清单（调用列表 / 详情）
 
