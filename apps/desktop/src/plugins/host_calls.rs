@@ -1,9 +1,8 @@
 //! The capabilities a plugin worker may reach: its own network calls, the
 //! model request it was registered with, and the protocol adapters.
 //!
-//! [`PluginWorker`](super::worker::PluginWorker) owns the process and the line
-//! protocol between it and Rust; this module owns what a `HostCall` frame
-//! received over that protocol is allowed to do. Splitting them keeps the
+//! [`PluginWorker`](super::worker::PluginWorker) owns the VM session; native
+//! capabilities dispatch here. This module owns what each invocation may do. Splitting them keeps the
 //! transport free of policy: the worker cannot widen its own permissions, and
 //! every check a plugin bypasses has to be changed here.
 
@@ -66,7 +65,7 @@ fn provider_error(error: reqwest::Error) -> Error {
 }
 
 /// What one plugin may reach from inside its worker. Cheap to clone: the worker
-/// reader task holds one for the process's lifetime.
+/// reader task holds one for the VM generation's lifetime.
 #[derive(Clone)]
 pub(super) struct HostContext {
     plugin_id: String,
@@ -81,16 +80,45 @@ pub(super) struct HostContext {
     http: OnceLock<reqwest::Client>,
     #[cfg(test)]
     sdk_projections: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    active_tasks: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A stream open under one invocation. Dropping it (via removal or invocation
 /// cancellation) frees the reader task through the shared cancellation token.
 struct OpenStream {
     lines: StreamLines,
+    owner: usize,
     cancellation: CancellationToken,
 }
 
+impl Drop for OpenStream {
+    fn drop(&mut self) {
+        // Removing an EOF/error entry also releases its cleanup waiter.
+        self.cancellation.cancel();
+    }
+}
+
+#[cfg(test)]
+pub(super) struct TaskGuard(Arc<std::sync::atomic::AtomicUsize>);
+#[cfg(test)]
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 impl HostContext {
+    #[cfg(test)]
+    pub(super) fn task_guard(&self) -> TaskGuard {
+        self.active_tasks
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        TaskGuard(Arc::clone(&self.active_tasks))
+    }
+    #[cfg(test)]
+    pub(super) fn active_task_count(&self) -> usize {
+        self.active_tasks.load(std::sync::atomic::Ordering::Acquire)
+    }
     /// The context for one plugin, taking exactly the manifest's `permissions`.
     pub(super) fn new(plugin_id: &str, permissions: &PluginPermissions) -> Self {
         Self {
@@ -107,6 +135,8 @@ impl HostContext {
             http: OnceLock::new(),
             #[cfg(test)]
             sdk_projections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            active_tasks: Arc::default(),
         }
     }
 
@@ -115,7 +145,7 @@ impl HostContext {
         &self.plugin_id
     }
 
-    /// Dispatches one `HostCall` frame. An unknown method is a protocol error:
+    /// Dispatches one native capability call. An unknown method is a protocol error:
     /// the worker SDK and this side ship together, so a mismatch is a bug rather
     /// than a plugin's mistake.
     pub(super) async fn call(
@@ -127,9 +157,9 @@ impl HostContext {
         match method {
             "network.fetch" => self.fetch(invocation, params).await,
             "network.stream.open" => self.stream_open(invocation, params).await,
-            "network.stream.read" => self.stream_read(params).await,
+            "network.stream.read" => self.stream_read(invocation, params).await,
             "network.stream.close" => {
-                self.close_stream(&params).await?;
+                self.close_stream(invocation, &params).await?;
                 Ok(Value::Null)
             }
             "protocol.stream" => super::adapters::stream(self, invocation, params).await,
@@ -147,7 +177,7 @@ impl HostContext {
             reason = "`self` is only read under cfg(test) to count SDK projections"
         )
     )]
-    fn read_request(&self, invocation: &InvocationState) -> Result<Value> {
+    pub(super) fn read_request(&self, invocation: &InvocationState) -> Result<Value> {
         #[cfg(test)]
         self.sdk_projections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -331,7 +361,7 @@ impl HostContext {
         // The stream belongs to this invocation: when the invocation is cancelled
         // the reader task observes the token and stops, and the entry is dropped
         // on the next read/close. A plugin cannot leak one past its call.
-        let cancellation = invocation.cancellation.clone();
+        let cancellation = invocation.cancellation.child_token();
         let response = tokio::select! {
             () = cancellation.cancelled() => return Err(Error::Cancelled),
             response = request.send() => response.map_err(provider_error)?,
@@ -345,22 +375,35 @@ impl HostContext {
         {
             let mut streams = self.streams.lock().await;
             prune_cancelled_streams(&mut streams);
-            if streams.len() >= MAX_STREAMS_PER_INVOCATION {
+            if streams
+                .values()
+                .filter(|stream| stream.owner == std::ptr::from_ref(invocation).addr())
+                .count()
+                >= MAX_STREAMS_PER_INVOCATION
+            {
                 return Err(Error::Provider(
                     "too many open plugin network streams".into(),
                 ));
             }
             let (sender, receiver) = mpsc::channel::<Result<String>>(STREAM_LINE_BUFFER);
-            tokio::spawn(stream_body(
-                response,
-                sender,
-                cancellation.clone(),
-                recorder,
-            ));
+            let stream_cancel = cancellation.clone();
+            let invocation_cancel = invocation.cancellation.clone();
+            let open_streams = Arc::clone(&self.streams);
+            let cleanup_id = stream_id.clone();
+            #[cfg(test)]
+            let task_guard = self.task_guard();
+            tokio::spawn(async move {
+                #[cfg(test)]
+                let _task_guard = task_guard;
+                stream_body(response, sender, stream_cancel.clone(), recorder).await;
+                tokio::select! { () = invocation_cancel.cancelled() => {}, () = stream_cancel.cancelled() => {} }
+                open_streams.lock().await.remove(&cleanup_id);
+            });
             streams.insert(
                 stream_id.clone(),
                 OpenStream {
                     lines: Arc::new(Mutex::new(receiver)),
+                    owner: std::ptr::from_ref(invocation).addr(),
                     cancellation,
                 },
             );
@@ -372,7 +415,7 @@ impl HostContext {
         }))
     }
 
-    async fn stream_read(&self, params: Value) -> Result<Value> {
+    async fn stream_read(&self, invocation: &InvocationState, params: Value) -> Result<Value> {
         let stream_id = wire::required_str(&params, "streamId", HOST_CALL)?;
         // Clone out the handle and release the map guard before waiting: the lock
         // must not be held across `recv()`.
@@ -381,6 +424,7 @@ impl HostContext {
             prune_cancelled_streams(&mut streams);
             streams
                 .get(stream_id)
+                .filter(|stream| stream.owner == std::ptr::from_ref(invocation).addr())
                 .map(|stream| Arc::clone(&stream.lines))
                 .ok_or_else(|| Error::Protocol(format!("unknown plugin stream: {stream_id}")))?
         };
@@ -414,9 +458,16 @@ impl HostContext {
     }
 
     /// Removes one stream, cancelling its reader task.
-    async fn close_stream(&self, params: &Value) -> Result<()> {
+    async fn close_stream(&self, invocation: &InvocationState, params: &Value) -> Result<()> {
         let stream_id = wire::required_str(params, "streamId", HOST_CALL)?;
-        if let Some(stream) = self.streams.lock().await.remove(stream_id) {
+        let mut streams = self.streams.lock().await;
+        if streams
+            .get(stream_id)
+            .is_some_and(|stream| stream.owner != std::ptr::from_ref(invocation).addr())
+        {
+            return Err(Error::Protocol("unknown plugin stream".into()));
+        }
+        if let Some(stream) = streams.remove(stream_id) {
             stream.cancellation.cancel();
         }
         Ok(())

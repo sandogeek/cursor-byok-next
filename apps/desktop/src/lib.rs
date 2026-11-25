@@ -529,7 +529,7 @@ impl From<HostFormSubmit> for PluginFormResult {
 /// A plugin runtime snapshot the settings page shows.
 #[derive(Debug, Clone, PartialEq, JsObject)]
 pub struct PluginSnapshot {
-    /// Whether a Bun executable was found; a plugin may still fail to load.
+    /// Whether the isolated plugin VM initialized successfully.
     pub runtime_ready: bool,
     /// Why the runtime is unavailable, when it is.
     pub runtime_error: Option<String>,
@@ -708,7 +708,7 @@ impl std::fmt::Debug for Plugins {
 
 #[class]
 impl Plugins {
-    /// Restores installed plugins and looks for Bun on PATH.
+    /// Restores embedded plugins and initializes their isolated VMs.
     pub fn new() -> Result<Self, plugins::Error> {
         let inner = shared_plugin_host()?;
         Ok(Self {

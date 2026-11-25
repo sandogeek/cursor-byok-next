@@ -6,7 +6,7 @@
   "author": "@leookun",
   "minAppVersion": "0.0.1",
   "icon": "assets/magpie.svg",
-  "entry": "main.ts",
+  "entry": "magpie/main.js",
   "permissions": {
     "network": [],
     "resourceOrigin": true

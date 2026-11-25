@@ -2,7 +2,6 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
     sync::Arc,
 };
 
@@ -29,7 +28,7 @@ use super::{
         PluginProviderDescriptor, PluginResourceDescriptor, PluginResourceView, ResourceDefinition,
         ResourcePresentation, ValidatedProvider, parse_model_id,
     },
-    find_bun, origin,
+    origin,
     state::{PluginStateStore, ResourceDraft, ResourcePatch, ResourceRecord, StoredModel},
     worker::{PluginWorker, WorkerRequest, WorkerStreamItem},
 };
@@ -56,7 +55,6 @@ struct HostInner {
     /// purpose: two interleaved form submits could otherwise write resources
     /// derived from the same stale snapshot.
     operations: Mutex<()>,
-    executable: RwLock<Option<std::path::PathBuf>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -71,8 +69,8 @@ pub struct FormSubmitResponse {
     pub model_sync_error: Option<String>,
 }
 
-/// What the Plugins screen renders. `runtime_ready` is false when Bun is
-/// missing, in which case `plugins` came from manifests alone.
+/// What the Plugins screen renders. `runtime_ready` is false when `QuickJS` is
+/// unavailable, in which case `plugins` came from manifests alone.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginSnapshot {
@@ -86,12 +84,12 @@ impl PluginHost {
     ///
     /// # Errors
     ///
-    /// Fails when the data directory cannot be resolved or the plugin workspace
-    /// and data store cannot be created.
+    /// Fails when the data directory cannot be resolved or the plugin data
+    /// store cannot be created.
     pub fn managed() -> Result<Self> {
         let data_dir = crate::storage::data_dir()?;
         Ok(Self::new(
-            PluginCatalog::managed()?,
+            PluginCatalog::managed(),
             PluginDataStore::at(data_dir.join("plugins/data"))?,
         ))
     }
@@ -105,43 +103,35 @@ impl PluginHost {
                 workers: Mutex::new(HashMap::new()),
                 catalogs: CatalogCache::default(),
                 operations: Mutex::new(()),
-                executable: RwLock::new(find_bun()),
             }),
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(root: &Path) -> Result<Self> {
+    pub(crate) fn for_test(root: &std::path::Path) -> Result<Self> {
         Ok(Self::new(
-            PluginCatalog::for_test(root)?,
+            PluginCatalog::for_test(root),
             PluginDataStore::at(root.join("data"))?,
         ))
     }
 
-    /// Everything the Plugins screen renders: the Bun runtime state plus each
+    /// Everything the Plugins screen renders: the `QuickJS` runtime state plus each
     /// plugin's providers, resources, and cached catalogs.
     ///
-    /// Never fails: a missing runtime is reported as `runtime_ready: false`
+    /// Never fails: a failed VM initialization is reported as `runtime_ready: false`
     /// with the manifests it could still read, so the UI can show plugin cards
-    /// before Bun exists.
+    /// if VM initialization fails.
     pub async fn snapshot(&self) -> PluginSnapshot {
-        let Some(executable) = self.runtime().await else {
-            return PluginSnapshot {
-                runtime_ready: false,
-                runtime_error: Some(super::text("plugin.error.bun_missing")),
-                plugins: self.manifest_plugins().await,
-            };
-        };
-        let entries = self.entries(&executable).await;
+        let entries = self.entries().await;
         let mut plugins = Vec::with_capacity(entries.len());
         for entry in entries.iter() {
-            plugins.push(self.descriptor(entry, &executable).await);
+            plugins.push(self.descriptor(entry).await);
         }
         if plugins.is_empty() {
             return PluginSnapshot {
-                runtime_ready: true,
-                runtime_error: Some(super::text("plugin.error.builtin_unavailable")),
-                plugins,
+                runtime_ready: false,
+                runtime_error: Some(super::text("plugin.error.vm_failed")),
+                plugins: Self::manifest_plugins(),
             };
         }
         PluginSnapshot {
@@ -166,8 +156,7 @@ impl PluginHost {
         values: serde_json::Value,
     ) -> Result<FormSubmitResponse> {
         let _operation = self.inner.operations.lock().await;
-        let executable = self.executable().await?;
-        let entry = self.find_entry(&executable, plugin_id).await?;
+        let entry = self.find_entry(plugin_id).await?;
         let resource = find_resource(&entry, resource_type)?;
         let method = resource
             .add
@@ -201,7 +190,7 @@ impl PluginHost {
             submitted.insert(field.id.clone(), serde_json::Value::String(raw.to_owned()));
         }
         let value = self
-            .worker(&entry, &executable)
+            .worker(&entry)
             .await
             .invoke(
                 "form.submit",
@@ -232,7 +221,7 @@ impl PluginHost {
         let changed: HashSet<_> = outcome.changed_ids.into_iter().collect();
         self.invalidate_live_catalogs(plugin_id, &changed).await;
         let model_sync_error = self
-            .sync_provider_models_for_resource(&entry, &executable, resource_type, &changed)
+            .sync_provider_models_for_resource(&entry, resource_type, &changed)
             .await;
         Ok(FormSubmitResponse {
             added: outcome.added,
@@ -254,8 +243,7 @@ impl PluginHost {
         resource_id: &str,
     ) -> Result<()> {
         let _operation = self.inner.operations.lock().await;
-        let executable = self.executable().await?;
-        let entry = self.find_entry(&executable, plugin_id).await?;
+        let entry = self.find_entry(plugin_id).await?;
         find_resource(&entry, resource_type)?;
         self.inner
             .state
@@ -281,10 +269,9 @@ impl PluginHost {
     /// Fails when the runtime is missing or the plugin or provider is unknown.
     pub async fn refresh_catalog(&self, plugin_id: &str, provider_id: &str) -> Result<()> {
         let _operation = self.inner.operations.lock().await;
-        let executable = self.executable().await?;
-        let entry = self.find_entry(&executable, plugin_id).await?;
+        let entry = self.find_entry(plugin_id).await?;
         let provider = find_provider(&entry, provider_id)?;
-        self.provider_models(&entry, &executable, provider, CatalogRefresh::Forced, None)
+        self.provider_models(&entry, provider, CatalogRefresh::Forced, None)
             .await;
         Ok(())
     }
@@ -294,10 +281,7 @@ impl PluginHost {
     /// that could still be loaded, because Cursor's model picker must not fail
     /// to open.
     pub async fn configured_models(&self) -> Vec<PluginModelDescriptor> {
-        let Ok(executable) = self.executable().await else {
-            return Vec::new();
-        };
-        let entries = self.entries(&executable).await;
+        let entries = self.entries().await;
         let mut models = Vec::new();
         for entry in entries.iter() {
             for provider in &entry.providers {
@@ -305,7 +289,7 @@ impl PluginHost {
                     continue;
                 }
                 let stored = self
-                    .provider_models(entry, &executable, provider, CatalogRefresh::Cached, None)
+                    .provider_models(entry, provider, CatalogRefresh::Cached, None)
                     .await
                     .models;
                 models.extend(stored.into_iter().map(|model| {
@@ -331,14 +315,13 @@ impl PluginHost {
         let Some(id) = parse_model_id(model_id) else {
             return Ok(None);
         };
-        let executable = self.executable().await?;
-        let entry = self.find_entry(&executable, id.plugin).await?;
+        let entry = self.find_entry(id.plugin).await?;
         let provider = find_provider(&entry, id.provider)?;
         if !self.provider_configured(&entry, provider).await {
             return Ok(None);
         }
         let stored = self
-            .provider_models(&entry, &executable, provider, CatalogRefresh::Cached, None)
+            .provider_models(&entry, provider, CatalogRefresh::Cached, None)
             .await
             .models;
         Ok(stored
@@ -372,11 +355,10 @@ impl PluginHost {
             let plugin_id = parsed.plugin.to_owned();
             let provider_id = parsed.provider.to_owned();
             let upstream_id = parsed.model.to_owned();
-            let executable = host.executable().await?;
-            let entry = host.find_entry(&executable, &plugin_id).await?;
+                let entry = host.find_entry(&plugin_id).await?;
             let provider = find_provider(&entry, &provider_id)?;
             let stored = host
-                .provider_models(&entry, &executable, provider, CatalogRefresh::Cached, None)
+                .provider_models(&entry, provider, CatalogRefresh::Cached, None)
                 .await
                 .models;
             let stored = stored
@@ -403,7 +385,7 @@ impl PluginHost {
                 "model": model_snapshot,
                 "resource": resource.as_ref().map(|(resource_type, record)| record.snapshot(resource_type)),
             });
-            let worker = host.worker(&entry, &executable).await;
+            let worker = host.worker(&entry).await;
             let origins = Self::resource_origins(&entry, resource.as_ref().map(|(_, record)| record));
             if invocation.request.model.max_output_tokens.is_none() {
                 invocation.request.model.max_output_tokens = stored.max_output_tokens;
@@ -512,11 +494,8 @@ impl PluginHost {
         }
     }
 
-    async fn manifest_plugins(&self) -> Vec<PluginDescriptor> {
-        self.inner
-            .catalog
-            .manifests()
-            .await
+    fn manifest_plugins() -> Vec<PluginDescriptor> {
+        PluginCatalog::manifests()
             .into_iter()
             .map(|loaded| PluginDescriptor {
                 id: loaded.manifest.id,
@@ -525,14 +504,14 @@ impl PluginHost {
                 author: loaded.manifest.author,
                 icon: loaded.icon,
                 runtime_ready: false,
-                runtime_error: Some(super::text("plugin.error.bun_missing")),
+                runtime_error: Some(super::text("plugin.error.vm_failed")),
                 providers: Vec::new(),
                 resources: Vec::new(),
             })
             .collect()
     }
 
-    async fn descriptor(&self, entry: &PluginEntry, executable: &Path) -> PluginDescriptor {
+    async fn descriptor(&self, entry: &PluginEntry) -> PluginDescriptor {
         let plugin_id = &entry.manifest.id;
         let mut providers = Vec::new();
         for provider in &entry.providers {
@@ -540,7 +519,7 @@ impl PluginHost {
                 models: stored,
                 error: catalog_error,
             } = self
-                .provider_models(entry, executable, provider, CatalogRefresh::Cached, None)
+                .provider_models(entry, provider, CatalogRefresh::Cached, None)
                 .await;
             let configured = self.provider_configured(entry, provider).await;
             let definition = &provider.definition;
@@ -572,8 +551,7 @@ impl PluginHost {
                 .await
             {
                 Ok(records) => (
-                    self.present_resources(entry, executable, definition, &records)
-                        .await,
+                    self.present_resources(entry, definition, &records).await,
                     None,
                 ),
                 Err(error) => (Vec::new(), Some(resource_storage_error(plugin_id, &error))),
@@ -604,7 +582,6 @@ impl PluginHost {
     async fn present_resources(
         &self,
         entry: &PluginEntry,
-        executable: &Path,
         definition: &ResourceDefinition,
         records: &[ResourceRecord],
     ) -> Vec<PluginResourceView> {
@@ -620,7 +597,7 @@ impl PluginHost {
             .flat_map(|record| Self::resource_origins(entry, Some(record)))
             .collect();
         let presented = self
-            .worker(entry, executable)
+            .worker(entry)
             .await
             .invoke(
                 "resource.present",
@@ -707,7 +684,6 @@ impl PluginHost {
     async fn sync_provider_models_for_resource(
         &self,
         entry: &PluginEntry,
-        executable: &Path,
         resource_type: &str,
         changed: &HashSet<String>,
     ) -> Option<String> {
@@ -717,13 +693,7 @@ impl PluginHost {
                 continue;
             }
             let catalog = self
-                .provider_models(
-                    entry,
-                    executable,
-                    provider,
-                    CatalogRefresh::Forced,
-                    Some(changed),
-                )
+                .provider_models(entry, provider, CatalogRefresh::Forced, Some(changed))
                 .await;
             errors.extend(catalog.error);
         }
@@ -733,7 +703,6 @@ impl PluginHost {
     async fn provider_models(
         &self,
         entry: &PluginEntry,
-        executable: &Path,
         provider: &ValidatedProvider,
         refresh: CatalogRefresh,
         only: Option<&HashSet<String>>,
@@ -757,7 +726,7 @@ impl PluginHost {
                 continue;
             }
             let catalog = self
-                .live_models_for_resource(entry, executable, provider, &record, refresh)
+                .live_models_for_resource(entry, provider, &record, refresh)
                 .await;
             models.extend(catalog.models);
             if let Some(error) = catalog.error {
@@ -773,7 +742,6 @@ impl PluginHost {
     async fn live_models_for_resource(
         &self,
         entry: &PluginEntry,
-        executable: &Path,
         provider: &ValidatedProvider,
         record: &ResourceRecord,
         refresh: CatalogRefresh,
@@ -787,7 +755,7 @@ impl PluginHost {
             return cached;
         }
         let result = self
-            .list_models(entry, executable, provider, Some(record))
+            .list_models(entry, provider, Some(record))
             .await
             .map_err(|error| error.to_string());
         self.inner.catalogs.store(key, result, &record.id).await
@@ -796,7 +764,6 @@ impl PluginHost {
     async fn list_models(
         &self,
         entry: &PluginEntry,
-        executable: &Path,
         provider: &ValidatedProvider,
         resource: Option<&ResourceRecord>,
     ) -> Result<Vec<StoredModel>> {
@@ -807,7 +774,7 @@ impl PluginHost {
             _ => None,
         };
         let value = self
-            .worker(entry, executable)
+            .worker(entry)
             .await
             .invoke(
                 "models.list",
@@ -846,39 +813,16 @@ impl PluginHost {
             .await;
     }
 
-    /// Re-detects Bun while the catalog has not been loaded yet, and hands back
-    /// the detected path.
-    ///
-    /// Detection walks `PATH` on the filesystem, so it runs before anything is
-    /// locked.
-    async fn runtime(&self) -> Option<std::path::PathBuf> {
-        if let Some(executable) = self.inner.executable.read().await.clone() {
-            return Some(executable);
-        }
-        let detected = find_bun();
-        let mut executable = self.inner.executable.write().await;
-        if let Some(current) = executable.as_ref() {
-            return Some(current.clone());
-        }
-        executable.clone_from(&detected);
-        detected
-    }
-
-    async fn executable(&self) -> Result<std::path::PathBuf> {
-        self.runtime()
-            .await
-            .ok_or_else(|| Error::Runtime(super::text("plugin.error.bun_missing")))
-    }
-
-    async fn entries(&self, executable: &Path) -> Arc<[Arc<PluginEntry>]> {
+    async fn entries(&self) -> Arc<[Arc<PluginEntry>]> {
         if let Some(entries) = self.inner.entries.read().await.as_ref() {
             return Arc::clone(entries);
         }
         let loaded: Arc<[Arc<PluginEntry>]> = self
             .inner
             .catalog
-            .entries(executable)
+            .entries()
             .await
+            .unwrap_or_default()
             .into_iter()
             .map(Arc::new)
             .collect();
@@ -888,8 +832,8 @@ impl PluginHost {
         loaded
     }
 
-    async fn find_entry(&self, executable: &Path, plugin_id: &str) -> Result<Arc<PluginEntry>> {
-        self.entries(executable)
+    async fn find_entry(&self, plugin_id: &str) -> Result<Arc<PluginEntry>> {
+        self.entries()
             .await
             .iter()
             .find(|entry| entry.manifest.id == plugin_id)
@@ -897,15 +841,23 @@ impl PluginHost {
             .ok_or_else(|| Error::NotFound(format!("plugin {plugin_id}")))
     }
 
-    async fn worker(&self, entry: &PluginEntry, executable: &Path) -> Arc<PluginWorker> {
+    async fn worker(&self, entry: &PluginEntry) -> Arc<PluginWorker> {
         let mut workers = self.inner.workers.lock().await;
-        Arc::clone(workers.entry(entry.manifest.id.clone()).or_insert_with(|| {
-            Arc::new(PluginWorker::new(
-                entry,
-                executable.to_path_buf(),
-                self.inner.catalog.loader().clone(),
-            ))
-        }))
+        Arc::clone(
+            workers
+                .entry(entry.manifest.id.clone())
+                .or_insert_with(|| Arc::new(PluginWorker::new(entry, self.inner.catalog.loader()))),
+        )
+    }
+
+    #[cfg(test)]
+    async fn last_invoke_frame(&self, plugin_id: &str) -> Vec<u8> {
+        self.inner
+            .workers
+            .lock()
+            .await
+            .get(plugin_id)
+            .map_or_else(Vec::new, |worker| worker.last_invoke_frame())
     }
 
     #[cfg(test)]
@@ -1073,15 +1025,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn magpie_catalog_through_real_bun() {
-        assert!(
-            find_bun().is_some(),
-            "install Bun on PATH to run the Magpie integration test"
-        );
+    async fn magpie_catalog_through_quickjs() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("data");
         let host = PluginHost::new(
-            PluginCatalog::for_test(temp.path()).unwrap(),
+            PluginCatalog::for_test(temp.path()),
             PluginDataStore::at(root.clone()).unwrap(),
         );
         let initial = host.snapshot().await;
@@ -1252,10 +1200,13 @@ mod tests {
         (origin, requests, received, disconnected, task)
     }
 
-    async fn configured_invocation_host(root: &Path, origin: String) -> (PluginHost, String) {
+    async fn configured_invocation_host(
+        root: &std::path::Path,
+        origin: String,
+    ) -> (PluginHost, String) {
         std::fs::create_dir_all(root).unwrap();
         let host = PluginHost::new(
-            PluginCatalog::for_test(root).unwrap(),
+            PluginCatalog::for_test(root),
             PluginDataStore::at(root.join("data")).unwrap(),
         );
         host.form_submit(
@@ -1308,10 +1259,6 @@ mod tests {
 
     #[tokio::test]
     async fn magpie_invocation_serializes_files_per_protocol() {
-        assert!(
-            find_bun().is_some(),
-            "install Bun on PATH to run the Magpie integration test"
-        );
         let temp = tempfile::tempdir().unwrap();
         let responses = invocation_gateway(
             "/v1/responses",
@@ -1365,10 +1312,6 @@ mod tests {
 
     #[tokio::test]
     async fn magpie_invocation_propagates_cancellation() {
-        assert!(
-            find_bun().is_some(),
-            "install Bun on PATH to run the Magpie integration test"
-        );
         let temp = tempfile::tempdir().unwrap();
         let messages = invocation_gateway("/v1/messages", "").await;
         let messages_host =
@@ -1415,10 +1358,6 @@ mod tests {
 
     #[tokio::test]
     async fn magpie_invocation_records_the_completed_call() {
-        assert!(
-            find_bun().is_some(),
-            "install Bun on PATH to run the Magpie integration test"
-        );
         let temp = tempfile::tempdir().unwrap();
         let store = crate::calls::CallStore::at(temp.path().join("calls.db"));
         store
@@ -1482,10 +1421,6 @@ mod tests {
 
     #[tokio::test]
     async fn magpie_invocation_records_cancellation() {
-        assert!(
-            find_bun().is_some(),
-            "install Bun on PATH to run the Magpie integration test"
-        );
         let temp = tempfile::tempdir().unwrap();
         let store = crate::calls::CallStore::at(temp.path().join("calls.db"));
         let messages = invocation_gateway("/v1/messages", "").await;
@@ -1535,10 +1470,6 @@ mod tests {
 
     #[tokio::test]
     async fn magpie_invocation_marks_resource_invalid_on_http_401() {
-        assert!(
-            find_bun().is_some(),
-            "install Bun on PATH to run the Magpie integration test"
-        );
         let temp = tempfile::tempdir().unwrap();
         let gateway =
             invocation_gateway_with_status("/v1/chat/completions", "unauthorized\n", 401).await;
@@ -1592,10 +1523,6 @@ mod tests {
 
     #[tokio::test]
     async fn magpie_invoke_frame_does_not_include_or_grow_with_the_model_body() {
-        assert!(
-            find_bun().is_some(),
-            "install Bun on PATH to run the Magpie integration test"
-        );
         let temp = tempfile::tempdir().unwrap();
         let gateway = invocation_gateway(
             "/v1/responses",
@@ -1620,7 +1547,7 @@ mod tests {
             short.next().await,
             Some(Ok(ModelEvent::Start { .. }))
         ));
-        let short_frame = super::super::worker::last_invoke_frame();
+        let short_frame = host.0.last_invoke_frame(MAGPIE).await;
         let short_params = invoke_frame_params(&short_frame);
         assert_invoke_frame_has_no_body(&short_params);
         drop(short);
@@ -1655,7 +1582,7 @@ mod tests {
             long.next().await,
             Some(Ok(ModelEvent::Start { .. }))
         ));
-        let long_frame = super::super::worker::last_invoke_frame();
+        let long_frame = host.0.last_invoke_frame(MAGPIE).await;
         let long_params = invoke_frame_params(&long_frame);
         assert_invoke_frame_has_no_body(&long_params);
         assert_eq!(short_frame.len(), long_frame.len());
@@ -1701,5 +1628,35 @@ mod tests {
                 model: "resource-1/gpt-5",
             })
         );
+    }
+    #[tokio::test]
+    async fn collector_failures_are_visible_as_safe_vm_failed_snapshots() {
+        for source in [
+            "throw new Error('secret private-source-path')",
+            "await Promise.reject(new Error('secret private-source-path'))",
+            "await import('./missing.js')",
+        ] {
+            let modules = super::super::vm::loader::Modules(Box::leak(
+                vec![("sdk/collect.js", source)].into_boxed_slice(),
+            ));
+            let root = tempfile::tempdir().unwrap();
+            let host = PluginHost::new(
+                PluginCatalog::with_modules(modules),
+                PluginDataStore::at(root.path().join("data")).unwrap(),
+            );
+            let snapshot = host.snapshot().await;
+            assert!(!snapshot.runtime_ready);
+            assert_eq!(
+                snapshot.runtime_error,
+                Some(super::super::text("plugin.error.vm_failed"))
+            );
+            assert_eq!(snapshot.plugins.len(), 1);
+            assert!(!snapshot.plugins[0].runtime_ready);
+            assert!(
+                !serde_json::to_string(&snapshot)
+                    .unwrap()
+                    .contains("private-source-path")
+            );
+        }
     }
 }

@@ -21,7 +21,7 @@ pub enum Error {
     Cancelled,
     #[error("{0}")]
     NotFound(String),
-    /// A plugin runtime (the Bun worker or its executable) is unavailable.
+    /// A plugin VM is unavailable.
     #[error("{0}")]
     Runtime(String),
     /// A storage operation failed and the message is all there is to say.

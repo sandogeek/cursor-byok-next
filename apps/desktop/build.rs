@@ -1,7 +1,10 @@
 //! Generates Cursor protobuf bindings used by the local loop.
 use std::{env, path::PathBuf};
 
+mod plugin_compile;
+
 fn main() {
+    plugin_compile::build().expect("compile embedded plugin modules");
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let proto_dir = manifest.join("../../protocols/cursor");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));

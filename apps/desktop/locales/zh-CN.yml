@@ -73,9 +73,7 @@ plugins:
   loading: 正在读取插件状态…
   runtime:
     failed: 无法加载 Magpie 插件
-    missingBun: 需要 Bun 才能加载 Magpie 插件
     retry: 请重试加载内置插件。
-    installBun: 把 bun 放到 PATH 后刷新。
     refresh: 刷新状态
   magpie:
     description: 从 Magpie 网关读取实时模型目录。
@@ -109,8 +107,8 @@ plugins:
 
 plugin:
   error:
-    bun_missing: 未在 PATH 中找到 Bun。
-    builtin_unavailable: 无法加载内置 Magpie 插件，请检查 Bun 是否可用后重试。
+    vm_failed: 插件虚拟机初始化失败，请重试。
+    builtin_unavailable: 无法加载内置 Magpie 插件，请重试。
     storage_unreadable: 无法读取已保存的网关，请检查插件数据文件后重试。
     storage_save_failed: 无法保存网关，请检查插件数据目录。
     storage_remove_failed: 无法移除网关，请检查插件数据目录。
