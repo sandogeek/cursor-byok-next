@@ -73,9 +73,7 @@ plugins:
   loading: Reading plugin state…
   runtime:
     failed: Magpie could not load
-    missingBun: Bun is required to load Magpie
     retry: Try loading the built-in plugin again.
-    installBun: Put bun on PATH, then refresh.
     refresh: Refresh
   magpie:
     description: Live model catalog from a Magpie gateway.
@@ -109,8 +107,8 @@ plugins:
 
 plugin:
   error:
-    bun_missing: Bun is not on PATH.
-    builtin_unavailable: Magpie could not load. Check that Bun is available and try again.
+    vm_failed: Plugin VM initialization failed. Please retry.
+    builtin_unavailable: Magpie could not load. Please retry.
     storage_unreadable: Could not read saved gateways. Check the plugin data file and try again.
     storage_save_failed: Could not save the gateway. Check the plugin data directory.
     storage_remove_failed: Could not remove the gateway. Check the plugin data directory.

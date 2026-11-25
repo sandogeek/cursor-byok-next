@@ -125,7 +125,7 @@ const sampleDetail: CallDetail = {
   chunks: [{ seq: 0, receivedOffsetMs: 12, data: "data: [DONE]\\n\\n", byteCount: 14 }],
 };
 
-function options(initial: HarnessState, calls: string[] = [], plugins: PluginSnapshot = { runtimeReady: false, runtimeError: "bun is not on PATH", plugins: [] }, records: CallsSnapshot = emptyCalls) {
+function options(initial: HarnessState, calls: string[] = [], plugins: PluginSnapshot = { runtimeReady: false, runtimeError: "plugin VM failed", plugins: [] }, records: CallsSnapshot = emptyCalls) {
   let current = initial;
   let catalog = plugins;
   let log = records;
@@ -265,7 +265,7 @@ test("插件页显示 Magpie 目录且不含密钥", async () => {
   expect(calls).toEqual(["refreshCatalog"]);
 });
 
-test("已安装 Bun 时，插件加载失败可重试而不会误报缺少 Bun", async () => {
+test("插件虚拟机加载失败可重试", async () => {
   const setup = options(ready, [], { runtimeReady: true, runtimeError: "内置插件加载失败", plugins: [] });
   let loads = 0;
   setup.host.handlers["plugins.snapshot"] = () => ++loads === 1
@@ -274,7 +274,7 @@ test("已安装 Bun 时，插件加载失败可重试而不会误报缺少 Bun",
   const app = await open("./test-fixtures/App.tsx", setup);
   await app.press("插件配置");
   expect(app.texts()).toContain("无法加载 Magpie 插件");
-  expect(app.texts()).not.toContain("需要 Bun 才能加载 Magpie 插件");
+  expect(app.texts()).toContain("刷新状态");
   await app.press("刷新状态");
   expect(app.texts()).toContain("GPT-5");
 });

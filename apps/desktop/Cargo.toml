@@ -9,6 +9,8 @@ publish = false
 workspace = true
 
 [dependencies]
+libc = "0.2"
+rquickjs = { package = "quickjs-jit", version = "=0.14.2", default-features = false, features = ["std", "loader"] }
 async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"
@@ -45,16 +47,18 @@ uuid = { version = "1", features = ["v4"] }
 x509-parser = "0.18"
 
 [build-dependencies]
+oxc = { version = "0.159", features = ["semantic", "transformer", "codegen", "ast_visit"] }
 prost-build = "0.14"
 protoc-bin-vendored = "3"
 
 [dev-dependencies]
+oxc = { version = "0.159", features = ["semantic", "transformer", "codegen", "ast_visit"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Threading"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"

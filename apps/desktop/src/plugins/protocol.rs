@@ -1,40 +1,21 @@
-//! Defines newline-delimited messages exchanged with a plugin worker.
-//!
-//! Host → worker: [`HostMessage`] frames, one JSON object per line. Worker →
-//! host: [`WorkerMessage`] frames, same framing. A worker may issue
-//! `host_call` frames at any time while its invocation is registered; every
-//! such call must be answered with exactly one `host_result` or `host_error`
-//! carrying the same id.
+//! Defines the JSON session frames exchanged with a plugin VM.
+//! Legacy capability frames remain parseable for diagnostics, never executable.
 
 use serde::{Deserialize, Serialize};
 
 /// One frame the host writes to a worker's stdin.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum HostMessage<'a> {
+pub enum HostMessage {
     /// Starts an invocation. The worker answers with events and one `result`.
     Request {
-        id: &'a str,
-        method: &'a str,
-        params: &'a serde_json::Value,
+        id: String,
+        method: String,
+        params: serde_json::Value,
     },
     /// Withdraws an in-flight request; the worker should stop and answer with
     /// a cancelled result.
-    Cancel { id: &'a str },
-    /// The answer to a worker's `host_call`.
-    HostResult {
-        id: &'a str,
-        result: &'a serde_json::Value,
-    },
-    /// The failed answer to a worker's `host_call`. `status` carries the HTTP
-    /// status when the failure was an upstream response, so a plugin can tell
-    /// an auth failure from a transport failure.
-    HostError {
-        id: &'a str,
-        error: &'a str,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        status: Option<u16>,
-    },
+    Cancel { id: String },
 }
 
 /// One frame a worker writes to stdout.
@@ -57,6 +38,13 @@ pub enum WorkerMessage {
     },
     /// A capability call the worker makes back into the host. `request_id`
     /// attributes it to the invocation that is allowed to make it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "legacy frames are parsed only for diagnostics and never executed"
+        )
+    )]
     HostCall {
         id: String,
         #[serde(rename = "requestId")]
@@ -86,32 +74,31 @@ mod tests {
                 id,
                 request_id,
                 method,
-                ..
+                params,
             } => {
                 assert_eq!(id, "host-2");
                 assert_eq!(request_id, "request-1");
                 assert_eq!(method, "network.fetch");
+                assert_eq!(params["url"], "https://example.com");
             }
             _ => panic!("expected host call"),
         }
     }
 
     #[test]
-    fn serializes_host_error_status_only_when_present() {
-        let with_status = serde_json::to_value(&HostMessage::HostError {
-            id: "host-1",
-            error: "HTTP 401: unauthorized",
-            status: Some(401),
-        })
-        .unwrap();
-        assert_eq!(with_status["type"], "host_error");
-        assert_eq!(with_status["status"], 401);
-        let without_status = serde_json::to_value(&HostMessage::HostError {
-            id: "host-1",
-            error: "plugin host call failed",
-            status: None,
-        })
-        .unwrap();
-        assert!(without_status.get("status").is_none());
+    fn golden_request_and_cancel_bytes() {
+        let request = HostMessage::Request {
+            id: "r1".into(),
+            method: "models.list".into(),
+            params: serde_json::json!({"providerId":"magpie"}),
+        };
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"type":"request","id":"r1","method":"models.list","params":{"providerId":"magpie"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&HostMessage::Cancel { id: "r1".into() }).unwrap(),
+            r#"{"type":"cancel","id":"r1"}"#
+        );
     }
 }
