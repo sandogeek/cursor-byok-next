@@ -1,0 +1,72 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Attach: Cursor-BYOK-Next (nsh host)",
+      "type": "lldb",
+      "request": "attach",
+      "program": "${workspaceFolder}/apps/desktop/target/debug/nsh-app-cursor-byok-next-macos-host",
+      "waitFor": true,
+      "sourceLanguages": ["rust"]
+    },
+    {
+      "name": "Attach: pick process",
+      "type": "lldb",
+      "request": "attach",
+      "pid": "${command:pickMyProcess}",
+      "sourceLanguages": ["rust"]
+    },
+    {
+      "name": "Debug tests: nsh-app-cursor-byok-next",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--lib",
+          "-p",
+          "nsh-app-cursor-byok-next"
+        ],
+        "cwd": "${workspaceFolder}",
+        "filter": {
+          "name": "nsh_app_cursor_byok_next",
+          "kind": "lib"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "sourceLanguages": ["rust"]
+    },
+    {
+      "name": "Launch: cursor-capture",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["run", "--bin", "cursor-capture"],
+        "cwd": "${workspaceFolder}",
+        "filter": {
+          "name": "cursor-capture",
+          "kind": "bin"
+        }
+      },
+      "cwd": "${workspaceFolder}",
+      "sourceLanguages": ["rust"]
+    },
+    {
+      "name": "Launch: cursor-protocol-extractor",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["run", "--bin", "cursor-protocol-extractor"],
+        "cwd": "${workspaceFolder}",
+        "filter": {
+          "name": "cursor-protocol-extractor",
+          "kind": "bin"
+        }
+      },
+      "cwd": "${workspaceFolder}",
+      "sourceLanguages": ["rust"]
+    }
+  ]
+}
