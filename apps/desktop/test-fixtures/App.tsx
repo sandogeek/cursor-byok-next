@@ -1,5 +1,5 @@
 import { host, mount, setColorScheme } from "nsh";
-import { Window } from "nsh/desktop";
+import type { WindowRef } from "nsh/desktop";
 import type { CallDetail, CallsSnapshot, DesktopState, HarnessState, PluginFormResult, PluginSnapshot } from "cursor-byok-next/native";
 import { Cursor } from "../src/screens/Cursor";
 import { restoreLocale } from "../src/screens/Language";
@@ -43,11 +43,15 @@ const desktop = {
   snapshot: () => host.call<DesktopState>("desktop.snapshot"),
   restore: () => host.call<void>("desktop.restore"),
   setDockIconVisible: (visible: boolean) => host.call<DesktopState>("desktop.setDockIconVisible", { visible }),
+  setWindowPresence: (presence: "open" | "closed") => host.call<void>("desktop.setWindowPresence", { presence }),
   setAppearance: (appearance: string) => host.call<void>("desktop.setAppearance", { appearance }),
 };
 
 void restoreAppearance().then(async (appearance) => {
   if (appearance) await desktop.setAppearance(appearance);
 }).then(() => restoreLocale()).then(() => {
-  mount(() => <Cursor takeover={takeover} plugins={plugins} calls={calls} desktop={desktop} trayIcon={trayIcon} />);
+  let window: WindowRef | undefined;
+  mount(() => <Cursor takeover={takeover} plugins={plugins} calls={calls} desktop={desktop} trayIcon={trayIcon} onWindow={(value) => { window = value; }} />);
+  host.on("tray.open", () => window?.focus());
+  host.on("window.minimize", () => window?.minimize());
 });

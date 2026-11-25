@@ -1,4 +1,4 @@
-import { Clipboard, createMotion, platform, resource, Scroll, signal, Text, View } from "nsh";
+import { Clipboard, createMotion, effect, platform, resource, Scroll, signal, Text, View } from "nsh";
 import { Tray, currentWindow, titleBar } from "nsh/desktop";
 import { t } from "nsh/i18n";
 import type { HarnessState, DesktopState } from "cursor-byok-next/native";
@@ -39,13 +39,26 @@ export interface DesktopPreferences {
   snapshot(): Promise<DesktopState>;
   restore(): Promise<void>;
   setDockIconVisible(visible: boolean): Promise<DesktopState>;
+  setWindowPresence(presence: "open" | "closed"): Promise<void>;
   setAppearance(appearance: Appearance): Promise<void>;
 }
 
 export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog; calls: CallLog; desktop: DesktopPreferences; trayIcon: ImageAsset | string; onWindow?: (window: WindowRef) => void }) {
   const window = currentWindow();
   props.onWindow?.(window);
-  const reopen = () => window.focus();
+  const syncWindowPresence = (presence: "open" | "closed") =>
+    props.desktop.setWindowPresence(presence).catch((cause: unknown) => {
+      console.warn("the Dock icon state did not follow the window", cause);
+    });
+  const reopen = () => {
+    if (platform.os === "macos") {
+      // Restore Regular activation policy before focusing when Dock is enabled
+      // so the menu bar and Dock icon appear with the window.
+      void syncWindowPresence("open").finally(() => window.focus());
+      return;
+    }
+    window.focus();
+  };
   Tray.set({
     icon: props.trayIcon,
     tooltip: "Cursor-BYOK-Next",
@@ -59,6 +72,16 @@ export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog
   if (platform.os === "macos") {
     window.set({ closeOnPress: false });
     window.on("closePress", () => window.hide());
+    let wasOpen: boolean | undefined;
+    effect(() => {
+      const state = window.state();
+      if (!state) return;
+      const open = state.visible || state.minimized;
+      if (wasOpen !== undefined && open !== wasOpen) {
+        void syncWindowPresence(open ? "open" : "closed");
+      }
+      wasOpen = open;
+    });
   }
   const page = signal<"cursor" | "plugins" | "calls" | "settings">("cursor");
   const selectedCall = signal<string | null>(null);

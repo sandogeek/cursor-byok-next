@@ -85,7 +85,7 @@ src/ui/appearance.ts     34  外观持久化（Storage 键）+ 启动返回值
 | 7 | Token 定价 | 四个单价字段，前端换算首页用量 | 不做 | 没有首页用量概览（`MODEL_CALLS.md` 刻意不做） |
 | 8 | 应用生命周期 | 开机启动 / 静默启动 / Dock 图标 / 托盘 | 接入 Dock 图标与托盘重开；其余不做 | Dock 通过 `objc2-app-kit` 在 NSH 主线程切换 `NSApplicationActivationPolicy`；托盘复用 `nsh/desktop` 的原生实现，开机启动与静默启动仍超出本步 |
 | 8a | Dock 设置载体 | SQLite `desktop_settings.show_dock_icon` | 独立 `desktop.json` 的 `dockIcon`，由 `Desktop` 独占 | 不混进 `harness.json` 的 Cursor 接管状态机；读写与代理端口互不覆盖 |
-| 8b | Dock 窗口联动 | 无窗口时先 `app.hide()` 再切 Accessory；托盘可重开窗口 | 只切 Activation Policy；macOS 关闭按钮隐藏窗口；托盘 `onClick` 与菜单「打开」共用 `currentWindow().focus()`（NSH 的 `Window.get("main")` 不返回该窗口） | NSH 的 `WindowRef` 已负责取消最小化、显示和激活；保留同一引擎，不复制上游的窗口销毁与重建逻辑 |
+| 8b | Dock 窗口联动 | 无窗口时先 `app.hide()` 再切 Accessory；托盘可重开窗口 | `WindowPresence::dock_icon(preference)` 统一决定当前有效策略；macOS 关闭按钮隐藏窗口后自动切 `Accessory`（不改写 `desktop.json` 的用户偏好），最小化保留 Dock 图标；托盘 `onClick` 与菜单「打开」恢复 `Regular`（若偏好开启）并经 `currentWindow().focus()` 聚焦（NSH 的 `Window.get("main")` 不返回该窗口） | NSH 的 `WindowRef` 已负责取消最小化、显示和激活，监听 `window.state()`（`visible \|\| minimized`）也自然覆盖全屏退出后再隐藏的时序；保留同一引擎，不复制上游的窗口销毁与重建逻辑 |
 | 8c | Dock 失败语义 | AppKit 切换后保存，失败尝试回滚 | 相同；读取页只调 `snapshot`，启动仅 `restore` 一次 | 打开设置页不能重复改系统策略；保存失败时开关保留最后确认值 |
 | 9 | 调用观测 | 独立「调用观测」卡片 | 合并进「调用记录」，与调用详细页共享 `Calls` class | 详细模式只有一个所有者；两页各写一份会让开关抢写 |
 | 10 | 存储清理范围 | `details` / `all` 两档，清理后刷新全应用 store | 同样两档，只刷新本页 `CallsSnapshot` | 没有全局 store；调用详细页下次进入会自己读 |
@@ -123,7 +123,7 @@ src/ui/appearance.ts     34  外观持久化（Storage 键）+ 启动返回值
 13. **`data_dir()` 每进程解析一次**（`OnceLock`），所有存储共用同一个目录值。
 14. **Dock 只在 macOS 暴露并立即生效**，默认 `Visible`；`desktop.json` 用原子写，成功后才更新 Rust 的已确认状态。
 15. **AppKit 只经 NSH 的 `run_on_main_thread` 调用**。先切策略再保存；保存失败必须尝试恢复旧策略，界面不更新为新值。
-16. **Dock 隐藏不销毁或隐藏当前窗口**，也不阻止接管后台运行。托盘点击或「打开」必须恢复并聚焦同一主窗口；退出走系统 `quit`，不能仅隐藏窗口。
+16. **Dock 隐藏不销毁或隐藏当前窗口**，也不阻止接管后台运行。关闭最后一个窗口后自动切为 `Accessory` 隐藏 Dock 图标但不改写 `desktop.json`；最小化到 Dock 仍视为窗口开启，不隐藏 Dock 图标。托盘点击或「打开」必须按偏好恢复并聚焦同一主窗口；退出走系统 `quit`，不能仅隐藏窗口。
 17. **读取与恢复分开**：设置页 `snapshot()` 只读，启动 `restore()` 才应用保存的策略；失败记录日志而不阻断界面。
 18. **macOS 关闭按钮只隐藏窗口**，不能销毁引擎、接管代理或调用存储；其他平台保留默认关闭行为。托盘点击与菜单「打开」共用同一 `currentWindow()` 引用的 `focus()`；不经 `Window.get("main")`（该 API 不返回本应用主窗口）。
 

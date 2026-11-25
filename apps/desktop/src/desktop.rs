@@ -25,6 +25,33 @@ impl DockIcon {
     }
 }
 
+/// Whether the app currently has an open window (visible on screen or
+/// minimized to the Dock).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PropEnum)]
+pub enum WindowPresence {
+    /// At least one window is open (or minimized in the Dock).
+    #[default]
+    Open,
+    /// Every window has been closed (hidden to the menu bar tray).
+    Closed,
+}
+
+impl WindowPresence {
+    /// Resolves the macOS Dock icon policy from the user's saved preference
+    /// and whether a window is currently open.
+    ///
+    /// Closing the last window hides the app into the menu bar tray, so the
+    /// Dock icon hides even when the preference is [`DockIcon::Visible`];
+    /// reopening a window restores it when the preference allows.
+    #[must_use]
+    pub fn dock_icon(self, preference: DockIcon) -> DockIcon {
+        match self {
+            Self::Open => preference,
+            Self::Closed => DockIcon::Hidden,
+        }
+    }
+}
+
 /// The appearance the app shows in, the same choice `setColorScheme` applies
 /// to the screens.
 ///
@@ -313,5 +340,25 @@ mod tests {
     fn the_policy_reports_the_visibility_the_toggle_binds_to() {
         assert!(DockIcon::Visible.is_visible());
         assert!(!DockIcon::Hidden.is_visible());
+    }
+
+    #[test]
+    fn closing_the_last_window_hides_the_dock_icon_without_losing_the_preference() {
+        assert_eq!(
+            WindowPresence::Open.dock_icon(DockIcon::Visible),
+            DockIcon::Visible
+        );
+        assert_eq!(
+            WindowPresence::Open.dock_icon(DockIcon::Hidden),
+            DockIcon::Hidden
+        );
+        assert_eq!(
+            WindowPresence::Closed.dock_icon(DockIcon::Visible),
+            DockIcon::Hidden
+        );
+        assert_eq!(
+            WindowPresence::Closed.dock_icon(DockIcon::Hidden),
+            DockIcon::Hidden
+        );
     }
 }

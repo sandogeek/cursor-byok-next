@@ -97,6 +97,7 @@ const desktop = {
   snapshot: async () => ({ showDockIcon: true }),
   restore: async () => {},
   setDockIconVisible: async () => ({ showDockIcon: true }),
+  setWindowPresence: async () => {},
   setAppearance: async () => {},
 };
 

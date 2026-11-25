@@ -158,6 +158,9 @@ function options(initial: HarnessState, calls: string[] = [], plugins: PluginSna
           calls.push(visible ? "dock-on" : "dock-off");
           return { showDockIcon: visible };
         },
+        "desktop.setWindowPresence": ({ presence }: { presence: string }) => {
+          calls.push(`window:${presence}`);
+        },
         "desktop.setAppearance": ({ appearance }: { appearance: string }) => {
           calls.push(`appearance:${appearance}`);
         },
@@ -461,4 +464,21 @@ test("调用详细空状态与英文文案", async () => {
   await app.press("English");
   await app.press("Calls");
   expect(app.texts()).toContain("No Magpie calls yet. They appear here after Cursor uses a local model.");
+});
+
+test("macOS 关闭最后一个窗口时自动隐藏 Dock 图标，最小化保留且重开恢复", async () => {
+  const calls: string[] = [];
+  const app = await open("./test-fixtures/App.tsx", options(ready, calls));
+  await app.host.send("window.minimize", {});
+  expect(app.window("main").state()?.minimized).toBe(true);
+  expect(calls).toEqual([]);
+  await app.host.send("tray.open", {});
+  expect(app.window("main").state()?.visible).toBe(true);
+  expect(calls).toEqual([]);
+  await app.window("main").pressClose();
+  expect(app.window("main").state()?.visible).toBe(false);
+  expect(calls).toEqual(["window:closed"]);
+  await app.host.send("tray.open", {});
+  expect(app.window("main").state()?.visible).toBe(true);
+  expect(calls).toEqual(["window:closed", "window:open"]);
 });

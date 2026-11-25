@@ -41,7 +41,7 @@ use tokio::sync::watch;
 
 use self::backend::Backend;
 use self::calls::{CallStatus, CallStore, PayloadStorage};
-pub use self::desktop::AppAppearance;
+pub use self::desktop::{AppAppearance, WindowPresence};
 use self::harness::{
     CaState as HarnessCa, CursorHarness, Error as HarnessError, HarnessPaths, HarnessStatus,
     IntegrationState as HarnessIntegration,
@@ -78,13 +78,23 @@ impl From<desktop::DockIcon> for DesktopState {
     }
 }
 
-/// Desktop shell settings. macOS restores and applies the Dock choice at startup.
-#[class]
-pub struct Desktop {
+struct DesktopInner {
     settings: parking_lot::Mutex<desktop::DesktopSettings>,
+    window_presence: parking_lot::Mutex<WindowPresence>,
+    /// The Dock policy last applied to `AppKit` (or assumed at launch);
+    /// avoids redundant main-thread calls when the effective policy is unchanged.
+    dock_applied: parking_lot::Mutex<Option<desktop::DockIcon>>,
+    /// Serializes `AppKit` Dock policy transitions across concurrent calls.
+    dock_sync: tokio::sync::Mutex<()>,
     /// The appearance last handed to `AppKit`; `None` before any was. Asking
     /// for the same one again then costs no trip to the main thread.
     applied: parking_lot::Mutex<Option<AppAppearance>>,
+}
+
+/// Desktop shell settings. macOS restores and applies the Dock choice at startup.
+#[class]
+pub struct Desktop {
+    inner: Arc<DesktopInner>,
 }
 
 impl std::fmt::Debug for Desktop {
@@ -100,8 +110,13 @@ impl Desktop {
     /// Restores the desktop shell's saved settings.
     pub fn new() -> Result<Self, Error> {
         Ok(Self {
-            settings: parking_lot::Mutex::new(desktop::DesktopSettings::managed()?),
-            applied: parking_lot::Mutex::new(None),
+            inner: Arc::new(DesktopInner {
+                settings: parking_lot::Mutex::new(desktop::DesktopSettings::managed()?),
+                window_presence: parking_lot::Mutex::new(WindowPresence::Open),
+                dock_applied: parking_lot::Mutex::new(None),
+                dock_sync: tokio::sync::Mutex::new(()),
+                applied: parking_lot::Mutex::new(None),
+            }),
         })
     }
 
@@ -115,17 +130,24 @@ impl Desktop {
         reason = "the #[class] binding is async-only; a sync member would change the generated TSX type"
     )]
     pub async fn snapshot(this: Instance<Self>) -> DesktopState {
-        this.with(|desktop| desktop.settings.lock().dock_icon())
+        this.with(|desktop| desktop.inner.settings.lock().dock_icon())
             .into()
     }
 
     /// Applies the restored Dock setting after the native window is mounted.
     pub async fn restore(this: Instance<Self>) {
-        let dock_icon = this.with(|desktop| desktop.settings.lock().dock_icon());
-        if dock_icon == desktop::DockIcon::Hidden
-            && let Err(error) = desktop::set_dock_icon(dock_icon).await
-        {
-            tracing::warn!(%error, "could not restore the Dock icon setting");
+        let inner = this.with(|desktop| Arc::clone(&desktop.inner));
+        let _sync = inner.dock_sync.lock().await;
+        let preference = inner.settings.lock().dock_icon();
+        let presence = *inner.window_presence.lock();
+        let effective = presence.dock_icon(preference);
+        if effective == desktop::DockIcon::Hidden {
+            match desktop::set_dock_icon(effective).await {
+                Ok(()) => *inner.dock_applied.lock() = Some(effective),
+                Err(error) => tracing::warn!(%error, "could not restore the Dock icon setting"),
+            }
+        } else {
+            *inner.dock_applied.lock() = Some(effective);
         }
     }
 
@@ -143,18 +165,53 @@ impl Desktop {
         } else {
             desktop::DockIcon::Hidden
         };
-        let previous = this.with(|desktop| desktop.settings.lock().dock_icon());
-        desktop::set_dock_icon(requested).await?;
-        let saved = this.with_mut(|desktop| desktop.settings.lock().save(requested));
+        let inner = this.with(|desktop| Arc::clone(&desktop.inner));
+        let _sync = inner.dock_sync.lock().await;
+        let previous = inner.settings.lock().dock_icon();
+        let presence = *inner.window_presence.lock();
+        let effective = presence.dock_icon(requested);
+        let previous_applied = *inner.dock_applied.lock();
+        let changed = previous_applied != Some(effective);
+        if changed {
+            desktop::set_dock_icon(effective).await?;
+        }
+        let saved = inner.settings.lock().save(requested);
         if let Err(error) = saved {
             // `AppKit` already accepted the change; put the previous state back
             // rather than leaving the window out of sync with the file.
-            if let Err(rollback) = desktop::set_dock_icon(previous).await {
-                tracing::error!(%rollback, "could not roll back the Dock icon setting");
+            if changed {
+                let rollback_target =
+                    previous_applied.unwrap_or_else(|| presence.dock_icon(previous));
+                if let Err(rollback) = desktop::set_dock_icon(rollback_target).await {
+                    tracing::error!(%rollback, "could not roll back the Dock icon setting");
+                }
             }
             return Err(error);
         }
+        *inner.dock_applied.lock() = Some(effective);
         Ok(requested.into())
+    }
+
+    /// Updates whether any window is open so macOS hides the Dock icon when
+    /// the last window closes to the tray and restores it on reopen.
+    pub async fn set_window_presence(
+        this: Instance<Self>,
+        presence: WindowPresence,
+    ) -> Result<(), Error> {
+        let inner = this.with(|desktop| {
+            *desktop.inner.window_presence.lock() = presence;
+            Arc::clone(&desktop.inner)
+        });
+        let _sync = inner.dock_sync.lock().await;
+        let latest = *inner.window_presence.lock();
+        let preference = inner.settings.lock().dock_icon();
+        let effective = latest.dock_icon(preference);
+        if *inner.dock_applied.lock() == Some(effective) {
+            return Ok(());
+        }
+        desktop::set_dock_icon(effective).await?;
+        *inner.dock_applied.lock() = Some(effective);
+        Ok(())
     }
 
     /// Applies the app's appearance to the title bar the platform draws.
@@ -167,11 +224,12 @@ impl Desktop {
         this: Instance<Self>,
         appearance: AppAppearance,
     ) -> Result<(), Error> {
-        if this.with(|desktop| *desktop.applied.lock()) == Some(appearance) {
+        let inner = this.with(|desktop| Arc::clone(&desktop.inner));
+        if *inner.applied.lock() == Some(appearance) {
             return Ok(());
         }
         desktop::set_app_appearance(appearance).await?;
-        this.with(|desktop| *desktop.applied.lock() = Some(appearance));
+        *inner.applied.lock() = Some(appearance);
         Ok(())
     }
 }
