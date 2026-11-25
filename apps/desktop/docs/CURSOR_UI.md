@@ -34,6 +34,7 @@ Cursor-BYOK-Next/apps/desktop/src/            Cursor-BYOK-Next/apps/desktop/
 | 主题 | 上游 | nsh 版 | 原因 |
 |---|---|---|---|
 | 应用壳 | 浮动卡片侧栏（距窗口左/底 8px）+ 独立浮动操作条 | 侧栏贴紧窗口左缘并顶底拉满，右侧细线分隔；操作条仍浮动 | 根布局 `p-4` 把导航从左缘推开 16pt；贴边侧栏符合桌面 sidebar workspace，不再用外层 padding 冒充浮动卡片 |
+| 窗口 chrome | Tauri `titleBarStyle: Overlay` + `hidden_title`，网页内容画到窗口顶边，交通灯浮在内容上 | `nsh.json` 的 `"window": { "titleBar": { "style": "hidden" } }`；macOS 侧栏顶部留 `titleBar().height` 的空白带（`windowDrag`），页头右侧留 `titleBar().right`（Windows / GTK 的按钮） | 与上游同一形态：系统不画标题栏，应用内容顶到窗口边缘；用启动默认值而不是挂载后再 `set`，避免首帧前闪一条系统标题栏 |
 | 导航 | 数据概览 / 调用详细 / 模型配置 / Cursor / 设置分组 | 同样顺序与中文文案；调用详细与插件配置可进页，其余未移植项禁用 | 复刻壳子，不承诺未实现功能 |
 | Cursor 行 | 图标 + Cursor + 已接管 / 未接管胶囊 | 保留，状态取 `integration` | 同时表达代理与设置不一致的降级状态 |
 | 操作栏 | 状态 + 开关 + 刷新；添加模型按钮 | 保留前三项；不加无功能的添加按钮 | 本步只做接管页 |
@@ -59,6 +60,7 @@ Cursor-BYOK-Next/apps/desktop/src/            Cursor-BYOK-Next/apps/desktop/
 4. 状态刷新失败不覆盖最后可用状态，不用假数据填空。
 5. 证书命令只在弹窗里复制，绝不执行。
 6. 不接触模型配置、数据库、后端地址；不扩大本步移植范围。
+7. **窗口 chrome 由启动默认值决定，不由首帧后的 `set` 决定。** `nsh.json` 的 `"window"."titleBar"` 是隐藏标题栏的唯一声明处；应用只负责给系统窗口按钮留位置（macOS 侧栏顶部 `titleBar().height`，页头右侧 `titleBar().right`），并在这些空白带里 `windowDrag`。不新增第二个开关，不在 TSX 里再 `currentWindow().set({ titleBar })`。
 
 ## 验证
 
@@ -72,7 +74,7 @@ Cursor-BYOK-Next/apps/desktop/src/            Cursor-BYOK-Next/apps/desktop/
 
 - 圆角：贴边侧栏无外圆角；门禁与弹窗为大圆角，按钮与代码块为控制级圆角，状态标签为胶囊；嵌套表面边界一致。
 - 字体：页面标题 / 正文 / 辅助 / 代码四类角色，等宽字体只用于代理地址和命令；状态不靠字号单独表达。
-- 间距：侧栏贴紧窗口左缘，内侧仍为 6pt；主区 16pt 内边距；导航行、状态标签和刷新共享中线。
+- 间距：侧栏贴紧窗口左缘，内侧仍为 6pt；主区 16pt 内边距；导航行、状态标签和刷新共享中线。隐藏标题栏后，macOS 的侧栏顶部先空出 `titleBar().height`，页头右侧再空出 `titleBar().right`，导航与操作条不会压到系统窗口按钮。
 - 对齐：侧栏贴窗口左/顶/底边，与主区共享顶安全区；操作栏与标题共享中线，内容区为唯一滚动所有者，虚线边界贴合主区。
 - 颜色：展示代码不含原始颜色或调色板类；明暗截图中前景、辅助文本、按钮和代码块可辨识，成功 / 警告同时有文字。
 - hover / pressed / focus：控件具有语义按钮或开关、原生 focus-visible ring、颜色过渡与按压反馈；禁用项无操作反馈。
@@ -83,3 +85,5 @@ Cursor-BYOK-Next/apps/desktop/src/            Cursor-BYOK-Next/apps/desktop/
 - macOS 的 Tab → Enter / Space 激活路径未通过自动化验收；换用前台运行、Space、先点击相邻按钮再 Tab 均未打开弹窗。按钮指针操作与弹窗 Escape 已通过。需进一步确认 NSH 原生按钮键盘焦点行为，不能记为键盘全流程通过。
 - 尚未验证 VoiceOver、Windows / Linux、减少动态效果、大字号和窄窗口。当前只声明 macOS 桌面壳的视觉验收。
 - `Visual.test.tsx` 使用纯展示夹具，仅证明布局与 Escape；真实操作行为由 `App.test.tsx` 的隔离宿主测试覆盖，不把视觉夹具当作接管成功。
+- 隐藏标题栏这一轮只做了静态验证：`tsc --noEmit`（仓库内 `.nsh/tsconfig.json`）与 `cargo clippy -p nsh-app-cursor-byok-next --all-targets -- -D warnings` 通过，`cargo test -p nsh-app-cursor-byok-next --lib` 202 项通过。窗口 chrome 是原生窗口属性，`nsh test` 的 headless 引擎不建原生窗口，证明不了它。
+- 本机 Homebrew 的 `nsh` 是 0.6.0，仓库锁的是 0.6.1，`nsh run` / `nsh check` 在本机卡在版本不一致（与本次改动无关）。需要用 0.6.1 的 CLI 跑一次 `nsh run`，在 macOS 上确认交通灯位置、侧栏顶部空白带与拖动区。

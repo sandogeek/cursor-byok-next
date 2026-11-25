@@ -91,7 +91,7 @@ src/ui/appearance.ts     34  外观持久化（Storage 键）+ 启动返回值
 | 10 | 存储清理范围 | `details` / `all` 两档，清理后刷新全应用 store | 同样两档，只刷新本页 `CallsSnapshot` | 没有全局 store；调用详细页下次进入会自己读 |
 | 11 | 语言 | 自建 i18n store + 系统语言标签 | `nsh/i18n` + `nsh` Storage 键 | `I18N.md` 已定；设置页复用侧栏同一实现，不复制第二份 |
 | 12 | 主题 | `themeIds` + localStorage + `data-theme` | `setColorScheme("system"|"light"|"dark")` + Storage，另经 `Desktop.setAppearance` 把同一选择交给原生标题栏 | NSH 原生外观：`dark:` 类、组件主题和平台控件一起跟随，不需要 DOM dataset；但 NSH 的 `setColorScheme` 只设置根视图与它自己开的窗口，不设置主窗口所属的 `NSApplication`，系统标题栏会停在系统外观（见 12a） |
-| 12a | 原生标题栏外观 | Tauri `titleBarStyle: Overlay` + 窗口 `background_color`，标题栏跟窗口背景走 | `src/desktop.rs` 的 `set_app_appearance`：macOS 在 `run_on_main_thread` 里设 `NSApplication.appearance`（`nil` = 跟随系统），其他平台 no-op | `NSApplication` 的外观是它各窗口的默认值，主窗口没有自己的外观，所以交通灯与顶栏直接跟着它；这是 NSH 边界之外的唯一缺口，绕不过去，只能在 Rust 侧补。失败只记日志，不撤销已应用的外观选择 |
+| 12a | 原生标题栏外观 | Tauri `titleBarStyle: Overlay` + 窗口 `background_color`，标题栏跟窗口背景走 | 标题栏本身已隐藏（`nsh.json` 的 `"window"."titleBar"."style": "hidden"`，见 `CURSOR_UI.md` 差异表）；`src/desktop.rs` 的 `set_app_appearance` 只在 macOS 设 `NSApplication.appearance`（`nil` = 跟随系统），其他平台 no-op | 标题栏隐藏后不再有「标题栏跟不跟窗口背景」的问题，剩下的是交通灯与窗口边框的外观：`NSApplication` 的外观是它各窗口的默认值，主窗口没有自己的外观，所以跟随它；这是 NSH 边界之外的唯一缺口，只能在 Rust 侧补。失败只记日志，不撤销已应用的外观选择 |
 | 13 | 数据目录 | 无此信息 | 「关于」显示 `dataDir` 并可复制 | 用户排查接管 / 插件问题需要知道 `~/.cursor-byok-next` 在哪；该值由 Rust 提供，TSX 不拼路径 |
 | 14 | 页面标题 | `PageContent` 内部滚动 | 应用壳统一标题栏 + 唯一滚动区 | `CURSOR_UI.md`：内容区是唯一滚动所有者 |
 | 15 | 保存反馈 | toast | 卡片内行内 notice（成功）/ 页尾 alert（失败） | 本仓库没有 toast 组件；设置项的反馈贴近控件更明确 |
@@ -109,10 +109,11 @@ src/ui/appearance.ts     34  外观持久化（Storage 键）+ 启动返回值
 4. **调用记录只有一个所有者。** 详细模式与清理都走 `Calls`（`calls.db`），设置页和调用详细页共享同一份实现。
 5. **清理是不可撤销操作**，必须经确认弹窗，文案写明保留什么、删什么。
 6. **外观与语言立即生效**，写入 `Storage` 后重启仍保留；「跟随系统」是删除键值，不是写特殊值。
-6a. **外观有两个落点，一个所有者。** 选择只存在 TSX（Storage + `signal`）；`chooseAppearance` 写 NSH 的 `setColorScheme`，同一个值经 `Desktop.setAppearance` 交给原生标题栏。Rust 不存这份选择，也不从 `Storage` 读它。
-6b. **原生标题栏失败不阻断界面。** `Desktop.setAppearance` 的错误只 `console.warn`，屏幕外观与 Storage 保持已选值；`Desktop` 记住最后一次成功应用的值，重复选择不再过主线程。
+6a. **外观有两个落点，一个所有者。** 选择只存在 TSX（Storage + `signal`）；`chooseAppearance` 写 NSH 的 `setColorScheme`，同一个值经 `Desktop.setAppearance` 交给 `NSApplication`（隐藏标题栏后的交通灯与窗口边框跟着它）。Rust 不存这份选择，也不从 `Storage` 读它。
+6b. **原生外观失败不阻断界面。** `Desktop.setAppearance` 的错误只 `console.warn`，屏幕外观与 Storage 保持已选值；`Desktop` 记住最后一次成功应用的值，重复选择不再过主线程。
 6c. **启动时只在有固定选择时调原生。** `restoreAppearance()` 返回 `null` 表示跟随系统，此时设置 `NSApplication.appearance = nil` 由 AppKit 默认值完成，不必跨线程调用。
 6d. **只有 macOS 需要这次原生同步。** Windows 的标题按钮由 NSH 按应用配色自绘，Linux 的 GTK 头部跟随环境；两者对 `set_app_appearance` 是 no-op，不引入平台分支到 TSX。
+6e. **标题栏的隐藏是窗口启动属性，不是设置项。** `nsh.json` 的 `"window"."titleBar"` 声明；`Desktop.setAppearance` 只改外观，不改标题栏样式，也不在运行时 `set` 它。
 7. **文案只放 `locales/`**，TSX 只调 `t()`；Rust 不新增用户可见文案。
 8. **设置页读取失败不抛错给界面**（`resource` 保留最后值），也不写假数据。
 9. **TSX 不拼路径、不猜端口。** `dataDir`、`preferredProxyPort`、`proxyPort` 全部来自 `HarnessState`。

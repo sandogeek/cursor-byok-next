@@ -1,5 +1,5 @@
 import { Clipboard, createMotion, platform, resource, Scroll, signal, Text, View } from "nsh";
-import { Tray, currentWindow } from "nsh/desktop";
+import { Tray, currentWindow, titleBar } from "nsh/desktop";
 import { t } from "nsh/i18n";
 import type { HarnessState, DesktopState } from "cursor-byok-next/native";
 import type { ImageAsset } from "nsh";
@@ -126,6 +126,13 @@ export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog
   return (
     <View class="flex-1 flex-row bg-background">
       <Surface variant="sidebar" class="w-60 shrink-0 self-stretch pt-[env(safe-area-inset-top)]">
+        {/* The system title bar is hidden: macOS's traffic lights float over the
+            sidebar's top left, so the strip keeps their height free and drags
+            the window as the bar it replaced did. Windows' and GTK's window
+            buttons are on the right instead, where the header reserves them. */}
+        <If when={platform.os === "macos"}>
+          <View class="shrink-0" style={{ height: titleBar().height }} desktop={{ windowDrag: true }} />
+        </If>
         <View class="min-h-0 flex-1 p-1.5">
           <View class="gap-0.5">
             <NavigationItem label={t("nav.overview")} icon="chart" disabled />
@@ -164,7 +171,7 @@ export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog
       </Surface>
 
       <View class="min-w-0 flex-1 px-4 pb-4 pt-[env(safe-area-inset-top)]">
-        <View class="min-h-16 flex-row items-center justify-between gap-4 pb-3 pl-1" desktop={{ windowDrag: true }}>
+        <View class="min-h-16 flex-row items-center justify-between gap-4 pb-3 pl-1" style={{ paddingRight: titleBar().right }} desktop={{ windowDrag: true }}>
           <Text role="header" class="text-2xl font-semibold text-foreground">{title()}</Text>
           <If when={page() === "cursor"}>
           <Surface class="flex-row items-center gap-2 p-1.5">

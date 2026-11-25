@@ -8,6 +8,9 @@
     "publicKey": "QIQBChER4HbtiTvXMN2HyEqTWaT3iUIj7McZ1Dg4WGQ="
   },
   "icon": "assets/icon.png",
+  "window": {
+    "titleBar": { "style": "hidden" }
+  },
   "rust": ".",
   "locales": ["zh-CN", "en-US"],
   "capabilities": {
