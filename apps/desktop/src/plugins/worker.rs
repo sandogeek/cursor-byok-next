@@ -1351,4 +1351,82 @@ export default defineProviderPlugin({providers:[{
         tasks_drained(&worker.inner.host).await;
         worker.stop().await;
     }
+
+    #[tokio::test]
+    async fn async_tla_defers_incoming_requests_until_module_is_ready() {
+        let source =
+            format!("await new Promise((resolve) => setTimeout(resolve, 25));\n{ECHO_PLUGIN}");
+        let temp = tempfile::tempdir().unwrap();
+        let (_, worker) = echo_worker(temp.path(), &source);
+        let events = invoke_echo(
+            &worker,
+            echo_invocation("after-tla"),
+            CancellationToken::new(),
+        )
+        .await;
+        let text = events
+            .iter()
+            .find_map(|event| match event {
+                crate::provider::ModelEvent::TextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["text"], "after-tla");
+        worker.stop().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_network_stream_reads_lines_and_closes_cleanly() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/events",
+            axum::routing::get(|| async { "data: first\n\ndata: second\n\n" }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let source = r"
+import { defineProviderPlugin } from 'cursor-byok-next:plugin';
+export default defineProviderPlugin({providers:[{
+ id:'echo',displayName:'Echo',providerType:'echo',async invoke(_input, output, context) {
+  const stream = await context.network.stream('ORIGIN/events', { method: 'GET' });
+  const lines = [];
+  for await (const line of stream.lines) {
+    if (line) lines.push(line);
+  }
+  output.emit({type:'text-delta',text:JSON.stringify({status:stream.status,lines})});
+  return {status:'completed'};
+ }
+}]});
+"
+        .replace("ORIGIN", &origin);
+        let temp = tempfile::tempdir().unwrap();
+        let (_, mut worker) = echo_worker(temp.path(), &source);
+        Arc::get_mut(&mut worker.inner).unwrap().host = host();
+        let mut items = network_probe(&worker, &origin, "stream", CancellationToken::new()).await;
+        let mut payload = None;
+        while let Some(item) = items.recv().await {
+            match item {
+                WorkerStreamItem::Event(crate::provider::ModelEvent::TextDelta(text)) => {
+                    payload = Some(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+                }
+                WorkerStreamItem::Result(result) => {
+                    result.unwrap();
+                    break;
+                }
+                WorkerStreamItem::Event(_) => {}
+            }
+        }
+        let payload = payload.unwrap();
+        assert_eq!(payload["status"], 200);
+        assert_eq!(
+            payload["lines"],
+            serde_json::json!(["data: first", "data: second"])
+        );
+        tasks_drained(&worker.inner.host).await;
+        worker.stop().await;
+        server.abort();
+    }
 }

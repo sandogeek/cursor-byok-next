@@ -139,38 +139,30 @@ pub(super) fn run(
                 .ok_or_else(|| Error::Runtime("plugin module unavailable".into()))?;
             let loading_started = std::time::Instant::now();
             let promise = Module::evaluate(ctx.clone(), main, source).map_err(vm_error)?;
+            let mut ready = false;
             loop {
                 check_limits(stop, &fatal, &exhausted)?;
-                if loading_started.elapsed() > Duration::from_secs(10)
-                    && promise.state() == PromiseState::Pending
-                {
-                    return Err(Error::Runtime("plugin module loading timed out".into()));
-                }
-                deadline.set(charged_now().saturating_add(CPU_BUDGET));
-                drain_jobs(&ctx, stop, &fatal, &exhausted)?;
-                if promise.state() == PromiseState::Rejected {
-                    // Consume the exception, without exposing upstream text or source paths.
-                    let _ = promise.result::<rquickjs::Value<'_>>();
-                    let _reason = ctx.catch();
-                    return Err(Error::Runtime("plugin module evaluation rejected".into()));
-                }
-                if main == "sdk/collect.js" && promise.state() == PromiseState::Resolved {
-                    return Ok(());
+                if !ready {
+                    deadline.set(charged_now().saturating_add(CPU_BUDGET));
+                    if poll_loading(&ctx, &promise, loading_started, stop, &fatal, &exhausted)? {
+                        if main == "sdk/collect.js" {
+                            return Ok(());
+                        }
+                        ready = true;
+                    }
                 }
                 deadline.set(Duration::MAX);
-                match input.recv_timeout(timers.wait()) {
-                    Ok(frame) => {
-                        if frame.len() > MAX_FRAME {
-                            return Err(Error::Runtime("plugin input exceeded limit".into()));
+                if ready {
+                    match input.recv_timeout(timers.wait()) {
+                        Ok(frame) => {
+                            deadline.set(charged_now().saturating_add(CPU_BUDGET));
+                            deliver_frame(&ctx, frame)?;
                         }
-                        deadline.set(charged_now().saturating_add(CPU_BUDGET));
-                        let recv: Function<'_> = ctx.globals().get("__recv").map_err(vm_error)?;
-                        let line = String::from_utf8(frame)
-                            .map_err(|_| Error::Runtime("invalid plugin frame".into()))?;
-                        recv.call::<_, ()>((line,)).map_err(vm_error)?;
+                        Err(channel::RecvTimeoutError::Timeout) => {}
+                        Err(channel::RecvTimeoutError::Disconnected) => return Ok(()),
                     }
-                    Err(channel::RecvTimeoutError::Timeout) => {}
-                    Err(channel::RecvTimeoutError::Disconnected) => return Ok(()),
+                } else {
+                    std::thread::sleep(timers.wait());
                 }
                 deadline.set(charged_now().saturating_add(CPU_BUDGET));
                 if let Some(bridge) = &bridge {
@@ -181,6 +173,7 @@ pub(super) fn run(
                 }
                 drain_jobs(&ctx, stop, &fatal, &exhausted)?;
                 timers.run().map_err(vm_error)?;
+                drain_jobs(&ctx, stop, &fatal, &exhausted)?;
             }
         })();
         if let Some(bridge) = &bridge {
@@ -189,6 +182,40 @@ pub(super) fn run(
         timers.clear();
         operation
     })
+}
+
+fn poll_loading(
+    ctx: &rquickjs::Ctx<'_>,
+    promise: &rquickjs::Promise<'_>,
+    started: std::time::Instant,
+    stop: &AtomicBool,
+    fatal: &AtomicBool,
+    exhausted: &AtomicBool,
+) -> Result<bool> {
+    if started.elapsed() > Duration::from_secs(10) && promise.state() == PromiseState::Pending {
+        return Err(Error::Runtime("plugin module loading timed out".into()));
+    }
+    drain_jobs(ctx, stop, fatal, exhausted)?;
+    match promise.state() {
+        PromiseState::Rejected => {
+            // Consume the exception, without exposing upstream text or source paths.
+            let _ = promise.result::<rquickjs::Value<'_>>();
+            let _reason = ctx.catch();
+            Err(Error::Runtime("plugin module evaluation rejected".into()))
+        }
+        PromiseState::Resolved => Ok(true),
+        PromiseState::Pending => Ok(false),
+    }
+}
+
+fn deliver_frame(ctx: &rquickjs::Ctx<'_>, frame: Vec<u8>) -> Result<()> {
+    if frame.len() > MAX_FRAME {
+        return Err(Error::Runtime("plugin input exceeded limit".into()));
+    }
+    let recv: Function<'_> = ctx.globals().get("__recv").map_err(vm_error)?;
+    let line =
+        String::from_utf8(frame).map_err(|_| Error::Runtime("invalid plugin frame".into()))?;
+    recv.call::<_, ()>((line,)).map_err(vm_error)
 }
 
 fn install_session(

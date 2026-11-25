@@ -15,17 +15,10 @@ await import(__entry());
 const plugin = __getRegisteredPlugin();
 const controllers = new Map<string, AbortController>();
 function send(value: unknown): Promise<void> { __send(JSON.stringify(value) + "\n"); return Promise.resolve(); }
-async function hostCall(requestId: string, method: string, params: unknown): Promise<unknown> {
+async function unwrapHostCall<T>(call: Promise<unknown>, parse = true): Promise<T> {
  try {
-  const p = (params ?? {}) as Record<string, unknown>;
-  switch (method) {
-    case "network.fetch": return await host.fetch(requestId, String(p.url), JSON.stringify(p)).then(JSON.parse);
-    case "network.stream.open": return await host.streamOpen(requestId, String(p.url), JSON.stringify(p)).then(JSON.parse);
-    case "network.stream.read": return await host.streamRead(requestId, String(p.streamId)).then(JSON.parse);
-    case "network.stream.close": return await host.streamClose(requestId, String(p.streamId));
-    case "protocol.stream": return await host.protocolStream(requestId, JSON.stringify(p)).then(JSON.parse);
-    default: throw new Error("unsupported host method");
-  }
+  const raw = await call;
+  return (parse ? JSON.parse(String(raw)) : undefined) as T;
  } catch (error) {
    if (error && typeof error === "object" && "status" in error && typeof error.status === "number") {
      throw new ProtocolHttpError(error.status, "upstream request failed");
@@ -37,28 +30,28 @@ async function hostCall(requestId: string, method: string, params: unknown): Pro
 async function* streamLines(requestId: string, streamId: string): AsyncGenerator<string> {
   try {
     for (;;) {
-      const chunk = await hostCall(requestId, "network.stream.read", { streamId }) as {
+      const chunk = await unwrapHostCall<{
         lines: string[];
         done: boolean;
-      };
+      }>(host.streamRead(requestId, streamId));
       for (const line of chunk.lines) yield line;
       if (chunk.done) return;
     }
   } finally {
-    void hostCall(requestId, "network.stream.close", { streamId }).catch(() => undefined);
+    void unwrapHostCall<void>(host.streamClose(requestId, streamId), false).catch(() => undefined);
   }
 }
 
 function contextFor(requestId: string, signal: AbortSignal): PluginContext {
   return {
     network: {
-      fetch: (url, init = {}) => hostCall(requestId, "network.fetch", { url, ...init }) as ReturnType<PluginContext["network"]["fetch"]>,
+      fetch: (url, init = {}) => unwrapHostCall(host.fetch(requestId, url, JSON.stringify(init))),
       stream: async (url, init = {}): Promise<NetworkEventStream> => {
-        const opened = await hostCall(requestId, "network.stream.open", { url, ...init }) as {
+        const opened = await unwrapHostCall<{
           streamId: string;
           status: number;
           headers: Record<string, string>;
-        };
+        }>(host.streamOpen(requestId, url, JSON.stringify(init)));
         return {
           status: opened.status,
           headers: opened.headers,
@@ -67,7 +60,7 @@ function contextFor(requestId: string, signal: AbortSignal): PluginContext {
       },
     },
     protocol: {
-      stream: (input) => hostCall(requestId, "protocol.stream", input).then(() => undefined),
+      stream: (input) => unwrapHostCall(host.protocolStream(requestId, JSON.stringify(input)), false),
     },
     signal,
   };

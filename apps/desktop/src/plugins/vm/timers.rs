@@ -81,14 +81,12 @@ impl<'js> Timers<'js> {
             let Some(mut timer) = self.entries.borrow_mut().remove(&id) else {
                 continue;
             };
+            let callback = timer.callback.clone();
             if let Some(interval) = timer.interval {
                 timer.due = now + interval;
-                let callback = timer.callback.clone();
                 self.entries.borrow_mut().insert(id, timer);
-                callback.call::<_, ()>(())?;
-            } else {
-                timer.callback.call::<_, ()>(())?;
             }
+            callback.call::<_, ()>(())?;
         }
         Ok(())
     }

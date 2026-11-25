@@ -145,3 +145,11 @@ fn oversized_output_is_a_fatal_session_error() {
     let (result, _) = probe("__send('x'.repeat(16 * 1024 * 1024 + 1));");
     assert!(result.is_err());
 }
+#[test]
+fn timer_resolved_tla_rejections_are_caught() {
+    let (result, _) = probe(
+        "await new Promise((_, reject) => setTimeout(() => reject(new Error('secret')), 1));",
+    );
+    let error = result.unwrap_err().to_string();
+    assert!(!error.contains("secret"));
+}
