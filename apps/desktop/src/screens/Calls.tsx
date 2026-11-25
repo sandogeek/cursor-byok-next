@@ -144,7 +144,7 @@ export function Calls(props: { log: CallLog; onOpen: (callId: string) => void })
 
           <Surface class="min-h-0 flex-1 gap-2 p-4">
             <View class="flex-row items-center gap-2 px-3">
-              <Text class="w-20 shrink-0 text-xs text-muted-foreground">{t("calls.columns.status")}</Text>
+              <Text class="w-24 shrink-0 text-xs text-muted-foreground">{t("calls.columns.status")}</Text>
               <Text class="min-w-40 flex-1 text-xs text-muted-foreground">{t("calls.columns.model")}</Text>
               <Text class="w-12 shrink-0 text-end text-xs text-muted-foreground">{t("calls.columns.http")}</Text>
               <Text class="w-16 shrink-0 text-end text-xs text-muted-foreground">{t("calls.columns.duration")}</Text>
@@ -166,7 +166,7 @@ export function Calls(props: { log: CallLog; onOpen: (callId: string) => void })
                     accessibilityLabel={t("calls.viewNamed", { name: call().displayName })}
                     onPress={() => props.onOpen(call().callId)}
                   >
-                    <View class="w-20 shrink-0">
+                    <View class="w-24 shrink-0 flex-row items-center">
                       <CallStatus status={call().status} />
                     </View>
                     <View class="min-w-40 flex-1 overflow-hidden gap-0.5">

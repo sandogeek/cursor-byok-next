@@ -13,8 +13,8 @@ export function Surface(props: { children?: JSX.Element; class?: string; variant
 
 export function StatusBadge(props: { label: string; tone?: "neutral" | "success" | "warning" }) {
   return (
-    <View class={`rounded-full border px-1.5 py-0.5 ${props.tone === "success" ? "border-success/30 bg-success/10" : props.tone === "warning" ? "border-warning/30 bg-warning/10" : "border-border bg-muted"}`}>
-      <Text class={`text-xs ${props.tone === "success" ? "text-success" : props.tone === "warning" ? "text-warning" : "text-muted-foreground"}`}>{props.label}</Text>
+    <View class={`w-fit shrink-0 flex-row items-center justify-center rounded-full border px-2 py-0.5 ${props.tone === "success" ? "border-success/30 bg-success/10" : props.tone === "warning" ? "border-warning/30 bg-warning/10" : "border-border bg-muted"}`}>
+      <Text class={`whitespace-nowrap text-xs ${props.tone === "success" ? "text-success" : props.tone === "warning" ? "text-warning" : "text-muted-foreground"}`}>{props.label}</Text>
     </View>
   );
 }
