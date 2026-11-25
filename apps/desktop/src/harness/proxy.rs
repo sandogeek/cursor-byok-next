@@ -226,7 +226,7 @@ impl HttpHandler for CursorRelay {
             .routing
             .routes(original.host().unwrap_or_default(), original.path())
         {
-            let Some(upstream) = original.to_string().parse().ok() else {
+            let Ok(upstream) = original.to_string().parse() else {
                 return bad_gateway("the original Cursor URL is not a valid header");
             };
             let path = original

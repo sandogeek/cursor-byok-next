@@ -16,7 +16,7 @@ pub const MAX_CONNECT_FRAME_BYTES: usize = 64 << 20;
 
 /// Everything the debugger needs to start: where it listens, what it captures,
 /// and where it stores the captures.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub service_addr: String,
     pub upstream_url: String,

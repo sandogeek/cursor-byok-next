@@ -23,7 +23,7 @@ const META_FILE: &str = "meta.json";
 const RULE_EXTENSION: &str = "md";
 const LOCAL_ID_PREFIX: &str = "local-";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuleRecord {
     pub id: String,
     pub knowledge: String,

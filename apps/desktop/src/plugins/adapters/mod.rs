@@ -251,12 +251,10 @@ fn push_buffered_lines(
     let mut consumed = 0;
     while let Some(relative) = buffered[consumed..].iter().position(|byte| *byte == b'\n') {
         let end = consumed + relative;
-        let mut line = buffered[consumed..end].to_vec();
+        let raw = &buffered[consumed..end];
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
         consumed = end + 1;
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        if push_sse_line(parser, frame, &String::from_utf8_lossy(&line), emit)? {
+        if push_sse_line(parser, frame, &String::from_utf8_lossy(line), emit)? {
             buffered.drain(..consumed);
             return Ok(true);
         }
@@ -509,12 +507,10 @@ fn provider_tool_name(name: &str) -> String {
             }
         })
         .collect::<String>();
-    let base = if normalized.is_empty() {
-        "_".to_owned()
-    } else {
-        normalized
-    };
-    truncated_tool_name(&base)
+    if normalized.is_empty() {
+        return "_".to_owned();
+    }
+    truncated_tool_name(&normalized)
 }
 
 /// Long names keep their first 57 characters plus a content hash, so two names

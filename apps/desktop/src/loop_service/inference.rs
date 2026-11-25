@@ -390,10 +390,8 @@ async fn serve(
         tasks: JoinSet::new(),
         exit: None,
         provider_call_index: 0,
-        // A plugin model carries no context-window figure: the descriptor the
-        // provider reports is the only source, and the run learns it from the
-        // client's own requested model instead.
-        configured_context_window: None,
+        // A plugin model carries no context-window figure: the run learns it
+        // solely from the client's requested model when available.
         run_context_window: None,
     };
     {
@@ -496,7 +494,6 @@ struct LoopState {
     tasks: JoinSet<()>,
     exit: Option<RunExit>,
     provider_call_index: u64,
-    configured_context_window: Option<u64>,
     run_context_window: Option<u64>,
 }
 
@@ -510,7 +507,7 @@ impl LoopState {
         let requested_window = project::requested_context_window(request.requested_model.as_ref())
             .ok()
             .flatten();
-        self.run_context_window = requested_window.or(self.configured_context_window);
+        self.run_context_window = requested_window;
         if self.run_context_window.is_none() {
             tracing::info!(
                 model_id = setup.model_id,

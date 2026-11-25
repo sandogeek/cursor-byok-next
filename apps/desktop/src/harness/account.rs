@@ -145,13 +145,9 @@ fn is_local_cursor_token(token: &str) -> bool {
         .decode(header)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .and_then(|value| {
-            value
-                .get("alg")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .as_deref()
+        .as_ref()
+        .and_then(|value| value.get("alg"))
+        .and_then(serde_json::Value::as_str)
         == Some("HS256")
         && URL_SAFE_NO_PAD
             .decode(payload)

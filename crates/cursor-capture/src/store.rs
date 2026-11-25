@@ -80,17 +80,17 @@ fn refuse_reentrancy(store: &ExchangeStore, operation: &'static str) -> bool {
 const BACKFILL_BATCH: usize = 64;
 
 /// Attaches the failed operation to a wrapped error.
-trait Context<T, E> {
+trait Context<T> {
     fn context(self, operation: &'static str) -> Result<T>;
 }
 
-impl<T> Context<T, rusqlite::Error> for std::result::Result<T, rusqlite::Error> {
+impl<T> Context<T> for std::result::Result<T, rusqlite::Error> {
     fn context(self, operation: &'static str) -> Result<T> {
         self.map_err(|source| Error::database(operation, source))
     }
 }
 
-impl<T> Context<T, serde_json::Error> for std::result::Result<T, serde_json::Error> {
+impl<T> Context<T> for std::result::Result<T, serde_json::Error> {
     fn context(self, operation: &'static str) -> Result<T> {
         self.map_err(|source| Error::json(operation, source))
     }
@@ -366,7 +366,7 @@ impl ExchangeStore {
     /// exchange it is given. Calling back into this store from it (or doing
     /// decoding that should have happened before) would either block on the
     /// non-reentrant lock or hold it for the length of that work. The
-    /// [`UPDATE_GUARD`] below turns such a call into a degraded answer instead
+    /// [`UpdateScope`] below turns such a call into a degraded answer instead
     /// of a hang; keep expensive work outside this call.
     fn apply_update(
         &self,

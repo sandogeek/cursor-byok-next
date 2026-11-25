@@ -446,14 +446,12 @@ impl Scanner<'_> {
         let Some(type_name) = first_string_argument(call) else {
             return;
         };
-        let mut diag = std::mem::take(&mut self.scan.diagnostics);
         let values = call
             .arguments
             .get(1)
             .and_then(argument_expr)
-            .map(|expr| Self::parse_enum_values(expr, &mut diag))
+            .map(|expr| Self::parse_enum_values(expr, &mut self.scan.diagnostics))
             .unwrap_or_default();
-        self.scan.diagnostics = diag;
         self.record_enum(type_name, assigned.unwrap_or(""), values, call.span.start);
     }
 
@@ -472,14 +470,12 @@ impl Scanner<'_> {
         else {
             return;
         };
-        let mut diag = std::mem::take(&mut self.scan.diagnostics);
         let values = call
             .arguments
             .get(2)
             .and_then(argument_expr)
-            .map(|expr| Self::parse_enum_values(expr, &mut diag))
+            .map(|expr| Self::parse_enum_values(expr, &mut self.scan.diagnostics))
             .unwrap_or_default();
-        self.scan.diagnostics = diag;
         self.record_enum(type_name, var_name, values, call.span.start);
     }
 
@@ -852,55 +848,53 @@ impl<'a> Visit<'a> for Scanner<'a> {
                 } else {
                     ident_name(object).map(str::to_string)
                 };
-            if prop == "typeName"
-                && let (Some(type_name), Some(var_name)) =
-                    (string_lit(&expr.right), assigned_var.clone())
-            {
-                let internal = self
-                    .current_class
-                    .as_ref()
-                    .map(|class| class.internal_name.clone())
-                    .unwrap_or_default();
-                self.record_message(type_name, &var_name, &internal, Vec::new(), expr.span.start);
-            }
-            if prop == "fields"
-                && let Some(var_name) = assigned_var
-            {
-                let fields = self.extract_fields_from_expr(&expr.right);
-                if let Some(message) = self
-                    .scan
-                    .messages
-                    .iter_mut()
-                    .rev()
-                    .find(|message| message.var_name == var_name && message.fields.is_empty())
-                {
-                    message.fields = fields;
+            match prop {
+                "typeName" => {
+                    if let (Some(type_name), Some(var_name)) =
+                        (string_lit(&expr.right), assigned_var)
+                    {
+                        let internal = self
+                            .current_class
+                            .as_ref()
+                            .map(|class| class.internal_name.clone())
+                            .unwrap_or_default();
+                        self.record_message(
+                            type_name,
+                            &var_name,
+                            &internal,
+                            Vec::new(),
+                            expr.span.start,
+                        );
+                    }
                 }
+                "fields" => {
+                    if let Some(var_name) = assigned_var {
+                        let fields = self.extract_fields_from_expr(&expr.right);
+                        if let Some(message) = self.scan.messages.iter_mut().rev().find(|message| {
+                            message.var_name == var_name && message.fields.is_empty()
+                        }) {
+                            message.fields = fields;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         walk::walk_assignment_expression(self, expr);
     }
 
     fn visit_class(&mut self, class: &Class<'a>) {
+        let name = class
+            .id
+            .as_ref()
+            .map(|id| id.name.as_str().to_string())
+            .unwrap_or_default();
         if class.is_declaration() {
-            let name = class
-                .id
-                .as_ref()
-                .map(|id| id.name.as_str().to_string())
-                .unwrap_or_default();
             self.collect_class(class, Some(name.as_str()));
         }
         let previous = self.current_class.replace(CurrentClass {
-            var_name: class
-                .id
-                .as_ref()
-                .map(|id| id.name.as_str().to_string())
-                .unwrap_or_default(),
-            internal_name: class
-                .id
-                .as_ref()
-                .map(|id| id.name.as_str().to_string())
-                .unwrap_or_default(),
+            var_name: name.clone(),
+            internal_name: name,
             start: class.span.start,
         });
         walk::walk_class(self, class);

@@ -358,7 +358,7 @@ fn decode_bidi_append_request(payload: &[u8]) -> DecodedUnary {
             let combined = BidiAppendView {
                 bidi_append_request: serde_json::from_str(&outer)
                     .unwrap_or(serde_json::Value::Null),
-                agent_client_kind: kind.clone(),
+                agent_client_kind: &kind,
                 agent_client_message: serde_json::from_str(&marshal_proto_json(&client))
                     .unwrap_or(serde_json::Value::Null),
             };
@@ -383,9 +383,9 @@ fn decode_bidi_append_request(payload: &[u8]) -> DecodedUnary {
 }
 
 #[derive(Serialize)]
-struct BidiAppendView {
+struct BidiAppendView<'a> {
     bidi_append_request: serde_json::Value,
-    agent_client_kind: String,
+    agent_client_kind: &'a str,
     agent_client_message: serde_json::Value,
 }
 
@@ -514,14 +514,14 @@ pub fn hydrate_stored_exchange(exchange: &mut Exchange) -> Hydration {
 
 /// Re-decodes one stored frame direction, reporting whether frames were
 /// actually filled in (an empty decode is not a change).
-fn hydrate_stored_frames(payload: &mut Payload, message_type: Option<String>) -> bool {
+fn hydrate_stored_frames(payload: &mut Payload, message_type: Option<&str>) -> bool {
     let Some(message_type) = message_type else {
         return false;
     };
     if !payload.frames.is_empty() || payload.raw_hex.is_empty() || payload.raw_truncated {
         return false;
     }
-    match decode_stored_connect_frames(&payload.raw_hex, &message_type, &payload.content_codec) {
+    match decode_stored_connect_frames(&payload.raw_hex, message_type, &payload.content_codec) {
         Ok(decoded) if !decoded.is_empty() => {
             payload.frames = decoded;
             true
@@ -535,7 +535,7 @@ fn hydrate_stored_request_frames(exchange: &mut Exchange) -> bool {
     let message_type = streaming_request_message_type(&exchange.summary.path);
     let summary = &mut exchange.summary;
     let payload = &mut exchange.request;
-    if !hydrate_stored_frames(payload, message_type) {
+    if !hydrate_stored_frames(payload, message_type.as_deref()) {
         return false;
     }
     if let Some(error) = &payload.decode_error {
@@ -556,7 +556,7 @@ fn hydrate_stored_response_frames(exchange: &mut Exchange) -> bool {
     let message_type = streaming_response_message_type(&exchange.summary.path);
     let summary = &mut exchange.summary;
     let payload = &mut exchange.response;
-    if !hydrate_stored_frames(payload, message_type) {
+    if !hydrate_stored_frames(payload, message_type.as_deref()) {
         return false;
     }
     summary.frame_count = clamped_i32(payload.frames.len());
@@ -639,20 +639,28 @@ fn hydrate_stored_unary_response(exchange: &mut Exchange) -> bool {
     }
 }
 
+fn hydrate_stored_text(payload: &mut Payload, path: &str, direction: RpcDirection) -> bool {
+    payload.decoded_json.is_empty()
+        && !payload.raw_hex.is_empty()
+        && !is_proto_content_type(&payload.content_type)
+        && streaming_message_type(path, direction).is_none()
+        && hydrate_stored_text_payload(payload)
+}
+
 fn hydrate_stored_request_text(exchange: &mut Exchange) -> bool {
-    exchange.request.decoded_json.is_empty()
-        && !exchange.request.raw_hex.is_empty()
-        && !is_proto_content_type(&exchange.request.content_type)
-        && streaming_request_message_type(&exchange.summary.path).is_none()
-        && hydrate_stored_text_payload(&mut exchange.request)
+    hydrate_stored_text(
+        &mut exchange.request,
+        &exchange.summary.path,
+        RpcDirection::Request,
+    )
 }
 
 fn hydrate_stored_response_text(exchange: &mut Exchange) -> bool {
-    exchange.response.decoded_json.is_empty()
-        && !exchange.response.raw_hex.is_empty()
-        && !is_proto_content_type(&exchange.response.content_type)
-        && streaming_response_message_type(&exchange.summary.path).is_none()
-        && hydrate_stored_text_payload(&mut exchange.response)
+    hydrate_stored_text(
+        &mut exchange.response,
+        &exchange.summary.path,
+        RpcDirection::Response,
+    )
 }
 
 fn hydrate_stored_text_payload(payload: &mut Payload) -> bool {
@@ -915,47 +923,129 @@ pub fn decode_stored_raw_payload(raw_hex_value: &str, codec: &str) -> Result<Vec
     decompress_payload(&payload, codec)
 }
 
-fn unary_request_message(path: &str) -> Option<(prost_reflect::MessageDescriptor, String)> {
-    let mapped = match path {
-        FORK_BACKGROUND_COMPOSER_PATH => Some((
+#[derive(Clone, Copy)]
+enum RpcDirection {
+    Request,
+    Response,
+}
+
+struct UnaryRpcEntry {
+    path: &'static str,
+    request: (&'static str, &'static str),
+    response: (&'static str, &'static str),
+}
+
+const UNARY_RPCS: &[UnaryRpcEntry] = &[
+    UnaryRpcEntry {
+        path: FORK_BACKGROUND_COMPOSER_PATH,
+        request: (
             "aiserver.v1.ForkBackgroundComposerRequest",
             "fork_background_composer_request",
-        )),
-        NOTIFY_CONVERSATION_CLONE_PATH => Some((
+        ),
+        response: (
+            "aiserver.v1.ForkBackgroundComposerResponse",
+            "fork_background_composer_response",
+        ),
+    },
+    UnaryRpcEntry {
+        path: NOTIFY_CONVERSATION_CLONE_PATH,
+        request: (
             "agent.v1.NotifyConversationCloneRequest",
             "notify_conversation_clone_request",
-        )),
-        UPLOAD_CONVERSATION_BLOBS_PATH => Some((
+        ),
+        response: (
+            "agent.v1.NotifyConversationCloneResponse",
+            "notify_conversation_clone_response",
+        ),
+    },
+    UnaryRpcEntry {
+        path: UPLOAD_CONVERSATION_BLOBS_PATH,
+        request: (
             "agent.v1.UploadConversationBlobsRequest",
             "upload_conversation_blobs_request",
-        )),
-        CPP_AVAILABLE_MODELS_PATH => Some((
+        ),
+        response: (
+            "agent.v1.UploadConversationBlobsResponse",
+            "upload_conversation_blobs_response",
+        ),
+    },
+    UnaryRpcEntry {
+        path: CPP_AVAILABLE_MODELS_PATH,
+        request: (
             "aiserver.v1.AvailableCppModelsRequest",
             "available_cpp_models_request",
-        )),
-        AI_AVAILABLE_MODELS_PATH => Some((
+        ),
+        response: (
+            "aiserver.v1.AvailableCppModelsResponse",
+            "available_cpp_models_response",
+        ),
+    },
+    UnaryRpcEntry {
+        path: AI_AVAILABLE_MODELS_PATH,
+        request: (
             "aiserver.v1.AvailableModelsRequest",
             "available_models_request",
-        )),
-        AI_GET_DEFAULT_MODEL_PATH => Some((
+        ),
+        response: (
+            "aiserver.v1.AvailableModelsResponse",
+            "available_models_response",
+        ),
+    },
+    UnaryRpcEntry {
+        path: AI_GET_DEFAULT_MODEL_PATH,
+        request: (
             "aiserver.v1.GetDefaultModelRequest",
             "get_default_model_request",
-        )),
-        AI_DEFAULT_MODEL_NUDGE_DATA_PATH => Some((
+        ),
+        response: (
+            "aiserver.v1.GetDefaultModelResponse",
+            "get_default_model_response",
+        ),
+    },
+    UnaryRpcEntry {
+        path: AI_DEFAULT_MODEL_NUDGE_DATA_PATH,
+        request: (
             "aiserver.v1.GetDefaultModelNudgeDataRequest",
             "get_default_model_nudge_data_request",
-        )),
-        MCP_GET_KNOWN_SERVERS_PATH => Some((
+        ),
+        response: (
+            "aiserver.v1.GetDefaultModelNudgeDataResponse",
+            "get_default_model_nudge_data_response",
+        ),
+    },
+    UnaryRpcEntry {
+        path: MCP_GET_KNOWN_SERVERS_PATH,
+        request: (
             "aiserver.v1.GetKnownServersRequest",
             "get_known_servers_request",
-        )),
-        SERVER_GET_CONFIG_PATH => Some((
+        ),
+        response: (
+            "aiserver.v1.GetKnownServersResponse",
+            "get_known_servers_response",
+        ),
+    },
+    UnaryRpcEntry {
+        path: SERVER_GET_CONFIG_PATH,
+        request: (
             "aiserver.v1.GetServerConfigRequest",
             "get_server_config_request",
-        )),
-        _ => None,
-    };
-    if let Some((name, kind)) = mapped {
+        ),
+        response: (
+            "aiserver.v1.GetServerConfigResponse",
+            "get_server_config_response",
+        ),
+    },
+];
+
+fn unary_message(
+    path: &str,
+    direction: RpcDirection,
+) -> Option<(prost_reflect::MessageDescriptor, String)> {
+    if let Some(entry) = UNARY_RPCS.iter().find(|entry| entry.path == path) {
+        let (name, kind) = match direction {
+            RpcDirection::Request => entry.request,
+            RpcDirection::Response => entry.response,
+        };
         return POOL
             .get_message_by_name(name)
             .map(|descriptor| (descriptor, kind.into()));
@@ -964,87 +1054,52 @@ fn unary_request_message(path: &str) -> Option<(prost_reflect::MessageDescriptor
     if method.is_client_streaming() || method.is_server_streaming() {
         return None;
     }
-    Some((method.input(), proto_message_kind(method.input().name())))
+    let descriptor = match direction {
+        RpcDirection::Request => method.input(),
+        RpcDirection::Response => method.output(),
+    };
+    let kind = proto_message_kind(descriptor.name());
+    Some((descriptor, kind))
+}
+
+fn unary_request_message(path: &str) -> Option<(prost_reflect::MessageDescriptor, String)> {
+    unary_message(path, RpcDirection::Request)
 }
 
 fn unary_response_message(path: &str) -> Option<(prost_reflect::MessageDescriptor, String)> {
-    let mapped = match path {
-        FORK_BACKGROUND_COMPOSER_PATH => Some((
-            "aiserver.v1.ForkBackgroundComposerResponse",
-            "fork_background_composer_response",
-        )),
-        NOTIFY_CONVERSATION_CLONE_PATH => Some((
-            "agent.v1.NotifyConversationCloneResponse",
-            "notify_conversation_clone_response",
-        )),
-        UPLOAD_CONVERSATION_BLOBS_PATH => Some((
-            "agent.v1.UploadConversationBlobsResponse",
-            "upload_conversation_blobs_response",
-        )),
-        CPP_AVAILABLE_MODELS_PATH => Some((
-            "aiserver.v1.AvailableCppModelsResponse",
-            "available_cpp_models_response",
-        )),
-        AI_AVAILABLE_MODELS_PATH => Some((
-            "aiserver.v1.AvailableModelsResponse",
-            "available_models_response",
-        )),
-        AI_GET_DEFAULT_MODEL_PATH => Some((
-            "aiserver.v1.GetDefaultModelResponse",
-            "get_default_model_response",
-        )),
-        AI_DEFAULT_MODEL_NUDGE_DATA_PATH => Some((
-            "aiserver.v1.GetDefaultModelNudgeDataResponse",
-            "get_default_model_nudge_data_response",
-        )),
-        MCP_GET_KNOWN_SERVERS_PATH => Some((
-            "aiserver.v1.GetKnownServersResponse",
-            "get_known_servers_response",
-        )),
-        SERVER_GET_CONFIG_PATH => Some((
-            "aiserver.v1.GetServerConfigResponse",
-            "get_server_config_response",
-        )),
-        _ => None,
-    };
-    if let Some((name, kind)) = mapped {
-        return POOL
-            .get_message_by_name(name)
-            .map(|descriptor| (descriptor, kind.into()));
+    unary_message(path, RpcDirection::Response)
+}
+
+fn streaming_message_type(path: &str, direction: RpcDirection) -> Option<String> {
+    if path == RUN_SSE_PATH {
+        return Some(match direction {
+            RpcDirection::Request => "aiserver.v1.BidiRequestId".into(),
+            RpcDirection::Response => "agent.v1.AgentServerMessage".into(),
+        });
     }
     let method = rpc_method_descriptor(path)?;
-    if method.is_client_streaming() || method.is_server_streaming() {
+    if !method.is_client_streaming() && !method.is_server_streaming() {
         return None;
     }
-    Some((method.output(), proto_message_kind(method.output().name())))
+    let descriptor = match direction {
+        RpcDirection::Request => method.input(),
+        RpcDirection::Response => method.output(),
+    };
+    Some(descriptor.full_name().to_string())
 }
 
 /// The request/response protobuf type a streaming RPC carries, or `None` when
 /// `path` is not a streaming method.
 #[must_use]
 pub fn streaming_request_message_type(path: &str) -> Option<String> {
-    if path == RUN_SSE_PATH {
-        return Some("aiserver.v1.BidiRequestId".into());
-    }
-    let method = rpc_method_descriptor(path)?;
-    if !method.is_client_streaming() && !method.is_server_streaming() {
-        return None;
-    }
-    Some(method.input().full_name().to_string())
+    streaming_message_type(path, RpcDirection::Request)
 }
 
 /// The response protobuf type a streaming RPC returns, or `None` when `path` is
 /// not a streaming method.
 #[must_use]
 pub fn streaming_response_message_type(path: &str) -> Option<String> {
-    if path == RUN_SSE_PATH {
-        return Some("agent.v1.AgentServerMessage".into());
-    }
-    let method = rpc_method_descriptor(path)?;
-    if !method.is_client_streaming() && !method.is_server_streaming() {
-        return None;
-    }
-    Some(method.output().full_name().to_string())
+    streaming_message_type(path, RpcDirection::Response)
 }
 
 /// Whether the debugger knows how to decode this path's request body.
@@ -1181,5 +1236,69 @@ fn message_field(message: &DynamicMessage, name: &str) -> Option<DynamicMessage>
     match message.get_field_by_name(name).as_deref() {
         Some(Value::Message(value)) => Some(value.clone()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The table is the hand-written half of unary decoding: a path whose
+    /// request or response type is missing from it falls back to reflection,
+    /// so a dropped or renamed entry silently changes which type a capture is
+    /// decoded as. Every entry must therefore name two types the embedded
+    /// descriptor set holds, with the kind string derived from the type.
+    #[test]
+    fn every_unary_entry_names_two_types_the_pool_holds() {
+        for entry in UNARY_RPCS {
+            for (direction, (name, kind)) in
+                [("request", entry.request), ("response", entry.response)]
+            {
+                let descriptor = POOL.get_message_by_name(name).unwrap_or_else(|| {
+                    panic!(
+                        "{}: the {direction} type {name} is not in the embedded descriptor set",
+                        entry.path
+                    )
+                });
+                assert_eq!(
+                    *kind,
+                    proto_message_kind(descriptor.name()),
+                    "{}: the {direction} kind is not derived from {name}",
+                    entry.path
+                );
+            }
+        }
+    }
+
+    /// A table entry that no longer matches the RPC's own signature decodes
+    /// captures as the wrong type: the request kind would be reused for a body
+    /// the reflection path resolves differently. The two must agree.
+    #[test]
+    fn unary_entries_agree_with_the_reflected_method_signature() {
+        for entry in UNARY_RPCS {
+            let method = rpc_method_descriptor(entry.path).unwrap_or_else(|| {
+                panic!(
+                    "{}: the RPC is not in the embedded descriptor set",
+                    entry.path
+                )
+            });
+            assert!(
+                !method.is_client_streaming() && !method.is_server_streaming(),
+                "{}: the table lists a streaming method as unary",
+                entry.path
+            );
+            assert_eq!(
+                entry.request.0,
+                method.input().full_name(),
+                "{}: the table's request type differs from the RPC input",
+                entry.path
+            );
+            assert_eq!(
+                entry.response.0,
+                method.output().full_name(),
+                "{}: the table's response type differs from the RPC output",
+                entry.path
+            );
+        }
     }
 }

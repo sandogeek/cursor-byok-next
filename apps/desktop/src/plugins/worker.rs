@@ -623,7 +623,7 @@ async fn read_stdout(
         };
         match message {
             WorkerMessage::Result { id, result, error } => {
-                deliver_result(pending, &id, result, error.as_ref());
+                deliver_result(pending, &id, result, error.as_deref());
             }
             WorkerMessage::Event { id, event } => {
                 deliver_event(pending, host, &id, &event);
@@ -642,7 +642,7 @@ async fn read_stdout(
 
 /// Delivers a terminal `Result` frame, waking the consumer with the invocation's
 /// own failure message when the plugin reported an error.
-fn deliver_result(pending: &Pending, id: &str, result: serde_json::Value, error: Option<&String>) {
+fn deliver_result(pending: &Pending, id: &str, result: serde_json::Value, error: Option<&str>) {
     if let Some(PendingInvocation {
         items,
         active,

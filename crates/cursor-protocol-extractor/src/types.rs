@@ -116,7 +116,7 @@ impl fmt::Display for FieldNumber {
 }
 
 /// Why [`FieldNumber::try_from`] rejected a tag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InvalidFieldNumberReason {
     /// Outside `1..=536_870_911`.
     OutOfRange,
@@ -125,7 +125,8 @@ pub enum InvalidFieldNumberReason {
 }
 
 /// A tag that is not a valid proto field number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InvalidFieldNumber {
     /// The rejected integer.
     pub number: i32,

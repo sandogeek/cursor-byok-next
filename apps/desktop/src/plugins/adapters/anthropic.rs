@@ -153,8 +153,8 @@ impl Parser {
         let index = required_index(value)?;
         let block = value.get("content_block").and_then(Value::as_object);
         let kind = required_type(block)?;
-        self.blocks.insert(index, BlockState::from_type(&kind));
-        match kind.as_str() {
+        self.blocks.insert(index, BlockState::from_type(kind));
+        match kind {
             "text" => emit(ModelEvent::TextStart),
             "thinking" => emit(ModelEvent::ThinkingStart),
             "redacted_thinking" => {
@@ -192,8 +192,8 @@ impl Parser {
         let index = required_index(value)?;
         let delta = value.get("delta").and_then(Value::as_object);
         let delta_kind = required_type(delta)?;
-        self.open_implicit_block(&delta_kind, index, emit);
-        match delta_kind.as_str() {
+        self.open_implicit_block(delta_kind, index, emit);
+        match delta_kind {
             "text_delta" => {
                 if let Some(delta_text) = map_text_field(delta, "text") {
                     emit(ModelEvent::TextDelta(delta_text.to_owned()));
@@ -650,7 +650,9 @@ fn merge_usage(total: &mut UsageState, update: &UsageState) {
     total.cache_read = merge_usage_field(total.cache_read, update.cache_read);
     total.cache_write = merge_usage_field(total.cache_write, update.cache_write);
     let context = total.input.map(|input| {
-        input.saturating_add(total.cache_read.unwrap_or(0)) + total.cache_write.unwrap_or(0)
+        input
+            .saturating_add(total.cache_read.unwrap_or(0))
+            .saturating_add(total.cache_write.unwrap_or(0))
     });
     if let (Some(context), Some(output)) = (context, total.output) {
         total.total = Some(context.saturating_add(output));
@@ -683,9 +685,8 @@ fn required_index(value: &Value) -> Result<usize> {
         .ok_or_else(|| Error::Provider("Anthropic event is missing index".into()))
 }
 
-fn required_type(value: Option<&serde_json::Map<String, Value>>) -> Result<String> {
+fn required_type(value: Option<&serde_json::Map<String, Value>>) -> Result<&str> {
     map_text_field(value, "type")
-        .map(str::to_owned)
         .ok_or_else(|| Error::Provider("Anthropic event is missing type".into()))
 }
 

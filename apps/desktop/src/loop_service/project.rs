@@ -203,8 +203,8 @@ fn tool_results(
             content: ProjectedContent::ToolResult(ToolResultContent {
                 call_id: part.tool_call_id.clone(),
                 name: part.tool_name.clone(),
-                content: match &content {
-                    Value::String(text) => text.clone(),
+                content: match content {
+                    Value::String(text) => text,
                     value => value.to_string(),
                 },
                 is_error: part.is_error,

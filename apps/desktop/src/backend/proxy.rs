@@ -263,14 +263,3 @@ fn remove_hop_by_hop_headers(headers: &mut axum::http::HeaderMap) {
     }
     headers.remove("keep-alive");
 }
-
-#[cfg(test)]
-impl CursorProxy {
-    #[expect(dead_code, reason = "test-only constructor")]
-    pub fn with_upstream(upstream: String) -> Self {
-        Self {
-            client: upstream_client(),
-            upstream,
-        }
-    }
-}

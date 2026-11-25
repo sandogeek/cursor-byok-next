@@ -451,19 +451,22 @@ fn parse_enum_pair(text: &str, start: usize) -> Option<(i32, String, usize)> {
     Some((no, name, start + end + 1))
 }
 
+#[must_use]
 pub fn compact_enum_prefix(short_name: &str) -> String {
     let name = crate::ast::last_segment(short_name);
     if name.is_empty() {
         return String::new();
     }
-    let mut prefix = String::new();
+    let mut prefix = String::with_capacity(name.len() + 4);
     for (i, ch) in name.chars().enumerate() {
         if i > 0 && ch.is_ascii_uppercase() {
             prefix.push('_');
         }
         prefix.push(ch);
     }
-    format!("{}_", prefix.to_ascii_uppercase())
+    prefix.push('_');
+    prefix.make_ascii_uppercase();
+    prefix
 }
 
 pub fn finish_compact_messages(

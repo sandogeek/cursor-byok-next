@@ -14,7 +14,7 @@ use cursor_protocol_extractor::{Strictness, extract_from_files};
 fn main() -> ExitCode {
     let mut inputs = Vec::new();
     let mut output = None;
-    let mut strict = true;
+    let mut strictness = Strictness::Strict;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -30,8 +30,8 @@ fn main() -> ExitCode {
                 };
                 output = Some(PathBuf::from(path));
             }
-            "-strict" | "--strict" => strict = true,
-            "-no-strict" | "--no-strict" => strict = false,
+            "-strict" | "--strict" => strictness = Strictness::Strict,
+            "-no-strict" | "--no-strict" => strictness = Strictness::Lenient,
             "-h" | "--help" => {
                 print_usage();
                 return ExitCode::SUCCESS;
@@ -51,11 +51,6 @@ fn main() -> ExitCode {
     let Some(output) = output else {
         eprintln!("-output is required");
         return ExitCode::from(2);
-    };
-    let strictness = if strict {
-        Strictness::Strict
-    } else {
-        Strictness::Lenient
     };
     match extract_from_files(&inputs, &output, strictness) {
         Ok(result) => {

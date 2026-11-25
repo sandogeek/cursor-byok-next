@@ -187,7 +187,7 @@ pub struct LlmCallRequest {
     pub byte_count: i64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LlmCallResponseChunk {
     pub seq: i64,
     pub received_offset_ms: i64,

@@ -92,7 +92,7 @@ impl ExchangeState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExchangeSummary {
     pub id: String,
@@ -122,7 +122,7 @@ pub struct ExchangeSummary {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Exchange {
     #[serde(flatten)]
@@ -131,7 +131,7 @@ pub struct Exchange {
     pub response: Payload,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Payload {
     pub headers: Vec<Header>,
@@ -163,13 +163,13 @@ pub struct Payload {
     pub frames: Vec<FrameView>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Header {
     pub name: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameView {
     pub index: i32,
@@ -197,7 +197,7 @@ impl FrameView {
     pub const KIND_END_STREAM: &str = "end_stream";
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationSummary {
     pub conversation_id: String,
@@ -211,7 +211,7 @@ pub struct ConversationSummary {
 ///
 /// The wire shape is built in [`crate::web`]; [`StoreEventKind::label`] is the
 /// single source of truth for the event name.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreEvent {
     pub kind: StoreEventKind,
     /// The exchange that changed, absent for [`StoreEventKind::Cleared`].

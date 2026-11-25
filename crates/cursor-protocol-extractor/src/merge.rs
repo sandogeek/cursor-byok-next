@@ -1,6 +1,6 @@
 //! Merge duplicate declarations and keep local-loop packages only.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::resolver::{TypeContext, TypeResolver};
 use crate::types::{
@@ -307,7 +307,7 @@ impl RefScope<'_> {
         &self,
         type_ref: &str,
         context: TypeContext<'_>,
-        needed: &mut HashSet<String>,
+        needed: &mut BTreeSet<String>,
         local_types: &HashSet<String>,
     ) {
         let Some(type_name) =
@@ -331,18 +331,19 @@ impl RefScope<'_> {
 ///
 /// Each declaration contributes references seen from its own position, so
 /// resolution prefers the module the declaration lives in.
+#[must_use]
 pub fn collect_needed_types(
     current_package: &str,
     messages: &[Message],
     services: &[Service],
     resolver: &TypeResolver,
     local_types: &HashSet<String>,
-) -> HashSet<String> {
+) -> BTreeSet<String> {
     let scope = RefScope {
         current_package,
         resolver,
     };
-    let mut needed = HashSet::new();
+    let mut needed = BTreeSet::new();
     for message in messages {
         let context = TypeContext::new(&message.package, message.pos, message.module_start);
         let references = message.fields.iter().flat_map(field_type_references);

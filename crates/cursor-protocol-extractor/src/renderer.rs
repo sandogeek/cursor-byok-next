@@ -63,6 +63,7 @@ fn emit(out: &mut String, args: std::fmt::Arguments<'_>) {
 ///
 /// Takes the file by value: the declarations are moved into the render tree
 /// instead of being deep-cloned.
+#[must_use]
 pub fn generate_proto_file(
     pkg_name: &str,
     file: ProtoFile,
@@ -207,10 +208,12 @@ fn write_message_comment(
     message: &Message,
     copied: &HashMap<String, CopiedType>,
 ) {
-    let mut var_info = message.var_name.clone();
-    if !message.internal_name.is_empty() && message.internal_name != message.var_name {
-        var_info = format!("{}, class: {}", message.var_name, message.internal_name);
-    }
+    let var_info: std::borrow::Cow<'_, str> =
+        if !message.internal_name.is_empty() && message.internal_name != message.var_name {
+            format!("{}, class: {}", message.var_name, message.internal_name).into()
+        } else {
+            message.var_name.as_str().into()
+        };
     match copied.get(&message.short_name) {
         Some(CopiedType::External(original)) => emit(
             out,

@@ -1,6 +1,6 @@
 //! Extract, merge, copy local-loop dependencies and write proto files.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -330,7 +330,9 @@ fn remove_staged_directory(path: &Path) -> Option<String> {
 }
 
 fn parent_or_cwd(path: &Path) -> &Path {
-    path.parent().unwrap_or_else(|| Path::new("."))
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 /// How many sibling temp names `unique_temp_dir` will try before giving up.
@@ -566,7 +568,7 @@ fn seed_local_types(result: &mut ProtoFile) -> HashSet<String> {
 /// many declarations it added.
 fn copy_one_round(
     pkg_name: &str,
-    needed: HashSet<String>,
+    needed: BTreeSet<String>,
     index: &DeclarationIndex<'_>,
     result: &mut ProtoFile,
     local_types: &mut HashSet<String>,

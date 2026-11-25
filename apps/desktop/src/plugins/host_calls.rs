@@ -291,9 +291,11 @@ impl HostContext {
                 return Ok(serde_json::json!({"status": status, "headers": {}, "body": ""}));
             }
         }
-        if response.content_length().is_some_and(|size| {
-            usize::try_from(size).map_or(true, |size| size > MAX_NETWORK_RESPONSE_BYTES)
-        }) {
+        if response
+            .content_length()
+            .zip(u64::try_from(MAX_NETWORK_RESPONSE_BYTES).ok())
+            .is_some_and(|(size, max)| size > max)
+        {
             return Err(response_too_large());
         }
         let headers = header_map(&response);
@@ -471,16 +473,14 @@ async fn stream_body(
         let mut consumed = 0;
         while let Some(relative) = buffered[consumed..].iter().position(|byte| *byte == b'\n') {
             let end = consumed + relative;
-            let mut line = buffered[consumed..end].to_vec();
+            let raw = &buffered[consumed..end];
+            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
             consumed = end + 1;
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
             // The receiver may be full because the plugin stopped reading; the
             // cancellation branch means that no longer blocks this task forever.
             if !send_line(
                 &sender,
-                String::from_utf8_lossy(&line).into_owned(),
+                String::from_utf8_lossy(line).into_owned(),
                 &cancellation,
             )
             .await
