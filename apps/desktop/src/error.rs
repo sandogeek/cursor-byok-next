@@ -55,9 +55,6 @@ pub enum Error {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    /// Cursor takeover failed; the cause is kept for the log line.
-    #[error(transparent)]
-    Harness(#[from] crate::harness::Error),
 }
 
 impl Error {
@@ -106,7 +103,6 @@ impl IntoResponse for Error {
             | Self::Storage(_)
             | Self::Database { .. }
             | Self::Context { .. }
-            | Self::Harness(_)
             | Self::Runtime(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         tracing::warn!(%status, error = %self, "local loop request failed");

@@ -49,6 +49,28 @@ pub(crate) fn u32_from_usize(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+/// 2^64: the first `f64` past `u64`'s range. Exactly representable.
+const U64_LIMIT: f64 = 18_446_744_073_709_551_616.0;
+
+/// Exact integral `f64` inside `u64`'s range. Compares bit patterns so `-0.0`
+/// counts as integral, and every accepted value casts losslessly.
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "range-checked to [0, 2^64) and integral, so the cast is exact"
+)]
+pub(crate) fn integral_u64(value: f64) -> Option<u64> {
+    if value.is_finite()
+        && value.trunc().to_bits() == value.to_bits()
+        && (0.0..U64_LIMIT).contains(&value)
+    {
+        Some(value as u64)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

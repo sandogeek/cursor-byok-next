@@ -67,7 +67,7 @@ fn wrapped_scan_is_better(original: &BundleScan, wrapped: &BundleScan) -> bool {
     if wrapped_decls < original_decls {
         return false;
     }
-    if wrapped.diagnostics.parse_errors.len() > original.diagnostics.parse_errors.len()
+    if wrapped.diagnostics.parse_error_count() > original.diagnostics.parse_error_count()
         && wrapped_decls == original_decls
     {
         return false;

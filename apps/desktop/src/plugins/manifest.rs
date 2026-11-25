@@ -22,7 +22,34 @@ pub struct PluginManifest {
     pub icon: String,
     pub entry: String,
     #[serde(default)]
-    pub permissions: PluginPermissions,
+    permissions: PluginPermissions,
+}
+
+/// Whether a plugin may talk to the origin a user bound to a resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ResourceOriginPolicy {
+    Allowed,
+    Denied,
+}
+
+impl ResourceOriginPolicy {
+    pub(super) fn is_allowed(self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+}
+
+impl PluginManifest {
+    pub(super) fn resource_origin_policy(&self) -> ResourceOriginPolicy {
+        if self.permissions.resource_origin {
+            ResourceOriginPolicy::Allowed
+        } else {
+            ResourceOriginPolicy::Denied
+        }
+    }
+
+    pub(super) fn network_hosts(&self) -> Vec<String> {
+        self.permissions.network.clone()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

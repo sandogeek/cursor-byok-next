@@ -570,14 +570,14 @@ pub struct Diagnostics {
     pub skipped_field_objects: usize,
     pub skipped_field_samples: Vec<String>,
     pub unresolved_type_refs: HashMap<String, usize>,
-    pub empty_messages: Vec<String>,
-    pub placeholder_hits: Vec<String>,
-    pub declared_types: usize,
-    pub extracted_types: usize,
-    pub missing_declarations: Vec<String>,
-    pub parse_errors: Vec<String>,
+    empty_messages: Vec<String>,
+    placeholder_hits: Vec<String>,
+    declared_types: usize,
+    extracted_types: usize,
+    missing_declarations: Vec<String>,
+    parse_errors: Vec<String>,
     /// Parse errors dropped after [`DIAGNOSTIC_SAMPLE_LIMIT`] were kept.
-    pub overflowed_parse_errors: usize,
+    overflowed_parse_errors: usize,
     pub shape_errors: Vec<String>,
     /// Bundle strings the extractor did not recognize (unknown field/method
     /// kinds, malformed service methods). Lenient runs render the old fallback
@@ -621,6 +621,32 @@ impl Diagnostics {
         } else {
             self.overflowed_parse_errors += 1;
         }
+    }
+
+    #[must_use]
+    pub fn parse_error_count(&self) -> usize {
+        self.parse_errors.len() + self.overflowed_parse_errors
+    }
+
+    pub fn add_empty_message(&mut self, type_name: impl Into<String>) {
+        self.empty_messages.push(type_name.into());
+    }
+
+    pub fn add_placeholder_hit(&mut self, hit: impl Into<String>) {
+        self.placeholder_hits.push(hit.into());
+    }
+
+    pub fn record_declaration_coverage(
+        &mut self,
+        declared: usize,
+        extracted: usize,
+        mut missing: Vec<String>,
+    ) {
+        missing.sort_unstable();
+        missing.dedup();
+        self.declared_types = declared;
+        self.extracted_types = extracted;
+        self.missing_declarations = missing;
     }
 
     pub fn add_shape_error(&mut self, error: &Error) {

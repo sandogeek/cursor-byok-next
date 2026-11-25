@@ -12,7 +12,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-use super::state::StoredModel;
+use crate::plugins::state::StoredModel;
 
 /// How long a provider's model list may be reused. Long enough that opening the
 /// picker repeatedly costs one round-trip, short enough that a model the
@@ -21,14 +21,14 @@ const LIVE_CATALOG_TTL: Duration = Duration::from_secs(15);
 
 /// A provider's model list plus the error that left it incomplete, if any.
 #[derive(Debug, Default)]
-pub(super) struct ProviderCatalog {
-    pub(super) models: Vec<StoredModel>,
-    pub(super) error: Option<String>,
+pub(in crate::plugins) struct ProviderCatalog {
+    pub(in crate::plugins) models: Vec<StoredModel>,
+    pub(in crate::plugins) error: Option<String>,
 }
 
 /// Whether a catalog read may reuse the TTL cache or must re-ask the plugin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum CatalogRefresh {
+pub(in crate::plugins) enum CatalogRefresh {
     Cached,
     Forced,
 }
@@ -36,28 +36,28 @@ pub(super) enum CatalogRefresh {
 /// The identity of one cached list: the same resource under the same provider is
 /// reused, anything else is a separate answer.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct LiveCatalogKey {
-    pub(super) plugin: String,
-    pub(super) provider: String,
-    pub(super) resource: String,
+pub(in crate::plugins) struct LiveCatalogKey {
+    pub(in crate::plugins) plugin: String,
+    pub(in crate::plugins) provider: String,
+    pub(in crate::plugins) resource: String,
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct LiveCatalogEntry {
-    pub(super) models: Vec<StoredModel>,
+pub(in crate::plugins) struct LiveCatalogEntry {
+    pub(in crate::plugins) models: Vec<StoredModel>,
     last_attempt: Instant,
-    pub(super) error: Option<String>,
+    pub(in crate::plugins) error: Option<String>,
 }
 
 #[derive(Debug, Default)]
-pub(super) struct CatalogCache {
+pub(in crate::plugins) struct CatalogCache {
     entries: Mutex<HashMap<LiveCatalogKey, LiveCatalogEntry>>,
 }
 
 impl CatalogCache {
     /// The cached answer for `key`, when `refresh` allows reusing it and it is
     /// younger than [`LIVE_CATALOG_TTL`]. A stale or forced read returns `None`.
-    pub(super) async fn get(
+    pub(in crate::plugins) async fn get(
         &self,
         key: &LiveCatalogKey,
         refresh: CatalogRefresh,
@@ -76,7 +76,7 @@ impl CatalogCache {
     /// see. A failure keeps the previously listed models and only attaches the
     /// new error, so a provider that just went offline still shows its last
     /// known catalog.
-    pub(super) async fn store(
+    pub(in crate::plugins) async fn store(
         &self,
         key: LiveCatalogKey,
         result: Result<Vec<StoredModel>, String>,
@@ -104,13 +104,17 @@ impl CatalogCache {
 
     /// Every cached entry, for tests that assert on what a read recorded.
     #[cfg(test)]
-    pub(super) async fn all(&self) -> HashMap<LiveCatalogKey, LiveCatalogEntry> {
+    pub(in crate::plugins) async fn all(&self) -> HashMap<LiveCatalogKey, LiveCatalogEntry> {
         self.entries.lock().await.clone()
     }
 
     /// Drops every entry listed for one plugin's changed resources, so the next
     /// read asks the plugin again instead of serving a pre-change list.
-    pub(super) async fn invalidate(&self, plugin_id: &str, resource_ids: &HashSet<String>) {
+    pub(in crate::plugins) async fn invalidate(
+        &self,
+        plugin_id: &str,
+        resource_ids: &HashSet<String>,
+    ) {
         self.entries
             .lock()
             .await
@@ -120,9 +124,8 @@ impl CatalogCache {
 
 /// Prefixes a listed model's id with the resource it came from, so two resources
 /// of the same provider cannot advertise colliding ids.
-fn bind_live_model(mut model: StoredModel, resource_id: &str) -> StoredModel {
-    model.id = format!("{resource_id}/{}", model.id);
-    model
+fn bind_live_model(model: StoredModel, resource_id: &str) -> StoredModel {
+    model.with_resource_prefix(resource_id)
 }
 
 #[cfg(test)]
@@ -138,14 +141,7 @@ mod tests {
     }
 
     fn model(id: &str) -> StoredModel {
-        StoredModel {
-            id: id.into(),
-            display_name: id.into(),
-            description: None,
-            max_output_tokens: None,
-            images: false,
-            private_data: serde_json::Value::Null,
-        }
+        StoredModel::for_test(id, id)
     }
 
     #[tokio::test]
@@ -153,7 +149,7 @@ mod tests {
         let cache = CatalogCache::default();
         cache.store(key("one"), Ok(vec![model("m1")]), "one").await;
         let after_failure = cache.store(key("one"), Err("HTTP 503".into()), "one").await;
-        assert_eq!(after_failure.models[0].id, "one/m1");
+        assert_eq!(after_failure.models[0].id(), "one/m1");
         assert_eq!(after_failure.error.as_deref(), Some("HTTP 503"));
     }
 

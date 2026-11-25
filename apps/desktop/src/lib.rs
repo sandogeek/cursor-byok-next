@@ -323,7 +323,7 @@ impl Harness {
             HarnessError::Config(format!("invalid local backend address: {error}"))
         })?;
         this.with(|harness| Arc::clone(&harness.inner))
-            .set_backend_addr(addr)
+            .set_backend_addr(addr, backend::provides)
             .await
     }
 
@@ -1245,11 +1245,10 @@ async fn attach_backend(
     // and does not stay borrowed across `set_backend_addr`'s await.
     let addr = backend.borrow().clone();
     if let Some(addr) = addr {
-        harness
-            .set_backend_addr(addr.parse().map_err(|error| {
-                HarnessError::Config(format!("invalid local backend address: {error}"))
-            })?)
-            .await?;
+        let addr = addr.parse().map_err(|error| {
+            HarnessError::Config(format!("invalid local backend address: {error}"))
+        })?;
+        harness.set_backend_addr(addr, backend::provides).await?;
     }
     Ok(())
 }

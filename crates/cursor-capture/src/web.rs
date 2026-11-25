@@ -1,7 +1,6 @@
 //! Read-only debug API, SSE updates, and the original embedded web UI.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -19,7 +18,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::config::DEBUG_BASE_PATH;
-use crate::proxy::Server;
+use crate::store::ExchangeStore;
 use crate::types::StoreEvent;
 
 /// How often a quiet SSE connection is nudged so proxies keep it open.
@@ -29,7 +28,15 @@ const SSE_HEARTBEAT: Duration = Duration::from_secs(15);
 #[folder = "web"]
 struct WebAssets;
 
-pub fn router() -> Router<Arc<Server>> {
+/// The read-only session view and store exposed to the debug UI.
+#[derive(Clone, Debug)]
+pub(crate) struct DebugState {
+    pub(crate) service_addr: String,
+    pub(crate) upstream_url: String,
+    pub(crate) store: ExchangeStore,
+}
+
+pub(crate) fn router(state: DebugState) -> Router {
     Router::new()
         .route("/", get(static_file))
         .route("/api/status", get(handle_status))
@@ -42,14 +49,15 @@ pub fn router() -> Router<Arc<Server>> {
         .route("/api/events", get(handle_events))
         .fallback(static_file)
         .layer(middleware::from_fn(security_headers))
+        .with_state(state)
 }
 
-async fn handle_status(State(server): State<Arc<Server>>) -> impl IntoResponse {
-    let status = server.store().status();
+async fn handle_status(State(state): State<DebugState>) -> impl IntoResponse {
+    let status = state.store.status();
     axum::Json(serde_json::json!({
-        "serviceAddr": server.service_addr(),
+        "serviceAddr": state.service_addr,
         "debugPath": format!("{DEBUG_BASE_PATH}/"),
-        "upstreamURL": server.upstream_url(),
+        "upstreamURL": state.upstream_url,
         "running": true,
         "databasePath": status.database_path,
         "databaseError": status.last_error,
@@ -62,45 +70,45 @@ struct ExchangeQuery {
 }
 
 async fn handle_exchange_list(
-    State(server): State<Arc<Server>>,
+    State(state): State<DebugState>,
     Query(query): Query<ExchangeQuery>,
 ) -> Response {
     let conversation_id = query.conversation_id.unwrap_or_default();
-    match server.store().summaries(conversation_id.trim()) {
+    match state.store.summaries(conversation_id.trim()) {
         Ok(summaries) => axum::Json(summaries).into_response(),
         Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }
 
 async fn handle_exchange_detail(
-    State(server): State<Arc<Server>>,
+    State(state): State<DebugState>,
     Path(id): Path<String>,
 ) -> Response {
-    match server.store().get(id.trim()) {
+    match state.store.get(id.trim()) {
         Ok(Some(exchange)) => axum::Json(exchange).into_response(),
         Ok(None) => json_error(StatusCode::NOT_FOUND, "请求记录不存在"),
         Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }
 
-async fn handle_clear_exchanges(State(server): State<Arc<Server>>) -> Response {
-    match server.clear_exchanges() {
+async fn handle_clear_exchanges(State(state): State<DebugState>) -> Response {
+    match state.store.clear() {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }
 
-async fn handle_conversation_list(State(server): State<Arc<Server>>) -> Response {
-    match server.store().conversations() {
+async fn handle_conversation_list(State(state): State<DebugState>) -> Response {
+    match state.store.conversations() {
         Ok(conversations) => axum::Json(conversations).into_response(),
         Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
     }
 }
 
 async fn handle_events(
-    State(server): State<Arc<Server>>,
+    State(state): State<DebugState>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-    let rx = server.store().subscribe();
+    let rx = state.store.subscribe();
     let stream = async_stream::stream! {
         yield Ok(Event::default().event("ready").data("{}"));
         let mut updates = BroadcastStream::new(rx);

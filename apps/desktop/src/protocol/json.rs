@@ -29,7 +29,7 @@ pub(crate) fn prost_struct(value: &Struct) -> Value {
 }
 
 fn json_number(value: f64) -> Value {
-    if let Some(int_value) = integral_u64(value) {
+    if let Some(int_value) = crate::saturating::integral_u64(value) {
         return Value::from(int_value);
     }
     if let Some(int_value) = integral_i64(value) {
@@ -38,8 +38,6 @@ fn json_number(value: f64) -> Value {
     serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number)
 }
 
-/// 2^64: the first `f64` past `u64`'s range. Exactly representable.
-const U64_LIMIT: f64 = 18_446_744_073_709_551_616.0;
 /// -2^63 and 2^63: `i64`'s range. Exactly representable.
 const I64_MIN_LIMIT: f64 = -9_223_372_036_854_775_808.0;
 const I64_MAX_LIMIT: f64 = 9_223_372_036_854_775_808.0;
@@ -50,23 +48,7 @@ fn is_integral(value: f64) -> bool {
     value.is_finite() && value.trunc().to_bits() == value.to_bits()
 }
 
-/// Every integral `f64` inside `u64`'s range is exactly representable as `u64`,
-/// so the guarded cast below is lossless.
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "range-checked to [0, 2^64) and integral, so the cast is exact"
-)]
-pub(crate) fn integral_u64(value: f64) -> Option<u64> {
-    if is_integral(value) && (0.0..U64_LIMIT).contains(&value) {
-        Some(value as u64)
-    } else {
-        None
-    }
-}
-
-/// Same reasoning as [`integral_u64`], for `i64`'s range.
+/// Integral `f64` inside `i64`'s range is exactly representable as `i64`.
 #[expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,

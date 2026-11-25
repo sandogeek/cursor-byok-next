@@ -1,16 +1,16 @@
 //! Runs one thread-confined `QuickJS` VM per active trusted plugin.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU16, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use tokio::{
-    sync::{Mutex, mpsc, watch},
+    sync::{Mutex, mpsc},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -18,206 +18,22 @@ use tokio_util::sync::CancellationToken;
 use super::{
     Error, Result,
     builtin::MAGPIE_PLUGIN_ID,
-    catalog::PluginEntry,
     host_calls::HostContext,
-    protocol::{HostMessage, WorkerMessage},
-    vm::{self, loader::Modules},
+    invocation::{InvocationState, Pending, WorkerStreamItem},
+    manifest::ResourceOriginPolicy,
+    vm::{
+        self,
+        loader::Modules,
+        protocol::{HostMessage, WorkerMessage},
+    },
     wire,
 };
-use crate::{calls::CallRecorder, model::ModelInvocation, provider::ModelEvent};
+use crate::{calls::CallRecorder, model::ModelInvocation};
 
 const INVOCATION_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// One item a plugin invocation produces: a streamed model event, or the
-/// terminal result that ends the invocation.
-#[derive(Debug)]
-pub enum WorkerStreamItem {
-    Event(ModelEvent),
-    Result(Result<serde_json::Value>),
-}
-
 /// Complete frames in the bounded in-process session queue.
 type Writer = std::sync::mpsc::SyncSender<Vec<u8>>;
-
-/// Events one invocation may have queued for its consumer. Bounded so a plugin
-/// that emits faster than the model pipeline drains cannot grow memory without
-/// limit; a full queue ends the invocation instead of dropping events silently.
-const EVENT_QUEUE_ITEMS: usize = 4_096;
-/// Live invocations one worker serves at once. Each costs a task plus its event
-/// queue, so a burst is capped rather than spawned without bound.
-const MAX_ACTIVE_INVOCATIONS: usize = 16;
-/// `host_call`s one invocation may have in flight. A plugin that fans out calls
-/// without awaiting them is rejected past this instead of spawning forever.
-const MAX_HOST_CALLS_PER_INVOCATION: usize = 8;
-/// A registered stream: the guard that unregisters it, the stream the caller
-/// reads events from, the sender the worker impl writes them to, and the
-/// liveness watch that tells the SDK bridge the invocation is still running.
-struct Registration {
-    guard: InvocationGuard,
-    receiver: mpsc::Receiver<WorkerStreamItem>,
-    items: mpsc::Sender<WorkerStreamItem>,
-    active: watch::Receiver<()>,
-}
-
-/// Per-invocation concurrency, so a plugin cannot spawn without bound.
-pub(super) struct InvocationBudget {
-    host_calls: std::sync::atomic::AtomicUsize,
-}
-
-impl InvocationBudget {
-    fn new() -> Self {
-        Self {
-            host_calls: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    /// Takes one `host_call` slot, or reports the invocation is saturated.
-    pub(super) fn try_acquire_host_call(&self) -> bool {
-        let mut current = self.host_calls.load(Ordering::Relaxed);
-        loop {
-            if current >= MAX_HOST_CALLS_PER_INVOCATION {
-                return false;
-            }
-            match self.host_calls.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => current = actual,
-            }
-        }
-    }
-
-    pub(super) fn release_host_call(&self) {
-        self.host_calls.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-pub(super) struct Pending(parking_lot::Mutex<PendingInvocationMap>);
-
-/// The invocation registry while the worker runs, or `None` once it stopped.
-type PendingInvocationMap = Option<HashMap<String, PendingInvocation>>;
-
-struct PendingInvocation {
-    items: mpsc::Sender<WorkerStreamItem>,
-    active: watch::Sender<()>,
-    state: Arc<InvocationState>,
-    budget: Arc<InvocationBudget>,
-}
-
-struct InvocationGuard {
-    id: String,
-    pending: Arc<Pending>,
-}
-
-impl Drop for InvocationGuard {
-    fn drop(&mut self) {
-        self.pending.remove(&self.id);
-    }
-}
-
-impl Pending {
-    pub(super) fn open() -> Self {
-        Self(parking_lot::Mutex::new(Some(HashMap::new())))
-    }
-
-    /// Registers one in-flight invocation. `self` stays an `Arc` at the call
-    /// site because the returned guard must keep the map alive.
-    fn register(self: &Arc<Self>, state: InvocationState) -> Result<Registration> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let mut pending = self.0.lock();
-        let map = pending
-            .as_mut()
-            .ok_or_else(|| Error::Provider("plugin worker stopped".into()))?;
-        if map.len() >= MAX_ACTIVE_INVOCATIONS {
-            return Err(Error::Provider(format!(
-                "plugin worker is already running {MAX_ACTIVE_INVOCATIONS} invocations"
-            )));
-        }
-        let (items, receiver) = mpsc::channel(EVENT_QUEUE_ITEMS);
-        let (active, active_rx) = watch::channel(());
-        *state.events.lock() = Some(items.clone());
-        map.insert(
-            id.clone(),
-            PendingInvocation {
-                items: items.clone(),
-                active,
-                state: Arc::new(state),
-                budget: Arc::new(InvocationBudget::new()),
-            },
-        );
-        Ok(Registration {
-            guard: InvocationGuard {
-                id,
-                pending: Arc::clone(self),
-            },
-            receiver,
-            items,
-            active: active_rx,
-        })
-    }
-
-    fn sender(&self, id: &str) -> Option<mpsc::Sender<WorkerStreamItem>> {
-        self.0
-            .lock()
-            .as_ref()?
-            .get(id)
-            .map(|invocation| invocation.items.clone())
-    }
-
-    fn remove(&self, id: &str) -> Option<PendingInvocation> {
-        let invocation = self.0.lock().as_mut()?.remove(id)?;
-        invocation.state.cancellation.cancel();
-        Some(invocation)
-    }
-
-    /// The state and liveness watch one `host_call` runs under, plus the budget
-    /// the spawned call must hold a slot in.
-    pub(super) fn authorization(
-        &self,
-        id: &str,
-    ) -> Option<(
-        Arc<InvocationState>,
-        watch::Receiver<()>,
-        Arc<InvocationBudget>,
-    )> {
-        let pending = self.0.lock();
-        let invocation = pending.as_ref()?.get(id)?;
-        Some((
-            Arc::clone(&invocation.state),
-            invocation.active.subscribe(),
-            Arc::clone(&invocation.budget),
-        ))
-    }
-
-    fn is_closed(&self) -> bool {
-        self.0.lock().is_none()
-    }
-
-    pub(super) fn close(&self, message: &str) {
-        let pending = self.0.lock().take();
-        for (
-            _,
-            PendingInvocation {
-                items,
-                active,
-                state,
-                ..
-            },
-        ) in pending.into_iter().flatten()
-        {
-            state.cancellation.cancel();
-            drop(active);
-            // A full queue cannot take the terminal error; the consumer ends when
-            // the sender drops with this map, so nothing is silently "completed".
-            let _ = items.try_send(WorkerStreamItem::Result(Err(Error::Provider(
-                message.into(),
-            ))));
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct PluginWorker {
@@ -271,72 +87,19 @@ impl Drop for WorkerProcess {
     }
 }
 
-pub(super) struct InvocationState {
-    pub(super) allowed_origins: HashSet<String>,
-    /// Set only for Magpie's `models.list`, and only its own HTTP status is
-    /// recorded: the app reports that status as `catalogError`.
-    pub(super) magpie_catalog_status: Option<AtomicU16>,
-    pub(super) cancellation: CancellationToken,
-    recorder: Option<CallRecorder>,
-    recorder_claimed: AtomicBool,
-    model: Option<Arc<ModelInvocation>>,
-    events: parking_lot::Mutex<Option<mpsc::Sender<WorkerStreamItem>>>,
-}
-
-impl InvocationState {
-    pub(super) fn claim_recorder(&self) -> Option<CallRecorder> {
-        self.recorder.as_ref().and_then(|recorder| {
-            self.recorder_claimed
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .ok()
-                .map(|_| recorder.clone())
-        })
-    }
-
-    pub(super) fn emit(&self, event: ModelEvent) {
-        let Some(events) = self.events.lock().as_ref().cloned() else {
-            return;
-        };
-        if events.try_send(WorkerStreamItem::Event(event)).is_err() {
-            self.cancellation.cancel();
-            // The consumer fell behind its budget. End the invocation with an
-            // explicit error instead of dropping an event and continuing as
-            // if the stream were still complete.
-            let _ = events.try_send(WorkerStreamItem::Result(Err(Error::Provider(
-                "plugin event queue overflowed; the invocation was ended".into(),
-            ))));
-        }
-    }
-
-    pub(super) fn model(&self) -> Result<&ModelInvocation> {
-        self.model.as_deref().ok_or_else(|| {
-            Error::Protocol("protocol.stream requires a registered model request".into())
-        })
-    }
-
-    fn failure(&self) -> Error {
-        let status = self
-            .magpie_catalog_status
-            .as_ref()
-            .map(|status| status.load(Ordering::Relaxed));
-        let message = match status {
-            Some(status @ (100..=199 | 300..=599)) => {
-                format!("Magpie model discovery failed (HTTP {status})")
-            }
-            _ => "plugin invocation failed".into(),
-        };
-        Error::Provider(message)
-    }
-}
-
 impl PluginWorker {
-    pub fn new(plugin: &PluginEntry, loader: Modules) -> Self {
-        let plugin_id = plugin.manifest.id.clone();
+    pub fn new(
+        plugin_id: String,
+        resource_origin: ResourceOriginPolicy,
+        network_hosts: Vec<String>,
+        entry: String,
+        loader: Modules,
+    ) -> Self {
         Self {
             inner: Arc::new(PluginWorkerInner {
-                host: HostContext::new(&plugin_id, &plugin.manifest.permissions),
+                host: HostContext::new(&plugin_id, resource_origin, network_hosts),
                 plugin_id,
-                entry: plugin.entry.clone(),
+                entry,
                 loader,
                 process: Mutex::new(None),
                 #[cfg(test)]
@@ -413,25 +176,20 @@ impl PluginWorker {
         } = request;
         let (writer, pending, stop) = self.connection().await?;
         let request_cancellation = CancellationToken::new();
-        let Registration {
-            guard: request,
-            receiver,
-            items,
-            mut active,
-        } = pending.register(InvocationState {
+        let mut state = InvocationState::new(
             allowed_origins,
-            magpie_catalog_status: (self.inner.plugin_id == MAGPIE_PLUGIN_ID
-                && method == "models.list")
-                .then(AtomicU16::default),
-            cancellation: request_cancellation.clone(),
+            request_cancellation.clone(),
             recorder,
-            recorder_claimed: AtomicBool::new(false),
             model,
-            events: parking_lot::Mutex::new(None),
-        })?;
+        );
+        if self.inner.plugin_id == MAGPIE_PLUGIN_ID && method == "models.list" {
+            state = state.with_magpie_catalog_tracking();
+        }
+        let (request, receiver, items, mut active) = pending.register(state)?;
+        let request_id = request.id().to_owned();
         let request_bytes = {
             let bytes = encode_message(&HostMessage::Request {
-                id: request.id.clone(),
+                id: request_id.clone(),
                 method: method.to_owned(),
                 params: params.clone(),
             })?;
@@ -441,7 +199,6 @@ impl PluginWorker {
             }
             bytes
         };
-        let request_id = request.id.clone();
         // One complete frame enters the bounded session queue, or registration is withdrawn.
         writer
             .try_send(request_bytes)
@@ -533,7 +290,7 @@ impl PluginWorker {
                     };
                     match message {
                         WorkerMessage::Result { id, result, error } => {
-                            deliver_result(&pending, &id, result, error.as_deref());
+                            pending.complete_result(&id, result, error.as_deref());
                         }
                         WorkerMessage::Event { id, event } => {
                             deliver_event(&pending, &host, &id, &event);
@@ -557,26 +314,6 @@ impl PluginWorker {
     }
 }
 
-/// Delivers a terminal `Result` frame, waking the consumer with the invocation's
-/// own failure message when the plugin reported an error.
-fn deliver_result(pending: &Pending, id: &str, result: serde_json::Value, error: Option<&str>) {
-    if let Some(PendingInvocation {
-        items,
-        active,
-        state,
-        budget: _,
-    }) = pending.remove(id)
-    {
-        drop(active);
-        let value = if error.is_some() {
-            Err(state.failure())
-        } else {
-            Ok(result)
-        };
-        let _ = items.try_send(WorkerStreamItem::Result(value));
-    }
-}
-
 /// Delivers one streamed event, ending the invocation explicitly if the event
 /// cannot be converted or the queue is full.
 fn deliver_event(pending: &Pending, host: &HostContext, id: &str, event: &serde_json::Value) {
@@ -586,8 +323,7 @@ fn deliver_event(pending: &Pending, host: &HostContext, id: &str, event: &serde_
     let event = match wire::model_event(event) {
         Ok(event) => event,
         Err(error) => {
-            pending.remove(id);
-            let _ = sender.try_send(WorkerStreamItem::Result(Err(error)));
+            pending.remove_and_fail(id, error);
             return;
         }
     };
@@ -598,19 +334,16 @@ fn deliver_event(pending: &Pending, host: &HostContext, id: &str, event: &serde_
         plugin = host.plugin_id(),
         "plugin event queue overflowed; ending the invocation"
     );
-    pending.remove(id);
-    let _ = sender.try_send(WorkerStreamItem::Result(Err(Error::Provider(
-        "plugin event queue overflowed; the invocation was ended".into(),
-    ))));
+    pending.remove_and_fail(
+        id,
+        Error::Provider("plugin event queue overflowed; the invocation was ended".into()),
+    );
 }
 
 /// Removes one invocation from the registry and tells its consumer it was
 /// cancelled. Runs locally, independent of the VM thread.
 fn deregister(pending: &Pending, request_id: &str) {
-    if let Some(PendingInvocation { items, active, .. }) = pending.remove(request_id) {
-        drop(active);
-        let _ = items.try_send(WorkerStreamItem::Result(Err(Error::Cancelled)));
-    }
+    pending.remove_and_fail(request_id, Error::Cancelled);
 }
 
 /// Best-effort delivery of a `Cancel` frame. It must never block the teardown
@@ -664,29 +397,17 @@ fn recorded_network_request(
 
 #[cfg(test)]
 mod tests {
+    use super::super::invocation::{EVENT_QUEUE_ITEMS, MAX_HOST_CALLS_PER_INVOCATION};
     use super::*;
+    use crate::provider::ModelEvent;
     use tokio::io::AsyncWriteExt;
 
     fn invocation(allowed_origins: HashSet<String>) -> InvocationState {
-        InvocationState {
-            allowed_origins,
-            magpie_catalog_status: None,
-            cancellation: CancellationToken::new(),
-            recorder: None,
-            recorder_claimed: AtomicBool::new(false),
-            model: None,
-            events: parking_lot::Mutex::new(None),
-        }
+        InvocationState::new(allowed_origins, CancellationToken::new(), None, None)
     }
 
     fn host() -> HostContext {
-        HostContext::new(
-            "test",
-            &crate::plugins::manifest::PluginPermissions {
-                network: Vec::new(),
-                resource_origin: true,
-            },
-        )
+        HostContext::new("test", ResourceOriginPolicy::Allowed, Vec::new())
     }
 
     #[tokio::test]
@@ -707,22 +428,21 @@ mod tests {
     #[tokio::test]
     async fn protocol_stream_rejects_unregistered_requests_and_foreign_hosts() {
         let host = host();
-        let missing = host
-            .call(
-                &invocation(HashSet::from(["http://127.0.0.1:1".into()])),
-                "protocol.stream",
-                serde_json::json!({
-                    "protocol": "openai-chat",
-                    "url": "http://127.0.0.1:1/v1/chat/completions",
-                    "model": "gpt"
-                }),
-            )
-            .await
-            .unwrap_err();
+        let missing = super::super::adapters::stream(
+            &host,
+            &invocation(HashSet::from(["http://127.0.0.1:1".into()])),
+            serde_json::json!({
+                "protocol": "openai-chat",
+                "url": "http://127.0.0.1:1/v1/chat/completions",
+                "model": "gpt"
+            }),
+        )
+        .await
+        .unwrap_err();
         assert!(missing.to_string().contains("registered model request"));
 
         let mut registered = invocation(HashSet::from(["http://127.0.0.1:1".into()]));
-        registered.model = Some(Arc::new(crate::model::ModelInvocation {
+        registered.set_model(Arc::new(crate::model::ModelInvocation {
             call_id: "call".into(),
             run_id: "run".into(),
             conversation_id: "conversation".into(),
@@ -736,31 +456,29 @@ mod tests {
                 history: Vec::new(),
             },
         }));
-        let foreign = host
-            .call(
-                &registered,
-                "protocol.stream",
-                serde_json::json!({
-                    "protocol": "openai-chat",
-                    "url": "http://10.0.0.2/v1/chat/completions",
-                    "model": "gpt"
-                }),
-            )
-            .await
-            .unwrap_err();
+        let foreign = super::super::adapters::stream(
+            &host,
+            &registered,
+            serde_json::json!({
+                "protocol": "openai-chat",
+                "url": "http://10.0.0.2/v1/chat/completions",
+                "model": "gpt"
+            }),
+        )
+        .await
+        .unwrap_err();
         assert!(foreign.to_string().contains("cannot access host"));
-        let credentials = host
-            .call(
-                &registered,
-                "protocol.stream",
-                serde_json::json!({
-                    "protocol": "openai-chat",
-                    "url": "http://user:pass@127.0.0.1:1/v1/chat/completions",
-                    "model": "gpt"
-                }),
-            )
-            .await
-            .unwrap_err();
+        let credentials = super::super::adapters::stream(
+            &host,
+            &registered,
+            serde_json::json!({
+                "protocol": "openai-chat",
+                "url": "http://user:pass@127.0.0.1:1/v1/chat/completions",
+                "model": "gpt"
+            }),
+        )
+        .await
+        .unwrap_err();
         assert!(
             credentials
                 .to_string()
@@ -810,15 +528,13 @@ mod tests {
                 .unwrap();
         });
         let host = host();
-        let invocation = InvocationState {
-            allowed_origins: HashSet::from([origin.clone()]),
-            magpie_catalog_status: Some(AtomicU16::default()),
-            cancellation: CancellationToken::new(),
-            recorder: None,
-            recorder_claimed: AtomicBool::new(false),
-            model: None,
-            events: parking_lot::Mutex::new(None),
-        };
+        let invocation = InvocationState::new(
+            HashSet::from([origin.clone()]),
+            CancellationToken::new(),
+            None,
+            None,
+        )
+        .with_magpie_catalog_tracking();
         assert!(!invocation.failure().to_string().contains("HTTP"));
         let result = host
             .call(
@@ -834,94 +550,6 @@ mod tests {
         );
         assert!(invocation.failure().to_string().contains("HTTP 401"));
         server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn pending_authorization_ends_on_completion_and_drop() {
-        let pending = Arc::new(Pending::open());
-        let Registration {
-            guard: completed,
-            mut receiver,
-            ..
-        } = pending.register(invocation(HashSet::new())).unwrap();
-        let (_, mut active, _) = pending.authorization(&completed.id).unwrap();
-        let PendingInvocation {
-            items,
-            active: signal,
-            ..
-        } = pending.remove(&completed.id).unwrap();
-        drop(signal);
-        items
-            .try_send(WorkerStreamItem::Result(Ok(serde_json::Value::Null)))
-            .unwrap();
-        match receiver.recv().await {
-            Some(WorkerStreamItem::Result(Ok(value))) => assert!(value.is_null()),
-            other => panic!("expected result, got {other:?}"),
-        }
-        assert!(active.changed().await.is_err());
-        assert!(pending.authorization(&completed.id).is_none());
-
-        let Registration {
-            guard: cancelled,
-            mut receiver,
-            ..
-        } = pending.register(invocation(HashSet::new())).unwrap();
-        let id = cancelled.id.clone();
-        let (_, mut active, _) = pending.authorization(&id).unwrap();
-        drop(cancelled);
-        assert!(receiver.recv().await.is_none());
-        assert!(active.changed().await.is_err());
-        assert!(pending.authorization(&id).is_none());
-    }
-
-    #[tokio::test]
-    async fn invocation_timeout_drops_its_pending_entry() {
-        let pending = Arc::new(Pending::open());
-        let mut id = None;
-        let timed_out = tokio::time::timeout(Duration::from_millis(1), async {
-            let Registration {
-                guard: request,
-                receiver: mut result,
-                ..
-            } = pending.register(invocation(HashSet::new())).unwrap();
-            id = Some(request.id.clone());
-            result.recv().await
-        })
-        .await;
-        assert!(timed_out.is_err());
-        assert!(pending.authorization(&id.unwrap()).is_none());
-    }
-
-    #[tokio::test]
-    async fn closing_one_generation_revokes_only_its_invocations() {
-        let old = Arc::new(Pending::open());
-        let Registration {
-            guard: old_request,
-            receiver: mut failed,
-            ..
-        } = old.register(invocation(HashSet::new())).unwrap();
-        let (_, mut active, _) = old.authorization(&old_request.id).unwrap();
-        let new = Arc::new(Pending::open());
-        let Registration {
-            guard: new_request,
-            receiver: mut unaffected,
-            ..
-        } = new.register(invocation(HashSet::new())).unwrap();
-        old.close("plugin worker exited");
-        match failed.recv().await {
-            Some(WorkerStreamItem::Result(Err(error))) => {
-                assert!(error.to_string().contains("worker exited"));
-            }
-            other => panic!("expected failed result, got {other:?}"),
-        }
-        assert!(active.changed().await.is_err());
-        assert!(old.authorization(&old_request.id).is_none());
-        assert!(old.register(invocation(HashSet::new())).is_err());
-        assert!(new.authorization(&new_request.id).is_some());
-        assert!(matches!(
-            unaffected.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
     }
 
     fn network_params() -> serde_json::Value {
@@ -972,24 +600,19 @@ mod tests {
     }
 
     fn recorded_invocation(recorder: CallRecorder) -> InvocationState {
-        InvocationState {
-            allowed_origins: HashSet::new(),
-            magpie_catalog_status: None,
-            cancellation: CancellationToken::new(),
-            recorder: Some(recorder),
-            recorder_claimed: AtomicBool::new(false),
-            model: None,
-            events: parking_lot::Mutex::new(None),
-        }
+        InvocationState::new(
+            HashSet::new(),
+            CancellationToken::new(),
+            Some(recorder),
+            None,
+        )
     }
 
     fn recording_host() -> HostContext {
         HostContext::new(
             "test",
-            &crate::plugins::manifest::PluginPermissions {
-                network: vec!["example.com".into()],
-                resource_origin: false,
-            },
+            ResourceOriginPolicy::Denied,
+            vec!["example.com".into()],
         )
     }
 
@@ -1084,7 +707,7 @@ mod tests {
         assert!(!summary.detailed);
     }
 
-    async fn echo_worker(_root: &std::path::Path, source: &str) -> (Modules, PluginWorker) {
+    fn echo_worker(_root: &std::path::Path, source: &str) -> (Modules, PluginWorker) {
         // The fixtures are JS modules; author-facing TS compilation has separate build tests.
         let source = source
             .replace(
@@ -1095,18 +718,17 @@ mod tests {
         let mut table = super::super::builtin::MODULES.to_vec();
         table.push(("echo/main.js", Box::leak(source.into_boxed_str())));
         let loader = Modules(Box::leak(table.into_boxed_slice()));
-        let definition = vm::collect(loader, "echo/main.js".into()).await.unwrap();
-        let providers = super::super::catalog::validate_definition(
-            "dev.cursorbyoknext.plugins.echo",
-            &definition,
+        let manifest: super::super::manifest::PluginManifest = serde_json::from_value(serde_json::json!({"apiVersion":1,"id":"dev.cursorbyoknext.plugins.echo","name":"Echo","version":"0.1.0","icon":"assets/magpie.svg","entry":"echo/main.js","permissions":{"network":[],"resourceOrigin":false}})).unwrap();
+        (
+            loader,
+            PluginWorker::new(
+                manifest.id.clone(),
+                manifest.resource_origin_policy(),
+                manifest.network_hosts(),
+                "echo/main.js".into(),
+                loader,
+            ),
         )
-        .unwrap();
-        let plugin = super::super::catalog::PluginEntry {
-            entry: "echo/main.js".into(),
-            manifest: serde_json::from_value(serde_json::json!({"apiVersion":1,"id":"dev.cursorbyoknext.plugins.echo","name":"Echo","version":"0.1.0","icon":"assets/magpie.svg","entry":"echo/main.js","permissions":{"network":[],"resourceOrigin":false}})).unwrap(),
-            definition, providers, icon: String::new(),
-        };
-        (loader, PluginWorker::new(&plugin, loader))
     }
 
     fn echo_invocation(text: &str) -> Arc<crate::model::ModelInvocation> {
@@ -1198,7 +820,7 @@ export default defineProviderPlugin({ providers: [provider] });
     #[tokio::test]
     async fn custom_plugin_reads_the_sdk_request_once_per_invoke() {
         let temp = tempfile::tempdir().unwrap();
-        let (_loader, worker) = echo_worker(temp.path(), ECHO_PLUGIN).await;
+        let (_loader, worker) = echo_worker(temp.path(), ECHO_PLUGIN);
         let events = invoke_echo(&worker, echo_invocation("hello"), CancellationToken::new()).await;
         let text = events.iter().find_map(|event| match event {
             crate::provider::ModelEvent::TextDelta(text) => Some(text.as_str()),
@@ -1216,7 +838,7 @@ export default defineProviderPlugin({ providers: [provider] });
     #[tokio::test]
     async fn concurrent_invokes_cannot_read_each_others_requests() {
         let temp = tempfile::tempdir().unwrap();
-        let (_loader, worker) = echo_worker(temp.path(), ECHO_PLUGIN).await;
+        let (_loader, worker) = echo_worker(temp.path(), ECHO_PLUGIN);
         let first = invoke_echo(&worker, echo_invocation("alpha"), CancellationToken::new());
         let second = invoke_echo(&worker, echo_invocation("beta"), CancellationToken::new());
         let (first, second) = tokio::join!(first, second);
@@ -1261,7 +883,7 @@ const provider: ProviderSupport = {
 export default defineProviderPlugin({ providers: [provider] });
 "#;
         let temp = tempfile::tempdir().unwrap();
-        let (_loader, worker) = echo_worker(temp.path(), source).await;
+        let (_loader, worker) = echo_worker(temp.path(), source);
         let cancellation = CancellationToken::new();
         let mut items = worker
             .invoke_streaming(WorkerRequest {
@@ -1294,61 +916,20 @@ export default defineProviderPlugin({ providers: [provider] });
     }
 
     #[test]
-    fn invoke_handles_are_taken_before_the_request_is_sent() {
-        let pending = Arc::new(Pending::open());
-        let Registration {
-            guard,
-            mut receiver,
-            items,
-            active,
-        } = pending.register(invocation(HashSet::new())).unwrap();
-        pending.remove(&guard.id);
-        let _ = items.try_send(WorkerStreamItem::Result(Ok(
-            serde_json::json!({"ok": true}),
-        )));
-        drop(active);
-        let Some(WorkerStreamItem::Result(Ok(value))) = receiver.try_recv().ok() else {
-            panic!("pre-send handles must still receive the worker result");
-        };
-        assert_eq!(value["ok"], true);
-        drop(guard);
-    }
-
-    #[tokio::test]
-    async fn register_rejects_more_than_the_active_invocation_budget() {
-        let pending = Arc::new(Pending::open());
-        let mut guards = Vec::new();
-        for _ in 0..MAX_ACTIVE_INVOCATIONS {
-            guards.push(pending.register(invocation(HashSet::new())).unwrap());
-        }
-        let overflow = pending.register(invocation(HashSet::new()));
-        assert!(overflow.is_err(), "a burst must be capped");
-        drop(guards);
-    }
-
-    #[test]
     fn event_overflow_ends_the_invocation_instead_of_dropping_events() {
         let pending = Arc::new(Pending::open());
-        let Registration {
-            guard,
-            mut receiver,
-            items,
-            active,
-        } = pending.register(invocation(HashSet::new())).unwrap();
-        let cancellation = pending
-            .authorization(&guard.id)
-            .unwrap()
-            .0
-            .cancellation
-            .clone();
+        let (guard, mut receiver, items, active) =
+            pending.register(invocation(HashSet::new())).unwrap();
+        let state = pending.authorization(guard.id()).unwrap().0;
         let event = serde_json::json!({"type":"text-start"});
         for _ in 0..EVENT_QUEUE_ITEMS {
-            deliver_event(&pending, &host(), &guard.id, &event);
+            deliver_event(&pending, &host(), guard.id(), &event);
         }
         assert_eq!(receiver.len(), EVENT_QUEUE_ITEMS);
-        deliver_event(&pending, &host(), &guard.id, &event);
-        assert!(pending.authorization(&guard.id).is_none());
-        assert!(cancellation.is_cancelled());
+        deliver_event(&pending, &host(), guard.id(), &event);
+        assert!(pending.authorization(guard.id()).is_none());
+        assert!(state.is_cancelled());
+        drop(state);
         assert!(active.has_changed().is_err());
         drop(items);
         let mut count = 0;
@@ -1373,7 +954,7 @@ export default defineProviderPlugin({providers:[{id:'echo',displayName:'Echo',pr
 }}]});
 "#;
         let temp = tempfile::tempdir().unwrap();
-        let (_, worker) = echo_worker(temp.path(), source).await;
+        let (_, worker) = echo_worker(temp.path(), source);
         let events = invoke_echo(&worker, echo_invocation("hello"), CancellationToken::new()).await;
         let text = events
             .iter()
@@ -1403,7 +984,7 @@ export default defineProviderPlugin({providers:[{id:'echo',displayName:'Echo',pr
     #[tokio::test]
     async fn a_stopped_vm_is_rebuilt_on_the_next_connection() {
         let temp = tempfile::tempdir().unwrap();
-        let (_, worker) = echo_worker(temp.path(), ECHO_PLUGIN).await;
+        let (_, worker) = echo_worker(temp.path(), ECHO_PLUGIN);
         let before = invoke_echo(&worker, echo_invocation("first"), CancellationToken::new()).await;
         worker.stop().await;
         let after = invoke_echo(&worker, echo_invocation("second"), CancellationToken::new()).await;
@@ -1432,8 +1013,8 @@ globalThis.__recv = async line => {
         let mut session = vm::spawn(modules, "unused.js".into(), &pending, host()).unwrap();
         let mut output = session.output.take().unwrap();
         for method in ["provider.invoke", "models.list"] {
-            let registration = pending.register(invocation(HashSet::new())).unwrap();
-            let id = &registration.guard.id;
+            let (guard, _, _, _) = pending.register(invocation(HashSet::new())).unwrap();
+            let id = guard.id().to_owned();
             let request =
                 format!(r#"{{"type":"request","id":"{id}","method":"{method}","params":{{}}}}"#);
             session.writer.try_send(request.into_bytes()).unwrap();
@@ -1521,7 +1102,7 @@ export default defineProviderPlugin({providers:[{
 }]});
 ".replace("ORIGIN", &origin);
         let temp = tempfile::tempdir().unwrap();
-        let (_, mut worker) = echo_worker(temp.path(), &source).await;
+        let (_, mut worker) = echo_worker(temp.path(), &source);
         Arc::get_mut(&mut worker.inner).unwrap().host = host();
         let mut items = network_probe(&worker, &origin, "start", CancellationToken::new()).await;
         let mut payload = None;
@@ -1579,7 +1160,7 @@ export default defineProviderPlugin({providers:[{
 "
         .replace("ORIGIN", &origin);
         let temp = tempfile::tempdir().unwrap();
-        let (_, mut worker) = echo_worker(temp.path(), &source).await;
+        let (_, mut worker) = echo_worker(temp.path(), &source);
         Arc::get_mut(&mut worker.inner).unwrap().host = host();
         let cancellation = CancellationToken::new();
         let mut items = network_probe(&worker, &origin, "start", cancellation.clone()).await;
@@ -1699,9 +1280,9 @@ export default defineProviderPlugin({providers:[{
         )
         .await
         .unwrap();
-        assert!(!second.cancellation.is_cancelled());
-        first.cancellation.cancel();
-        second.cancellation.cancel();
+        assert!(!second.is_cancelled());
+        first.cancel();
+        second.cancel();
         tasks_drained(&host).await;
         server.abort();
     }
@@ -1714,7 +1295,7 @@ export default defineProviderPlugin({providers:[{
             if (mode === 'heap') { const held=[]; try { for (;;) held.push(new Array(100000).fill(42)); } catch {} }
         ");
         let temp = tempfile::tempdir().unwrap();
-        let (_, worker) = echo_worker(temp.path(), &source).await;
+        let (_, worker) = echo_worker(temp.path(), &source);
         for mode in ["spin", "heap"] {
             let mut items = network_probe(
                 &worker,
@@ -1753,7 +1334,7 @@ export default defineProviderPlugin({providers:[{
             vec![("sdk/worker.js", source)].into_boxed_slice(),
         ));
         let temp = tempfile::tempdir().unwrap();
-        let (_, mut worker) = echo_worker(temp.path(), ECHO_PLUGIN).await;
+        let (_, mut worker) = echo_worker(temp.path(), ECHO_PLUGIN);
         let inner = Arc::get_mut(&mut worker.inner).unwrap();
         inner.loader = modules;
         inner.host = host();

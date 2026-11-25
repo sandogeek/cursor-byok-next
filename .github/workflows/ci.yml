@@ -81,7 +81,7 @@ jobs:
           # (assert_is_empty arrived in 1.100), so CI must not move on its own.
           # Bump together with the fixes it needs.
           toolchain: "1.100.0"
-          components: rustfmt, clippy
+          components: rustfmt, clippy, rust-analyzer, rust-src
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -98,6 +98,12 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Install deslop-please
+        run: cargo install --locked deslop-please --version 0.1.4
+
+      - name: Run deslop-please
+        run: deslop-please --all-features
 
       - name: Run workspace tests
         if: matrix.tests

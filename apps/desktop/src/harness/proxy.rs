@@ -174,21 +174,40 @@ async fn bind_listener(requested_port: u16) -> Result<TcpListener> {
 
 /// Which requests go to the local backend. The relay reads this shared value
 /// for every request, so a backend can arrive after the proxy has started.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Routing {
-    backend: Arc<RwLock<Option<SocketAddr>>>,
+    backend: Arc<RwLock<Option<BackendTarget>>>,
+}
+
+#[derive(Clone, Copy)]
+struct BackendTarget {
+    addr: SocketAddr,
+    provides: fn(&str) -> bool,
+}
+
+impl std::fmt::Debug for Routing {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Routing")
+            .field("backend", &self.backend.read().map(|target| target.addr))
+            .finish()
+    }
 }
 
 impl Routing {
     /// Points the relay at a freshly started local backend. Every request
     /// reads this value, so the backend may arrive after the proxy started.
-    pub fn set_backend_addr(&self, addr: SocketAddr) {
-        *self.backend.write() = Some(addr);
+    pub fn set_backend_addr(&self, addr: SocketAddr, provides: fn(&str) -> bool) {
+        *self.backend.write() = Some(BackendTarget { addr, provides });
     }
 
     /// The backend the relay should use, or `None` when none is connected.
     fn backend(&self) -> Option<SocketAddr> {
-        self.backend.read().filter(|addr| addr.ip().is_loopback())
+        self.backend
+            .read()
+            .as_ref()
+            .filter(|target| target.addr.ip().is_loopback())
+            .map(|target| target.addr)
     }
 
     /// Whether a local backend is connected.
@@ -198,11 +217,14 @@ impl Routing {
     }
 
     fn routes(&self, host: &str, path: &str) -> Option<SocketAddr> {
-        if is_cursor_host(host) && is_local_path(path) {
-            self.backend()
-        } else {
-            None
+        if !is_cursor_host(host) {
+            return None;
         }
+        self.backend
+            .read()
+            .as_ref()
+            .filter(|target| target.addr.ip().is_loopback() && (target.provides)(path))
+            .map(|target| target.addr)
     }
 }
 
@@ -283,18 +305,6 @@ fn bad_gateway(message: &'static str) -> RequestOrResponse {
 pub fn is_cursor_host(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     matches!(host.as_str(), "api2.cursor.sh" | "api3.cursor.sh") || host.ends_with(".cursor.sh")
-}
-
-/// The requests a local backend owns once it exists. Adding a path here widens
-/// what takeover can serve; every entry needs a local handler behind it.
-///
-/// `AgentService/Run`, `RunSSE`, and `RunPoll` stay off this list: they serve
-/// the backend loop, which needs a local `RunEngine` this app does not have.
-/// The agent-host still routes turns that the local loop refuses (unsupported
-/// mode or action, harness override, tool restriction) to that loop, so
-/// claiming them locally would turn working turns into a 404.
-fn is_local_path(path: &str) -> bool {
-    crate::backend::provides(path)
 }
 
 #[cfg(test)]
@@ -397,6 +407,15 @@ mod tests {
         }
     }
 
+    fn test_local_paths(path: &str) -> bool {
+        matches!(
+            path,
+            "/aiserver.v1.InferenceService/RunInferenceSSE"
+                | "/aiserver.v1.BidiService/BidiAppend"
+                | "/auth/stripe_profile"
+        )
+    }
+
     #[test]
     fn a_backendless_takeover_routes_nothing() {
         let routing = Routing::default();
@@ -411,7 +430,7 @@ mod tests {
     #[test]
     fn backend_loop_rpcs_stay_with_cursor_upstream() {
         let routing = Routing::default();
-        routing.set_backend_addr(SocketAddr::from(([127, 0, 0, 1], 3000)));
+        routing.set_backend_addr(SocketAddr::from(([127, 0, 0, 1], 3000)), test_local_paths);
         for path in [
             "/agent.v1.AgentService/Run",
             "/agent.v1.AgentService/RunSSE",
@@ -426,7 +445,7 @@ mod tests {
     fn the_local_loop_pair_is_routed_locally() {
         let routing = Routing::default();
         let backend = SocketAddr::from(([127, 0, 0, 1], 3000));
-        routing.set_backend_addr(backend);
+        routing.set_backend_addr(backend, test_local_paths);
         for path in [
             "/aiserver.v1.InferenceService/RunInferenceSSE",
             "/aiserver.v1.BidiService/BidiAppend",
@@ -443,7 +462,7 @@ mod tests {
     fn a_configured_backend_routes_only_allowlisted_cursor_paths() {
         let routing = Routing::default();
         let backend = SocketAddr::from(([127, 0, 0, 1], 3000));
-        routing.set_backend_addr(backend);
+        routing.set_backend_addr(backend, test_local_paths);
         assert_eq!(
             routing.routes("api2.cursor.sh", "/aiserver.v1.BidiService/BidiAppend"),
             Some(backend)
@@ -473,7 +492,7 @@ mod tests {
         );
 
         let backend = SocketAddr::from(([127, 0, 0, 1], 3000));
-        routing.set_backend_addr(backend);
+        routing.set_backend_addr(backend, test_local_paths);
 
         assert_eq!(
             relay
@@ -486,7 +505,7 @@ mod tests {
     #[test]
     fn a_non_loopback_backend_is_not_used() {
         let routing = Routing::default();
-        routing.set_backend_addr(SocketAddr::from(([192, 0, 2, 1], 3000)));
+        routing.set_backend_addr(SocketAddr::from(([192, 0, 2, 1], 3000)), test_local_paths);
         assert_eq!(
             routing.routes("api2.cursor.sh", "/auth/stripe_profile"),
             None

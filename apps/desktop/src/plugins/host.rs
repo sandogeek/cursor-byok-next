@@ -18,19 +18,22 @@ use crate::{
 
 use super::{
     Error, Result,
-    catalog::{PluginCatalog, PluginEntry},
-    catalog_cache::{
-        CatalogCache, CatalogRefresh, LiveCatalogEntry, LiveCatalogKey, ProviderCatalog,
+    catalog::{
+        PluginCatalog, PluginEntry,
+        cache::{CatalogCache, CatalogRefresh, LiveCatalogEntry, LiveCatalogKey, ProviderCatalog},
     },
-    data::PluginDataStore,
     descriptor::{
         FormFieldKind, ModelSource, PluginDescriptor, PluginModelDescriptor,
         PluginProviderDescriptor, PluginResourceDescriptor, PluginResourceView, ResourceDefinition,
         ResourcePresentation, ValidatedProvider, parse_model_id,
     },
+    invocation::WorkerStreamItem,
     origin,
-    state::{PluginStateStore, ResourceDraft, ResourcePatch, ResourceRecord, StoredModel},
-    worker::{PluginWorker, WorkerRequest, WorkerStreamItem},
+    state::{
+        PluginStateStore, ResourceDraft, ResourcePatch, ResourceRecord, StoredModel,
+        data::PluginDataStore,
+    },
+    worker::{PluginWorker, WorkerRequest},
 };
 
 #[derive(Clone)]
@@ -206,7 +209,7 @@ impl PluginHost {
         if resources.is_empty() {
             return Err(Error::Protocol("form submit produced no resources".into()));
         }
-        if entry.manifest.permissions.resource_origin {
+        if entry.manifest.resource_origin_policy().is_allowed() {
             for draft in &mut resources {
                 let origin = origin::origin_from_private_data(&draft.private_data)?;
                 origin::rewrite_private_origin(&mut draft.private_data, &origin);
@@ -326,7 +329,7 @@ impl PluginHost {
             .models;
         Ok(stored
             .into_iter()
-            .find(|model| model.id == id.model)
+            .find(|model| model.id() == id.model)
             .map(|model| {
                 PluginModelDescriptor::new(id.plugin, &entry.manifest.name, provider, &model)
             }))
@@ -363,7 +366,7 @@ impl PluginHost {
                 .models;
             let stored = stored
                 .into_iter()
-                .find(|model| model.id == upstream_id)
+                .find(|model| model.id() == upstream_id)
                 .ok_or_else(|| {
                     Error::NotFound(format!(
                         "plugin model {}",
@@ -789,7 +792,7 @@ impl PluginHost {
         let mut seen = HashSet::new();
         for definition in definitions {
             let model = StoredModel::from_definition(definition)?;
-            if seen.insert(model.id.clone()) {
+            if seen.insert(model.id().to_owned()) {
                 models.push(model);
             }
         }
@@ -797,7 +800,7 @@ impl PluginHost {
     }
 
     fn resource_origins(entry: &PluginEntry, record: Option<&ResourceRecord>) -> HashSet<String> {
-        if !entry.manifest.permissions.resource_origin {
+        if !entry.manifest.resource_origin_policy().is_allowed() {
             return HashSet::new();
         }
         record
@@ -843,11 +846,15 @@ impl PluginHost {
 
     async fn worker(&self, entry: &PluginEntry) -> Arc<PluginWorker> {
         let mut workers = self.inner.workers.lock().await;
-        Arc::clone(
-            workers
-                .entry(entry.manifest.id.clone())
-                .or_insert_with(|| Arc::new(PluginWorker::new(entry, self.inner.catalog.loader()))),
-        )
+        Arc::clone(workers.entry(entry.manifest.id.clone()).or_insert_with(|| {
+            Arc::new(PluginWorker::new(
+                entry.manifest.id.clone(),
+                entry.manifest.resource_origin_policy(),
+                entry.manifest.network_hosts(),
+                entry.entry.clone(),
+                self.inner.catalog.loader(),
+            ))
+        }))
     }
 
     #[cfg(test)]
@@ -1596,8 +1603,8 @@ mod tests {
     async fn binds_live_models_to_resource_ids() {
         // The binding happens inside the cache, so its effect is observed through
         // the same read the picker makes.
-        let cache = super::super::catalog_cache::CatalogCache::default();
-        let key = super::super::catalog_cache::LiveCatalogKey {
+        let cache = super::super::catalog::cache::CatalogCache::default();
+        let key = super::super::catalog::cache::LiveCatalogKey {
             plugin: "dev.cursorbyoknext.plugins.magpie".into(),
             provider: "magpie".into(),
             resource: "resource-1".into(),
@@ -1605,22 +1612,15 @@ mod tests {
         let entry = cache
             .store(
                 key,
-                Ok(vec![StoredModel {
-                    id: "gpt-5".into(),
-                    display_name: "GPT".into(),
-                    description: None,
-                    max_output_tokens: None,
-                    images: false,
-                    private_data: serde_json::Value::Null,
-                }]),
+                Ok(vec![StoredModel::for_test("gpt-5", "GPT")]),
                 "resource-1",
             )
             .await;
-        assert_eq!(entry.models[0].id, "resource-1/gpt-5");
+        assert_eq!(entry.models[0].id(), "resource-1/gpt-5");
         assert_eq!(
             crate::plugins::parse_model_id(&format!(
                 "plugin:dev.cursorbyoknext.plugins.magpie/magpie/{}",
-                entry.models[0].id
+                entry.models[0].id()
             )),
             Some(crate::plugins::ModelId {
                 plugin: "dev.cursorbyoknext.plugins.magpie",

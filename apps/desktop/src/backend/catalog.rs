@@ -11,7 +11,7 @@ use crate::{
     Result,
     backend::proxy::{self, CursorProxy},
     plugins::{PluginHost, PluginModelDescriptor},
-    protocol::{connect, proto::agent::v1 as agent},
+    protocol::{self, proto::agent::v1 as agent},
 };
 
 const CLI_LOCAL_MODEL_API_KEY: &str = "cursor-byok-next-local";
@@ -348,11 +348,12 @@ fn merge_response(upstream: proxy::BufferedResponse, extra: Vec<u8>) -> Result<R
         tracing::warn!(status = %upstream.status, "Cursor model catalog upstream rejected request; using local catalog");
         return Ok(super::proto_bytes_response(extra));
     }
-    let (framing, payload) = connect::split_unary(&upstream.body, "model catalog")?;
-    let mut merged = Vec::with_capacity(payload.len() + extra.len());
-    merged.extend_from_slice(payload);
-    merged.extend_from_slice(&extra);
-    let body = connect::wrap_unary(&merged, framing)?;
+    let body = protocol::rewrite_unary(&upstream.body, "model catalog", |payload| {
+        let mut merged = Vec::with_capacity(payload.len() + extra.len());
+        merged.extend_from_slice(payload);
+        merged.extend_from_slice(&extra);
+        Ok(merged)
+    })?;
     Ok(upstream.with_body(body))
 }
 

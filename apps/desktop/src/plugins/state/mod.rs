@@ -1,8 +1,11 @@
 //! Owns core-side persistence of plugin resources.
 
+pub(super) mod data;
+
 use serde::{Deserialize, Serialize};
 
-use super::{Error, Result, data::PluginDataStore};
+use self::data::PluginDataStore;
+use super::{Error, Result};
 use crate::time::now_ms;
 
 /// What every `Debug` in this module prints instead of stored credentials.
@@ -148,7 +151,7 @@ impl std::fmt::Debug for ResourcePatch {
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct StoredModel {
-    pub id: String,
+    id: String,
     pub display_name: String,
     #[serde(default)]
     pub description: Option<String>,
@@ -175,6 +178,30 @@ impl std::fmt::Debug for StoredModel {
 }
 
 impl StoredModel {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn with_resource_prefix(mut self, resource_id: &str) -> Self {
+        self.id = format!("{resource_id}/{}", self.id);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn for_test(id: &str, display_name: &str) -> Self {
+        Self {
+            id: id.into(),
+            display_name: display_name.into(),
+            description: None,
+            max_output_tokens: None,
+            images: false,
+            private_data: serde_json::Value::Null,
+        }
+    }
+
     /// Reads one `models.list` entry.
     ///
     /// # Errors
@@ -536,14 +563,8 @@ mod tests {
             private_data: Some(serde_json::json!({ "token": secret })),
             state: None,
         };
-        let model = StoredModel {
-            id: "m1".into(),
-            display_name: "Model".into(),
-            description: None,
-            max_output_tokens: None,
-            images: false,
-            private_data: serde_json::json!({ "token": secret }),
-        };
+        let mut model = StoredModel::for_test("m1", "Model");
+        model.private_data = serde_json::json!({ "token": secret });
         for rendered in [
             format!("{record:?}"),
             format!("{draft:?}"),

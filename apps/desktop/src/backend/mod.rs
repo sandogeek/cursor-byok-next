@@ -30,15 +30,13 @@ use crate::{
     Result,
     calls::CallStore,
     harness,
-    loop_service::{InferenceRoute, InferenceService, decode_append},
+    loop_service::{InferenceRoute, InferenceService, KnowledgeService, decode_append},
     plugins::PluginHost,
     protocol::{
-        connect,
+        self,
         proto::{agent::v1 as agent, aiserver::v1 as ai, inference::v1 as inference},
     },
 };
-
-pub use knowledge::KnowledgeService;
 
 pub struct Backend {
     addr: SocketAddr,
@@ -277,7 +275,7 @@ fn misc_routes() -> Router {
 }
 
 async fn is_connected() -> Result<Response<Body>> {
-    Ok(proto_bytes_response(connect::encode_message(
+    Ok(proto_bytes_response(protocol::encode_message(
         &ai::IsConnectedResponse {},
     )?))
 }
@@ -288,7 +286,7 @@ async fn run_inference_sse(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     let (parts, body) = buffered(request).await?;
-    let request: agent::BidiRequestId = connect::decode_unary(&body)?;
+    let request: agent::BidiRequestId = protocol::decode_unary(&body)?;
     let request_id = request.request_id;
     match inference_service.wait_route(&request_id).await {
         InferenceRoute::Upstream => {
@@ -299,8 +297,7 @@ async fn run_inference_sse(
             let stream = async_stream::stream! {
                 let _subscription = subscription;
                 while let Some(frame) = receiver.recv().await {
-                    let complete = connect::decode_frames(&frame)
-                        .is_ok_and(|frames| frames.last().is_some_and(connect::Frame::is_end_stream));
+                    let complete = protocol::chunk_ends_stream(&frame);
                     yield Ok::<Bytes, std::convert::Infallible>(frame);
                     if complete {
                         return;
@@ -329,7 +326,7 @@ async fn bidi_append(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     let (parts, body) = buffered(request).await?;
-    let mut request: ai::BidiAppendRequest = connect::decode_unary(&body)?;
+    let mut request: ai::BidiAppendRequest = protocol::decode_unary(&body)?;
     // Owned, so the payload can be moved out of the request below without a
     // copy and without holding a borrow of `request`.
     let request_id = request
@@ -460,10 +457,7 @@ pub(crate) fn router_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{
-        connect,
-        proto::{agent::v1 as agent, aiserver::v1 as ai, inference::v1 as pb},
-    };
+    use crate::protocol::proto::{agent::v1 as agent, aiserver::v1 as ai, inference::v1 as pb};
     use axum::{
         body::Body,
         http::{Request, StatusCode, header},
@@ -521,7 +515,7 @@ mod tests {
         message: pb::RunInferenceClientMessage,
     ) {
         let payload = message.encode_to_vec();
-        let body = connect::encode_message(&ai::BidiAppendRequest {
+        let body = protocol::encode_message(&ai::BidiAppendRequest {
             data: String::new(),
             request_id: Some(ai::BidiRequestId {
                 request_id: request_id.into(),
@@ -573,7 +567,7 @@ mod tests {
                 Request::post("/aiserver.v1.InferenceService/RunInferenceSSE")
                     .header(header::CONTENT_TYPE, "application/proto")
                     .body(Body::from(
-                        connect::encode_message(&agent::BidiRequestId {
+                        protocol::encode_message(&agent::BidiRequestId {
                             request_id: "inference-test".into(),
                         })
                         .unwrap(),
@@ -589,8 +583,7 @@ mod tests {
             .expect("run ready must arrive")
             .expect("stream started")
             .unwrap();
-        let frames = connect::decode_frames(&frame).unwrap();
-        let ready = pb::RunInferenceServerMessage::decode(frames[0].payload.clone()).unwrap();
+        let ready: pb::RunInferenceServerMessage = protocol::decode_unary(&frame).unwrap();
         assert!(matches!(
             ready.message,
             Some(pb::run_inference_server_message::Message::RunReady(_))

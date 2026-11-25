@@ -9,7 +9,7 @@ use prost::Message;
 use crate::{Error, Result};
 
 /// Set on the frame that ends a server stream.
-pub const END_STREAM_FLAG: u8 = 0x02;
+const END_STREAM_FLAG: u8 = 0x02;
 /// Set on a frame whose payload is compressed.
 const COMPRESSED_FLAG: u8 = 0x01;
 /// Header bytes preceding every payload.
@@ -21,23 +21,17 @@ const END_STREAM_PAYLOAD: &[u8] = b"{}";
 
 /// One Connect frame: the flag byte plus the payload it announced.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Frame {
+struct Frame {
     /// The raw flag byte; [`Frame::is_end_stream`] answers the common question.
-    pub flags: u8,
-    pub payload: Bytes,
+    flags: u8,
+    payload: Bytes,
 }
 
 impl Frame {
     /// Whether this frame ends the stream.
     #[must_use]
-    pub fn is_end_stream(&self) -> bool {
+    fn is_end_stream(&self) -> bool {
         self.flags & END_STREAM_FLAG != 0
-    }
-
-    /// Whether the payload is compressed, so the caller must inflate it.
-    #[must_use]
-    pub fn is_compressed(&self) -> bool {
-        self.flags & COMPRESSED_FLAG != 0
     }
 }
 
@@ -95,16 +89,37 @@ pub fn decode_unary<M: Message + Default>(body: &[u8]) -> Result<M> {
 
 /// Whether a buffered unary body carries the 5-byte Connect envelope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Framing {
+enum Framing {
     Enveloped,
     Bare,
 }
 
 impl Framing {
     #[must_use]
-    pub fn is_enveloped(self) -> bool {
+    fn is_enveloped(self) -> bool {
         self == Self::Enveloped
     }
+}
+
+/// Rewrites an optionally-enveloped unary protobuf body while keeping its framing.
+///
+/// # Errors
+///
+/// Returns [`Error::Protocol`] when the input carries unsupported flags or the
+/// rewritten payload exceeds 4 GiB, or propagates any error from `rewrite`.
+pub fn rewrite_unary<F>(body: &[u8], label: &str, rewrite: F) -> Result<Bytes>
+where
+    F: FnOnce(&[u8]) -> Result<Vec<u8>>,
+{
+    let (framing, payload) = split_unary(body, label)?;
+    let rewritten = rewrite(payload)?;
+    wrap_unary(&rewritten, framing)
+}
+
+/// Whether `chunk` decodes as Connect frames ending with an end-stream marker.
+#[must_use]
+pub fn chunk_ends_stream(chunk: &[u8]) -> bool {
+    decode_frames(chunk).is_ok_and(|frames| frames.last().is_some_and(Frame::is_end_stream))
 }
 
 /// Splits an optional Connect unary envelope off `body`.
@@ -113,7 +128,7 @@ impl Framing {
 ///
 /// Returns [`Error::Protocol`] when the body is a framed message with flags
 /// that cannot be rewritten, such as a compressed or terminal frame.
-pub fn split_unary<'a>(body: &'a [u8], label: &str) -> Result<(Framing, &'a [u8])> {
+fn split_unary<'a>(body: &'a [u8], label: &str) -> Result<(Framing, &'a [u8])> {
     if body.len() < ENVELOPE_BYTES {
         return Ok((Framing::Bare, body));
     }
@@ -136,7 +151,7 @@ pub fn split_unary<'a>(body: &'a [u8], label: &str) -> Result<(Framing, &'a [u8]
 ///
 /// Returns [`Error::Protocol`] when an enveloped payload exceeds the 4 GiB the
 /// length prefix holds.
-pub fn wrap_unary(payload: &[u8], framing: Framing) -> Result<Bytes> {
+fn wrap_unary(payload: &[u8], framing: Framing) -> Result<Bytes> {
     if !framing.is_enveloped() {
         return Ok(Bytes::copy_from_slice(payload));
     }
@@ -154,7 +169,7 @@ pub fn wrap_unary(payload: &[u8], framing: Framing) -> Result<Bytes> {
 /// # Errors
 ///
 /// Returns [`Error::Protocol`] when the body ends mid-envelope or mid-payload.
-pub fn decode_frames(mut body: &[u8]) -> Result<Vec<Frame>> {
+fn decode_frames(mut body: &[u8]) -> Result<Vec<Frame>> {
     let mut frames = Vec::new();
     while !body.is_empty() {
         if body.len() < ENVELOPE_BYTES {

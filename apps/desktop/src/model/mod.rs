@@ -1,10 +1,13 @@
 //! Provider-independent model types used by the local loop.
 
+mod id;
 mod inference;
 mod message;
 mod projection;
 mod token_count;
 mod tool;
+
+pub use id::{ADAPTER_ID_PREFIX, ModelId, model_id, parse_model_id};
 
 pub use inference::{
     ModelInvocation, ModelLatency, ModelRequest, ModelSpec, PromptSpec, Reasoning, Usage,

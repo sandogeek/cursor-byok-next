@@ -80,6 +80,11 @@ impl Server {
 
     /// The debugger's own router; `Arc<Server>` is the axum state.
     pub fn router(self: Arc<Self>) -> Router {
+        let debug_state = web::DebugState {
+            service_addr: self.config.service_addr.clone(),
+            upstream_url: self.upstream_url.clone(),
+            store: self.store.clone(),
+        };
         Router::new()
             .route(
                 DEBUG_BASE_PATH,
@@ -87,9 +92,9 @@ impl Server {
                     axum::response::Redirect::temporary(&format!("{DEBUG_BASE_PATH}/"))
                 }),
             )
-            .nest(&format!("{DEBUG_BASE_PATH}/"), web::router())
             .fallback(proxy)
             .with_state(self)
+            .nest(&format!("{DEBUG_BASE_PATH}/"), web::router(debug_state))
     }
 
     /// The loopback address the proxy listens on.
@@ -510,7 +515,7 @@ impl BodyTarget {
             decode_error,
         };
         store.update(&self.id, |exchange| {
-            exchange.publish_body(self.side, &decoded, &finished);
+            self.side.publish_body(exchange, &decoded, &finished);
             if let Some(err) = read_error {
                 exchange.summary.state = ExchangeState::Error;
                 exchange.summary.error = Some(err);
@@ -594,33 +599,39 @@ fn decode_protobuf(side: Side, path: &str, payload: &[u8]) -> (DecodedSide, Opti
     }
 }
 
-impl Exchange {
-    /// Writes one finished body into the summary and payload.
-    fn publish_body(&mut self, side: Side, decoded: &DecodedSide, finished: &FinishedBody<'_>) {
+impl Side {
+    /// Writes one finished body into the exchange's summary and payload.
+    fn publish_body(
+        self,
+        exchange: &mut Exchange,
+        decoded: &DecodedSide,
+        finished: &FinishedBody<'_>,
+    ) {
         let raw_hex = raw_hex(finished.bytes);
-        match side {
-            Side::Request => {
-                self.summary.request_bytes = finished.size;
+        match self {
+            Self::Request => {
+                exchange.summary.request_bytes = finished.size;
                 if !decoded.kind.is_empty() {
-                    self.summary.request_kind.clone_from(&decoded.kind);
+                    exchange.summary.request_kind.clone_from(&decoded.kind);
                 }
                 if !decoded.request_id.is_empty() {
-                    self.summary.request_id.clone_from(&decoded.request_id);
+                    exchange.summary.request_id.clone_from(&decoded.request_id);
                 }
                 if !decoded.conversation_id.is_empty() {
-                    self.summary
+                    exchange
+                        .summary
                         .conversation_id
                         .clone_from(&decoded.conversation_id);
                 }
             }
-            Side::Response => {
-                self.summary.response_bytes = finished.size;
+            Self::Response => {
+                exchange.summary.response_bytes = finished.size;
                 if !decoded.kind.is_empty() {
-                    self.summary.response_kind.clone_from(&decoded.kind);
+                    exchange.summary.response_kind.clone_from(&decoded.kind);
                 }
-                self.summary.duration_ms = elapsed_ms(self.summary.started_at);
-                if self.summary.state != ExchangeState::Error {
-                    self.summary.state = ExchangeState::Completed;
+                exchange.summary.duration_ms = elapsed_ms(exchange.summary.started_at);
+                if exchange.summary.state != ExchangeState::Error {
+                    exchange.summary.state = ExchangeState::Completed;
                 }
             }
         }
@@ -630,7 +641,7 @@ impl Exchange {
         } else {
             decoded.language.as_str()
         };
-        let payload = side.payload(self);
+        let payload = self.payload(exchange);
         payload.size = finished.size;
         payload.raw_hex = raw_hex;
         payload.raw_truncated = finished.completeness == BodyCompleteness::Truncated;

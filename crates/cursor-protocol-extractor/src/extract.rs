@@ -9,7 +9,7 @@ use crate::merge::{
     collect_needed_types, declaration_coverage, keep_local_loop_enums, keep_local_loop_messages,
     keep_local_loop_services, merge_enums_by_type_name, merge_messages_by_type_name,
     merge_services_by_type_name, normalize_type_references, reclassify_enum_fields,
-    record_empty_messages, sorted_dedup,
+    record_empty_messages,
 };
 use crate::renderer::{CopiedType, ProtoFile, generate_proto_file};
 use crate::resolver::{TypeResolver, build_alias_index, build_module_imports};
@@ -223,9 +223,7 @@ pub fn extract_from_sources(
 
     record_empty_messages(&mut diag, &messages);
     let coverage = declaration_coverage(&declared, &messages, &enums, &services);
-    diag.declared_types = coverage.declared;
-    diag.extracted_types = coverage.extracted;
-    diag.missing_declarations = sorted_dedup(coverage.missing);
+    diag.record_declaration_coverage(coverage.declared, coverage.extracted, coverage.missing);
 
     let files = generate_local_loop_protos(&messages, &enums, &services, &resolver, &mut diag);
     if strictness == Strictness::Strict && diag.has_failure() {
@@ -467,8 +465,7 @@ fn generate_local_loop_protos(
         }
         for (idx, line) in body.lines().enumerate() {
             if has_placeholder(line) {
-                diag.placeholder_hits
-                    .push(format!("{pkg_name}:{}: {}", idx + 1, line.trim()));
+                diag.add_placeholder_hit(format!("{pkg_name}:{}: {}", idx + 1, line.trim()));
             }
         }
         files.insert(file_name, body);

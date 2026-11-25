@@ -10,7 +10,7 @@ use prost::Message;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{Error, Result, backend::proxy, protocol::connect};
+use crate::{Error, Result, backend::proxy, protocol};
 
 pub const BOOTSTRAP_STATSIG_PATH: &str = "/aiserver.v1.AnalyticsService/BootstrapStatsig";
 /// The gates agent-host reads to route a turn to the local loop. Every gate
@@ -50,13 +50,14 @@ pub async fn bootstrap_statsig(
 }
 
 fn patch_upstream(response: proxy::BufferedResponse) -> Result<Response<Body>> {
-    let (framing, payload) = connect::split_unary(&response.body, "Statsig")?;
-    let mut message = BootstrapStatsigResponse::decode(payload)?;
-    let mut config = serde_json::from_str::<Value>(&message.config)?;
-    configure_agent_gates(&mut config)?;
-    message.config = serde_json::to_string(&config)?;
-    let body = message.encode_to_vec();
-    Ok(response.with_body(connect::wrap_unary(&body, framing)?))
+    let body = protocol::rewrite_unary(&response.body, "Statsig", |payload| {
+        let mut message = BootstrapStatsigResponse::decode(payload)?;
+        let mut config = serde_json::from_str::<Value>(&message.config)?;
+        configure_agent_gates(&mut config)?;
+        message.config = serde_json::to_string(&config)?;
+        Ok(message.encode_to_vec())
+    })?;
+    Ok(response.with_body(body))
 }
 
 fn local_response() -> Result<Response<Body>> {

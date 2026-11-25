@@ -14,9 +14,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     Error, Result,
-    backend::KnowledgeService,
     calls::{CallRecorder, CallStore, NewLlmCall, plugin_request_url},
     loop_service::{
+        knowledge::KnowledgeService,
         output::OutputHub,
         overflow, project,
         subagent_models::{self, ByokModel},
@@ -24,7 +24,7 @@ use crate::{
     model::{ModelInvocation, ModelLatency, Usage},
     plugins::{ADAPTER_ID_PREFIX, PluginHost, PluginModelDescriptor},
     protocol::{
-        connect,
+        self,
         proto::{agent::v1 as agent, inference::v1 as pb},
     },
     provider::ModelEvent,
@@ -609,7 +609,7 @@ impl LoopState {
             return;
         }
         if exit.sends_end_stream() {
-            self.output.emit(connect::encode_end_stream());
+            self.output.emit(protocol::encode_end_stream());
         }
     }
 }
@@ -1128,7 +1128,7 @@ fn emit(output: &OutputHub, message: pb::run_inference_server_message::Message) 
     let message = pb::RunInferenceServerMessage {
         message: Some(message),
     };
-    if let Ok(frame) = connect::encode_message(&message) {
+    if let Ok(frame) = protocol::encode_message(&message) {
         output.emit(frame);
     }
 }

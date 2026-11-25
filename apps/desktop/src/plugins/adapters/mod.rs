@@ -13,7 +13,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use super::{Error, Result, host_calls::HostContext, worker::InvocationState};
+use super::{Error, Result, host_calls::HostContext, invocation::InvocationState};
 use crate::{
     model::{
         ContentPart, ModelInvocation, ProjectedContent, ProjectedMessage, ProviderReplayState,
@@ -98,7 +98,7 @@ pub(super) async fn stream(
             Some(&body_text),
         )
         .await?;
-    let cancellation = invocation.cancellation.clone();
+    let cancellation = invocation.child_cancellation();
     let mut response = send_cancellable(builder, &cancellation).await?;
     let status = response.status().as_u16();
     if let Some(recorder) = &recorder {
@@ -365,11 +365,9 @@ fn map_text_field<'a>(
 
 fn count_u64(value: &Value) -> Option<u64> {
     match value {
-        Value::Number(number) => number.as_u64().or_else(|| {
-            number
-                .as_f64()
-                .and_then(crate::protocol::json::integral_u64)
-        }),
+        Value::Number(number) => number
+            .as_u64()
+            .or_else(|| number.as_f64().and_then(crate::saturating::integral_u64)),
         _ => None,
     }
 }

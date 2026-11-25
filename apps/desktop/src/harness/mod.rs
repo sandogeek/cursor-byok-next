@@ -219,7 +219,11 @@ impl CursorHarness {
 
     /// Connects a loopback local service. If takeover is already running, this
     /// also applies its account and settings before local routing begins.
-    pub async fn set_backend_addr(&self, addr: SocketAddr) -> Result<()> {
+    pub async fn set_backend_addr(
+        &self,
+        addr: SocketAddr,
+        provides: fn(&str) -> bool,
+    ) -> Result<()> {
         if !addr.ip().is_loopback() {
             return Err(Error::Config(
                 "the Cursor backend must be on loopback".into(),
@@ -227,7 +231,7 @@ impl CursorHarness {
         }
         let _operation = self.operation.lock().await;
         let url = self.proxy.lock().await.url();
-        self.routing.set_backend_addr(addr);
+        self.routing.set_backend_addr(addr, provides);
         // Starting local routing while takeover runs applies the account and
         // settings a fresh enable would, so the two paths cannot drift.
         match url {

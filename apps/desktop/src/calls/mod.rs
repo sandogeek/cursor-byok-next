@@ -35,7 +35,7 @@ pub struct PluginRequestUrl {
 /// A model id that is not a plugin id is reported as its own model under a
 /// `plugin://` URL built from the id itself.
 pub fn plugin_request_url(model_id: &str) -> PluginRequestUrl {
-    crate::plugins::parse_model_id(model_id).map_or_else(
+    crate::model::parse_model_id(model_id).map_or_else(
         || PluginRequestUrl {
             model: model_id.to_owned(),
             provider: "plugin".into(),

@@ -9,7 +9,7 @@ use std::{
 use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-use super::{Error, Result};
+use crate::plugins::{Error, Result};
 
 /// Rejects ids and keys that could escape their plugin directory.
 const MAX_COMPONENT_BYTES: usize = 128;

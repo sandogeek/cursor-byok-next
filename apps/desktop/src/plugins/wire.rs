@@ -199,7 +199,15 @@ pub(super) fn required_str<'a>(
 const MODEL_EVENT: &str = "plugin model event";
 
 fn required_index(value: &serde_json::Value) -> Result<usize> {
-    super::adapters::count_field(value, "index")
+    value
+        .get("index")
+        .and_then(|field| match field {
+            serde_json::Value::Number(number) => number
+                .as_u64()
+                .or_else(|| number.as_f64().and_then(crate::saturating::integral_u64)),
+            _ => None,
+        })
+        .and_then(|index| usize::try_from(index).ok())
         .ok_or_else(|| Error::Protocol("plugin model event requires index".into()))
 }
 

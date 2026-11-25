@@ -3,14 +3,12 @@
 mod adapters;
 mod builtin;
 mod catalog;
-mod catalog_cache;
-mod data;
 mod descriptor;
 mod host;
 mod host_calls;
+mod invocation;
 mod manifest;
 mod origin;
-mod protocol;
 mod state;
 mod vm;
 mod wire;

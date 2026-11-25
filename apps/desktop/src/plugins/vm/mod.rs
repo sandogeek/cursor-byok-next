@@ -5,6 +5,7 @@ mod globals;
 mod host_module;
 pub(super) mod loader;
 mod natives;
+pub(super) mod protocol;
 mod runtime;
 mod timers;
 pub(super) use collect::collect;

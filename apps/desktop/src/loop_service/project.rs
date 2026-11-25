@@ -13,10 +13,7 @@ use crate::{
         joined_text, parse_token_count,
     },
     plugins::PluginModelDescriptor,
-    protocol::{
-        json::{prost_json, prost_struct},
-        proto::inference::v1 as pb,
-    },
+    protocol::{prost_json, prost_struct, proto::inference::v1 as pb},
 };
 
 /// `InferenceCoreMessage.role` values, matching `InferenceMessageRole` in

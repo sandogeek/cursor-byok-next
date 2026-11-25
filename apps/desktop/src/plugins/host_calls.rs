@@ -16,7 +16,9 @@ use serde_json::Value;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use super::{Error, Result, manifest::PluginPermissions, origin, wire, worker::InvocationState};
+use super::{
+    Error, Result, invocation::InvocationState, manifest::ResourceOriginPolicy, origin, wire,
+};
 use crate::calls::CallRecorder;
 
 /// Per-request deadline for a plugin's own `fetch`/`stream` calls. The worker's
@@ -119,18 +121,21 @@ impl HostContext {
     pub(super) fn active_task_count(&self) -> usize {
         self.active_tasks.load(std::sync::atomic::Ordering::Acquire)
     }
-    /// The context for one plugin, taking exactly the manifest's `permissions`.
-    pub(super) fn new(plugin_id: &str, permissions: &PluginPermissions) -> Self {
+    /// The context for one plugin, taking its origin policy and static host list.
+    pub(super) fn new(
+        plugin_id: &str,
+        resource_origin: ResourceOriginPolicy,
+        network_hosts: Vec<String>,
+    ) -> Self {
         Self {
             plugin_id: plugin_id.to_owned(),
             network_hosts: Arc::new(
-                permissions
-                    .network
-                    .iter()
+                network_hosts
+                    .into_iter()
                     .map(|host| host.to_ascii_lowercase())
                     .collect(),
             ),
-            resource_origin: permissions.resource_origin,
+            resource_origin: resource_origin.is_allowed(),
             streams: Arc::new(Mutex::new(HashMap::new())),
             http: OnceLock::new(),
             #[cfg(test)]
@@ -162,7 +167,6 @@ impl HostContext {
                 self.close_stream(invocation, &params).await?;
                 Ok(Value::Null)
             }
-            "protocol.stream" => super::adapters::stream(self, invocation, params).await,
             "provider.readRequest" => self.read_request(invocation),
             _ => Err(Error::Protocol(format!(
                 "unsupported plugin host method: {method}"
@@ -213,7 +217,7 @@ impl HostContext {
             .ok_or_else(|| Error::Config("plugin network URL has no host".into()))?
             .to_ascii_lowercase();
         let origin = origin::request_origin(&url)?;
-        let allowed_origin = invocation.allowed_origins.contains(&origin);
+        let allowed_origin = invocation.is_allowed_origin(&origin);
         let allowed_static_host = url.scheme() == "https" && self.network_hosts.contains(&host);
         if !(allowed_static_host || (self.resource_origin && allowed_origin)) {
             if url.scheme() != "https" && !self.resource_origin {
@@ -301,25 +305,19 @@ impl HostContext {
         let origin = origin::request_origin(&url)?;
         // Magpie's model discovery is the one call whose status the app reports
         // as `catalogError`; every other status is the plugin's own business.
-        let catalog_status = invocation.magpie_catalog_status.as_ref().filter(|_| {
-            invocation.allowed_origins.contains(&origin)
-                && method == reqwest::Method::GET
-                && url.path() == "/v1/models"
-        });
         let request = request.timeout(NETWORK_REQUEST_TIMEOUT);
         let mut response = tokio::select! {
-            () = invocation.cancellation.cancelled() => return Err(Error::Cancelled),
+            () = invocation.cancelled() => return Err(Error::Cancelled),
             response = request.send() => response.map_err(provider_error)?,
         };
         let status = response.status().as_u16();
         if let Some(recorder) = &recorder {
             recorder.response_headers(status).await;
         }
-        if let Some(catalog_status) = catalog_status {
-            catalog_status.store(status, std::sync::atomic::Ordering::Relaxed);
-            if !response.status().is_success() {
-                return Ok(serde_json::json!({"status": status, "headers": {}, "body": ""}));
-            }
+        if invocation.observe_catalog_response(&origin, &method, url.path(), status)
+            && !response.status().is_success()
+        {
+            return Ok(serde_json::json!({"status": status, "headers": {}, "body": ""}));
         }
         if response
             .content_length()
@@ -332,7 +330,7 @@ impl HostContext {
         let mut body = Vec::new();
         loop {
             let chunk = tokio::select! {
-                () = invocation.cancellation.cancelled() => return Err(Error::Cancelled),
+                () = invocation.cancelled() => return Err(Error::Cancelled),
                 chunk = response.chunk() => chunk.map_err(provider_error)?,
             };
             let Some(chunk) = chunk else { break };
@@ -361,7 +359,7 @@ impl HostContext {
         // The stream belongs to this invocation: when the invocation is cancelled
         // the reader task observes the token and stops, and the entry is dropped
         // on the next read/close. A plugin cannot leak one past its call.
-        let cancellation = invocation.cancellation.child_token();
+        let cancellation = invocation.child_cancellation();
         let response = tokio::select! {
             () = cancellation.cancelled() => return Err(Error::Cancelled),
             response = request.send() => response.map_err(provider_error)?,
@@ -387,7 +385,7 @@ impl HostContext {
             }
             let (sender, receiver) = mpsc::channel::<Result<String>>(STREAM_LINE_BUFFER);
             let stream_cancel = cancellation.clone();
-            let invocation_cancel = invocation.cancellation.clone();
+            let stream_lifetime = invocation.child_cancellation();
             let open_streams = Arc::clone(&self.streams);
             let cleanup_id = stream_id.clone();
             #[cfg(test)]
@@ -396,7 +394,7 @@ impl HostContext {
                 #[cfg(test)]
                 let _task_guard = task_guard;
                 stream_body(response, sender, stream_cancel.clone(), recorder).await;
-                tokio::select! { () = invocation_cancel.cancelled() => {}, () = stream_cancel.cancelled() => {} }
+                tokio::select! { () = stream_lifetime.cancelled() => {}, () = stream_cancel.cancelled() => {} }
                 open_streams.lock().await.remove(&cleanup_id);
             });
             streams.insert(

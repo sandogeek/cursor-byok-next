@@ -1,6 +1,6 @@
 //! One OS thread and independent bounded `QuickJS` heap per plugin session.
 use super::{allocator::HeapAllocator, loader::Modules, natives::Bridge, timers::Timers};
-use crate::plugins::{Error, Result, host_calls::HostContext, worker::Pending};
+use crate::plugins::{Error, Result, host_calls::HostContext, invocation::Pending};
 use rquickjs::{Context, Function, Module, Runtime, promise::PromiseState};
 use std::{
     cell::{Cell, RefCell},

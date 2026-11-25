@@ -115,6 +115,7 @@ cargo test --workspace
 cargo test -p cursor-protocol-extractor
 cargo test -p cursor-capture
 cargo clippy --workspace --all-targets --all-features # BeautifulRust lint 表，见下方
+deslop-please --all-features # 架构检查（需 rust-analyzer 组件），见下方
 cargo fmt --all
 
 # 桌面 mixed 应用
@@ -137,6 +138,16 @@ nsh package --target macos
 - 三个成员都是应用（桌面 app + 两个 CLI），所以 BeautifulRust 标注 `[lib]` 的 lint（`missing_docs`、`missing_errors_doc`、`missing_panics_doc`、`unreachable_pub`、`exhaustive_enums`）已按表内说明去掉；哪天真出库 crate 再加回来。
 - CLI 入口用 `#![expect(clippy::print_stdout, clippy::print_stderr, reason = …)]` 显式豁免打印。
 - `cargo fmt --all` 之后再提交；本仓库没有自定义 `rustfmt.toml`，用默认风格。
+
+## 架构检查（deslop-please）
+
+使用 [`deslop-please`](https://github.com/deterministic-machines/deslop-please) 检查模块边界与代码结构（`module-cycle`、`tangle`、`field-leak`、`shallow-module`、`wide-directory`、`long-file`）。
+
+- 目标形态已经达成：`deslop-please --all-features` 全绿（`deslop-please: ok`），不使用 `.deslop-please.allow` 掩盖结构债务，改动后必须保持全绿；涉及平台 `cfg` 分支时可加 `--target <triple>`（如 `x86_64-unknown-linux-gnu`、`x86_64-pc-windows-msvc`）交叉验证。
+- `deslop-please` 报出的错误必须从第一性原理做架构重构，不做机械搬运隐藏问题：
+  - `module-cycle` & `tangle`：审视预期的抽象分层与依赖方向，确定每个模块所处的层级。
+  - `field-leak` & `shallow-module`：追问这些字段与公开函数为何存在、调用模式是什么，将实现细节整体收敛在窄接口之后，而非逐个打补丁。
+  - 较大的结构调整前，先画架构对照图说明重构前后的边界变化。
 
 ## 当前进度
 

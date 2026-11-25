@@ -1,8 +1,9 @@
 //! Native I/O bridge. JS handles stay on their owning VM thread.
 use super::host_module::{HostDone, HostError};
 use crate::plugins::{
+    adapters,
     host_calls::HostContext,
-    worker::{InvocationBudget, Pending},
+    invocation::{InvocationBudget, Pending},
 };
 use rquickjs::{Ctx, Exception, Function, Promise};
 use std::{
@@ -72,10 +73,14 @@ impl<'js> Bridge<'js> {
                     let result = tokio::select! {
                         biased;
                         _ = active.changed() => Err(HostError { message: "plugin invocation is no longer active".into(), status: None }),
-                        () = invocation.cancellation.cancelled() => Err(crate::Error::Cancelled.into()),
+                        () = invocation.cancelled() => Err(crate::Error::Cancelled.into()),
                         result = async {
                             let params = serde_json::from_str(&json).map_err(crate::Error::from)?;
-                            let value = host.call(&invocation, &method, params).await?;
+                            let value = if method == "protocol.stream" {
+                                adapters::stream(&host, &invocation, params).await?
+                            } else {
+                                host.call(&invocation, &method, params).await?
+                            };
                             serde_json::to_string(&value).map_err(crate::Error::from)
                         } => result.map_err(HostError::from),
                     };
@@ -139,7 +144,7 @@ impl<'js> Bridge<'js> {
             .filter(|(_, waiting)| {
                 self.pending
                     .authorization(&waiting.id)
-                    .is_none_or(|(state, _, _)| state.cancellation.is_cancelled())
+                    .is_none_or(|(state, _, _)| state.is_cancelled())
             })
             .map(|(key, _)| *key)
             .collect();

@@ -739,7 +739,7 @@ var Ads={typeName:"aiserver.v1.InAppAdService",methods:{ok:{name:"Ok",I:Keep,O:K
 #[test]
 fn scan_records_oxc_parse_errors() {
     let scan = scan_source("var x = {;");
-    assert_ne!(scan.diagnostics.parse_errors, Vec::<String>::new());
+    assert!(scan.diagnostics.parse_error_count() > 0);
 }
 
 #[test]

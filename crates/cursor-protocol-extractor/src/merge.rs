@@ -290,7 +290,7 @@ pub fn sorted_dedup(mut values: Vec<String>) -> Vec<String> {
 pub fn record_empty_messages(diag: &mut Diagnostics, messages: &[Message]) {
     for message in messages {
         if message.fields.is_empty() {
-            diag.empty_messages.push(message.type_name.clone());
+            diag.add_empty_message(message.type_name.clone());
         }
     }
 }

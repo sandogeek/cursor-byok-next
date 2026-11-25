@@ -1,11 +1,13 @@
 //! Loads only the app's embedded Magpie plugin.
 
+pub(in crate::plugins) mod cache;
+
 use base64::{Engine, engine::general_purpose::STANDARD};
 
-use super::{
-    Error, Result,
+use crate::plugins::{
+    Error, Result, builtin,
     descriptor::{CatalogMode, PluginModuleDefinition, ValidatedProvider},
-    manifest::{PluginManifest, validate_id},
+    manifest::{self, PluginManifest, validate_id},
     vm::{self, loader::Modules},
 };
 
@@ -75,7 +77,7 @@ pub(crate) struct LoadedManifest {
 }
 
 fn load_manifest() -> Result<LoadedManifest> {
-    let manifest: PluginManifest = serde_json::from_str(super::builtin::MANIFEST)?;
+    let manifest: PluginManifest = serde_json::from_str(builtin::MANIFEST)?;
     manifest.validate()?;
     require_app_version(&manifest, APP_VERSION)?;
     if Modules::embedded().source(&manifest.entry).is_none() {
@@ -83,7 +85,7 @@ fn load_manifest() -> Result<LoadedManifest> {
     }
     let icon = format!(
         "data:image/svg+xml;base64,{}",
-        STANDARD.encode(super::builtin::ICON)
+        STANDARD.encode(builtin::ICON)
     );
     Ok(LoadedManifest { manifest, icon })
 }
@@ -92,7 +94,7 @@ fn require_app_version(manifest: &PluginManifest, app_version: &str) -> Result<(
     let Some(minimum) = &manifest.min_app_version else {
         return Ok(());
     };
-    if super::manifest::version_at_least(app_version, minimum) {
+    if manifest::version_at_least(app_version, minimum) {
         return Ok(());
     }
     Err(Error::Config(format!(
@@ -213,7 +215,7 @@ pub(super) fn validate_definition(
 fn validate_form_fields(
     plugin_id: &str,
     method_id: &str,
-    fields: &[super::descriptor::FormFieldDefinition],
+    fields: &[crate::plugins::descriptor::FormFieldDefinition],
 ) -> Result<()> {
     if fields.is_empty() {
         return Err(Error::Config(format!(
@@ -256,15 +258,12 @@ mod tests {
         let catalog = PluginCatalog::for_test(root.path());
         let manifests = PluginCatalog::manifests();
         assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].manifest.id, builtin::MAGPIE_PLUGIN_ID);
         assert_eq!(
-            manifests[0].manifest.id,
-            super::super::builtin::MAGPIE_PLUGIN_ID
+            manifests[0].manifest.resource_origin_policy(),
+            crate::plugins::manifest::ResourceOriginPolicy::Allowed
         );
-        assert!(manifests[0].manifest.permissions.resource_origin);
-        assert_eq!(
-            manifests[0].manifest.permissions.network,
-            Vec::<String>::new()
-        );
+        assert_eq!(manifests[0].manifest.network_hosts(), Vec::<String>::new());
         assert!(manifests[0].icon.starts_with("data:image/svg+xml;base64,"));
         let entries = catalog.entries().await.unwrap();
         assert_eq!(entries[0].definition.providers[0].id, "magpie");
