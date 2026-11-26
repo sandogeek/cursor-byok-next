@@ -39,11 +39,12 @@ export interface DesktopPreferences {
   snapshot(): Promise<DesktopState>;
   restore(): Promise<void>;
   setDockIconVisible(visible: boolean): Promise<DesktopState>;
+  setSilentStart(enabled: boolean): Promise<DesktopState>;
   setWindowPresence(presence: "open" | "closed"): Promise<void>;
   setAppearance(appearance: Appearance): Promise<void>;
 }
 
-export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog; calls: CallLog; desktop: DesktopPreferences; trayIcon: ImageAsset | string; onWindow?: (window: WindowRef) => void }) {
+export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog; calls: CallLog; desktop: DesktopPreferences; trayIcon: ImageAsset | string; silentStart?: boolean; onWindow?: (window: WindowRef) => void }) {
   const window = currentWindow();
   props.onWindow?.(window);
   const syncWindowPresence = (presence: "open" | "closed") =>
@@ -69,14 +70,22 @@ export function Cursor(props: { takeover: CursorTakeover; plugins: PluginCatalog
       { role: "quit" },
     ],
   });
-  if (platform.os === "macos") {
+  if (platform.desktop) {
     window.set({ closeOnPress: false });
     window.on("closePress", () => window.hide());
-    let wasOpen: boolean | undefined;
+  }
+  if (platform.os === "macos") {
+    let wasOpen: boolean | undefined = props.silentStart ? false : undefined;
     effect(() => {
       const state = window.state();
       if (!state) return;
       const open = state.visible || state.minimized;
+      if (wasOpen === undefined && !open && !props.silentStart) {
+        // Normal launch starts with `window.defaultVisible: false` and calls
+        // `window.focus()` right after mount; wait for that initial show
+        // before tracking open/closed transitions.
+        return;
+      }
       if (wasOpen !== undefined && open !== wasOpen) {
         void syncWindowPresence(open ? "open" : "closed");
       }

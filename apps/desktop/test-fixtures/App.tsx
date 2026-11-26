@@ -43,15 +43,21 @@ const desktop = {
   snapshot: () => host.call<DesktopState>("desktop.snapshot"),
   restore: () => host.call<void>("desktop.restore"),
   setDockIconVisible: (visible: boolean) => host.call<DesktopState>("desktop.setDockIconVisible", { visible }),
+  setSilentStart: (enabled: boolean) => host.call<DesktopState>("desktop.setSilentStart", { enabled }),
   setWindowPresence: (presence: "open" | "closed") => host.call<void>("desktop.setWindowPresence", { presence }),
   setAppearance: (appearance: string) => host.call<void>("desktop.setAppearance", { appearance }),
 };
 
-void restoreAppearance().then(async (appearance) => {
-  if (appearance) await desktop.setAppearance(appearance);
-}).then(() => restoreLocale()).then(() => {
+void Promise.all([
+  restoreAppearance().then(async (appearance) => {
+    if (appearance) await desktop.setAppearance(appearance);
+  }),
+  restoreLocale(),
+  desktop.snapshot(),
+]).then(([, , desktopState]) => {
   let window: WindowRef | undefined;
-  mount(() => <Cursor takeover={takeover} plugins={plugins} calls={calls} desktop={desktop} trayIcon={trayIcon} onWindow={(value) => { window = value; }} />);
+  mount(() => <Cursor takeover={takeover} plugins={plugins} calls={calls} desktop={desktop} trayIcon={trayIcon} silentStart={desktopState.silentStart} onWindow={(value) => { window = value; }} />);
+  if (!desktopState.silentStart) window?.focus();
   host.on("tray.open", () => window?.focus());
   host.on("window.minimize", () => window?.minimize());
 });

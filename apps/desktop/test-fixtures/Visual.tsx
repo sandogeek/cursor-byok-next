@@ -94,9 +94,10 @@ const calls = {
 };
 
 const desktop = {
-  snapshot: async () => ({ showDockIcon: true }),
+  snapshot: async () => ({ showDockIcon: true, silentStart: false }),
   restore: async () => {},
-  setDockIconVisible: async () => ({ showDockIcon: true }),
+  setDockIconVisible: async () => ({ showDockIcon: true, silentStart: false }),
+  setSilentStart: async () => ({ showDockIcon: true, silentStart: false }),
   setWindowPresence: async () => {},
   setAppearance: async () => {},
 };
@@ -104,5 +105,6 @@ const desktop = {
 void restoreLocale().then(() => {
   let window: WindowRef | undefined;
   mount(() => <Cursor takeover={takeover} plugins={plugins} calls={calls} desktop={desktop} trayIcon={trayIcon} onWindow={(value) => { window = value; }} />);
+  window?.focus();
   host.on("tray.open", () => window?.focus());
 });

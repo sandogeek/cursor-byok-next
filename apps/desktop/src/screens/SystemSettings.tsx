@@ -1,4 +1,5 @@
 import { appInfo, Clipboard, openUrl, Scroll, createMotion, resource, signal, Text, View } from "nsh";
+import { Application, currentWindow } from "nsh/desktop";
 import { t } from "nsh/i18n";
 import { shellInfo } from "nsh/updater";
 import type { CallsSnapshot, HarnessState } from "cursor-byok-next/native";
@@ -57,15 +58,25 @@ export function SystemSettings(props: { takeover: CursorTakeover; calls: Setting
   /** The takeover state holds the port the user chose and the app's data dir. */
   const tracking = resource(() => props.takeover.status(), { initialValue: initialTracking });
   const calls = resource(() => props.calls.snapshot(), { initialValue: emptyCalls });
-  const desktop = resource(() => props.desktop.snapshot(), { initialValue: { showDockIcon: true } });
+  const isDev = () => appInfo().development;
+  const autostart = resource(
+    () => (isDev() ? Promise.resolve(false) : Application.launchAtLogin()),
+    { initialValue: false },
+  );
+  const desktop = resource(() => props.desktop.snapshot(), { initialValue: { showDockIcon: true, silentStart: false } });
   const appearance = signal<Appearance>("system");
   const busy = signal(false);
   const error = signal("");
   const notice = signal("");
+  const autostartApprovalPending = signal(false);
   const portDraft = signal<string | null>(null);
   const confirmClear = signal<"details" | "all" | null>(null);
   const reveal = createMotion({
     enter: { keyframes: [{ opacity: 0, translateY: motion.distance }, { opacity: 1, translateY: 0 }], duration: motion.base, easing: "easeOut" },
+  });
+
+  currentWindow().on("focusChange", ({ focused }) => {
+    if (focused && !isDev()) autostart.refetch();
   });
 
   const current = () => tracking() ?? initialTracking;
@@ -126,6 +137,25 @@ export function SystemSettings(props: { takeover: CursorTakeover; calls: Setting
   const toggleDock = (visible: boolean) => {
     void perform(async () => {
       desktop.mutate(await props.desktop.setDockIconVisible(visible));
+    });
+  };
+
+  const toggleAutostart = (enabled: boolean) => {
+    if (isDev()) return;
+    void perform(async () => {
+      autostartApprovalPending.set(false);
+      await Application.setLaunchAtLogin(enabled);
+      const actual = await Application.launchAtLogin();
+      autostart.mutate(actual);
+      if (enabled && !actual) {
+        autostartApprovalPending.set(true);
+      }
+    });
+  };
+
+  const toggleSilentStart = (enabled: boolean) => {
+    void perform(async () => {
+      desktop.mutate(await props.desktop.setSilentStart(enabled));
     });
   };
 
@@ -238,8 +268,43 @@ export function SystemSettings(props: { takeover: CursorTakeover; calls: Setting
         </Surface>
 
         <Surface class="gap-1 p-4">
+          <View class="pb-1">
+            <Text role="header" class="text-sm font-semibold text-foreground">{t("settings.startup.title")}</Text>
+          </View>
+          <SettingRow
+            title={t("settings.autostart.title")}
+            description={isDev() ? t("settings.autostart.devDescription") : t("settings.autostart.description")}
+          >
+            <Switch
+              checked={autostart()}
+              testID="settings-autostart"
+              label={t("settings.autostart.title")}
+              disabled={busy() || autostart.loading() || isDev()}
+              onChange={({ checked }) => toggleAutostart(checked)}
+            />
+          </SettingRow>
+          <If when={autostartApprovalPending() && !autostart()}>
+            <Text role="alert" class="pt-2 text-xs text-warning">{t("settings.autostart.approvalHint")}</Text>
+          </If>
+          <SettingRow
+            title={t("settings.silentStart.title")}
+            description={t("settings.silentStart.description")}
+            separated={current().platform === "macos"}
+          >
+            <Switch
+              checked={desktop().silentStart}
+              testID="settings-silent-start"
+              label={t("settings.silentStart.title")}
+              disabled={busy() || desktop.loading()}
+              onChange={({ checked }) => toggleSilentStart(checked)}
+            />
+          </SettingRow>
           <If when={current().platform === "macos"}>
-            <SettingRow title={t("settings.dock.title")} description={t("settings.dock.description")}>
+            <SettingRow
+              title={t("settings.dock.title")}
+              description={t("settings.dock.description")}
+              separated={false}
+            >
               <Switch
                 checked={desktop().showDockIcon}
                 testID="settings-dock"
@@ -249,6 +314,9 @@ export function SystemSettings(props: { takeover: CursorTakeover; calls: Setting
               />
             </SettingRow>
           </If>
+        </Surface>
+
+        <Surface class="gap-1 p-4">
           <SettingRow title={t("settings.appearance.title")} description={t("settings.appearance.description")}>
             <ChoiceGroup
               label={t("settings.appearance.title")}

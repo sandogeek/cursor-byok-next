@@ -63,17 +63,20 @@ fn native(registry: &mut Registry) {
         .class::<Desktop>();
 }
 
-/// Whether macOS shows the app's Dock icon.
+/// Desktop shell settings shared with TSX.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, JsObject)]
 pub struct DesktopState {
     /// The saved choice; this setting has no effect on other platforms.
     pub show_dock_icon: bool,
+    /// Whether the app starts hidden in the tray without showing the main window.
+    pub silent_start: bool,
 }
 
-impl From<desktop::DockIcon> for DesktopState {
-    fn from(value: desktop::DockIcon) -> Self {
+impl From<&desktop::DesktopSettings> for DesktopState {
+    fn from(settings: &desktop::DesktopSettings) -> Self {
         Self {
-            show_dock_icon: value.is_visible(),
+            show_dock_icon: settings.dock_icon().is_visible(),
+            silent_start: settings.launch_mode().is_silent(),
         }
     }
 }
@@ -109,10 +112,12 @@ impl std::fmt::Debug for Desktop {
 impl Desktop {
     /// Restores the desktop shell's saved settings.
     pub fn new() -> Result<Self, Error> {
+        let settings = desktop::DesktopSettings::managed()?;
+        let initial_presence = WindowPresence::at_launch(settings.launch_mode());
         Ok(Self {
             inner: Arc::new(DesktopInner {
-                settings: parking_lot::Mutex::new(desktop::DesktopSettings::managed()?),
-                window_presence: parking_lot::Mutex::new(WindowPresence::Open),
+                settings: parking_lot::Mutex::new(settings),
+                window_presence: parking_lot::Mutex::new(initial_presence),
                 dock_applied: parking_lot::Mutex::new(None),
                 dock_sync: tokio::sync::Mutex::new(()),
                 applied: parking_lot::Mutex::new(None),
@@ -130,8 +135,7 @@ impl Desktop {
         reason = "the #[class] binding is async-only; a sync member would change the generated TSX type"
     )]
     pub async fn snapshot(this: Instance<Self>) -> DesktopState {
-        this.with(|desktop| desktop.inner.settings.lock().dock_icon())
-            .into()
+        this.with(|desktop| DesktopState::from(&*desktop.inner.settings.lock()))
     }
 
     /// Applies the restored Dock setting after the native window is mounted.
@@ -175,21 +179,52 @@ impl Desktop {
         if changed {
             desktop::set_dock_icon(effective).await?;
         }
-        let saved = inner.settings.lock().save(requested);
-        if let Err(error) = saved {
-            // `AppKit` already accepted the change; put the previous state back
-            // rather than leaving the window out of sync with the file.
-            if changed {
-                let rollback_target =
-                    previous_applied.unwrap_or_else(|| presence.dock_icon(previous));
-                if let Err(rollback) = desktop::set_dock_icon(rollback_target).await {
-                    tracing::error!(%rollback, "could not roll back the Dock icon setting");
-                }
+        let saved = {
+            let mut settings = inner.settings.lock();
+            settings
+                .set_dock_icon(requested)
+                .map(|()| DesktopState::from(&*settings))
+        };
+        match saved {
+            Ok(state) => {
+                *inner.dock_applied.lock() = Some(effective);
+                Ok(state)
             }
-            return Err(error);
+            Err(error) => {
+                // `AppKit` already accepted the change; put the previous state back
+                // rather than leaving the window out of sync with the file.
+                if changed {
+                    let rollback_target =
+                        previous_applied.unwrap_or_else(|| presence.dock_icon(previous));
+                    if let Err(rollback) = desktop::set_dock_icon(rollback_target).await {
+                        tracing::error!(%rollback, "could not roll back the Dock icon setting");
+                    }
+                }
+                Err(error)
+            }
         }
-        *inner.dock_applied.lock() = Some(effective);
-        Ok(requested.into())
+    }
+
+    /// Saves whether the app starts hidden in the system tray without showing
+    /// the main window. Takes effect on the next launch.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "the native boundary takes the switch's boolean directly"
+    )]
+    pub async fn set_silent_start(
+        this: Instance<Self>,
+        enabled: bool,
+    ) -> Result<DesktopState, Error> {
+        let inner = this.with(|desktop| Arc::clone(&desktop.inner));
+        let _sync = inner.dock_sync.lock().await;
+        let mut settings = inner.settings.lock();
+        let launch_mode = if enabled {
+            desktop::LaunchMode::Silent
+        } else {
+            desktop::LaunchMode::Normal
+        };
+        settings.set_launch_mode(launch_mode)?;
+        Ok(DesktopState::from(&*settings))
     }
 
     /// Updates whether any window is open so macOS hides the Dock icon when

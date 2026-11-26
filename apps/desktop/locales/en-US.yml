@@ -222,6 +222,16 @@ settings:
     retention: The latest 1000 calls are retained.
     clearDetails: Clear details
     clearAll: Clear all
+  startup:
+    title: Startup & window
+  autostart:
+    title: Launch at login
+    description: Automatically start Cursor-BYOK-Next when you log in.
+    devDescription: Launch at login is only available in packaged builds (currently running in development mode).
+    approvalHint: Login item was registered, but the system has not enabled it yet. Allow Cursor-BYOK-Next in your system's Login Items or Startup Apps settings.
+  silentStart:
+    title: Silent launch
+    description: Start hidden in the system tray without showing the main window.
   dock:
     title: Show in Dock
     description: Turning this off hides the Dock icon. Reopen the window from the menu bar icon. The choice is restored at launch.

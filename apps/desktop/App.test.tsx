@@ -1,4 +1,4 @@
-import { expect, open, test } from "nsh/test";
+import { expect, open, test, type OpenOptions } from "nsh/test";
 import type { CallDetail, CallRecord, CallsSnapshot, HarnessState, PluginSnapshot } from "cursor-byok-next/native";
 
 const missing: HarnessState = {
@@ -129,6 +129,8 @@ function options(initial: HarnessState, calls: string[] = [], plugins: PluginSna
   let current = initial;
   let catalog = plugins;
   let log = records;
+  let showDockIcon = true;
+  let silentStart = false;
   return {
     width: 1100,
     height: 720,
@@ -152,11 +154,17 @@ function options(initial: HarnessState, calls: string[] = [], plugins: PluginSna
           current = { ...current, preferredProxyPort: port };
           return current;
         },
-        "desktop.snapshot": () => ({ showDockIcon: true }),
+        "desktop.snapshot": () => ({ showDockIcon, silentStart }),
         "desktop.restore": () => {},
         "desktop.setDockIconVisible": ({ visible }: { visible: boolean }) => {
+          showDockIcon = visible;
           calls.push(visible ? "dock-on" : "dock-off");
-          return { showDockIcon: visible };
+          return { showDockIcon, silentStart };
+        },
+        "desktop.setSilentStart": ({ enabled: next }: { enabled: boolean }) => {
+          silentStart = next;
+          calls.push(next ? "silent-on" : "silent-off");
+          return { showDockIcon, silentStart };
         },
         "desktop.setWindowPresence": ({ presence }: { presence: string }) => {
           calls.push(`window:${presence}`);
@@ -481,4 +489,102 @@ test("macOS 关闭最后一个窗口时自动隐藏 Dock 图标，最小化保�
   await app.host.send("tray.open", {});
   expect(app.window("main").state()?.visible).toBe(true);
   expect(calls).toEqual(["window:closed", "window:open"]);
+});
+
+test("开发模式下禁用开机自启开关并显示说明", async () => {
+  const app = await open("./test-fixtures/App.tsx", options(ready));
+  await app.press("系统设置");
+  expect(app.texts()).toContain("开机自启");
+  expect(app.texts()).toContain("仅打包后的独立应用支持开机自启（当前为开发运行模式）。");
+  expect(app.enabled("id:settings-autostart")).toBe(false);
+});
+
+test("打包模式下开机自启同步系统状态、支持待批准提示与失败回显", async () => {
+  const calls: string[] = [];
+  let launchAtLogin = true;
+  let pendingApproval = false;
+  let failNext = false;
+  const setup: OpenOptions = options(ready, calls);
+  setup.modules = {
+    ...setup.modules,
+    nsh: {
+      ...setup.modules?.nsh,
+      appInfo: () => ({ id: "dev.cursorbyoknext.app", name: "Cursor-BYOK-Next", version: "0.0.1", build: 1, development: false }),
+    },
+    "nsh/desktop": {
+      "Application.launchAtLogin": async () => launchAtLogin,
+      "Application.setLaunchAtLogin": async (next: boolean) => {
+        calls.push(next ? "autostart-on" : "autostart-off");
+        if (failNext) {
+          failNext = false;
+          throw new Error("系统拒绝更改登录项");
+        }
+        launchAtLogin = pendingApproval ? false : next;
+      },
+    },
+  };
+  const app = await open("./test-fixtures/App.tsx", setup);
+  await app.press("系统设置");
+  expect(app.enabled("id:settings-autostart")).toBe(true);
+  expect(app.texts()).toContain("登录系统时自动启动 Cursor-BYOK-Next。");
+  await app.press("id:settings-autostart");
+  expect(calls).toEqual(["autostart-off"]);
+
+  pendingApproval = true;
+  await app.press("id:settings-autostart");
+  expect(calls).toEqual(["autostart-off", "autostart-on"]);
+  expect(app.texts()).toContain("已请求开启自启，但系统尚未允许。请在系统设置的「登录项」或「启动应用」中允许 Cursor-BYOK-Next。");
+
+  failNext = true;
+  await app.press("id:settings-autostart");
+  expect(app.texts()).toContain("系统拒绝更改登录项");
+});
+
+test("静默启动开关立即保存并独立于开机自启显示", async () => {
+  const calls: string[] = [];
+  const setup = { ...options({ ...ready, platform: "windows" }, calls), platform: "windows" as const };
+  const app = await open("./test-fixtures/App.tsx", setup);
+  await app.press("系统设置");
+  expect(app.texts()).toContain("静默启动");
+  expect(app.texts()).not.toContain("在 Dock 栏显示");
+  await app.press("id:settings-silent-start");
+  expect(calls).toEqual(["silent-on"]);
+  await app.press("id:settings-silent-start");
+  expect(calls).toEqual(["silent-on", "silent-off"]);
+});
+
+test("静默启动保存失败时显示错误并保留已确认状态", async () => {
+  const setup = options(ready);
+  setup.host.handlers["desktop.setSilentStart"] = () => {
+    throw new Error("静默启动保存失败");
+  };
+  const app = await open("./test-fixtures/App.tsx", setup);
+  await app.press("系统设置");
+  await app.press("id:settings-silent-start");
+  expect(app.texts()).toContain("静默启动保存失败");
+});
+
+test("静默启动时初始隐藏窗口并在托盘打开后恢复 Dock 状态", async () => {
+  const calls: string[] = [];
+  const setup = options(ready, calls);
+  setup.host.handlers["desktop.snapshot"] = () => ({ showDockIcon: true, silentStart: true });
+  const app = await open("./test-fixtures/App.tsx", setup);
+  expect(app.window("main").state()?.visible).toBe(false);
+  await app.host.send("tray.open", {});
+  expect(app.window("main").state()?.visible).toBe(true);
+  expect(calls).toEqual(["window:open"]);
+});
+
+test("Windows 与 Linux 关闭窗口隐藏到托盘且可重新打开", async () => {
+  for (const os of ["windows", "linux"] as const) {
+    const app = await open("./test-fixtures/App.tsx", {
+      ...options({ ...ready, platform: os }),
+      platform: os,
+    });
+    expect(app.window("main").state()?.visible).toBe(true);
+    await app.window("main").pressClose();
+    expect(app.window("main").state()?.visible).toBe(false);
+    await app.host.send("tray.open", {});
+    expect(app.window("main").state()?.visible).toBe(true);
+  }
 });

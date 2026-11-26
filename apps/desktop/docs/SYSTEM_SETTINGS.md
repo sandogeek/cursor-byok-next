@@ -3,7 +3,7 @@
 上游实现：`cursor-byok/apps/desktop/src/features/settings/`（`SettingsPage.tsx` + 7 张卡片）+ `server/src/store/settings.rs` + `server/src/control/settings.rs`。
 本移植：`apps/desktop/src/screens/SystemSettings.tsx` + `src/ui/{SettingRow,NumberField,Select,ChoiceGroup,appearance}` + `src/harness/{state,mod}.rs` + `src/desktop.rs` + `src/lib.rs` 的 `Harness` / `Desktop`。
 
-范围只有一件事：**给本仓库真正拥有的状态提供设置界面**。端口、调用记录、外观、界面语言、Dock 图标、数据目录位置；不做上游那些本仓库没有后端的功能。
+范围只有一件事：**给本仓库真正拥有的状态提供设置界面**。端口、调用记录、开机自启、静默启动、外观、界面语言、Dock 图标、数据目录位置；不做上游那些本仓库没有后端的功能。
 
 ## 目录映射
 
@@ -49,24 +49,34 @@ src/ui/appearance.ts     34  外观持久化（Storage 键）+ 启动返回值
 │   ├── resource(() => calls.snapshot())        detailed / storage 计数
 │   ├── 详细记录开关 → Calls.setDetailed → CallsSnapshot
 │   └── 清空详情 / 全部 → 确认弹窗 → Calls.clearDetails / clearAll
+├── 启动与窗口
+│   ├── 开机自启
+│   │   ├── appInfo().development === true    禁用开关 + 开发模式提示
+│   │   ├── Application.launchAtLogin()       读取系统真实登录项（页面加载 / 窗口聚焦刷新）
+│   │   └── Application.setLaunchAtLogin      切换后回读，若仍为 false 显示待批准引导
+│   ├── 静默启动
+│   │   ├── Desktop.snapshot().silentStart    读 desktop.json，启动决定是否 window.focus()
+│   │   └── Desktop.setSilentStart            原子写 desktop.json（保留 dockIcon）
+│   └── Dock（仅 macOS）
+│       ├── Desktop.snapshot()                读 desktop.json，无副作用
+│       ├── Desktop.setDockIconVisible        AppKit 主线程切换 → 原子保存 → 失败回滚
+│       └── App.tsx 启动挂载后 Desktop.restore 静默启动时初始 WindowPresence::Closed（隐藏 Dock）
+├── 托盘与单实例（macOS / Windows / Linux 统一关闭隐藏到托盘）
+│   ├── nsh.json singleInstance + defaultVisible: false
+│   ├── Cursor 根组件 Tray.set                单色模板图标 / 打开 / 退出
+│   ├── 关闭按钮 → closeOnPress: false → WindowRef.hide()
+│   └── 托盘点击 / 菜单「打开」/ Windows·Linux 二次启动 → currentWindow().focus()
+│       └── 同一主窗口 / 引擎 / 接管生命周期，不重建应用
 ├── 外观 → chooseAppearance（setColorScheme + Storage）
 │              └── Desktop.setAppearance（原生标题栏，本次新增）
-├── Dock（仅 macOS）
-│   ├── Desktop.snapshot()                 读 desktop.json，无副作用
-│   ├── Desktop.setDockIconVisible          AppKit 主线程切换 → 原子保存 → 失败回滚
-│   └── App.tsx 启动挂载后 Desktop.restore   恢复上次的 Dock 选择
-├── 托盘（macOS 关闭窗口后仍可恢复）
-│   ├── Cursor 根组件 Tray.set             单色模板图标 / 打开 / 退出
-│   ├── 关闭按钮 → closeOnPress: false → WindowRef.hide()
-│   └── 图标点击或「打开」→ currentWindow().focus()
-│       └── 同一主窗口 / 引擎 / 接管生命周期，不重建应用
 ├── 界面语言 → chooseLocale → setLocale + Storage（`src/screens/Language.tsx` 的 `languageItems` / `localePreference`）
 └── 关于 → dataDir（只读）+ 复制 → Clipboard.writeText
 
 持久化
 ├── ~/.cursor-byok-next/harness.json   enabled / proxyPort / preferredPort
-├── ~/.cursor-byok-next/desktop.json   dockIcon（Visible / Hidden，默认 Visible）
+├── ~/.cursor-byok-next/desktop.json   dockIcon（Visible / Hidden，默认 Visible）+ silentStart（默认 false）
 ├── ~/.cursor-byok-next/calls.db       service_settings.llm_detailed_logging + 调用表
+├── 系统登录项                         macOS SMAppService.mainApp / Windows HKCU Run / Linux XDG autostart
 └── NSH Storage                        cursor-byok-next:appearance / :locale
 ```
 
@@ -83,10 +93,10 @@ src/ui/appearance.ts     34  外观持久化（Storage 键）+ 启动返回值
 | 5 | TAB / commit 模型 | 可配置公益服务地址与 commit 模型 | 不做 | `LOCAL_LOOP.md` 刻意不做清单：没有 commit settings / TAB 直连需求 |
 | 6 | 外部 API | 本地 OpenAI/Anthropic 端点开关 + 密钥 | 不做 | 本仓库不对外提供模型 API，模型只经 Cursor 的 local loop |
 | 7 | Token 定价 | 四个单价字段，前端换算首页用量 | 不做 | 没有首页用量概览（`MODEL_CALLS.md` 刻意不做） |
-| 8 | 应用生命周期 | 开机启动 / 静默启动 / Dock 图标 / 托盘 | 接入 Dock 图标与托盘重开；其余不做 | Dock 通过 `objc2-app-kit` 在 NSH 主线程切换 `NSApplicationActivationPolicy`；托盘复用 `nsh/desktop` 的原生实现，开机启动与静默启动仍超出本步 |
-| 8a | Dock 设置载体 | SQLite `desktop_settings.show_dock_icon` | 独立 `desktop.json` 的 `dockIcon`，由 `Desktop` 独占 | 不混进 `harness.json` 的 Cursor 接管状态机；读写与代理端口互不覆盖 |
-| 8b | Dock 窗口联动 | 无窗口时先 `app.hide()` 再切 Accessory；托盘可重开窗口 | `WindowPresence::dock_icon(preference)` 统一决定当前有效策略；macOS 关闭按钮隐藏窗口后自动切 `Accessory`（不改写 `desktop.json` 的用户偏好），最小化保留 Dock 图标；托盘 `onClick` 与菜单「打开」恢复 `Regular`（若偏好开启）并经 `currentWindow().focus()` 聚焦（NSH 的 `Window.get("main")` 不返回该窗口） | NSH 的 `WindowRef` 已负责取消最小化、显示和激活，监听 `window.state()`（`visible \|\| minimized`）也自然覆盖全屏退出后再隐藏的时序；保留同一引擎，不复制上游的窗口销毁与重建逻辑 |
-| 8c | Dock 失败语义 | AppKit 切换后保存，失败尝试回滚 | 相同；读取页只调 `snapshot`，启动仅 `restore` 一次 | 打开设置页不能重复改系统策略；保存失败时开关保留最后确认值 |
+| 8 | 应用生命周期 | 开机启动 / 静默启动 / Dock 图标 / 托盘 | 接入全部四项：开机自启走 NSH 原生 `Application.launchAtLogin` / `setLaunchAtLogin`；静默启动走 `nsh.json` `window.defaultVisible: false` + `desktop.json` `silentStart`；Dock 通过 `objc2-app-kit` 在 NSH 主线程切换；托盘与关闭进托盘扩展到全桌面平台并开启 `singleInstance: true` | NSH 原生登录项（`SMAppService.mainApp` / `Run` / XDG `.desktop`）不注入自定义 `--autostart` 参数，因此不再自建 LaunchAgent/注册表并行实现，静默启动改为控制所有启动是否直接进入托盘 |
+| 8a | 桌面壳设置载体 | SQLite `desktop_settings`（`show_dock_icon` / `silent_start`） | 独立 `desktop.json`（`dockIcon` + `silentStart`），由 `Desktop` 独占；开机自启不写本地配置 | 不混进 `harness.json` 的 Cursor 接管状态机；开机自启由系统登录项作为唯一所有者，避免应用内缓存与系统设置脱节 |
+| 8b | Dock 窗口联动 | 无窗口时先 `app.hide()` 再切 Accessory；托盘可重开窗口 | `WindowPresence::dock_icon(preference)` 与 `WindowPresence::at_launch(silent_start)` 统一决定当前有效策略；静默启动或关闭窗口隐藏后自动切 `Accessory`（不改写 `desktop.json` 的 `dockIcon` 偏好），最小化保留 Dock 图标；托盘 `onClick` 与菜单「打开」恢复 `Regular`（若偏好开启）并经 `currentWindow().focus()` 聚焦（NSH 的 `Window.get("main")` 不返回该窗口） | NSH 的 `WindowRef` 已负责取消最小化、显示和激活，监听 `window.state()`（`visible \|\| minimized`）也自然覆盖全屏退出后再隐藏与静默启动后首次打开的时序；保留同一引擎，不复制上游的窗口销毁与重建逻辑 |
+| 8c | 生命周期失败与开发态语义 | AppKit 切换后保存，失败尝试回滚；开机启动绑定自启折叠静默开关 | Dock 与静默启动保持独立原子保存；开机自启与静默启动独立显示；`appInfo().development` 下禁用开机自启并提示，打包版开启后回读仍为 `false` 时提示待系统批准 | 静默启动对手动启动同样有效，无需强制依赖开机自启；`SMAppService.mainApp` 在 macOS 登录项未批准或 `nsh run` 开发模式下不可直接置为 `true`，需向用户明确状态 |
 | 9 | 调用观测 | 独立「调用观测」卡片 | 合并进「调用记录」，与调用详细页共享 `Calls` class | 详细模式只有一个所有者；两页各写一份会让开关抢写 |
 | 10 | 存储清理范围 | `details` / `all` 两档，清理后刷新全应用 store | 同样两档，只刷新本页 `CallsSnapshot` | 没有全局 store；调用详细页下次进入会自己读 |
 | 11 | 语言 | 自建 i18n store + 系统语言标签 | `nsh/i18n` + `nsh` Storage 键 | `I18N.md` 已定；设置页复用侧栏同一实现，不复制第二份 |
@@ -125,7 +135,9 @@ src/ui/appearance.ts     34  外观持久化（Storage 键）+ 启动返回值
 15. **AppKit 只经 NSH 的 `run_on_main_thread` 调用**。先切策略再保存；保存失败必须尝试恢复旧策略，界面不更新为新值。
 16. **Dock 隐藏不销毁或隐藏当前窗口**，也不阻止接管后台运行。关闭最后一个窗口后自动切为 `Accessory` 隐藏 Dock 图标但不改写 `desktop.json`；最小化到 Dock 仍视为窗口开启，不隐藏 Dock 图标。托盘点击或「打开」必须按偏好恢复并聚焦同一主窗口；退出走系统 `quit`，不能仅隐藏窗口。
 17. **读取与恢复分开**：设置页 `snapshot()` 只读，启动 `restore()` 才应用保存的策略；失败记录日志而不阻断界面。
-18. **macOS 关闭按钮只隐藏窗口**，不能销毁引擎、接管代理或调用存储；其他平台保留默认关闭行为。托盘点击与菜单「打开」共用同一 `currentWindow()` 引用的 `focus()`；不经 `Window.get("main")`（该 API 不返回本应用主窗口）。
+18. **全平台关闭按钮只隐藏窗口**，不能销毁引擎、接管代理或调用存储；仅托盘「退出」与系统退出真正结束进程；`nsh.json` 开启 `singleInstance: true` 防止 Windows / Linux 后台常驻时重复拉起多实例。托盘点击与菜单「打开」共用同一 `currentWindow()` 引用的 `focus()`；不经 `Window.get("main")`（该 API 不返回本应用主窗口）。
+19. **开机自启只有系统一个所有者。** 不在 `desktop.json` 保存 `autostart` 布尔值，每次进入设置页及窗口重新获焦时通过 `Application.launchAtLogin()` 读取系统状态；`nsh run` 开发模式下禁用开关；打包版开启后回读仍为 `false` 时展示待系统批准提示。
+20. **静默启动决定首次启动是否显示主窗口。** `nsh.json` 以 `window.defaultVisible: false` 启动隐藏主窗口，由 `App.tsx` 读取 `desktop.snapshot().silentStart` 后决定是否调用 `focus()`；为 `true` 时不弹出主窗口，`Desktop` 初始 `WindowPresence` 为 `Closed`，macOS 同步隐藏 Dock 图标直到用户从托盘或菜单打开窗口。
 
 ## 验证
 

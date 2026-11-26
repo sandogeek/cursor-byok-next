@@ -222,6 +222,16 @@ settings:
     retention: 只保留最近 1000 次调用。
     clearDetails: 清空详情
     clearAll: 清空全部
+  startup:
+    title: 启动与窗口
+  autostart:
+    title: 开机自启
+    description: 登录系统时自动启动 Cursor-BYOK-Next。
+    devDescription: 仅打包后的独立应用支持开机自启（当前为开发运行模式）。
+    approvalHint: 已请求开启自启，但系统尚未允许。请在系统设置的「登录项」或「启动应用」中允许 Cursor-BYOK-Next。
+  silentStart:
+    title: 静默启动
+    description: 启动时不显示主窗口，仅保留系统托盘图标。
   dock:
     title: 在 Dock 栏显示
     description: 关闭后隐藏 Dock 栏图标，可点击菜单栏图标重新打开窗口；重启后继续使用此设置。

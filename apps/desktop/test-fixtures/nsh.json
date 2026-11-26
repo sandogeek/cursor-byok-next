@@ -4,6 +4,7 @@
   "build": 1,
   "rust": "..",
   "window": {
+    "defaultVisible": false,
     "titleBar": { "style": "hidden" }
   },
   "theme": {
