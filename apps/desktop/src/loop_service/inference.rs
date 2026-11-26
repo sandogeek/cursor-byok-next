@@ -36,6 +36,11 @@ const SUMMARY_UNUSED_WINDOW_PERCENT: f64 = 0.1;
 const DEFAULT_SUMMARY_PROMPT_CHARS: u64 = 2_800_000;
 const SUMMARY_PROMPT_SCALE_WINDOW: u64 = 1_000_000;
 const DISCONNECTED_RUN_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+/// Cursor's local-loop `StallDetector` resets only on inbound server frames
+/// (default `failTimeoutMs` is 30 s). Emitting heartbeats at 10 s matches
+/// Cursor's `SERVER_HEARTBEAT_INTERVAL_MS` so slow TTFT or long local tools do
+/// not cut the run.
+const SERVER_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 /// Client frames a run may buffer before `BidiAppend` starts waiting on the
 /// consumer, so a slow turn applies backpressure instead of growing without end.
 const RUN_INPUT_QUEUE_FRAMES: usize = 64;
@@ -396,11 +401,19 @@ async fn serve(
     };
     {
         use pb::run_inference_client_message::Message;
+        let mut heartbeat = tokio::time::interval(SERVER_HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate tick at t=0 so `RunReady` is still emitted first.
+        heartbeat.tick().await;
         loop {
             let message = tokio::select! {
                 () = loop_state.cancellation.cancelled() => {
                     loop_state.exit = Some(RunExit::Disconnected);
                     break;
+                }
+                _ = heartbeat.tick() => {
+                    emit_heartbeat(&output);
+                    continue;
                 }
                 message = input.recv() => message,
             };
@@ -636,6 +649,7 @@ impl RunSetup<'_> {
             resolved_model: request.requested_model.clone(),
             supports_self_summary: true,
             routed_model_display_name,
+            accepts_client_heartbeat: true,
             accepts_aborted_finish: true,
             accepts_subagent_model_resolution: true,
             ..pb::RunInferenceRunReady::default()
@@ -1133,6 +1147,17 @@ fn emit(output: &OutputHub, message: pb::run_inference_server_message::Message) 
     }
 }
 
+fn emit_heartbeat(output: &OutputHub) {
+    let message = pb::RunInferenceServerMessage {
+        message: Some(pb::run_inference_server_message::Message::Heartbeat(
+            pb::RunInferenceHeartbeat::default(),
+        )),
+    };
+    if let Ok(frame) = protocol::encode_message(&message) {
+        output.emit_live(&frame);
+    }
+}
+
 /// Decodes one `BidiAppend` payload into the client message it carries.
 pub(crate) fn decode_append(data: &[u8]) -> Result<pb::RunInferenceClientMessage> {
     pb::RunInferenceClientMessage::decode(data).map_err(Error::from)
@@ -1274,5 +1299,96 @@ mod tests {
         assert!(!output.has_history());
         assert!(receiver.try_recv().is_err());
         assert!(!output.emit(Bytes::from_static(b"late")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_run_emits_server_heartbeats_without_polluting_replay_history() {
+        let root = tempfile::tempdir().unwrap();
+        let service = InferenceService::new(
+            PluginHost::for_test(root.path()).unwrap(),
+            KnowledgeService::with_root(root.path().join("rules")).unwrap(),
+            CallStore::at(root.path().join("calls.db")),
+        );
+        let route = service
+            .begin(
+                "heartbeat-run",
+                &pb::RunInferenceClientMessage {
+                    message: Some(pb::run_inference_client_message::Message::RunRequest(
+                        pb::RunInferenceRunRequest {
+                            conversation_id: "conversation".into(),
+                            requested_model: Some(pb::InferenceRequestedModel {
+                                model_id:
+                                    "plugin:dev.cursorbyoknext.plugins.magpie/magpie/missing/model"
+                                        .into(),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+        let InferenceRoute::Local(run) = route else {
+            panic!("plugin model must start a local run");
+        };
+        let (mut receiver, subscription) =
+            service.subscribe("heartbeat-run".into(), Arc::clone(&run));
+        run.append(
+            0,
+            pb::RunInferenceClientMessage {
+                message: Some(pb::run_inference_client_message::Message::RunRequest(
+                    pb::RunInferenceRunRequest {
+                        conversation_id: "conversation".into(),
+                        ..Default::default()
+                    },
+                )),
+            },
+        )
+        .await
+        .unwrap();
+        let first = receiver.recv().await.unwrap();
+        let first_msg: pb::RunInferenceServerMessage = protocol::decode_unary(&first).unwrap();
+        let Some(pb::run_inference_server_message::Message::RunReady(ready)) = first_msg.message
+        else {
+            panic!("expected RunReady first");
+        };
+        assert!(ready.accepts_client_heartbeat);
+
+        tokio::time::sleep(SERVER_HEARTBEAT_INTERVAL).await;
+        let second = receiver.recv().await.unwrap();
+        let second_msg: pb::RunInferenceServerMessage = protocol::decode_unary(&second).unwrap();
+        assert!(matches!(
+            second_msg.message,
+            Some(pb::run_inference_server_message::Message::Heartbeat(_))
+        ));
+
+        // Heartbeats must stay ephemeral so reconnecting clients only replay real frames.
+        let (mut late_receiver, late_subscription) =
+            service.subscribe("heartbeat-run".into(), Arc::clone(&run));
+        let replayed = late_receiver.try_recv().unwrap();
+        let replayed_msg: pb::RunInferenceServerMessage =
+            protocol::decode_unary(&replayed).unwrap();
+        assert!(matches!(
+            replayed_msg.message,
+            Some(pb::run_inference_server_message::Message::RunReady(_))
+        ));
+        assert!(late_receiver.try_recv().is_err());
+
+        run.append(
+            1,
+            pb::RunInferenceClientMessage {
+                message: Some(pb::run_inference_client_message::Message::FinishRun(
+                    pb::RunInferenceFinishRun {
+                        aborted: false,
+                        ..Default::default()
+                    },
+                )),
+            },
+        )
+        .await
+        .unwrap();
+        drop(late_subscription);
+        drop(subscription);
     }
 }

@@ -120,10 +120,15 @@ being stranded in a different queue. No active HTTP wait consumes JS CPU budget.
 
 `stop()` sets the atomic stop flag, revokes pending invocations and joins the
 thread through Tokio's blocking pool. Drop requests stop and schedules the join
-without blocking an async executor worker. The 60-second invocation timeout kills
-the entire generation; the next connection creates a new independent runtime.
-Old generations have their own completion queues, so late results cannot settle
-Promises in a replacement VM. No runtime-directory cleanup thread remains.
+without blocking an async executor worker. The 90-second `INVOCATION_TIMEOUT`
+applies only to unary control invocations (`form.submit`, `models.list`,
+`resource.present`), killing the generation on timeout so a stuck VM is replaced
+on the next connection; streaming `provider.invoke` calls are bounded by
+cancellation, stream close, and the adapter/network timeouts (`REQUEST_TIMEOUT`
+1 hour / `STREAM_IDLE_TIMEOUT` 30 minutes) so long model generations are not
+aborted at a short fixed wall-clock cap. Old generations have their own
+completion queues, so late results cannot settle Promises in a replacement VM.
+No runtime-directory cleanup thread remains.
 
 ## Global objects and verified engine assumptions
 

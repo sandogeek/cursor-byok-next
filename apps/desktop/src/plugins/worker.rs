@@ -2,10 +2,7 @@
 
 use std::{
     collections::HashSet,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 
@@ -30,7 +27,7 @@ use super::{
 };
 use crate::{calls::CallRecorder, model::ModelInvocation};
 
-const INVOCATION_TIMEOUT: Duration = Duration::from_secs(60);
+const INVOCATION_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Complete frames in the bounded in-process session queue.
 type Writer = std::sync::mpsc::SyncSender<Vec<u8>>;
@@ -155,6 +152,10 @@ impl PluginWorker {
     /// Sends one request and hands back the stream of events and the terminal
     /// result.
     ///
+    /// Streaming invocations are bounded by cancellation, stream close, or the
+    /// underlying protocol/network timeouts rather than [`INVOCATION_TIMEOUT`],
+    /// so long model generations do not get cut off mid-stream.
+    ///
     /// The caller must drain the receiver: cancelling `request.cancellation`
     /// or dropping the receiver withdraws the request from the worker.
     ///
@@ -174,7 +175,7 @@ impl PluginWorker {
             allowed_origins,
             model,
         } = request;
-        let (writer, pending, stop) = self.connection().await?;
+        let (writer, pending) = self.connection().await?;
         let request_cancellation = CancellationToken::new();
         let mut state = InvocationState::new(
             allowed_origins,
@@ -205,7 +206,6 @@ impl PluginWorker {
             .map_err(|_| Error::Runtime("plugin request queue is unavailable".into()))?;
         tokio::spawn(async move {
             tokio::select! {
-                () = tokio::time::sleep(INVOCATION_TIMEOUT) => { request_cancellation.cancel(); pending.close("plugin invocation timed out"); stop.store(true, Ordering::Release); }
                 // Local teardown first: request-cancel, deregistration and the
                 // error to the consumer never depend on the child still reading.
                 () = cancellation.cancelled() => {
@@ -248,7 +248,7 @@ impl PluginWorker {
         self.inner.host.sdk_projection_count()
     }
 
-    async fn connection(&self) -> Result<(Writer, Arc<Pending>, Arc<AtomicBool>)> {
+    async fn connection(&self) -> Result<(Writer, Arc<Pending>)> {
         let mut process = self.inner.process.lock().await;
         if process
             .as_ref()
@@ -259,11 +259,7 @@ impl PluginWorker {
         let Some(process) = process.as_ref() else {
             return Err(Error::Provider("plugin worker was not started".into()));
         };
-        Ok((
-            process.writer.clone(),
-            Arc::clone(&process.pending),
-            Arc::clone(&process.session.stop),
-        ))
+        Ok((process.writer.clone(), Arc::clone(&process.pending)))
     }
 
     fn spawn(&self) -> Result<WorkerProcess> {
@@ -1428,5 +1424,91 @@ export default defineProviderPlugin({providers:[{
         tasks_drained(&worker.inner.host).await;
         worker.stop().await;
         server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn streaming_invocation_survives_past_unary_invocation_timeout() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let server_release = Arc::clone(&release);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let first = b"data: {\"choices\":[{\"delta\":{\"content\":\"part1\"}}]}\n\n";
+            let chunk = format!("{:x}\r\n", first.len());
+            socket.write_all(chunk.as_bytes()).await.unwrap();
+            socket.write_all(first).await.unwrap();
+            socket.write_all(b"\r\n").await.unwrap();
+            socket.flush().await.unwrap();
+
+            server_release.notified().await;
+
+            let second = b"data: {\"choices\":[{\"delta\":{\"content\":\" part2\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            let chunk = format!("{:x}\r\n", second.len());
+            socket.write_all(chunk.as_bytes()).await.unwrap();
+            socket.write_all(second).await.unwrap();
+            socket.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+            socket.flush().await.unwrap();
+        });
+
+        let source = r#"
+import { defineProviderPlugin } from "cursor-byok-next:plugin";
+export default defineProviderPlugin({providers:[{
+ id:"echo",displayName:"Echo",providerType:"echo",async invoke(_input, output, context) {
+  await context.protocol.stream({protocol:"openai-chat",url:"ORIGIN/v1/chat/completions",model:"echo"});
+  return {status:"completed"};
+ }
+}]});
+"#
+        .replace("ORIGIN", &origin);
+        let temp = tempfile::tempdir().unwrap();
+        let (_, mut worker) = echo_worker(temp.path(), &source);
+        Arc::get_mut(&mut worker.inner).unwrap().host = host();
+        let mut items =
+            network_probe(&worker, &origin, "long-stream", CancellationToken::new()).await;
+
+        let mut text = String::new();
+        loop {
+            match items.recv().await.unwrap() {
+                WorkerStreamItem::Event(ModelEvent::TextDelta(delta)) => {
+                    text.push_str(&delta);
+                    if text == "part1" {
+                        break;
+                    }
+                }
+                WorkerStreamItem::Result(result) => {
+                    panic!("stream ended early: {result:?}");
+                }
+                WorkerStreamItem::Event(_) => {}
+            }
+        }
+
+        tokio::time::sleep(INVOCATION_TIMEOUT + Duration::from_secs(30)).await;
+        release.notify_one();
+
+        while let Some(item) = items.recv().await {
+            match item {
+                WorkerStreamItem::Event(ModelEvent::TextDelta(delta)) => text.push_str(&delta),
+                WorkerStreamItem::Result(result) => {
+                    result.unwrap();
+                    break;
+                }
+                WorkerStreamItem::Event(_) => {}
+            }
+        }
+        assert_eq!(text, "part1 part2");
+        tasks_drained(&worker.inner.host).await;
+        worker.stop().await;
+        server.await.unwrap();
     }
 }

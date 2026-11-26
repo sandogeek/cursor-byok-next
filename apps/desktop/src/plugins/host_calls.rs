@@ -21,10 +21,14 @@ use super::{
 };
 use crate::calls::CallRecorder;
 
-/// Per-request deadline for a plugin's own `fetch`/`stream` calls. The worker's
-/// own invocation deadline is longer, so a hanging upstream reports as a network
-/// failure rather than a wedged worker.
+/// Per-request deadline for a plugin's unary `fetch` calls. The worker's own
+/// unary invocation deadline is longer, so a hanging upstream reports as a
+/// network failure rather than a wedged worker.
 const NETWORK_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Handshake/response-header deadline for a plugin's `network.stream` calls.
+const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_hours(1);
+/// Idle gap allowed between streamed chunks before a `network.stream` call fails.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 /// A buffered `fetch` reply must fit in memory; the runtime's job count does not
 /// bound a hostile plugin's response size.
 const MAX_NETWORK_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -362,6 +366,12 @@ impl HostContext {
         let cancellation = invocation.child_cancellation();
         let response = tokio::select! {
             () = cancellation.cancelled() => return Err(Error::Cancelled),
+            () = tokio::time::sleep(STREAM_REQUEST_TIMEOUT) => {
+                return Err(Error::Provider(format!(
+                    "plugin network stream request timed out after {} seconds",
+                    STREAM_REQUEST_TIMEOUT.as_secs()
+                )));
+            }
             response = request.send() => response.map_err(provider_error)?,
         };
         let status = response.status().as_u16();
@@ -494,6 +504,18 @@ async fn stream_body(
         let chunk = tokio::select! {
             () = cancellation.cancelled() => {
                 send_terminal(&sender, Err(Error::Cancelled), &cancellation).await;
+                return;
+            }
+            () = tokio::time::sleep(STREAM_IDLE_TIMEOUT) => {
+                fail(
+                    &sender,
+                    &format!(
+                        "plugin network stream idle timeout: no events received for {} seconds",
+                        STREAM_IDLE_TIMEOUT.as_secs()
+                    ),
+                    &cancellation,
+                )
+                .await;
                 return;
             }
             chunk = body.next() => chunk,

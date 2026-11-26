@@ -48,7 +48,8 @@ Cursor agent-host（managed-local）
     └── Upstream → 官方 HTTPS
 
 Local serve()
-├── RunRequest → RunReady（vendor / summarization / subagent / 本地 rules）
+├── RunRequest → RunReady（vendor / summarization / subagent / 本地 rules；`accepts_client_heartbeat=true`）
+├── 10s 定时 → `emit_live` 推送空 `RunInferenceHeartbeat`（不进重放历史），保活 Cursor `StallDetector`
 ├── InvokeModel → PluginHost.stream_model → 登记 Arc<ModelInvocation>
 │                  → QuickJS 插件 VM 里的 Magpie provider.invoke（仅 providerId / model / resource）
 │                  → protocol.stream → Rust 适配器从登记项读核心请求 → HTTP/SSE
@@ -80,7 +81,7 @@ Local serve()
 | 14 | 后端启动 | Tokio 应用启动阶段创建 | 同步构造只建共享状态；异步成员用当前 runtime 启动，`Idle → Starting → Running`；失败或 panic 回 `Idle` | nsh 引擎线程不在 Tokio 上下文中；直接 `spawn` 会 panic 并毒化锁，失败必须能被后续状态刷新重试 |
 | 15 | 后端任务所有权 | 服务端持有长生命周期 `Backend` | `BackendWatch.backend: OnceLock<Backend>` 持有；`Backend` 的 `JoinHandle` 随进程存活 | 原先用 `std::mem::forget` 泄漏句柄；放进 `OnceLock` 表达“只启动一次、活到进程结束”，也让重复启动能被记录 |
 | 16 | 状态锁 | `std::sync::Mutex`，poison 时清毒继续 | `parking_lot::Mutex`，无 poison 状态 | 状态锁中毒后继续用是未定义的状态；换成无 poison 的锁后不需要恢复分支，也不需要额外测试 |
-| 17 | 重放历史上限 | 重放缓冲不设上限，随 Run 增长 | `OutputHub` 只保留最近 `MAX_REPLAY_FRAMES`（4096）帧，更早的帧计入 `dropped_frames` | 订阅者迟到时重放整条流是常态；无上限的历史让一个没人读的 Run 一直占内存。`Cursor` 的 SSE 每帧很小，4096 帧远大于正常重连窗口 |
+| 17 | 重放历史上限 | 重放缓冲不设上限，随 Run 增长 | `OutputHub` 只保留最近 `MAX_REPLAY_FRAMES`（4096）帧，更早的帧计入 `dropped_frames`；服务端 10s `Heartbeat` 走 `emit_live` 不入历史 | 订阅者迟到时重放整条流是常态；无上限的历史让一个没人读的 Run 一直占内存，且心跳不应挤占重放窗口 |
 | 18 | 适配器工具累积 | 每个适配器各自维护 `ToolState` 与 `update_tool`，`Chat` 用 `String`、`Responses` 用 `Option<String>` + `ended` | 统一为 `adapters/tools.rs` 的 `ToolState`：`merge_call_id`/`merge_name` 处理片段，`take_start`/`take_arguments_delta`/`take_end` 各自只在未发出时返回事件 | 两种协议对同一件事（何时发 start / 参数增量 / end）的簿记只写一次；`String` 与 `Option` 的差异由空值判定吸收，事件序列不变 |
 | 19 | local loop 白名单 | 白名单与路由表各一份 | `backend::PROVIDED_PATHS` 是唯一来源，`harness::proxy::is_local_path` 查它 | 漂移时请求直通官方且无任何报错；合成一份后，加路由就自动可被改写 |
 | 20 | 知识库读写的执行线程 | axum handler 里直接同步读目录与文件 | 每次操作一次 `spawn_blocking`，锁也在阻塞线程内获取 | `read_dir` + 逐文件 `read_to_string` 在 async worker 上会占住运行时线程；锁改 `blocking_lock` 后不再与 async 任务争用 |

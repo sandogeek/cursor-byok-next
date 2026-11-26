@@ -60,6 +60,24 @@ impl Subscriber {
     }
 }
 
+impl OutputState {
+    fn broadcast(&mut self, frame: &Bytes) -> bool {
+        if self.closed {
+            return false;
+        }
+        let mut lagged = 0;
+        self.subscribers.retain_mut(|subscriber| {
+            let kept = subscriber.offer(frame);
+            if !kept {
+                lagged += 1;
+            }
+            kept
+        });
+        self.lagged += lagged;
+        true
+    }
+}
+
 impl OutputHub {
     /// The empty hub.
     #[must_use]
@@ -74,18 +92,9 @@ impl OutputHub {
     /// fallen behind is dropped and counted by [`OutputHub::lagged`].
     pub fn emit(&self, frame: Bytes) -> bool {
         let mut state = self.state.lock();
-        if state.closed {
+        if !state.broadcast(&frame) {
             return false;
         }
-        let mut lagged = 0;
-        state.subscribers.retain_mut(|subscriber| {
-            let kept = subscriber.offer(&frame);
-            if !kept {
-                lagged += 1;
-            }
-            kept
-        });
-        state.lagged += lagged;
         let len = frame.len();
         state.history.push_back(frame);
         state.history_bytes += len;
@@ -97,6 +106,12 @@ impl OutputHub {
             }
         }
         true
+    }
+
+    /// Sends one ephemeral frame (such as a server heartbeat) to every live
+    /// subscriber without storing it in the replay history.
+    pub fn emit_live(&self, frame: &Bytes) -> bool {
+        self.state.lock().broadcast(frame)
     }
 
     /// A receiver that first replays the frames already emitted, then follows
@@ -201,5 +216,16 @@ mod tests {
             replayed += 1;
         }
         assert!(replayed >= 1);
+    }
+
+    #[test]
+    fn emit_live_reaches_active_subscribers_without_entering_history() {
+        let hub = OutputHub::new();
+        let mut live = hub.subscribe();
+        assert!(hub.emit_live(&Bytes::from_static(b"heartbeat")));
+        assert_eq!(live.try_recv().unwrap(), Bytes::from_static(b"heartbeat"));
+        assert!(!hub.has_history());
+        let mut late = hub.subscribe();
+        assert!(late.try_recv().is_err());
     }
 }
